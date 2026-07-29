@@ -16,7 +16,11 @@ def test_resolve_log_path_none_relative_absolute_and_tilde(tmp_path):
     # regardless of the shell's cwd.
     assert resolve_log_path("events.log", tmp_path) == tmp_path / "events.log"
     assert resolve_log_path("logs/a.log", tmp_path) == tmp_path / "logs" / "a.log"
-    assert resolve_log_path("/abs/x.log", tmp_path) == Path("/abs/x.log")
+    # An absolute path is taken as it stands. Built from the filesystem's own anchor, because
+    # "/abs/x.log" is NOT absolute on Windows (no drive) and is resolved against the repo root
+    # there, which is the correct Windows reading of a rooted path rather than a bug.
+    absolute = Path(tmp_path.anchor) / "abs" / "x.log"
+    assert resolve_log_path(str(absolute), tmp_path) == absolute
     assert resolve_log_path("~/x.log", tmp_path) == Path.home() / "x.log"
 
 

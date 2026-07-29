@@ -1561,6 +1561,27 @@ def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
     assert (base / "dup.txt").read_text() == "new\n"  # overwritten
 
 
+def test_two_files_that_differ_are_offered_even_with_the_same_size_and_mtime(tmp_path):
+    """The comparison behind the offer must read the CONTENT. It used to accept filecmp's
+    shallow verdict — a matching (size, mtime) — as proof the files were identical, which it
+    is not: two different files written in the same clock tick were then quietly dropped from
+    the offer and the user's work stayed stranded in the worktree. Windows, whose file
+    timestamps are coarser, hit this as a matter of course."""
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    # Same size (they are), and now the same mtime to the nanosecond.
+    stamp = os.stat(base / "dup.txt").st_mtime_ns
+    os.utime(wt / "dup.txt", ns=(stamp, stamp))
+    assert os.stat(wt / "dup.txt").st_size == os.stat(base / "dup.txt").st_size
+
+    assert runner._differs_from_base(wt / "dup.txt", base / "dup.txt") is True
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite all"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner._offer_copy_unstaged_to_base()
+    assert (base / "dup.txt").read_text() == "new\n"  # offered, and copied
+
+
 def test_offer_copy_unstaged_overwrite_all_prompts_once(tmp_path):
     # "Yes, overwrite all" is a SINGLE confirmation covering every conflict, not one
     # prompt per file.
@@ -6660,7 +6681,10 @@ def test_exit_worktree_prompt_lists_paths_and_caches_decision(tmp_path):
     runner._select_popup = lambda title, opts, **k: seen.append((title, k.get("detail"))) or "Delete them"
 
     assert runner._should_delete_worktrees_on_exit() is True
-    assert str(tmp_path / "wt") in str(seen[0][1])  # the precise location is shown
+    # The precise location is shown. Checked against the detail LINES, not against the repr of
+    # the list holding them: repr escapes backslashes, so on Windows the real path is never a
+    # substring of it however right the prompt is.
+    assert any(str(tmp_path / "wt") in line for line in seen[0][1])
 
     seen.clear()
     assert runner._should_delete_worktrees_on_exit() is True  # cached
@@ -8871,8 +8895,12 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
     assert visible.rstrip().endswith("session-1")
 
 
-def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
-    monkeypatch.setenv("HOME", "/Users/dev")
+def test_screen_renderer_status_line_notes_no_worktree():
+    # Built from the platform's OWN home rather than a monkeypatched $HOME: Windows resolves
+    # "~" from USERPROFILE and ignores HOME entirely, so setting HOME asserted nothing there
+    # while the point of this test — the "(no worktree)" note — applies on every platform.
+    home = os.path.expanduser("~")
+    cwd = os.path.join(home, "code", "repo")
     r = ScreenRenderer(5, 100, color_mode="truecolor")
     line = r.status_line(
         cols=100,
@@ -8884,10 +8912,10 @@ def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
-        cwd="/Users/dev/code/repo",
+        cwd=cwd,
     )
-    # The base path is shown, with the no-worktree mode noted right after it.
-    assert "~/code/repo (no worktree)" in line
+    # The base path is shown, home-abbreviated, with the no-worktree mode noted right after it.
+    assert f"~{os.sep}code{os.sep}repo (no worktree)" in line
 
 
 def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):

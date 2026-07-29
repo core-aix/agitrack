@@ -12186,10 +12186,14 @@ class ProxyRunner:
                 return True
             if wt_path.is_dir():
                 return self._dirs_differ(wt_path, base_path)
-            # Cheap shallow check first (size + mtime); only read content when that disagrees, so
-            # mtime jitter doesn't produce a false "differs" and identical files aren't re-read.
-            if filecmp.cmp(str(wt_path), str(base_path), shallow=True):
-                return False
+            # Size first (free, and settles most cases); when the sizes match, the CONTENT
+            # decides. This used to accept filecmp's SHALLOW verdict as proof of "identical",
+            # and a matching (size, mtime) is not proof of anything: two different files
+            # written in the same clock tick compare equal, and the copy-back offer then
+            # dropped a file the user had actually changed — losing their work silently.
+            # Windows, with the coarser file timestamps, lost that race as a matter of course.
+            if wt_path.stat().st_size != base_path.stat().st_size:
+                return True
             return not filecmp.cmp(str(wt_path), str(base_path), shallow=False)
         except OSError:
             return True
