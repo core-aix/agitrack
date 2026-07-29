@@ -105,9 +105,7 @@ def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkey
     story = (out / "story" / "index.html").read_text(encoding="utf-8")
 
     # The controls the page creates as it goes are matched by selector, not by id.
-    assert "#more-moments, .zcloser, .zpart" in story
-    # ...except when "look closer" is only NAVIGATION into a telling that already exists.
-    assert 'document.getElementById("more-moments").dataset.told' in story
+    assert 'e.target.closest(".zpart")' in story
     # The note goes to the page's OWN toast where there is one, so two boxes never stack.
     assert 'if (typeof window.flash === "function") {' in story
     # And the safety net: whatever still reaches the page's error path is shown as a notice.

@@ -77,10 +77,13 @@ _BATCH_CHARS = 24000
 # moments in one go is both a long wait and more than anyone reads at once; "go further
 # back" fetches the next stretch when it is actually wanted.
 _MAX_BATCHES = 1
-# Moments per part at each zoom. The first telling of a part is a handful spread across its
-# whole span; looking closer re-tells the same span at finer grain.
+# Moments per part: a handful spread across its whole span. There was once a second, finer
+# telling of the same span behind a "look closer" button. It was removed: it re-read commits
+# the reader had already paid to have told, and because a part can hold no more moments than
+# it has sittings of work, it could come back with FEWER moments than the view it was
+# supposed to magnify. Choosing the DAYS you want a story about (the range control) gives a
+# reader the same thing honestly - fewer commits told at the same grain is a closer look.
 _MOMENTS_COARSE = 6
-_MOMENTS_FINE = 15
 # How much of one episode the outline call reads: this many of its commits, spread across it
 # so the writer sees its beginning, middle and end, with an ask under the first few.
 _HEADLINE_COMMITS = 8
@@ -214,7 +217,13 @@ class StoryStore:
         if not isinstance(story, dict):
             return None
         if "moments" not in story and "chapters" in story:
-            story["moments"] = story.pop("chapters")  # written before the zoom levels were named
+            story["moments"] = story.pop("chapters")  # written before moments were called moments
+        # A story told when "look closer" existed carries a second, finer set of moments over
+        # days the first set already covers. That feature is gone; keeping them would show the
+        # same stretch twice in one list. Drop them, and let the coarse telling stand.
+        moments = story.get("moments")
+        if isinstance(moments, list) and any(int(m.get("level") or 1) > 1 for m in moments if isinstance(m, dict)):
+            story["moments"] = [m for m in moments if isinstance(m, dict) and int(m.get("level") or 1) <= 1]
         return story
 
     def put(self, key: str, story: dict[str, Any]) -> None:
@@ -970,7 +979,7 @@ def _ask(choice, prompt: str, timeout: int) -> dict | None:
 
 
 def _material(
-    stats: list[CommitStat], story: dict | None, mode: str, part_id: str = "", level: int = 1
+    stats: list[CommitStat], story: dict | None, mode: str, part_id: str = ""
 ) -> tuple[list[CommitStat], str]:
     """Which commits this build tells, and where their moments go.
 
@@ -980,7 +989,7 @@ def _material(
     through to escape.
 
     * ``rewrite`` - the newest part; replaces the story.
-    * ``part`` - the named part (at ``level`` 2 it re-tells the same span, closer).
+    * ``part`` - the named part.
     * ``extend`` - what landed after the story's newest covered commit; appends.
     * ``earlier`` - the next part back from the oldest one told; prepends.
     """
@@ -1004,9 +1013,7 @@ def _material(
         era = next((row for row in eras if row.get("id") == part_id), None)
         if era is None:
             return [], "append"
-        # Looking CLOSER re-tells the same span at finer grain, so coverage does not exclude
-        # it: the same commits legitimately appear at both zooms, once each.
-        return inside(era, fresh_only=level < 2), "merge"
+        return inside(era, fresh_only=True), "merge"
     if mode == "earlier":
         # The next part back that still has something untold, so "further back" walks parts
         # rather than an arbitrary number of sittings.
@@ -1021,17 +1028,28 @@ def _material(
     return [stat for stat in kept if stat.sha not in covered and (not newest or stat.timestamp >= newest)], "append"
 
 
-def _moments_in_span(story: dict | None, start: int, end: int, level: int = 0) -> list[dict]:
-    """The story's moments lying inside ``start``..``end`` (optionally only at ``level``).
-    Spans, not part ids: parts are recomputed as history grows, so a moment written under an
-    older shape of the story still belongs to whatever now covers its days."""
-    return [
-        moment
-        for moment in (story or {}).get("moments") or []
-        if start <= moment.get("from", 0)
-        and moment.get("to", 0) <= end
-        and (not level or int(moment.get("level") or 1) == level)
-    ]
+_EMPTY_RANGE = (
+    "There are no commits in those days on this branch, so there is no story to tell about "
+    "them. Widen the range, or pick 'all time'."
+)
+
+
+def _epoch(value: object) -> int:
+    """A timestamp from the page: seconds, or 0 for "no bound"."""
+    try:
+        seconds = int(float(value or 0))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return seconds if seconds > 0 else 0
+
+
+def in_range(stats: list[CommitStat], since: int = 0, until: int = 0) -> list[CommitStat]:
+    """``stats`` narrowed to the days the reader asked for (either bound may be 0 = open).
+
+    The range scopes a TELLING, not a view: everything downstream - the parts, how many of
+    them there are, which commits count as covered - is computed from what this returns, so a
+    story of one week is that week's own story rather than a week highlighted inside a year."""
+    return [stat for stat in stats if (not since or stat.timestamp >= since) and (not until or stat.timestamp <= until)]
 
 
 def uncovered_count(stats: list[CommitStat], story: dict | None) -> int:
@@ -1054,7 +1072,8 @@ def build_story(
     repo_name: str = "",
     note: str = "",
     part_id: str = "",
-    level: int = 1,
+    since: int = 0,
+    until: int = 0,
     key: str = "",
     stop: threading.Event | None = None,
 ) -> dict[str, Any]:
@@ -1069,7 +1088,7 @@ def build_story(
     for stat in story_stats(stats):
         by_sha[stat.sha] = stat
         by_sha[stat.short] = stat
-    material, placement = _material(stats, existing, mode, part_id, level)
+    material, placement = _material(stats, existing, mode, part_id)
     if not material:
         raise StoryError("There is nothing new to tell: the story already covers this branch.")
     # Segment the material itself, not the whole history: an episode is a sitting of work
@@ -1077,25 +1096,10 @@ def build_story(
     selected = segment_episodes(material, sha_paths)
 
     # A telling COVERS its material rather than starting at one end of it: the sittings are
-    # spread into as many groups as this zoom level asks for, and each group becomes a
+    # spread into as many groups as there are moments to write, and each group becomes one
     # moment. Taking the first N sittings instead left the rest of a part untold and made
     # "show earlier moments" the only way to see the middle of your own history.
-    # Spread ALWAYS: a telling covers its scope end to end, whichever mode asked for it.
-    wanted = _MOMENTS_FINE if level >= 2 else _MOMENTS_COARSE
-    selected = spread(selected, wanted)
-    if level >= 2:
-        # "Closer" has to be CLOSER. A part is cut into as many moments as it has sittings of
-        # work, capped at _MOMENTS_FINE, so a part with few sittings can produce FEWER moments
-        # than the coarse telling above it - and the reader clicks "look closer" and gets a
-        # shorter list, which reads as the button doing the opposite of what it says.
-        already = len(_moments_in_span(existing, material[0].timestamp, material[-1].timestamp, 1))
-        if already and len(selected) <= already:
-            raise StoryError(
-                f"This part is already told as finely as it can be. It holds {len(selected)} "
-                f"sitting{'' if len(selected) == 1 else 's'} of work (a sitting is a run of commits "
-                f"with no long pause in it), and the {already} moments you have already cover them, "
-                "so telling it closer would produce nothing new to read."
-            )
+    selected = spread(selected, _MOMENTS_COARSE)
     all_batches = _batches(selected)
     batches = all_batches[:_MAX_BATCHES] if placement in ("append", "merge") else all_batches[-_MAX_BATCHES:]
     left_behind = len(all_batches) - len(batches)
@@ -1130,8 +1134,7 @@ def build_story(
             # Two unusable answers about this stretch. Tell it plainly from the commits and
             # keep going: one bad reply must not cost the whole build.
             moments = _fallback_moments(batch, by_sha, sha_paths, used_ids)
-        for moment in moments:  # which part, and at which zoom, this telling belongs to
-            moment["level"] = level
+        for moment in moments:  # which part this telling belongs to
             if part_id:
                 moment["part"] = part_id
         produced.extend(moments)
@@ -1150,6 +1153,9 @@ def build_story(
     story = _assemble(
         kept, produced, placement, story_key, tone, note, existing, by_sha, choice, left_behind, partial=False
     )
+    # Which days this telling was asked for, kept with it: the page says so, and a reader
+    # coming back tomorrow can see the story is of a stretch rather than of everything.
+    story["range"] = {"from": since, "to": until}
     # The coarse story: the WHOLE history in eras, named in one call. Independent of how much
     # has been written out, so the reader always sees where the project has been, even on a
     # first build that only detailed the last week.
@@ -1186,11 +1192,7 @@ def _assemble(
     else:
         moments = list(produced)
     moments.sort(key=lambda moment: (moment.get("from", 0), moment.get("to", 0)))
-    # Coverage tracks the COARSE telling only: a finer one revisits the same commits by
-    # design, and counting them would make "what is left to tell" meaningless.
-    covered_shas = sorted(
-        {sha for moment in moments if int(moment.get("level") or 1) <= 1 for sha in moment.get("shas", [])}
-    )
+    covered_shas = sorted({sha for moment in moments for sha in moment.get("shas", [])})
     story: dict[str, Any] = {
         "branch": story_key,
         "tone": tone,
@@ -1338,7 +1340,8 @@ def start_build(
     repo_name: str = "",
     note: str = "",
     part_id: str = "",
-    level: int = 1,
+    since: int = 0,
+    until: int = 0,
 ) -> dict[str, Any]:
     """Kick off a build on a background thread and return immediately.
 
@@ -1349,7 +1352,7 @@ def start_build(
     # Answer "there is nothing to tell" immediately instead of spawning a thread that fails a
     # moment later: the page would otherwise show a spinner and then an error for a button
     # press that could never have worked.
-    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode, part_id, level)
+    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode, part_id)
     if not material:
         return {
             "error": (
@@ -1392,7 +1395,8 @@ def start_build(
                     repo_name=repo_name,
                     note=note,
                     part_id=part_id,
-                    level=level,
+                    since=since,
+                    until=until,
                     key=key,
                     stop=stop,
                 )
@@ -1521,9 +1525,15 @@ def handle_story_post(
             mode = str(body.get("mode") or "extend")
             if mode not in ("extend", "rewrite", "earlier", "part"):
                 mode = "extend"
+            # The reader's chosen days scope the WHOLE build: the parts are computed over the
+            # range too, so a story of one week is that week split into parts, not a week's
+            # worth of moments hanging off a year-long timeline.
+            window = in_range(stats, _epoch(body.get("from")), _epoch(body.get("to")))
+            if not window:
+                return {"error": _EMPTY_RANGE}
             return start_build(
                 root,
-                stats,
+                window,
                 sha_paths,
                 branch=branch,
                 tone=str(body.get("tone") or DEFAULT_TONE),
@@ -1531,7 +1541,8 @@ def handle_story_post(
                 repo_name=repo_name,
                 note=str(body.get("note") or ""),
                 part_id=str(body.get("part") or ""),
-                level=2 if body.get("closer") else 1,
+                since=_epoch(body.get("from")),
+                until=_epoch(body.get("to")),
             )
         if path == "/story/moment":
             stats, sha_paths = view(branch)
@@ -1678,6 +1689,16 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
   transition:background .15s,color .15s}
 .gobtn:hover{background:var(--phosphor);color:var(--ink)}
 .gobtn[disabled]{opacity:.4;cursor:not-allowed}
+/* Which days to tell: the dashboard's range control, scoping a telling instead of a view. */
+__UI_RANGE_CSS__
+#f-period{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:6px 30px 6px 11px;cursor:pointer;border-radius:4px;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+#f-period:focus{outline:none;border-color:var(--phosphor)}
+/* The popup is anchored under the select, which sits inside a wrapping row: pin it to the
+   LEFT here, or on a narrow screen it hangs off the side of the panel. */
+#periodwrap .daterange{right:auto;left:0}
 
 /* ---------------------------------------------------------------- build progress */
 __UI_OVERLAY_CSS__
@@ -1694,8 +1715,6 @@ __UI_FLASH_CSS__
 .zoomctx .zin b{color:var(--phosphor)}
 .emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
   padding:18px;margin:8px 0}
-/* What "closer" actually did, said in one line under the heading. */
-.zwhat{color:var(--fg-dim);font-size:12.5px;margin:-4px 0 14px;max-width:70ch}
 .era{cursor:pointer}
 .era .zoomin{color:var(--phosphor-dim)}
 .era:hover .zoomin{color:var(--phosphor)}
@@ -1922,6 +1941,19 @@ __BACKTRACE_BANNER__
         <button class="chip" data-v="epic">&#127905; epically</button>
       </div>
     </div>
+    <div class="row"><label>which days</label>
+      <div class="period-field" id="periodwrap">
+        <select id="f-period">
+          __UI_RANGE_OPTIONS__
+        </select>
+        <div class="daterange" id="daterange" hidden>
+          <div class="dr-field"><label for="f-from">from</label><input type="date" id="f-from"></div>
+          <div class="dr-field"><label for="f-to">to</label><input type="date" id="f-to"></div>
+          <button class="dr-done" id="dr-done">done</button>
+        </div>
+      </div>
+      <span class="hint" id="rangehint" style="margin-top:0"></span>
+    </div>
     <div class="row"><label>anything to add</label>
       <input type="text" id="f-note" maxlength="300"
              placeholder="optional: a style, something to focus on, someone to credit…">
@@ -1956,9 +1988,7 @@ __BACKTRACE_BANNER__
   <div id="eras" hidden></div>
   <div id="timeline"></div>
   <div id="morewrap" class="morewrap" hidden>
-    <button class="btn" id="more-moments">show earlier moments</button>
     <button class="btn" id="earlier2">&#8617; go further back</button>
-    <span class="zwhat" id="asfine" hidden></span>
   </div>
 
   <div class="outline" id="outlinewrap" hidden>
@@ -2000,9 +2030,12 @@ const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const state = {
   data: null, story: null, tone: "playful", branch: "", open: new Set(), told: new Set(),
   poll: null, building: false,
+  // Which days a telling covers. 0/0 is the whole history; anything else scopes the commits
+  // the agent reads, which is how a reader asks for a closer look at a stretch of work.
+  fromTs: 0, toTs: 0,
   // Depth 2 is the top: the parts. You walk in from there; normalizeZoom() drops to the
   // flat moment list for a story that has no parts.
-  zoom: 2, part: null, pendingZoom: 0
+  zoom: 2, part: null
 };
 
 // ------------------------------------------------------------------ helpers
@@ -2018,6 +2051,66 @@ function day(ts){ if(!ts) return ""; const d = new Date(ts*1000);
 function stamp(ts){ return ts ? new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : ""; }
 const AI_KINDS = new Set(["agent", "covered", "agent-merge"]);
 const post = postJson;
+__UI_RANGE_JS__
+
+// ---------------------------------------------------------------- which days to tell
+// The same control the dashboard filters WITH, used here to scope what gets WRITTEN: a
+// story of last week is a closer look at last week than any re-telling of the whole year.
+function historySpan(){
+  const m = (state.data && state.data.meta) || {};
+  return {from: m.first || 0, to: m.last || 0};
+}
+function applyPeriod(){
+  const v = $("f-period").value;
+  if (v === "") { state.fromTs = 0; state.toTs = 0; }
+  else if (v === "custom") { state.fromTs = dateToTs($("f-from").value, false); state.toTs = dateToTs($("f-to").value, true); }
+  else { state.fromTs = Math.floor(Date.now() / 1000) - (+v) * DAY_SECONDS; state.toTs = 0; }
+  syncPeriodDates();
+  renderRangeHint();
+}
+// The from/to inputs always show the range actually in force, so "last 30 days" is a pair of
+// real dates rather than a phrase the reader has to work out.
+function syncPeriodDates(){
+  const v = $("f-period").value, span = historySpan();
+  if (v === "custom") return;
+  if (v === "") { $("f-from").value = ymd(span.from); $("f-to").value = ymd(span.to); }
+  else {
+    $("f-from").value = ymd(Math.floor(Date.now() / 1000) - (+v) * DAY_SECONDS);
+    $("f-to").value = ymd(span.to || Math.floor(Date.now() / 1000));
+  }
+}
+function setDateBounds(){
+  const span = historySpan(), lo = ymd(span.from), hi = ymd(span.to);
+  for (const id of ["f-from", "f-to"]) { const el = $(id); el.min = lo; el.max = hi; }
+}
+// How many commits the chosen days actually hold, said before an agent call is spent: a
+// range with nothing in it is the one mistake this control invites. The outline only carries
+// the most recent stretch of sittings, so a range reaching further back than it goes is
+// reported by its dates alone rather than by a count that would be wrong.
+function commitsInRange(){
+  const rows = (state.data && state.data.outline) || [];
+  if (!rows.length) return -1;
+  const oldest = Math.min.apply(null, rows.map(r => r.from || 0));
+  if (state.fromTs && state.fromTs < oldest) return -1;
+  let n = 0;
+  for (const row of rows) {
+    if (state.fromTs && row.to < state.fromTs) continue;
+    if (state.toTs && row.from > state.toTs) continue;
+    n += row.commits || 0;
+  }
+  return n;
+}
+function rangeLabel(){
+  if (!state.fromTs && !state.toTs) return "the whole history";
+  const span = historySpan();
+  return ymd(state.fromTs || span.from) + " → " + ymd(state.toTs || span.to || Math.floor(Date.now() / 1000));
+}
+function renderRangeHint(){
+  if (!state.fromTs && !state.toTs) { $("rangehint").textContent = "the whole history"; return; }
+  const n = commitsInRange();
+  $("rangehint").textContent = rangeLabel() +
+    (n < 0 ? "" : n ? " · about " + n + " commit" + (n === 1 ? "" : "s") : " · no commits in these days");
+}
 function flash(html){ const f = $("flash"); f.innerHTML = html; f.onclick = () => { f.innerHTML = ""; }; }
 function notice(text){ flash('<div class="notice">' + esc(text) + "</div>"); }
 function fail(text){ flash('<div class="error">' + esc(text) + "</div>"); }
@@ -2100,6 +2193,9 @@ function render(){
   $("skeleton").hidden = true;
   normalizeZoom();
   renderBranches();
+  setDateBounds();
+  syncPeriodDates();
+  renderRangeHint();
   renderHero();
   renderStudio();
   renderZoomContext();
@@ -2184,16 +2280,17 @@ function renderStudio(){
   $("studiohint").textContent = hint;
 }
 
-// The story has three depths and you walk between them, one step at a time:
+// The story has two depths and you walk between them:
 //
 //   2  the parts          click a part to go in
-//   3  inside one part    its moments, told once
-//   4  closer inside it   the same span told finer
+//   3  inside one part    its moments; open one for the telling and the commits
 //
 // There is deliberately no zoom control. A row of stops let someone jump to a depth that
 // only means something INSIDE a part, from a view where no part was chosen; it either did
 // nothing or landed somewhere they had not asked for. Going in is a click on the thing you
-// want; coming out is one button that says where it goes.
+// want; coming out is one button that says where it goes. A reader who wants a CLOSER look
+// than a part gives them asks for a narrower range of days, which is the same story told
+// over fewer commits rather than a second telling of the same ones.
 function partsLevel(){
   // A story told before parts existed has only its moments: that flat list is the top.
   return ((state.story && state.story.eras) || []).length ? 2 : 3;
@@ -2204,10 +2301,10 @@ function partsLevel(){
 // different parts) under a page that is already sitting at some depth.
 function normalizeZoom(){
   const top = partsLevel();
-  state.zoom = Math.max(top, Math.min(4, state.zoom || top));
+  state.zoom = Math.max(top, Math.min(3, state.zoom || top));
   if (state.zoom === 2) { state.part = null; return; }       // the parts view is nobody's part
-  // Depths 3 and 4 are per-part. Reached without one (an old link, a hash typed by hand),
-  // they open the newest part rather than a blank page.
+  // Depth 3 is per-part. Reached without one (an old link, a hash typed by hand), it opens
+  // the newest part rather than a blank page.
   if (!currentPart()) {
     const eras = (state.story && state.story.eras) || [];
     state.part = eras.length ? eras[eras.length - 1].id : null;
@@ -2240,63 +2337,20 @@ function renderZoomContext(){
   const part = currentPart(), host = $("zoomctx");
   host.hidden = state.zoom <= partsLevel() || !part;
   if (host.hidden) return;
-  const up = state.zoom === 4
-    ? '<button class="btn small zback">&larr; back to ' + esc(part.title.toLowerCase()) + "</button>"
-    : '<button class="btn small zback">&larr; back to ' + partsLabel() + "</button>";
-  host.innerHTML = up +
-    '<span class="zin">' + (state.zoom === 4 ? "closer inside " : "inside ") + "<b>" + esc(part.title) + "</b> &nbsp;·&nbsp; " +
+  host.innerHTML = '<button class="btn small zback">&larr; back to ' + partsLabel() + "</button>" +
+    '<span class="zin">inside <b>' + esc(part.title) + "</b> &nbsp;·&nbsp; " +
     esc(part.when) + " &rarr; " + esc(part.until) + " &nbsp;·&nbsp; " + part.commits + " commits</span>" +
     // A part nobody has told yet is a dead end without this: the reader is looking straight
     // at it and there is nothing to read and no obvious way to get any.
-    (state.zoom === 3 && !momentsInView().length ? '<button class="btn zpart">&#10024; tell this part</button>' : "");
+    (momentsInView().length ? "" : '<button class="btn zpart">&#10024; tell this part</button>');
 }
 
-// Everything the current depth (and part) is looking at. Level 1 is the handful spread
-// across a part; level 2 is the same span told closer.
+// The moments of the part being read (all of them, in one telling), or the whole story when
+// no part is chosen.
 function momentsInView(){
   const all = (state.story && state.story.moments) || [];
   const part = currentPart();
-  const scoped = part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
-  // At the closer depth, level 1 is NOT a stand-in: showing it would repeat the view the
-  // reader just came from and read as a button that did nothing. Its absence is the cue to
-  // offer the closer telling, which renderTimeline does.
-  if (state.zoom >= 4) return scoped.filter(m => (Number(m.level) || 1) >= 2);
-  return scoped.filter(m => (Number(m.level) || 1) === 1);
-}
-function scopedMoments(){
-  const all = (state.story && state.story.moments) || [];
-  const part = currentPart();
   return part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
-}
-function hasCloser(){
-  return scopedMoments().some(m => (Number(m.level) || 1) >= 2);
-}
-
-function countAt(level){
-  return scopedMoments().filter(m => (Number(m.level) || 1) === (level === 1 ? 1 : Math.max(2, level))).length;
-}
-// How many moments a part COULD be cut into: one per sitting of work in it. The sparkline is
-// drawn one bar per sitting, so the page already has the number. A part with four sittings
-// cannot be told as ten moments, however much anyone zooms.
-function sittings(part){ return ((part && part.spark) || []).length; }
-
-// Told closer looks like "a different set of moments" unless the page says what changed:
-// it is the SAME stretch of history, cut into more pieces, so each moment covers less of it.
-function closerNote(){
-  const part = currentPart();
-  if (!part) return "";
-  const coarse = countAt(1), fine = countAt(2);
-  if (!fine) return "";
-  const days = Math.max(1, Math.round((part.to - part.from) / 86400));
-  const same = "The same " + part.commits + " commits over the same " + days + " day" + (days === 1 ? "" : "s");
-  // A telling written when the parts had a different shape can end up NOT finer. Say that
-  // plainly rather than claiming a zoom that did not happen.
-  if (coarse && fine <= coarse)
-    return same + ", told again in " + fine + " moments. This is not finer than the " + coarse +
-      " above it: the parts have shifted since it was written, so tell it closer again to redo it.";
-  return same + (coarse ? ", cut into " + fine + " moments instead of " + coarse : ", cut into " + fine + " moments") +
-    ". Nothing new happened here: each moment simply covers a shorter stretch of it, so smaller " +
-    "things get named.";
 }
 
 // The whole project, coarse: one row per era, newest first, each with its span, size and the
@@ -2341,20 +2395,6 @@ function renderTimeline(){
   $("morewrap").hidden = true;
 
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
-  if (state.zoom === 4 && part && !hasCloser()) {             // nothing finer here yet: offer it
-    const coarse = countAt(1);
-    host.innerHTML = '<h2 class="section">closer, inside ' + esc(part.title.toLowerCase()) + "</h2>" +
-      (sittings(part) > coarse
-        ? '<div class="emptypart">This part has not been told closer yet. Your agent re-reads the same ' +
-          part.commits + " commits and cuts them into more, shorter moments, so smaller things get " +
-          "named; about half a minute. " +
-          '<button class="btn zcloser">&#10024; tell it closer</button></div>'
-        // Asking anyway would spend an agent call to get the same list back, or a shorter one.
-        : '<div class="emptypart">There is nothing finer to tell here: the ' + coarse +
-          " moments above already cover each of this part's " + sittings(part) +
-          " sittings of work one by one.</div>");
-    return;
-  }
   if (!all.length) {                                          // an untold part explains itself
     host.innerHTML = part
       ? '<div class="emptypart">Nothing from this part has been told yet. It covers ' + part.commits +
@@ -2365,33 +2405,13 @@ function renderTimeline(){
 
   const newestFirst = all.slice().reverse();                  // a telling is bounded: no paging
   let html = '<h2 class="section">' +
-    (part ? (state.zoom === 4 ? "closer, inside " : "inside ") + esc(part.title.toLowerCase())
-          : "moment by moment") + "</h2>";
-  // Without this, a closer telling is just a different list of titles and it is not obvious
-  // that it covers the very same days.
-  if (state.zoom === 4) html += '<p class="zwhat">' + esc(closerNote()) + "</p>";
-  html += '<div class="timeline">';
+    (part ? "inside " + esc(part.title.toLowerCase()) : "moment by moment") + '</h2><div class="timeline">';
   newestFirst.forEach((moment, position) => { html += momentHtml(moment, position); });
   host.innerHTML = html + "</div>";
 
-  // Seeing more of a part means looking closer, which is a step further in, not a pager.
-  // This is also the ONLY way to that depth now that the zoom stops are gone, so it says
-  // plainly whether it costs an agent call or just walks into what is already written.
-  if (part && state.zoom === 3) {
-    const told = hasCloser();
-    const room = sittings(part) > newestFirst.length;   // is there anything left to cut?
-    $("morewrap").hidden = false;
-    $("more-moments").hidden = !told && !room;
-    $("more-moments").dataset.told = told ? "1" : "";
-    $("more-moments").textContent = told
-      ? "\u{1F50D} look closer: the same days as " + countAt(2) + " moments"
-      : "\u2728 tell this part closer (these " + newestFirst.length + " moments, cut smaller)";
-    // A part with no more sittings than moments cannot be cut finer, and a button that would
-    // spend an agent call to return the same list is worse than no button.
-    $("asfine").hidden = told || room;
-    $("asfine").textContent = "These " + newestFirst.length + " moments already cover every one of this part's " +
-      sittings(part) + " sittings of work, so there is nothing finer to tell here.";
-  }
+  // Reaching further back than the story currently goes is the one thing left to offer from
+  // inside a part; wanting a CLOSER look is answered by telling a narrower range of days.
+  if (part && (state.story || {}).more_earlier) $("morewrap").hidden = false;
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
     if (el) { el.classList.add("open"); fillMoment(el, false); }
@@ -2748,20 +2768,19 @@ const BUILD_OPENING = {
   part:    "reading this part…",
 };
 
-async function build(mode, options){
+async function build(mode){
   if (state.building) return;
   flash("");
   state.building = true; renderStudio();
   // At the click, not when the server answers. Starting a build is a POST that has to reach
   // the daemon and hand the work to a thread; waiting for it left about a second in which
   // the button had visibly done nothing and people pressed it again.
-  showOverlay((options && options.closer ? "reading this part again, closer…" : BUILD_OPENING[mode]) || "reading your history…",
-              "", true);
+  showOverlay(BUILD_OPENING[mode] || "reading your history…", "", true);
   if (!(state.story && (state.story.moments || []).length)) $("skeleton").hidden = false;
   try {
     const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode,
                                         note: $("f-note").value.trim(), part: state.part || "",
-                                        closer: !!(options && options.closer)});
+                                        from: state.fromTs || 0, to: state.toTs || 0});
     if (r.error || r.busy) { state.building = false; hideOverlay(); fail(r.error || "busy"); renderStudio(); return; }
     renderBuild(r.progress);
     startPolling();
@@ -2794,7 +2813,6 @@ function startPolling(){
       if (!data.building || !data.building.running) {
         stopPolling();
         $("skeleton").hidden = true;
-        if (state.pendingZoom) { setZoom(state.pendingZoom); state.pendingZoom = 0; }
         render();                          // one final, complete paint
         if (after) celebrate();
       }
@@ -2833,7 +2851,6 @@ function openFromHash(){
 
 // ------------------------------------------------------------------ wiring
 $("timeline").addEventListener("click", e => {
-  if (e.target.closest(".zcloser")) { state.pendingZoom = 4; build("part", {closer: true}); return; }
   const flip = e.target.closest(".cflip");
   if (flip) {
     const row = flip.closest(".cmt"), view = row.querySelector(".cview");
@@ -2890,12 +2907,18 @@ $("build-cancel").addEventListener("click", async () => {
   $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
-$("more-moments").addEventListener("click", () => {
-  // Already written: this is navigation, and must not spend another agent call on it.
-  if ($("more-moments").dataset.told) { setZoom(4); return; }
-  state.pendingZoom = 4; build("part", {closer: true});
-});
 $("earlier2").addEventListener("click", () => build("earlier"));
+// Which days to tell. The custom popup opens from the preset list and closes on "done" or on
+// a click anywhere outside it, exactly as it does on the dashboard.
+const showDateRange = on => { $("daterange").hidden = !on; };
+$("f-period").addEventListener("change", () => { showDateRange($("f-period").value === "custom"); applyPeriod(); });
+const onDate = () => { $("f-period").value = "custom"; applyPeriod(); };
+$("f-from").addEventListener("change", onDate);
+$("f-to").addEventListener("change", onDate);
+$("dr-done").addEventListener("click", () => showDateRange(false));
+document.addEventListener("click", e => {
+  if (!$("daterange").hidden && !e.target.closest("#periodwrap")) showDateRange(false);
+});
 $("e-backend").addEventListener("change", () => { $("e-backend").dataset.touched = "1"; loadModels(null); });
 $("e-save").addEventListener("click", saveEngine);
 $("eras").addEventListener("click", e => {
@@ -2903,8 +2926,7 @@ $("eras").addEventListener("click", e => {
   if (seg) setZoom(3, seg.dataset.part);
 });
 $("zoomctx").addEventListener("click", e => {
-  // One step out: closer -> this part's moments -> the parts.
-  if (e.target.closest(".zback")) { setZoom(state.zoom === 4 ? 3 : 2); return; }
+  if (e.target.closest(".zback")) { setZoom(2); return; }
   if (e.target.closest(".zpart")) build("part");
 });
 $("f-branch").addEventListener("change", () => {

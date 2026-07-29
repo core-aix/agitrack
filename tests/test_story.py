@@ -10,7 +10,7 @@ The file is laid out the way the feature works, so a gap is visible as a gap:
 
 * SHAPE OF THE HISTORY - sittings of work, parts, how many parts a history deserves
 * TELLING IT          - what a build covers, and what it may never do
-* ZOOMING             - parts, the moments inside one, looking closer, going further back
+* ZOOMING             - parts, the moments inside one, which days to tell, going further back
 * WHEN IT GOES WRONG  - bad replies, dead backends, stopping
 * HOW IT IS WRITTEN   - the storyteller's instructions
 * THE PAGE            - every control, and what it looks like
@@ -38,7 +38,7 @@ from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.commits import build_agent_commit_message
 from agitrack.git import GitRepo
 from agitrack.metrics import build_server
-from agitrack.metrics import learn, story
+from agitrack.metrics import learn, story, ui
 from agitrack.metrics.collect import CommitStat, build_dashboard
 
 DAY = 86400
@@ -477,9 +477,8 @@ def test_one_telling_is_always_one_call(tmp_path):
     silently drop the tail of the part. The per-call ceiling has to fit a whole spread."""
     repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(30)], gap_days=1)
     stats, sha_paths = _view_of(repo)
-    for wanted in (story._MOMENTS_COARSE, story._MOMENTS_FINE):
-        spread = story.spread(story.segment_episodes(story.story_stats(stats), sha_paths), wanted)
-        assert len(story._batches(spread)) == 1, f"a telling of {wanted} moments needs {len(spread)} calls"
+    spread = story.spread(story.segment_episodes(story.story_stats(stats), sha_paths), story._MOMENTS_COARSE)
+    assert len(story._batches(spread)) == 1, f"one telling needs {len(story._batches(spread))} calls"
 
 
 def test_a_commit_id_the_model_invents_is_dropped(tmp_path, monkeypatch):
@@ -616,7 +615,7 @@ def test_an_outline_title_is_cut_at_a_word_end(tmp_path):
 
 
 # ============================================================================
-# ZOOMING: parts, moments, and looking closer
+# ZOOMING: parts, the moments inside one, and which days a telling covers
 # ============================================================================
 
 
@@ -668,30 +667,46 @@ def test_a_part_can_be_told_on_its_own(tmp_path, monkeypatch):
     assert "step 11" not in fake.prompts[0]
 
 
-def test_looking_closer_retells_the_same_span_at_finer_grain(tmp_path, monkeypatch):
-    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(16)], gap_days=1)
+def test_a_story_can_be_told_for_a_stretch_of_days(tmp_path, monkeypatch):
+    """The range control scopes the WHOLE telling: the commits read, the parts they are split
+    into, and what counts as covered. This is what replaced "look closer" - a narrower stretch
+    told at the same grain is genuinely a closer look, where re-telling the same commits was
+    not."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(20)], gap_days=1)
     stats, sha_paths = _view_of(repo)
     ordered = story.story_stats(stats)
-    monkeypatch.setattr(story, "_BATCH_EPISODES", 40)
-    _fake_agent(
-        monkeypatch,
-        [
-            _moment_reply([{"id": "coarse", "title": "Broadly", "summary": "s", "shas": [s.short for s in ordered]}]),
-            _ARC,
-        ],
-    )
-    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    era = built["eras"][-1]
+    window_from, window_to = ordered[6].timestamp, ordered[11].timestamp
 
-    _fake_agent(monkeypatch, [_moment_reply([]), _ARC])
-    closer = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"], level=2)
-    fine = [m for m in closer["moments"] if int(m.get("level") or 1) >= 2]
-    assert fine, "a closer telling exists"
-    # The coarse telling is still there: this is a zoom, not a replacement.
-    assert any(int(m.get("level") or 1) == 1 for m in closer["moments"])
-    # Coverage still describes the COARSE telling, or "what is left" would be meaningless.
-    coarse_shas = {sha for m in closer["moments"] if int(m.get("level") or 1) == 1 for sha in m["shas"]}
-    assert set(closer["covered_shas"]) == coarse_shas
+    inside = story.in_range(stats, window_from, window_to)
+    assert [stat.short for stat in inside] == [stat.short for stat in ordered[6:12]]
+    assert story.in_range(stats, 0, 0) == stats  # no bounds means the whole history
+
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "That week", "summary": "s"}]), _ARC])
+    built = story.build_story(
+        tmp_path, inside, sha_paths, branch="main", mode="rewrite", since=window_from, until=window_to
+    )
+    # Nothing outside the chosen days is told, and the story remembers what it was asked for.
+    assert built["range"] == {"from": window_from, "to": window_to}
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
+    assert told <= {stat.sha for stat in inside}
+    assert ordered[0].subject not in fake.prompts[0] and ordered[-1].subject not in fake.prompts[0]
+    # The parts are computed over the RANGE: they span it, not the whole history behind it.
+    assert built["eras"][0]["from"] >= window_from and built["eras"][-1]["to"] <= window_to
+
+
+def test_a_range_with_no_commits_in_it_is_refused_before_any_agent_call(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "x", "summary": "s"}]), _ARC])
+    answer = story.handle_story_post(
+        "/story/build",
+        {"branch": "main", "mode": "rewrite", "from": 2_000_000_000, "to": 2_000_100_000},
+        root=tmp_path,
+        view=lambda branch: (stats, sha_paths),
+        repo_name="demo",
+    )
+    assert "no commits in those days" in answer["error"]
+    assert not fake.prompts, "nothing was asked of the agent"
 
 
 def test_going_further_back_walks_parts(tmp_path, monkeypatch):
@@ -975,7 +990,7 @@ def test_the_page_paints_without_any_story(tmp_path):
     assert 'id="loading"' in html and 'id="skeleton"' in html
     # The coarse story (every era, always complete) and only a handful of moments at once.
     assert 'id="eras"' in html and "function renderEras" in html
-    assert 'id="more-moments"' in html  # seeing more of a part is a zoom, not a pager
+    assert 'id="earlier2"' in html  # reaching further back, from inside a part
     # Cards appear as they are reached; they used to all animate at once on load.
     assert "IntersectionObserver" in html and "rootMargin" in html
     assert ".outline .num{flex-basis:100%}" in html
@@ -1014,90 +1029,66 @@ def test_there_is_no_zoom_control_only_a_way_back_out():
     for gone in ["zstop", "zoombar", 'id="toolbar"', 'id="zoom"', "zlabel2"]:
         assert gone not in html, f"the zoom control is still on the page ({gone})"
     assert 'class="btn small zback"' in html and 'e.target.closest(".zback")' in html
-    # One step out, and it names the level it goes to rather than "back".
-    assert "setZoom(state.zoom === 4 ? 3 : 2)" in html
-    assert "&larr; back to ' + esc(part.title.toLowerCase())" in html
+    # One step out, and it names where it lands rather than saying "back".
+    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
     assert "&larr; back to ' + partsLabel()" in html
 
 
-def test_the_way_in_is_clicking_a_part_then_looking_closer():
-    """Every depth has to be reachable now that the stops are gone: a part row goes in, and
-    the one button under a part's moments goes deeper - generating that closer telling the
-    first time, and simply walking into it afterwards."""
+def test_the_way_in_is_clicking_a_part():
+    """One way in, one way out. A part row opens that part; the button in the context bar
+    tells a part nobody has told yet."""
     html = _page()
     assert "if (seg) setZoom(3, seg.dataset.part)" in html  # the parts list goes in
-    assert '$("more-moments").addEventListener' in html
-    assert 'if ($("more-moments").dataset.told) { setZoom(4); return; }' in html
-    # ...and when there is nothing finer yet, both routes offer to write it.
-    assert 'class="btn zcloser"' in html and 'e.target.closest(".zcloser")' in html
+    assert 'class="btn zpart"' in html and 'e.target.closest(".zpart")' in html
 
 
-def test_the_closer_depth_never_silently_shows_the_coarser_telling():
-    """This is what made the "closer" stop look dead: with no level-2 moments the page fell
-    back to the level-1 list, so going closer redrew the view you were already on."""
+def test_the_closer_telling_is_gone_for_good():
+    """ "Look closer" re-read commits the reader had already paid to have told, and because a
+    part holds no more moments than it has sittings of work it could come back with FEWER
+    moments than the view it was meant to magnify. It was removed in favour of choosing the
+    DAYS to tell, which narrows the material instead of re-cutting it."""
     html = _page()
-    body = html[html.index("function momentsInView()") : html.index("function hasCloser()")]
-    assert "if (state.zoom >= 4) return scoped.filter(m => (Number(m.level) || 1) >= 2);" in body
-    # The absence is the cue to offer the finer telling instead.
-    assert "state.zoom === 4 && part && !hasCloser()" in html
+    for gone in ["zcloser", "more-moments", "hasCloser", "closerNote", "asfine", "look closer", "_MOMENTS_FINE"]:
+        assert gone not in html, f"{gone} is still on the page"
+    # Two depths, and nothing can ask for a third.
+    assert "state.zoom = Math.max(top, Math.min(3, state.zoom || top));" in html
+    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
 
 
-def test_the_closer_view_says_what_it_did_differently():
-    """Told closer is just a different list of titles unless the page says why: it is the
-    SAME commits over the SAME days, cut into more pieces. Without that line the reader
-    cannot tell a finer telling from a second, unrelated one."""
-    html = _page()
-    assert "function closerNote()" in html
-    note = html[html.index("function closerNote()") : html.index("function renderEras()")]
-    assert '"The same " + part.commits + " commits over the same "' in note
-    assert "cut into " in note and "instead of " in note
-    assert "Nothing new happened here" in note
-    # It is rendered under the heading of the closer view, and only there.
-    assert "if (state.zoom === 4) html += '<p class=\"zwhat\">' + esc(closerNote())" in html
-    # The two ways in say which one costs an agent call and what it will produce.
-    assert 'look closer: the same days as " + countAt(2) + " moments' in html
-    assert 'tell this part closer (these " + newestFirst.length + " moments, cut smaller)' in html
-    assert "cuts them into more, shorter moments" in html
-
-
-def test_a_part_is_never_offered_a_telling_that_would_come_out_coarser():
-    """ "Closer" that returns FEWER moments is the button doing the opposite of its label. A
-    part is cut into at most one moment per sitting of work, so a part whose moments already
-    match its sittings has nothing finer in it - and one told under an older shape of the
-    parts can hold a "closer" set that is no longer finer than what sits above it."""
-    html = _page()
-    # The page knows the ceiling: one bar of the sparkline per sitting.
-    assert "function sittings(part){ return ((part && part.spark) || []).length; }" in html
-    assert "const room = sittings(part) > newestFirst.length;" in html
-    assert '$("more-moments").hidden = !told && !room;' in html
-    assert '$("asfine").hidden = told || room;' in html
-    assert "sittings of work, so there is nothing finer to tell here." in html
-    # The same rule at the closer depth itself, reached by an old link.
-    assert "There is nothing finer to tell here" in html
-    # ...and a stored telling that is not finer says so instead of claiming a zoom.
-    assert "This is not finer than the " in html
-
-
-def test_the_server_refuses_a_closer_telling_that_cannot_be_finer(tmp_path, monkeypatch):
-    """The page hides the button, but a stale tab (or the API) can still ask: the build has to
-    refuse rather than spend an agent call to return a shorter list."""
-    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(8)], gap_days=1)
-    stats, sha_paths = _view_of(repo)
-    _fake_agent(
-        monkeypatch,
-        [_moment_reply([{"n": i + 1, "title": f"Moment {i}", "summary": "s"} for i in range(6)]), _ARC],
+def test_a_stored_closer_telling_is_dropped_on_load(tmp_path):
+    store = story.StoryStore(tmp_path)
+    store.put(
+        "main",
+        {
+            "moments": [
+                {"id": "coarse", "title": "The week", "from": 10, "to": 90, "shas": ["a"]},
+                {"id": "fine-1", "title": "Tuesday", "level": 2, "from": 20, "to": 30, "shas": ["a"]},
+            ]
+        },
     )
-    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    era = built["eras"][-1]
-    told = [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]
-    assert told, "the newest part is told"
+    kept = store.get("main")["moments"]
+    assert [m["id"] for m in kept] == ["coarse"], "the finer re-telling is not shown beside the coarse one"
 
-    # Every sitting in that part already has a moment of its own: there is nothing to cut.
-    _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Finer", "summary": "s"}]), _ARC])
-    with pytest.raises(story.StoryError) as caught:
-        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"], level=2)
-    assert "already told as finely as it can be" in str(caught.value)
-    assert "sitting" in str(caught.value)  # ...and it says what the limit actually is
+
+def test_the_page_can_ask_for_a_stretch_of_days():
+    """The dashboard's range control, on the story page, scoping what gets WRITTEN. It is the
+    honest replacement for "look closer": fewer commits told at the same grain."""
+    html = _page()
+    assert 'id="f-period"' in html and 'id="daterange"' in html
+    assert 'id="f-from"' in html and 'id="f-to"' in html and 'id="dr-done"' in html
+    # The same presets as the dashboard, custom range included, from one definition.
+    assert ui.RANGE_OPTIONS in html
+    assert '<option value="custom">custom range' in ui.RANGE_OPTIONS
+    # The choice reaches the server with the build...
+    assert "from: state.fromTs || 0, to: state.toTs || 0" in html
+    # ...and the reader is told what they picked, in dates and in commits, before spending a call.
+    assert "function renderRangeHint()" in html and "function commitsInRange()" in html
+    assert "no commits in these days" in html
+    # A range reaching past what the page can count is reported by its dates alone.
+    assert "if (state.fromTs && state.fromTs < oldest) return -1;" in html
+    # The popup opens from the preset list and closes on done or an outside click.
+    assert 'showDateRange($("f-period").value === "custom")' in html
+    assert '!e.target.closest("#periodwrap")' in html
 
 
 def test_a_depth_that_needs_a_part_always_has_one():
@@ -1137,7 +1128,7 @@ def test_the_spinner_is_up_before_the_server_answers():
     Waiting for it left about a second in which "tell it again" had visibly done nothing, and
     people pressed it again."""
     html = _page()
-    builder = html[html.index("async function build(mode, options)") : html.index("function startPolling()")]
+    builder = html[html.index("async function build(mode)") : html.index("function startPolling()")]
     assert builder.index("showOverlay(") < builder.index("await post("), "the overlay waits for the server"
     assert "BUILD_OPENING" in builder and "true);" in builder  # named for the mode, and stoppable
     for mode in ("rewrite", "extend", "earlier", "part"):

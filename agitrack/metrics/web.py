@@ -877,20 +877,7 @@ header{padding:26px 0 18px}
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
-input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
-input[type=date]:focus{outline:none;border-color:var(--phosphor)}
-input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
-/* custom date range: a popup anchored under the period select */
-.period-field{position:relative}
-.daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
-  border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
-  box-shadow:0 10px 28px rgba(0,0,0,.6)}
-.dr-field{display:flex;flex-direction:column;gap:4px}
-.dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
-.dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
-  font-family:var(--mono);font-size:12.5px;padding:6px 12px}
-.dr-done:hover{background:var(--phosphor);color:var(--ink)}
+__UI_RANGE_CSS__
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
@@ -1058,7 +1045,9 @@ h2.section::before{content:"# ";color:var(--amber)}
    width where a phone has least). The indent stays, so the detail still reads as belonging
    to its row. */
 .entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;padding-left:14px;cursor:default}
-.entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px}
+/* The diff toggle and the GitHub link sat flush against each other, reading as one control. */
+.entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
 /* The expanded commit message. No frame of its own: a bordered, inset box inside the
    already-indented detail wasted horizontal space and read as a nested panel on a phone.
@@ -1232,12 +1221,7 @@ __UPDATE_BANNER__
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
     <div class="field period-field"><label for="f-period">range</label><select id="f-period">
-      <option value="">all time</option>
-      <option value="1">last 24 hours</option>
-      <option value="7">last 7 days</option>
-      <option value="30">last 30 days</option>
-      <option value="90">last 90 days</option>
-      <option value="custom">custom range…</option>
+      __UI_RANGE_OPTIONS__
     </select>
       <div class="daterange" id="daterange" hidden>
         <div class="dr-field"><label for="f-from">from</label><input type="date" id="f-from"></div>
@@ -2112,12 +2096,7 @@ async function refresh(){
 }
 
 // --- time range ---
-function dateToTs(value, endOfDay){
-  if(!value) return 0;
-  const ts = Date.parse(value + "T00:00:00Z")/1000;
-  return isNaN(ts) ? 0 : (endOfDay ? ts + DAY - 1 : ts);
-}
-const ymd = ts => ts ? new Date(ts*1000).toISOString().slice(0,10) : "";
+__UI_RANGE_JS__
 // Bound the native date pickers to the actual history span.
 function setDateBounds(){
   const lo = ymd(SPAN.from), hi = ymd(SPAN.to);

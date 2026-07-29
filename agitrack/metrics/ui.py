@@ -72,6 +72,46 @@ BANNER_CSS = """.backtracebanner,.btbanner,.updatebanner{position:sticky;top:0;z
 .backtracebanner a:hover,.btbanner a:hover,.updatebanner a:hover{color:var(--ink);
   background:var(--phosphor);text-decoration:none}"""
 
+# --------------------------------------------------------------------------- a date range
+
+# "Which days am I looking at": a preset dropdown with a custom from/to popup anchored under
+# it. The dashboard filters what it SHOWS with this; the story page scopes what it TELLS.
+# Same control, same look, same keyboard and date-picker behaviour, one definition.
+RANGE_CSS = """input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
+input[type=date]:focus{outline:none;border-color:var(--phosphor)}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
+/* custom date range: a popup anchored under the period select */
+.period-field{position:relative}
+.daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
+  border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
+  box-shadow:0 10px 28px rgba(0,0,0,.6)}
+.dr-field{display:flex;flex-direction:column;gap:4px}
+.dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:6px 12px}
+.dr-done:hover{background:var(--phosphor);color:var(--ink)}"""
+
+# The presets, in one place, so both pages offer the same choices in the same order.
+RANGE_OPTIONS = """<option value="">all time</option>
+      <option value="1">last 24 hours</option>
+      <option value="7">last 7 days</option>
+      <option value="30">last 30 days</option>
+      <option value="90">last 90 days</option>
+      <option value="custom">custom range…</option>"""
+
+# Turning the control into two timestamps, and reflecting the choice back into the inputs.
+RANGE_JS = """const DAY_SECONDS = 86400;
+// Read as UTC, like every other date these pages show, so the range a reader picks means the
+// same days as the stamps on the commits. "to" is the END of its day, or a commit made that
+// afternoon falls outside a range that names it.
+function dateToTs(value, endOfDay){
+  if(!value) return 0;
+  const ts = Date.parse(value + "T00:00:00Z") / 1000;
+  return isNaN(ts) ? 0 : (endOfDay ? ts + DAY_SECONDS - 1 : ts);
+}
+const ymd = ts => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "";"""
+
 # --------------------------------------------------------------------------- notices
 
 # What a page says when something is unavailable, refused or went wrong. It floats as ONE
@@ -268,6 +308,9 @@ def render(template: str, **extra: str) -> str:
         .replace("__UI_BANNER_CSS__", BANNER_CSS)
         .replace("__UI_FLASH_CSS__", FLASH_CSS)
         .replace("__UI_ENGINE_CSS__", ENGINE_CSS)
+        .replace("__UI_RANGE_CSS__", RANGE_CSS)
+        .replace("__UI_RANGE_OPTIONS__", RANGE_OPTIONS)
+        .replace("__UI_RANGE_JS__", RANGE_JS)
         .replace("__UI_OVERLAY_CSS__", OVERLAY_CSS)
         .replace("__UI_COMMIT_CSS__", COMMIT_CSS)
         .replace("__UI_DOM_JS__", DOM_JS)
