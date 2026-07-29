@@ -27,9 +27,10 @@
 <meta name="twitter:description" content="Wrap your coding agent backends with Git: every agent turn becomes a traceable commit with its full story, and a coach teaches you from your own sessions.">
 <meta name="twitter:image" content="https://agitrack.core-aix.org/images/dashboard-v6.png">
 <!-- Structured data: helps Google understand the project and show a last-updated date.
-     dateModified is STAMPED AT DEPLOY TIME by .github/workflows/pages.yml from the last
-     commit that touched this file, so it tracks the page rather than whoever last
-     remembered to edit it. The value below is only what the file carries on its own. -->
+     dateModified is maintained by docs/generate_sitemap.py, which the release workflow runs:
+     it dates the page from the last commit that CHANGED it (release and sitemap-refresh
+     commits excluded) and writes the same date into sitemap.xml, so the two always agree.
+     Do not hand-edit it. -->
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -40,7 +41,7 @@
   "url": "https://agitrack.core-aix.org/",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Linux, Windows",
-  "dateModified": "2026-07-28",
+  "dateModified": "2026-07-29",
   "codeRepository": "https://github.com/core-aix/agitrack",
   "downloadUrl": "https://pypi.org/project/agitrack/",
   "installUrl": "https://pypi.org/project/agitrack/",
