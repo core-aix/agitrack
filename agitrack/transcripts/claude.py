@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
@@ -535,15 +536,19 @@ def import_shared_session(
 
 def _rewrite_path_prefixes(value, prefixes: tuple[str, ...], new: str):
     """Recursively rewrite any string under ``value`` that IS one of ``prefixes`` or sits under
-    it (``prefix + "/..."``) so its prefix becomes ``new``. Used to repoint a resumed session's
-    absolute file paths — tool ``file_path`` args, command output, mentions in text — from the
-    old worktree it ran in to the launch dir, so the agent edits there and not the old worktree."""
+    it so its prefix becomes ``new``. Used to repoint a resumed session's absolute file paths —
+    tool ``file_path`` args, command output, mentions in text — from the old worktree it ran in
+    to the launch dir, so the agent edits there and not the old worktree.
+
+    Matching is by path SHAPE (:mod:`agitrack.paths`): a transcript mixes separators freely
+    (``C:\\repo\\.agitrack\\worktrees\\x/app.py`` is one real example), and comparing raw
+    strings simply left every such path pointing at the worktree."""
     if isinstance(value, str):
         for prefix in prefixes:
-            if value == prefix:
-                return new
-            if value.startswith(prefix + "/"):
-                return new + value[len(prefix) :]
+            tail = paths.relative_to(value, prefix)
+            if tail is None:
+                continue
+            return new + ("/" + tail if tail else "")
         return value
     if isinstance(value, list):
         return [_rewrite_path_prefixes(item, prefixes, new) for item in value]
@@ -660,7 +665,9 @@ def retarget_session_cwd(repo: Path, session_id: str, cwd: str, *, git_branch: s
     # old worktree it sees throughout its history (tool file_path args, command output, mentions).
     # Scoped to our own ``.agitrack/worktrees/`` dirs so an imported session's unrelated absolute
     # paths (which don't exist in this repo anyway) are left alone — only its cwd field is aligned.
-    worktree_prefixes = tuple(d for d in (_recorded_cwds(original) - {cwd}) if "/.agitrack/worktrees/" in d)
+    worktree_prefixes = tuple(
+        d for d in (_recorded_cwds(original) - {cwd}) if paths.contains_segments(d, "/.agitrack/worktrees/")
+    )
     retargeted = _retarget_rows(original, cwd=cwd, rewrite_prefixes=worktree_prefixes, git_branch=git_branch)
     if retargeted == original:
         return False  # already at this cwd — leave the (possibly hardlinked) file alone
@@ -792,6 +799,16 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     return export_session_at(_session_path(repo, session_id), collect_edits=collect_edits)
 
 
+# The last export, keyed by the file's identity. A long session's transcript is large (this
+# repo's own is ~150 MB) and re-reading it costs a fifth of a second EVERY time, which the
+# user waits out with their prompt held ("checking existing git changes..."). An append-only
+# JSONL that has not grown or been touched since the last read cannot have changed, so the
+# previous result stands. One entry only, and dropped after a couple of minutes: this exists
+# to serve the same file twice in a row, not to hold a 150 MB session in memory all day.
+_LAST_EXPORT: tuple[tuple, "ExportedSession | None", float] | None = None
+_EXPORT_MEMO_SECONDS = 120.0
+
+
 def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSession | None:
     """Export the session recorded in the transcript file at ``path`` (the session id is
     its filename stem). Reads a specific file rather than encoding a repo path, so the
@@ -799,9 +816,23 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
     including ones whose recorded cwd is a subdirectory or a deleted worktree.
 
     ``collect_edits`` also recovers each turn's file edits from the tool-call inputs (see
-    :func:`_edits_from_message`); it is off for ordinary exports."""
+    :func:`_edits_from_message`); it is off for ordinary exports.
+
+    Repeated calls for an UNCHANGED file (same size and mtime) reuse the previous result."""
+    global _LAST_EXPORT
     if not path.is_file():
         return None
+    try:
+        stamp = path.stat()
+        key = (str(path), stamp.st_size, stamp.st_mtime_ns, collect_edits)
+    except OSError:
+        key = None
+    if _LAST_EXPORT is not None:
+        cached_key, cached, stored_at = _LAST_EXPORT
+        if time.monotonic() - stored_at > _EXPORT_MEMO_SECONDS:
+            _LAST_EXPORT = None  # let a big session go rather than hold it for a caller who left
+        elif key is not None and cached_key == key:
+            return cached
     rows: list[dict] = []
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -815,13 +846,16 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
                     continue
     except OSError:
         return None
-    return parse_rows(
+    exported = parse_rows(
         path.stem,
         rows,
         subagent_tokens=_subagent_token_map(path),
         unmatched_subagent_time=_subagent_unmatched_mtime(path),
         collect_edits=collect_edits,
     )
+    if key is not None:
+        _LAST_EXPORT = (key, exported, time.monotonic())
+    return exported
 
 
 def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:

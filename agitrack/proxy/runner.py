@@ -1528,6 +1528,13 @@ class ProxyRunner:
             # SIGWINCH/SIGHUP don't exist on native Windows — there the host terminal's
             # resize watcher feeds _resize_child via consume_resize_pending() in the select
             # phase, and console-close is handled by the platform console-control handler.
+            # While the TUI owns the screen, a background thread that dies must not print its
+            # traceback: stderr IS the alternate screen, so an unhandled worker exception
+            # scribbles over the session and leaves the display out of step with what
+            # aGiTrack thinks is on it. Record it instead; the local guards handle the known
+            # workers, this catches every other thread, now and later.
+            self._prev_thread_excepthook = threading.excepthook
+            threading.excepthook = self._thread_excepthook
             if sys.platform != "win32":
                 self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
                 self.original_signal_handlers = {
@@ -1550,7 +1557,29 @@ class ProxyRunner:
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
+        except Exception as error:
+            # The reactor died. The teardown below is about to switch the terminal back out
+            # of the alternate screen, taking the traceback with it, so capture it to a file
+            # FIRST and tell the user where it is once they have their terminal back.
+            from agitrack.proxy.crash import crash_message, write_crash_report
+
+            exit_code = 1
+            path = write_crash_report(
+                self.repo.repo,
+                error,
+                context={
+                    "terminal": f"{self.rows}x{self.cols}",
+                    "backend": getattr(self.backend, "name", "?"),
+                    "session": self._session_label(),
+                    "scrollback": self.scroll_back,
+                    "history": self._history_len(),
+                },
+            )
+            self._crash_notice = crash_message(path, error)
         finally:
+            if self._prev_thread_excepthook is not None:
+                threading.excepthook = self._prev_thread_excepthook
+                self._prev_thread_excepthook = None
             if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
@@ -1598,6 +1627,10 @@ class ProxyRunner:
             print(self._backend_exit_notice)
         # A self-update was applied; re-exec aGiTrack in place now that the terminal
         # is restored and the management lock is released. Does not return.
+        if self._crash_notice:
+            # The terminal is the user's again (the finally above restored it), so this is
+            # the first thing they can actually read.
+            print(self._crash_notice, file=sys.stderr)
         if self._pending_restart:
             # Finalize may have removed the worktree this process was launched in; the
             # re-exec'd aGiTrack would then start with a deleted CWD and crash before it
@@ -5892,10 +5925,13 @@ class ProxyRunner:
         outcome: dict = {}
 
         def push() -> None:
-            login = self._cached_or_resolve_login()
-            owner, name, contributors = self._share_identity(sid, login)
-            ctx.update(login=login, owner=owner, name=name, contributors=contributors)
-            outcome["result"] = self._auto_share_worker(ctx)
+            try:
+                login = self._cached_or_resolve_login()
+                owner, name, contributors = self._share_identity(sid, login)
+                ctx.update(login=login, owner=owner, name=name, contributors=contributors)
+                outcome["result"] = self._auto_share_worker(ctx)
+            except Exception as error:  # a failed share is a warning, never a traceback on screen
+                self._debug(f"exit share failed: {error!r}")
 
         thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
         thread.start()
@@ -8402,6 +8438,32 @@ class ProxyRunner:
     def _cursor_sequence(self) -> str:
         return ScreenRenderer.cursor_sequence(self, self.rows, self.cols, self.scroll_back)
 
+    # The interpreter-wide hook we displaced while the TUI owns the screen (restored on exit).
+    _prev_thread_excepthook: "Callable[[threading.ExceptHookArgs], object] | None" = None
+
+    def _thread_excepthook(self, args: "threading.ExceptHookArgs") -> None:
+        """Where a background thread's unhandled exception goes while the TUI is up.
+
+        Python's default prints it to stderr, which is the terminal aGiTrack is drawing on:
+        the traceback lands on top of the session and the display no longer matches the
+        model. Log it, keep a crash report so it is diagnosable, and let the session live."""
+        try:
+            name = getattr(args.thread, "name", "?")
+            self._debug(f"thread {name} died: {args.exc_type.__name__}: {args.exc_value!r}")
+            if args.exc_value is not None:
+                from agitrack.proxy.crash import write_crash_report
+
+                write_crash_report(self.repo.repo, args.exc_value, context={"thread": name, "fatal": False})
+        except Exception:
+            pass
+
+    # Set while a frame is being written. A SIGWINCH handler repaints (see _resize_child),
+    # and a signal can land on ANY bytecode boundary: without this, that repaint would
+    # interleave its escape sequences with the frame already going out, which is how a
+    # terminal ends up in a mode the user cannot get out of.
+    _rendering = False
+    _crash_notice = ""
+
     def _render(self) -> None:
         if self.screen is None:
             return
@@ -8412,6 +8474,21 @@ class ProxyRunner:
             self._render_pending = True
             self._wake_main_loop()
             return
+        if self._rendering:  # re-entered from a signal handler: let the frame in flight finish
+            self._render_pending = True
+            return
+        self._rendering = True
+        try:
+            self._render_frame()
+        except Exception as error:
+            # A repaint is display only. Dropping a frame costs nothing (the next event
+            # paints again); raising here would end the session, which is the difference
+            # between a flicker and losing the terminal.
+            self._debug(f"render failed: {error!r}")
+        finally:
+            self._rendering = False
+
+    def _render_frame(self) -> None:
         capturing = self.input.capturing
         ScreenRenderer.render(
             self,
@@ -8470,39 +8547,49 @@ class ProxyRunner:
         # PageUp/PageDown also scroll. Consumed events are stripped from input.
         if self.child_mouse:
             return data
+        # Every scroll event in this chunk moves the view; the SCREEN is painted once at the
+        # end. A trackpad flick arrives as one read holding hundreds of wheel reports, and
+        # painting each of them was the whole cost (see ScreenRenderer.scroll).
+        delta = 0
         page = max(self.rows - 2, 1)
         for match in _PAGE_KEY_RE.finditer(data):
-            self._scroll(page if match.group(1) == b"5" else -page)
+            delta += page if match.group(1) == b"5" else -page
         data = _PAGE_KEY_RE.sub(b"", data)
         if b"\x1b[<" in data:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
-                self._handle_mouse(int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4))
+                delta += self._mouse_scroll_delta(int(match.group(1)))
             data = _SGR_MOUSE_RE.sub(b"", data)
         if b"\x1b[M" in data:
             # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
             # column, row each offset by 32; the offset button matches the SGR button numbers
-            # _handle_mouse expects (wheel = 64/65), so the wheel still scrolls. Strip them so
-            # the raw coordinate bytes don't leak into the backend's input.
+            # (wheel = 64/65), so the wheel still scrolls. Strip them so the raw coordinate
+            # bytes don't leak into the backend's input.
             for match in _X10_MOUSE_RE.finditer(data):
-                report = match.group()
-                self._handle_mouse(report[3] - 32, report[4] - 32, report[5] - 32, b"M")
+                delta += self._mouse_scroll_delta(match.group()[3] - 32)
             data = _X10_MOUSE_RE.sub(b"", data)
+        if delta:
+            self._scroll(delta)
         return data
 
-    def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
-        # Only the wheel is aGiTrack's to act on (history scrollback for a backend that
-        # doesn't drive the mouse itself, e.g. Claude). Left-button press/drag/release are
-        # deliberately left alone so the TERMINAL owns text selection.
-        #
-        # aGiTrack used to drag-select-and-copy here, but that path only ever ran in
-        # terminals that forward a plain drag to the application (mouse mode 1000) — and
-        # there it both SUPPRESSED the terminal's native selection and popped an unwanted
-        # "Copied N char(s) to clipboard" message (#112). Terminals that select natively
-        # never forward the drag, so they never hit this code and are unaffected; dropping
-        # it removes only the harmful case. The mouse bytes are still stripped from the
-        # input forwarded to the backend by _intercept_scroll.
-        if button & 64:  # wheel
-            self._scroll(-3 if button & 1 else 3)
+    @staticmethod
+    def _mouse_scroll_delta(button: int) -> int:
+        """How far this mouse report scrolls the view: 3 lines per wheel notch, 0 for
+        anything else.
+
+        Only the wheel is aGiTrack's to act on (history scrollback for a backend that doesn't
+        drive the mouse itself, e.g. Claude). Left-button press/drag/release are deliberately
+        left alone so the TERMINAL owns text selection.
+
+        aGiTrack used to drag-select-and-copy here, but that path only ever ran in terminals
+        that forward a plain drag to the application (mouse mode 1000), and there it both
+        SUPPRESSED the terminal's native selection and popped an unwanted "Copied N char(s)
+        to clipboard" message (#112). Terminals that select natively never forward the drag,
+        so they never hit this code and are unaffected; dropping it removes only the harmful
+        case. The mouse bytes are still stripped from the input forwarded to the backend by
+        _intercept_scroll."""
+        if not button & 64:  # not the wheel
+            return 0
+        return -3 if button & 1 else 3
 
     def _selection_ranges(self) -> dict[int, tuple[int, int]]:
         return ScreenRenderer.selection_ranges(self, self.cols)
@@ -8531,7 +8618,12 @@ class ProxyRunner:
         return ScreenRenderer.history_len(self)
 
     def _scroll(self, delta: int) -> None:
-        ScreenRenderer.scroll(self, delta, self._render)
+        # Scrolling paints at most one frame per RENDER_MIN_INTERVAL, exactly like backend
+        # output. When a frame is skipped the repaint is owed, so flag it and wake the loop:
+        # the last event of a flick must still land on screen, not wait for the next keypress.
+        if ScreenRenderer.scroll(self, delta, self._render, min_interval=self.RENDER_MIN_INTERVAL):
+            self._render_pending = True
+            self._wake_main_loop()
 
     def _visible_lines(self) -> list:
         return ScreenRenderer.visible_lines(self, self.rows)
@@ -8559,8 +8651,8 @@ class ProxyRunner:
     def history_len(self) -> int:
         return ScreenRenderer.history_len(self)
 
-    def scroll(self, delta: int, render_fn) -> None:
-        ScreenRenderer.scroll(self, delta, render_fn)
+    def scroll(self, delta: int, render_fn, *, min_interval: float = 0.0) -> bool:
+        return ScreenRenderer.scroll(self, delta, render_fn, min_interval=min_interval)
 
     def visible_lines(self, rows: int) -> list:
         return ScreenRenderer.visible_lines(self, rows)
@@ -11424,6 +11516,9 @@ class ProxyRunner:
             session=self.active,
             discover_session_id_fn=self._discover_spawned_session,
             debug_fn=self._debug,
+            # The prompt the user just pressed Enter on is HELD until this parse finishes;
+            # wake the reactor the moment it does instead of letting it wait out the poll.
+            on_finish=self._wake_main_loop,
         )
 
     def _finish_agent_parse_if_ready(
@@ -12091,10 +12186,14 @@ class ProxyRunner:
                 return True
             if wt_path.is_dir():
                 return self._dirs_differ(wt_path, base_path)
-            # Cheap shallow check first (size + mtime); only read content when that disagrees, so
-            # mtime jitter doesn't produce a false "differs" and identical files aren't re-read.
-            if filecmp.cmp(str(wt_path), str(base_path), shallow=True):
-                return False
+            # Size first (free, and settles most cases); when the sizes match, the CONTENT
+            # decides. This used to accept filecmp's SHALLOW verdict as proof of "identical",
+            # and a matching (size, mtime) is not proof of anything: two different files
+            # written in the same clock tick compare equal, and the copy-back offer then
+            # dropped a file the user had actually changed — losing their work silently.
+            # Windows, with the coarser file timestamps, lost that race as a matter of course.
+            if wt_path.stat().st_size != base_path.stat().st_size:
+                return True
             return not filecmp.cmp(str(wt_path), str(base_path), shallow=False)
         except OSError:
             return True
@@ -12299,8 +12398,11 @@ class ProxyRunner:
             # PTY ioctl delegated to the session-owned BackendProcess.
             self.active.process.resize(max(self.rows - 1, 1), self.cols)
             self._render()
-        except OSError:
-            pass
+        except Exception as error:
+            # This runs INSIDE the SIGWINCH handler, so an exception here does not fail a
+            # resize: it propagates into whatever the main thread happened to be executing.
+            # A resize is never worth ending a session for.
+            self._debug(f"resize failed: {error!r}")
 
     def _terminal_size(self) -> tuple[int, int]:
         if self._host is not None:

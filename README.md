@@ -259,7 +259,7 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 `agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
 
-**Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release.
+**Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release. Its [storyline](https://agitrack.core-aix.org/dashboard/story/) and [learn page](https://agitrack.core-aix.org/dashboard/learn/) are there too.
 
 ```bash
 agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
@@ -278,6 +278,8 @@ Re-running `agitrack -d` while a dashboard is already up **restarts** it — the
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
 - **Agent efficiency** — an [efficiency insights](#agent-efficiency-insights) panel that mines the **filtered** history for *how* the agents are being driven (correction loops, rework hotspots, unverified turns, context cost …), shows whether each habit is **improving or worsening**, and suggests what to change.
 - **Tokens, efficiency, and loop detection**, plus a **Log** section with two tabs: **commits** (click any commit to read its full message and show its file diff) and **files** (a collapsible folder tree — pick a file to see its whole change history and the conversation/tokens behind each change). All diffs are served from your local clone — no GitHub needed.
+
+The dashboard is also the way in to the other two pages: 📖 [**story**](#storyline-your-repos-history-told-as-a-story), which tells this history at whatever zoom you like, and 🎓 [**learn**](#learn-let-the-agent-coach-you-from-your-own-sessions), which coaches you from it.
 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
 
@@ -302,6 +304,23 @@ The dashboard's **learn** page (the big **Learn from these traces** card in the 
 The learn page is also served in [backtrace](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one) mode, so you can be coached from reconstructed sessions too (in a directory that isn't a git repo, progress stays local and the sync toggle reports itself unavailable). The efficiency insights panel is likewise available in both the live and backtrace dashboards.
 
 Like the summarizer, all coach calls are one-shot bare backend runs from a scratch directory outside your repo: they never touch your coding sessions, and nothing is uploaded anywhere (the agent backend you already use is the only thing called).
+
+
+## Storyline: your repo's history, told as a story
+
+The dashboard's **story** page (the 📖 **story** link in the header, the **Read it as a story** card above the commit log, or `http://localhost:8765/story`) turns the same commits into something you can actually read: an arc with a title, **moments** you zoom into one at a time, and under each one the developer's own thinking and the code that came out of it.
+
+It is a walk **in**, not a wall of text. You start at the whole project, open what interests you, and one **← back** button always says where it lands. A **which days** control (the dashboard's, with the same presets and the same custom from/to range) decides what a telling covers, so you can ask for the story of last week as easily as the story of everything:
+
+1. **The parts.** Your history split into a handful of eras (how many depends on how long and how busy the history is, not a fixed five), each with its span, its size, and a sparkline of the work inside it. Click one to go inside it.
+2. **The moments.** A part told across its whole range, newest first: when it happened, what kind of moment it was (turning point, feature, fix, refactor, milestone, experiment), one line of what happened, and its size drawn rather than described (a bar for the lines it moved, a dot per commit, its token cost, all labelled).
+3. **All the way in.** The telling, then **what you asked for**: the actual prompts you typed at the pivotal moments, each with a sentence on what you were working out. Those quotes are never written by the agent; they are read straight out of the `# Interaction Trace` in your commits, and a commit the model cannot point to is dropped. Under that, the commits themselves, each opening on its commit message with a button to flip to the file changes.
+
+Press **tell me the story** and your backend agent does two small readings: one over the **whole timeline**, which gives you the parts above (always complete, however long the project is), and one over the **most recent stretch**, which gives you moments you can open. About twenty seconds, with a spinner that names the model spending your tokens and stops the moment you ask it to. **A moment is written out the first time you open it**, one call over that moment's own material, so you only pay for depth where you actually read. Everything is stored per branch in `.agitrack/story.json` and costs nothing to reopen. When new commits arrive, **add the N new commits** continues the story instead of retelling it. Tell it `plainly`, `playfully` or `epically`, pick which days it covers, add an instruction of your own, and pick which backend and model tells it (the same setting the learn page uses); change any of those and the **tell it again** button lights up, because a story is written with the settings of the moment it was told and nothing changes until you press it. Deep-link straight to a depth (`#z3.part-2`) or a moment (`#ch-...`).
+
+The writer is handed each sitting of work with **every commit stamped to the minute, oldest first**, and is asked for one moment per sitting — so a moment cannot quietly reorder your week, and no commit can be lost to an id the model mistyped.
+
+Before anything is generated (or if no backend is configured) the page still shows **the shape of it**: every sitting of work, grouped, with the prompt that started it. That part needs no agent at all. The storyline is served in [backtrace](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one) mode too, where it tells the story of the reconstruction instead of a branch.
 
 
 ## Backtrace — show and commit a history you didn't track from day one

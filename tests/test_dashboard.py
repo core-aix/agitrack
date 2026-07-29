@@ -207,6 +207,51 @@ def test_phone_layout_uses_the_full_width(tmp_path):
     assert ".entry .ksub{min-width:0;flex-basis:100%}" in html
 
 
+def test_expanded_commit_message_has_no_box_and_reads_the_same_everywhere(tmp_path):
+    # The expanded message was drawn as a bordered, inset panel inside the already-indented
+    # detail — wasted width and read as a nested box on a phone. The rule is also no longer
+    # scoped to the commit log: the FILES view renders the same element and matched none of
+    # it, so its messages came out in the page's much larger body font.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert ".dmsg{font-size:12.5px" in html  # one rule, both views
+    assert ".entry .detail .dmsg{" not in html  # …not scoped to the commit log any more
+    box = html.split(".dmsg{", 1)[1].split("}", 1)[0]
+    assert "border:" not in box and "background:" not in box  # no frame, no inset panel
+    # …and no scroll region of its own: a message that scrolled separately from the page
+    # read as a framed pane and left the #trace deep link with two things to scroll.
+    assert "max-height" not in box and "overflow" not in box
+    # …and the expanded detail draws no vertical rule of its own — the log's timeline rail
+    # already runs beside every entry, so a second stripe was redundant.
+    detail = html.split(".entry .detail{", 1)[1].split("}", 1)[0]
+    assert "border-left" not in detail and "padding-left:14px" in detail
+
+
+def test_footer_is_just_the_name_and_the_two_links(tmp_path):
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    footer = html.split("<footer>", 1)[1].split("</footer>", 1)[0]
+    assert "agent + git tracking" not in footer and "metrics from commit metadata" not in footer
+    assert "aGiTrack" in footer and ">website<" in footer and ">GitHub<" in footer
+
+
+def test_backtrace_explains_an_empty_diff_instead_of_claiming_no_changes(tmp_path):
+    # An empty diff means different things in the two views. On the live dashboard the
+    # commit really changed nothing. In a RECONSTRUCTION it usually means the change was
+    # made in a way the transcript never recorded as an edit — a shell command, a
+    # formatter, a generated file — since only the agent's file-editing tool calls are
+    # readable after the fact. "no changes to show" would simply be untrue there.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "BACKTRACE ? BACKTRACE_NO_DIFF :" in html  # the live wording is untouched
+    assert "No file changes were recovered for this turn." in html
+    assert "shell commands" in html and "formatters" in html  # …why it can be missing
+    assert "Run your agent through <b>aGiTrack</b> from now on" in html  # …and the fix
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.
@@ -235,7 +280,9 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     # neutralized here: on the relative phone bar it shoved the bar down, leaving a
     # banner-sized blank gap at the top of narrow backtrace pages.
     assert "top:auto !important" in phone.split("}", 2)[0] + phone.split("}", 2)[1]
-    assert ".backtracebanner code{color:var(--fg)" in html
+    # The banner's <code> chip is styled once for all three pages (agitrack/metrics/ui.py),
+    # so this asserts the SHARED rule reached the rendered page.
+    assert ".backtracebanner code,.btbanner code,.updatebanner code{color:var(--fg)" in html
 
 
 def test_subject_truncation_cuts_at_word_ends(tmp_path):
@@ -1896,3 +1943,59 @@ def test_token_anomaly_badge_reaches_the_log(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert '"token_anomaly"' not in html  # payload key travels via /log JSON, not the shell
     assert "badge anomaly" in html and "tokens excluded" in html
+
+
+def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch):
+    """Reading the whole history is the expensive thing this server does, and it used to
+    happen on EVERY request: each poll, each log page, and each return from the story or
+    learn page. It only changes when a ref moves."""
+    import agitrack.metrics.server as server_mod
+
+    repo = _demo_repo(tmp_path)
+    server = build_server(repo, port=0)
+    handler = server.RequestHandlerClass
+    builds = []
+    real_build = server_mod.build_dashboard
+    monkeypatch.setattr(server_mod, "build_dashboard", lambda *a, **k: (builds.append(1), real_build(*a, **k))[1])
+    try:
+        # A handler instance without the request cycle: BaseHTTPRequestHandler.__init__ IS
+        # the request, so it is skipped and only the class attributes (repo, caches) are used.
+        probe = type("Probe", (handler,), {"__init__": lambda self: None})()
+        first = probe._dashboard()
+        again = probe._dashboard()
+        assert again is first and len(builds) == 1  # the second request reused it
+
+        _write_lines(repo, "later.txt", 3)
+        repo.commit("something new")
+        after = probe._dashboard()
+        assert after is not first and len(builds) == 2  # ...and a new commit rebuilds it
+    finally:
+        handler._dash_cache.clear()
+        server.server_close()
+
+
+def _rendered_dashboard() -> str:
+    """The page as a browser sees it: the shared UI blocks (agitrack/metrics/ui.py) are
+    substituted at render time, so asserting against the raw template would miss them."""
+    from agitrack.metrics import ui
+    from agitrack.metrics.web import _TEMPLATE
+
+    return ui.render(_TEMPLATE)
+
+
+def test_the_file_filter_is_hidden_outside_the_files_view():
+    """It does nothing in the commits view. `hidden` alone was not enough: the box is a flex
+    container, and any author `display` outranks the attribute's UA rule, so it stayed on
+    screen until the page grew a [hidden] rule of its own."""
+    html = _rendered_dashboard()
+
+    assert '<div class="panehead" id="head-files" hidden>' in html
+    assert 'if(hf) hf.hidden = tab !== "files";' in html  # ...and follows the tab
+    assert "[hidden]{display:none !important}" in html  # ...and hiding actually hides
+
+
+def test_a_long_diff_line_wraps_instead_of_widening_the_page():
+    html = _rendered_dashboard()
+
+    assert "white-space:pre-wrap;overflow-wrap:anywhere" in html
+    assert "max-height:460px" not in html  # no scroll box either

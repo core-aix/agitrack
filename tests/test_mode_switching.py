@@ -208,15 +208,15 @@ def test_stale_background_handshake_with_dead_pid_reads_as_not_running(tmp_path)
 
 
 def _find_dead_pid() -> int:
-    # A pid that is not currently a live process. Scan downward from a high value; os.kill(pid, 0)
-    # raises ProcessLookupError for a free pid (and we skip our own / permission cases).
+    """A pid that is not currently a live process, scanning down from a high value.
+
+    Asked through the product's own :func:`agitrack.proc.pid_alive`, which is the thing under
+    test here anyway. A raw ``os.kill(pid, 0)`` cannot answer this on Windows: there is no
+    signal 0 there, and a pid outside the valid range raises ``OSError(WinError 87)`` rather
+    than the ``ProcessLookupError`` this used to catch."""
+    from agitrack.proc import pid_alive
+
     for candidate in range(999_999, 100_000, -1):
-        if candidate == os.getpid():
-            continue
-        try:
-            os.kill(candidate, 0)
-        except ProcessLookupError:
+        if candidate != os.getpid() and not pid_alive(candidate):
             return candidate
-        except PermissionError:
-            continue
     return 999_999
