@@ -9,6 +9,7 @@ non-git temp directory to prove the git-independence the feature promises.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -1102,9 +1103,23 @@ def test_watch_signature_separates_files_from_directories(tmp_path):
     assert grown_files != files
     assert grown_dirs == dirs  # …which is NOT a reason to re-discover
 
-    (tmp_path / "another.jsonl").write_text("x\n", encoding="utf-8")  # a NEW session appeared
+    # A NEW session appears. The directory's own mtime is then put BACK to what it was, which
+    # is what Windows effectively does by itself: NTFS does not reliably bump a directory's
+    # write time when a file inside it is created, and its st_size is always 0 there. So a
+    # signature built from the directory's stat could not see this at all, the daemon never
+    # ran a fresh discovery pass, and a reconstruction quietly stopped keeping up.
+    before = os.stat(tmp_path)
+    (tmp_path / "another.jsonl").write_text("x\n", encoding="utf-8")
+    os.utime(tmp_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert os.stat(tmp_path).st_mtime_ns == before.st_mtime_ns  # the stat really is unchanged
+
     _, new_dirs = bt._watch_signature([source])
     assert new_dirs != grown_dirs  # …which IS
+
+    (tmp_path / "another.jsonl").unlink()  # and a session going away counts too
+    os.utime(tmp_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    _, gone_dirs = bt._watch_signature([source])
+    assert gone_dirs != new_dirs
 
 
 def test_rebuild_reprocesses_only_the_sessions_that_changed(monkeypatch, tmp_path):
