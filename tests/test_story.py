@@ -580,7 +580,6 @@ def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monke
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
     assert len(fake.prompts) == 2  # ONE outline call plus the whole-history overview
-    assert built["more_earlier"] is True
     assert built["covered"] < len(ordered)
     # ...and the coarse story still spans everything, including what has no moments yet.
     assert sum(era["commits"] for era in built["eras"]) == len(ordered)
@@ -709,19 +708,18 @@ def test_a_range_with_no_commits_in_it_is_refused_before_any_agent_call(tmp_path
     assert not fake.prompts, "nothing was asked of the agent"
 
 
-def test_going_further_back_walks_parts(tmp_path, monkeypatch):
-    """ "Further back" is a part, not an arbitrary number of sittings, so a reader always
-    gains a whole named era."""
+def test_an_older_part_is_told_on_request(tmp_path, monkeypatch):
+    """Reaching back is asking for a PART (or for a range of days), not a vague "further
+    back": a reader always gains a whole named era and knows which one before they press."""
     repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(20)], gap_days=1)
     stats, sha_paths = _view_of(repo)
     _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    assert built["more_earlier"] is True
 
+    older = built["eras"][-2]
     _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
-    back = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="earlier")
-    earlier_part = back["eras"][-2]
-    assert [m for m in back["moments"] if earlier_part["from"] <= m["from"] <= earlier_part["to"]]
+    back = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=older["id"])
+    assert [m for m in back["moments"] if older["from"] <= m["from"] <= older["to"]]
     # ...and the newest part's moments are untouched.
     assert [m["id"] for m in built["moments"]] == [
         m["id"] for m in back["moments"] if m["id"] in {x["id"] for x in built["moments"]}
@@ -824,7 +822,6 @@ def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monk
     )
     first = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     assert [c["id"] for c in first["moments"]] == ["newest"]
-    assert first["more_earlier"] is True  # there is older history, not yet told
 
     _fake_agent(
         monkeypatch,
@@ -833,8 +830,9 @@ def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monk
             learn.LearnAgentError("the claude backend exited with code 1"),
         ],
     )
+    older = first["eras"][0]["id"]
     with pytest.raises(story.StoryError, match="exited with code 1"):
-        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="earlier")
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=older)
     stored = story.StoryStore(tmp_path).get("main")
     assert [c["id"] for c in stored["moments"]] == ["newest"]  # the told stretch is untouched
 
@@ -990,7 +988,6 @@ def test_the_page_paints_without_any_story(tmp_path):
     assert 'id="loading"' in html and 'id="skeleton"' in html
     # The coarse story (every era, always complete) and only a handful of moments at once.
     assert 'id="eras"' in html and "function renderEras" in html
-    assert 'id="earlier2"' in html  # reaching further back, from inside a part
     # Cards appear as they are reached; they used to all animate at once on load.
     assert "IntersectionObserver" in html and "rootMargin" in html
     assert ".outline .num{flex-basis:100%}" in html
@@ -1086,9 +1083,10 @@ def test_the_page_can_ask_for_a_stretch_of_days():
     assert "no commits in these days" in html
     # A range reaching past what the page can count is reported by its dates alone.
     assert "if (state.fromTs && state.fromTs < oldest) return -1;" in html
-    # The popup opens from the preset list and closes on done or an outside click.
-    assert 'showDateRange($("f-period").value === "custom")' in html
-    assert '!e.target.closest("#periodwrap")' in html
+    # The popup is wired by the shared helper, so picking "custom" a SECOND time reopens it
+    # (a select fires no change event when the value does not change).
+    assert "bindRangeControl(" in html
+    assert ui.RANGE_JS in html
 
 
 def test_a_depth_that_needs_a_part_always_has_one():
@@ -1102,6 +1100,49 @@ def test_a_depth_that_needs_a_part_always_has_one():
     assert "return ((state.story && state.story.eras) || []).length ? 2 : 3;" in html
     # ...and it runs before every paint, not only on a click.
     assert "  normalizeZoom();\n  renderBranches();" in html
+
+
+def test_the_destructive_confirm_does_not_look_like_the_button_that_was_pressed():
+    """ "Tell it again" arms into "yes, throw it away and start over" - the same button, one
+    press later. If it still looks the same, a second click lands on it by muscle memory."""
+    html = _page()
+    assert ".btn.danger{border-color:var(--bad);color:var(--ink);background:var(--bad)" in html
+    assert '$("rewrite").classList.add("danger")' in html
+    assert '$("rewrite").classList.remove("danger")' in html  # ...and disarming puts it back
+    assert "@keyframes armed" in html and "prefers-reduced-motion" in html
+
+
+def test_changing_a_setting_shows_on_the_button_that_applies_it():
+    """A story is written with the settings of the moment it was told. Changing the voice, the
+    days or the extra instruction does nothing until it is told again, so the button that does
+    that says so and stands out."""
+    html = _page()
+    assert "function settingsKey()" in html and "function markStale()" in html
+    assert '[state.tone, state.fromTs || 0, state.toTs || 0, $("f-note").value.trim()].join' in html
+    assert 'button.classList.toggle("stale", stale)' in html
+    assert "tell it again with these settings" in html
+    assert ".btn.stale{border-color:var(--phosphor)" in html
+    # Every control that feeds the key marks it.
+    assert '$("f-note").addEventListener("input", markStale)' in html
+    assert "bindRangeControl(() => { state.touchedRange = true; applyPeriod(); markStale(); })" in html
+    # ...and a finished telling clears it, since the story now matches the controls.
+    assert 'state.told0 = state.story ? settingsKey() : "";' in html
+
+
+def test_a_finished_telling_lands_on_the_parts():
+    """A rewrite rewrites the PARTS too, so wherever the reader was standing may no longer
+    exist. One exception: a telling asked for one named part leaves them in that part."""
+    html = _page()
+    assert 'if (state.lastMode !== "part") setZoom(2);' in html
+    assert "state.lastMode = mode;" in html
+
+
+def test_going_further_back_is_gone():
+    """Nobody could tell what "go further back" would give them. Choosing the days says the
+    same thing precisely, so the button and the mode behind it were removed."""
+    html = _page()
+    for gone in ["earlier2", "go further back", "morewrap", "more_earlier"]:
+        assert gone not in html, f"{gone} is still on the page"
 
 
 def test_the_page_no_longer_carries_the_features_that_did_not_work():
@@ -1128,10 +1169,10 @@ def test_the_spinner_is_up_before_the_server_answers():
     Waiting for it left about a second in which "tell it again" had visibly done nothing, and
     people pressed it again."""
     html = _page()
-    builder = html[html.index("async function build(mode)") : html.index("function startPolling()")]
+    builder = html[html.index("async function build(mode){") : html.index("function startPolling()")]
     assert builder.index("showOverlay(") < builder.index("await post("), "the overlay waits for the server"
     assert "BUILD_OPENING" in builder and "true);" in builder  # named for the mode, and stoppable
-    for mode in ("rewrite", "extend", "earlier", "part"):
+    for mode in ("rewrite", "extend", "part"):
         assert f"  {mode}:" in html, f"a build started as {mode} has no opening line"
     # ...and it comes back down if the build never starts.
     assert builder.count("hideOverlay();") == 2

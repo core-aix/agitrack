@@ -2325,18 +2325,12 @@ async function init(){
   $("f-sort").value = state.sort;
   $("f-sort").onchange = async e => { state.sort = e.target.value; showLoading(true);
     try{ if(await loadLog(0)) renderLog(); } finally { showLoading(false); } };
-  // "custom range…" reveals a date-range popup anchored under the select; the
-  // presets and "all time" hide it.
+  // "custom range…" reveals a date-range popup anchored under the select; the presets and
+  // "all time" hide it. Wired by the shared helper (ui.RANGE_JS), so the story page's copy
+  // of this control behaves identically - including re-opening the popup when "custom" is
+  // picked again, which fires no change event and so used to do nothing at all.
   const showDateRange = on => { $("daterange").hidden = !on; };
-  $("f-period").onchange = () => { showDateRange($("f-period").value === "custom"); applyPeriod(); applyFilters(); };
-  const onDate = () => { $("f-period").value = "custom"; applyPeriod(); applyFilters(); };
-  $("f-from").onchange = onDate;
-  $("f-to").onchange = onDate;
-  $("dr-done").onclick = () => showDateRange(false);
-  // Dismiss the popup on a click outside the period control.
-  document.addEventListener("click", e => {
-    if(!$("daterange").hidden && !e.target.closest(".period-field")) showDateRange(false);
-  });
+  bindRangeControl(() => { applyPeriod(); applyFilters(); });
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for

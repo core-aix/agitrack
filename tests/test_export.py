@@ -84,8 +84,8 @@ def test_export_ships_the_storyline_page(tmp_path, monkeypatch):
     assert state["branches"] == []  # one branch is shipped; a picker would lie
 
     assert 'if (name === "story/state") return file("story.json"' in _shim_of(story)
-    # Every control that would start (or undo) a build answers with the shared demo toast.
-    assert '["write", "extend", "earlier", "earlier2", "rewrite", "forget", "build-cancel", "e-save"]' in story
+    # The whole studio answers with the shared demo toast, not just its last button.
+    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
     assert "demoflash" in story  # ...as the same fixed bottom toast the dashboard uses
     # Cross-links: on the live server each page is a sibling path, in the demo a directory.
     assert 'relink("backlink", "../"); relink("learnlink", "../learn/")' in story
@@ -104,8 +104,13 @@ def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkey
     out = _export(tmp_path, monkeypatch)
     story = (out / "story" / "index.html").read_text(encoding="utf-8")
 
-    # The controls the page creates as it goes are matched by selector, not by id.
-    assert 'e.target.closest(".zpart")' in story
+    # Style, days, the note box and every button: all of it, by selector, so controls the
+    # page draws later are covered too.
+    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
+    # A select opens on mousedown, before any click lands...
+    assert 'document.addEventListener("mousedown"' in story
+    # ...and the note box would otherwise take a caret and typing.
+    assert "note.readOnly = true" in story
     # The note goes to the page's OWN toast where there is one, so two boxes never stack.
     assert 'if (typeof window.flash === "function") {' in story
     # And the safety net: whatever still reaches the page's error path is shown as a notice.
