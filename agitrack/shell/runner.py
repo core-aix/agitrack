@@ -99,7 +99,9 @@ class AgitrackShell:
         if resolved != self.state.backend:
             self.state.backend = resolved
         if not self.management_lock.acquire():
-            message = already_running_message(self.management_lock.owner_pid())
+            message = already_running_message(
+                self.management_lock.owner_pid(), repo_root=getattr(self.repo, "repo", None)
+            )
             print(message)
             if self._bridge is not None:
                 self._bridge.emit({"type": "error", "message": message})

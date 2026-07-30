@@ -104,17 +104,29 @@ def stop_background(repo: GitRepo) -> int:
     return 0
 
 
-def _running_tracker_is_current(repo: GitRepo, *, owner_pid: int | None = None) -> bool:
+def handshake_is_manual(info: dict | None) -> bool:
+    """Whether a handshake record describes a MANUAL-commit tracker. The field is a human-readable
+    label (``"manual commits"`` / ``"auto commits"``), so match on the word."""
+    mode = (info or {}).get("mode")
+    return isinstance(mode, str) and "manual" in mode
+
+
+def _running_tracker_is_current(repo: GitRepo, *, owner_pid: int | None = None, manual: bool | None = None) -> bool:
     """True when a LIVE background tracker on this repo is already running the current aGiTrack
-    version — so a rerun of ``agitrack -b`` has nothing new to load and should leave it in place
-    rather than SIGTERM-and-respawn it. Returns False when no background tracker is running, when
-    something else (an interactive TUI) holds the lock (``owner_pid`` mismatch), or when the
-    running version differs from ours (a genuine update — restart to pick it up)."""
+    version IN THE REQUESTED COMMIT MODE — so a rerun of ``agitrack -b`` has nothing new to load
+    and should leave it in place rather than SIGTERM-and-respawn it. Returns False when no
+    background tracker is running, when something else (an interactive TUI) holds the lock
+    (``owner_pid`` mismatch), when the running version differs from ours (a genuine update —
+    restart to pick it up), or when *manual* asks for a commit mode the running daemon isn't in
+    (``agitrack -b -m`` over an auto-commit daemon, or ``-b --auto-commit`` over a manual one):
+    that's a deliberate MODE SWITCH, so the daemon must be replaced, not left in place."""
     pid = _live_background_pid(repo)
     if pid is None or (owner_pid is not None and pid != owner_pid):
         return False
     info = _read_handshake(repo) or {}
-    return info.get("version") == __version__
+    if info.get("version") != __version__:
+        return False
+    return manual is None or handshake_is_manual(info) == manual
 
 
 def replace_running_tracker(repo: GitRepo, *, owner_pid: int | None) -> bool:
@@ -276,8 +288,10 @@ def _background_mode_path(repo: GitRepo) -> Path:
 
 
 def write_background_mode(repo: GitRepo, *, manual: bool) -> None:
-    """Persist the commit mode of the LAST background run ("manual"/"auto"), so an auto-start on a
-    later commit can resume the same mode. Survives the daemon stopping (unlike the handshake)."""
+    """Persist the commit mode of the LAST run ("manual"/"auto"), so an auto-start on a later commit
+    resumes the mode the user last chose. Survives the tracker stopping (unlike the handshake), and
+    is written by BOTH the background daemon and the interactive proxy — otherwise switching to
+    interactive auto-commit and then committing would auto-start a manual-commit daemon."""
     try:
         path = _background_mode_path(repo)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,11 +383,19 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     turn and removes its hooks). The daemon keeps running after the terminal closes; stop it
     with ``agitrack -b stop``.
 
-    Exception: a daemon already running the CURRENT version is left untouched — restarting it
-    would only churn (stop+respawn) with no new code to load. That needless teardown is what made
-    the tracker appear to "quit" whenever aGiTrack was invoked again for an unrelated reason."""
+    Exception: a daemon already running the CURRENT version IN THE REQUESTED COMMIT MODE is left
+    untouched — restarting it would only churn (stop+respawn) with no new code to load. That
+    needless teardown is what made the tracker appear to "quit" whenever aGiTrack was invoked again
+    for an unrelated reason. A run asking for the OTHER commit mode still replaces it, so
+    ``agitrack -b -m`` over an auto-commit daemon really does switch modes."""
+    # The launcher always forwards one of these two, so the requested commit mode is unambiguous.
+    manual: bool | None = None
+    if "--manual-commits" in extra_args:
+        manual = True
+    elif "--auto-commit" in extra_args:
+        manual = False
     running = _live_background_pid(repo)
-    if running is not None and _running_tracker_is_current(repo, owner_pid=running):
+    if running is not None and _running_tracker_is_current(repo, owner_pid=running, manual=manual):
         print(f"\naGiTrack background tracker already running (PID {running}, current version) — left in place.")
         return 0
     if running is not None:
@@ -595,6 +617,7 @@ class BackgroundRunner:
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
         self._write_handshake()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
+        self._clear_stale_worktree_guard()
         self._manual.setup()
         self._install_autotrack_hook()
         self._install_signal_handlers()
@@ -643,8 +666,24 @@ class BackgroundRunner:
             # Undo the teardown: visibility (handshake + --daemons registry, both via
             # _write_handshake) and the commit hooks come back before tracking resumes.
             self._write_handshake()
+            self._clear_stale_worktree_guard()
             self._manual.setup()
             self._install_autotrack_hook()
+
+    def _clear_stale_worktree_guard(self) -> None:
+        """Drop a worktree base-commit guard left in the base repo by a crashed WORKTREE run.
+
+        Background mode is always no-worktree, so the guard is never wanted here — and both it and
+        our persistent auto-track hook want the same ``pre-commit`` slot. Clearing it first (which
+        restores any project hook it chained) means the auto-track install below chains the
+        PROJECT hook rather than burying a dead guard under it. Mirrors the interactive proxy's
+        "start from a clean hook slate", so switching modes between runs is always safe. Only ever
+        touches aGiTrack's own marked hook."""
+        try:
+            if not self.repo.core_hooks_path():
+                git_hooks.remove_base_commit_guard(self.repo.hooks_dir(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"stale worktree guard removal failed: {error!r}")
 
     def _teardown(self, *, restarting: bool = False) -> None:
         # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
@@ -985,7 +1024,7 @@ class BackgroundRunner:
         # under the stop finalize; in every other path turns[-1] is already complete.
         turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
-        covered = self._agent_committed_own_work() if turn_complete else []
+        covered = self._agent_committed_own_work(turns) if turn_complete else []
         if covered:
             # The cover commit is created immediately and the daemon never amends HEAD, so — unlike
             # the async note flow for other commits — its message must LEAD with the summary already.
@@ -1021,7 +1060,7 @@ class BackgroundRunner:
         # ``covered_commits``. In manual-record mode commit_turns never makes a cover; the SHAs only
         # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
         # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
-        in_flight_covered = self._uncovered_agent_commits() if turn_complete else []
+        in_flight_covered = self._uncovered_agent_commits(turns) if turn_complete else []
         result = engine.commit_turns(
             turns=turns,
             backend=backend,
@@ -1090,7 +1129,40 @@ class BackgroundRunner:
             return False
         return is_fully_tracked_message(body) or body.lstrip().startswith("<aGiTrack")
 
-    def _agent_committed_own_work(self) -> list[str]:
+    def _turn_window_start(self, turns) -> int | None:
+        """Epoch seconds of the earliest prompt among *turns*, or None when the backend
+        transcript carries no timestamps (in which case no time gate can be applied)."""
+        stamps = [turn.started_at for turn in turns or [] if getattr(turn, "started_at", None)]
+        return min(stamps) if stamps else None
+
+    # Slack on the turn-window gate below. Both clocks are this machine's — the backend transcript's
+    # prompt timestamp and git's committer date — so a couple of seconds covers rounding; the slack
+    # only ever widens what may be claimed, so it is deliberately kept tight.
+    _WINDOW_SLACK_SECONDS = 5
+
+    def _since_turn_start(self, commits: list[str], turns) -> list[str]:
+        """*commits* (oldest first) with the leading ones that predate the turn dropped.
+
+        The watermark is persistent and deliberately survives the daemon being down, so commits the
+        daemon never watched can sit between it and HEAD — including purely human ones a user made
+        in another mode (interactive, or plain ``git commit`` with no aGiTrack running at all). A
+        commit created BEFORE the user's prompt arrived cannot be that prompt's work, so it is never
+        claimed. Only a leading prefix is dropped: what remains stays a contiguous range ending at
+        HEAD, which is what a cover commit's parents describe.
+
+        Commits made after the prompt are still claimed even if the daemon was down when they
+        landed — that's the coverage the persistent watermark exists to provide."""
+        start = self._turn_window_start(turns)
+        if start is None:
+            return commits
+        cutoff = start - self._WINDOW_SLACK_SECONDS
+        for index, sha in enumerate(commits):
+            stamp = self.repo.commit_timestamp(sha)
+            if stamp is None or stamp >= cutoff:
+                return commits[index:]
+        return []
+
+    def _agent_committed_own_work(self, turns) -> list[str]:
         """Full SHAs (oldest first) of the commit(s) to cover for a just-completed turn — the
         UNTRACKED commits on ``tracked_head..HEAD`` when the working tree is clean — or ``[]``.
 
@@ -1099,9 +1171,12 @@ class BackgroundRunner:
         advanced past the watermark with the tree clean, the agent/user committed the turn's work
         themselves, so those commits are covered and the watermark advances. Commits that already
         carry aGiTrack tracking are skipped (and the watermark still advances past them), so the
-        daemon's own commits and hook-folded user commits are never re-covered. The one trade-off,
-        deliberately chosen for reliable coverage over the old "miss it entirely" behavior: a purely
-        human commit that happens to sit between two AI turns is attributed to the later turn."""
+        daemon's own commits and hook-folded user commits are never re-covered. Commits that predate the
+        turn's own prompt are dropped by :meth:`_since_turn_start`, so history the daemon never
+        watched — a user's own commits made in another mode, or before it ever ran — is not
+        retroactively claimed. The one remaining trade-off, deliberately chosen for reliable coverage
+        over the old "miss it entirely" behavior: a purely human commit made DURING an AI turn is
+        attributed to that turn."""
         if self._tracked_head is None:
             return []
         try:
@@ -1117,7 +1192,9 @@ class BackgroundRunner:
         # Commits that arrived from another branch (a merge/pull/PR) are not the agent's,
         # however they came to sit between the watermark and HEAD.
         untracked = [
-            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+            sha
+            for sha in self._since_turn_start(commits, turns)
+            if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
         ]
         if not untracked or untracked[-1] != head:
             # Nothing new to cover, or a tracked commit sits at HEAD (can't cover onto it) — just
@@ -1126,7 +1203,7 @@ class BackgroundRunner:
             return []
         return untracked
 
-    def _uncovered_agent_commits(self) -> list[str]:
+    def _uncovered_agent_commits(self, turns) -> list[str]:
         """Not-yet-tracked commit(s) on ``tracked_head..HEAD`` (oldest first): the agent's own
         commits — typically one it ran mid-turn (``git commit``) before this now-complete turn
         finished — whose lines this turn's token count accounts for, so the folded turn body
@@ -1135,7 +1212,10 @@ class BackgroundRunner:
         Unlike :meth:`_agent_committed_own_work` this does NOT require a clean tree: it runs on
         the latent (dirty-tree) path, where the agent committed once mid-turn and then kept
         editing, so its edits are still uncommitted while a prior self-made commit already sits in
-        history. Returns ``[]`` when nothing untracked lies between the watermark and HEAD."""
+        history. Returns ``[]`` when nothing untracked lies between the watermark and HEAD.
+
+        Same turn-window gate as the cover path: a commit that predates this turn's prompt (a user's
+        own commit made while the daemon was down or running in another mode) is never claimed."""
         if self._tracked_head is None:
             return []
         try:
@@ -1147,7 +1227,9 @@ class BackgroundRunner:
             self._debug(f"uncovered agent commit check failed: {error!r}")
             return []
         return [
-            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+            sha
+            for sha in self._since_turn_start(commits, turns)
+            if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
         ]
 
     # ------------------------------------------------------------------
