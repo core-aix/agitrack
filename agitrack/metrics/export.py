@@ -72,7 +72,9 @@ _DEMO_WINDOW_DAYS = 30
 # What the shims answer for anything the snapshot cannot serve: a filter, an unbaked diff, any
 # action that needs a live agent. Deliberately says nothing about WHICH page it is on, because
 # all three show it and a reader who met it on the dashboard was being told about the learn page.
-_DEMO_NOTE = "This is a frozen demo snapshot, so it can't do this: there is no agent and no repository behind it. Run aGiTrack on your own repo to do it for real."
+_DEMO_NOTE = (
+    "This action is not supported in this static snapshot demo. Install and run aGiTrack yourself to try this feature."
+)
 
 
 def _banner_html(css_class: str, site_root: str, text: str = "") -> str:
