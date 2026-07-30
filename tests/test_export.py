@@ -86,7 +86,7 @@ def test_export_ships_the_storyline_page(tmp_path, monkeypatch):
 
     assert 'if (name === "story/state") return file("story.json"' in _shim_of(story)
     # The whole studio answers with the shared demo toast, not just its last button.
-    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
+    assert 'lockPanel("studio", ".zpart, #e-save"' in story
     assert "demoflash" in story  # ...as the same fixed bottom toast the dashboard uses
     # Cross-links: on the live server each page is a sibling path, in the demo a directory.
     assert 'relink("backlink", "../"); relink("learnlink", "../learn/")' in story
@@ -107,16 +107,44 @@ def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkey
 
     # Style, days, the note box and every button: all of it, by selector, so controls the
     # page draws later are covered too.
-    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
+    assert 'lockPanel("studio", ".zpart, #e-save"' in story
     # A select opens on mousedown, before any click lands...
     assert 'document.addEventListener("mousedown"' in story
-    # ...and the note box would otherwise take a caret and typing.
-    assert "note.readOnly = true" in story
+    # ...and a text box would otherwise take a caret and typing.
+    assert "field.readOnly = true" in story
     # The note goes to the page's OWN toast where there is one, so two boxes never stack.
     assert 'if (typeof window.flash === "function") {' in story
     # And the safety net: whatever still reaches the page's error path is shown as a notice.
     assert "if ((LEARN || STORY) && typeof window.flash === " in story
     assert 'html.replace(/class="error"/g, \'class="notice"\')' in story
+
+
+def test_the_note_never_names_a_page_it_might_not_be_on(tmp_path, monkeypatch):
+    """All three pages show the same note, so it cannot describe one of them: a reader who met
+    it on the dashboard was being told about "the learn page's agent-driven features"."""
+    from agitrack.metrics.export import _DEMO_NOTE
+
+    for word in ("learn", "dashboard", "story", "storyline"):
+        assert word not in _DEMO_NOTE.lower(), f"the shared note names the {word} page"
+
+
+def test_the_learn_pages_generation_controls_are_locked_too(tmp_path, monkeypatch):
+    """Whose sessions, which branch, which period, how much time, how you feel, the note: all of
+    it feeds a lesson that only a live agent can write. Leaving those live let a reader set every
+    one of them, watch nothing change, and find out why only at the last button."""
+    out = _export(tmp_path, monkeypatch)
+    learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+
+    # The same helper that locks the story page's studio, pointed at the check-in panel.
+    assert 'lockPanel("checkin", ""' in learn
+    assert "var lockPanel = function(panel, alsoMatching, why)" in learn
+    # ...which covers clicks, a select's mousedown, and the note box taking a caret.
+    assert 'document.addEventListener("mousedown"' in learn
+    assert "field.readOnly = true" in learn
+    assert 'box.style.cursor = "not-allowed"' in learn
+    # The panel holds every control a lesson is asked for with.
+    for control in ('id="f-source"', 'id="f-branch"', 'id="f-period"', 'id="time-chips"', 'id="mood-chips"', 'id="go"'):
+        assert control in learn, control
 
 
 def test_each_exported_page_can_be_posted_on_its_own(tmp_path, monkeypatch):
