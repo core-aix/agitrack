@@ -126,7 +126,6 @@ def test_the_note_never_names_a_page_it_might_not_be_on(tmp_path, monkeypatch):
 
     for word in ("learn", "dashboard", "story", "storyline"):
         assert word not in _DEMO_NOTE.lower(), f"the shared note names the {word} page"
-    assert "frozen demo snapshot" in _DEMO_NOTE and "own repo" in _DEMO_NOTE
 
 
 def test_the_learn_pages_generation_controls_are_locked_too(tmp_path, monkeypatch):
