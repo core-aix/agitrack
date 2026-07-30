@@ -55,19 +55,57 @@ def _open_lock_file(path: str) -> int:
     return os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
 
 
-def already_running_message(pid: int | None) -> str:
+def _lock_holder_description(repo_root: Path | str | None, pid: int | None) -> tuple[str, str]:
+    """``(what the holder is, how to stop it)`` for the refusal below.
+
+    The single repo lock is shared by every mode — interactive TUI, background daemon, manual or
+    auto commits — so a refusal can be about a process the user started in a *different* mode and
+    may have forgotten. The mode-specific records the daemon and the proxy write next to the lock
+    (``background.json`` / ``session.json``) say which, and they are plain JSON, so this stays
+    dependency-free (no import back into the proxy layer).
+    """
+    if repo_root is None or pid is None:
+        return "Another aGiTrack instance", "Stop it before starting a new one."
+    root = Path(repo_root)
+
+    def _record(name: str) -> dict | None:
+        try:
+            data = json.loads((root / ".agitrack" / name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) and data.get("pid") == pid else None
+
+    background = _record("background.json")
+    if background is not None:
+        mode = background.get("mode")
+        label = f"aGiTrack background tracker ({mode})" if isinstance(mode, str) else "aGiTrack background tracker"
+        return label, "Stop it with `agitrack -b stop` before starting a new one."
+    session = _record("session.json")
+    if session is not None:
+        commits = session.get("commits")
+        detail = f" ({commits} commits)" if isinstance(commits, str) else ""
+        return (
+            f"An interactive aGiTrack session{detail}",
+            "Quit that session (Ctrl-G → quit) before starting a new one.",
+        )
+    return "Another aGiTrack instance", "Stop it before starting a new one."
+
+
+def already_running_message(pid: int | None, *, repo_root: Path | str | None = None) -> str:
     """Refusal shown when a second aGiTrack is started on a repo that already has one
     running. aGiTrack auto-commits and merges as the agent works, so two instances on
     the same repo would race over commits and branches; we allow only one. Names
-    the holding process so the user can find (and stop) it."""
+    the holding process — and, when *repo_root* is given, which MODE it is running in and the
+    command that stops it, since the holder was often started in a different mode."""
+    holder, how_to_stop = _lock_holder_description(repo_root, pid)
     owner = f"already running on this repo (PID {pid})" if pid else "already running on this repo"
     return (
-        f"Another aGiTrack instance is {owner}.\n"
-        "Stop it before starting a new one.\n"
+        f"{holder} is {owner}.\n"
+        f"{how_to_stop}\n"
         "\n"
         "aGiTrack manages your git commits as the agent works. Running two instances on "
         "the same repo would let them fight over commits and branches, so only one is "
-        "allowed at a time."
+        "allowed at a time — in any mode (interactive or background, manual or auto commits)."
     )
 
 

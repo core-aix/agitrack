@@ -221,6 +221,27 @@ def test_commit_message_removes_mouse_coordinate_reports():
     assert "keep text" in message
 
 
+def test_commit_message_removes_a_malformed_mouse_report_too():
+    """Real bug: a mouse report the proxy's own capture failed to recognize as complete (cut
+    off before its M/m terminator, or otherwise corrupted in flight) left a raw fragment like
+    "[<35;124;48" sitting in a commit's interaction trace looking exactly like something the
+    user had typed. The proxy capture is fixed separately (`_escape_sequence_complete` now
+    aborts a report the moment a byte outside {digit, ';'} shows up), but the commit-message
+    sanitizer must not depend on the capture being perfect: a fragment reaching it from
+    anywhere else is still not something a real prompt would ever start with."""
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[{"role": "user", "content": "[<35;124;48/model please, keep this text"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+    )
+    assert "35;124;48" not in message
+    assert "keep this text" in message
+    assert "please" in message
+
+
 def test_agent_commit_message_preserves_user_trace_order():
     message = build_agent_commit_message(
         latest_prompt="fix it",

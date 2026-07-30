@@ -304,6 +304,18 @@ class GitRepo:
     def commit_message(self, ref: str = "HEAD") -> str:
         return self._run(["git", "log", "-1", "--format=%B", ref], check=False).stdout
 
+    def commit_timestamp(self, ref: str = "HEAD") -> int | None:
+        """Committer date of *ref* as epoch seconds, or None when it can't be read.
+
+        Used to decide whether a commit could possibly belong to a given AI turn: one
+        created before the user's prompt even arrived is somebody else's work.
+        """
+        output = self._run(["git", "log", "-1", "--format=%ct", ref], check=False).stdout.strip()
+        try:
+            return int(output)
+        except ValueError:
+            return None
+
     def diff_range(self, base: str, head: str) -> str:
         return self._run(["git", "diff", f"{base}..{head}"], check=False).stdout
 

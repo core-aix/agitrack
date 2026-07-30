@@ -663,7 +663,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         banner_html=_banner_html(
             "btbanner",
             "../../",
-            "STATIC DEMO: aGiTrack's own history, told as a story by its coding agent. Writing a new one needs a live install. ",
+            "STATIC DEMO: aGiTrack's own story told by its coding agent. Writing a new one needs a live install. ",
         ),
     )
     story_dir = out_dir / "story"

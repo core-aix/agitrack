@@ -13,6 +13,34 @@ def test_already_running_message_names_the_pid():
     assert "already running on this repo" in already_running_message(None)
 
 
+def test_already_running_message_names_the_holders_mode_and_how_to_stop_it(tmp_path):
+    # The single repo lock spans every mode, so a refusal is often about a process the user started
+    # in a DIFFERENT mode (and may have forgotten). Name which one it is and the command that ends
+    # it, instead of a bare "stop it before starting a new one".
+    agit = tmp_path / ".agitrack"
+    agit.mkdir()
+
+    (agit / "background.json").write_text(json.dumps({"pid": 4241, "mode": "manual commits"}), encoding="utf-8")
+    message = already_running_message(4241, repo_root=tmp_path)
+    assert "background tracker (manual commits)" in message
+    assert "agitrack -b stop" in message
+
+    # A pid that does not match the record must not be described as that mode's holder.
+    assert "background tracker" not in already_running_message(9999, repo_root=tmp_path)
+
+    (agit / "background.json").unlink()
+    (agit / "session.json").write_text(
+        json.dumps({"pid": 4242, "mode": "interactive", "commits": "auto", "worktree": True}), encoding="utf-8"
+    )
+    message = already_running_message(4242, repo_root=tmp_path)
+    assert "interactive aGiTrack session (auto commits)" in message
+    assert "Ctrl-G" in message  # how to end an interactive session
+
+    # No records at all (e.g. a session still in startup) ⇒ the generic refusal.
+    (agit / "session.json").unlink()
+    assert "Another aGiTrack instance" in already_running_message(4242, repo_root=tmp_path)
+
+
 def test_acquire_and_release(tmp_path):
     lock = RepoLock(tmp_path / "lock")
     assert lock.acquire() is True
