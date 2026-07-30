@@ -69,9 +69,10 @@ _REPO_URL = "https://github.com/core-aix/agitrack"
 # How much history the demo ships: the dashboard's "last 30 days" range, not all time.
 _DEMO_WINDOW_DAYS = 30
 
-# What the shims answer for anything the snapshot cannot serve (an unbaked diff, a learn
-# action that needs the live coach). Rendered in place by the page's normal error paths.
-_DEMO_NOTE = "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
+# What the shims answer for anything the snapshot cannot serve: a filter, an unbaked diff, any
+# action that needs a live agent. Deliberately says nothing about WHICH page it is on, because
+# all three show it and a reader who met it on the dashboard was being told about the learn page.
+_DEMO_NOTE = "This is a frozen demo snapshot, so it can't do this: there is no agent and no repository behind it. Run aGiTrack on your own repo to do it for real."
 
 
 def _banner_html(css_class: str, site_root: str, text: str = "") -> str:
@@ -407,31 +408,37 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     }};
     if (LEARN) {{ relink("backlink", "../"); relink("storylink", "../story/"); }}
     if (STORY) {{ relink("backlink", "../"); relink("learnlink", "../learn/"); }}
-    // Writing a story needs a live agent, so the WHOLE studio is off in a snapshot: the
-    // voice, the days, the extra instruction, and every button that would start or undo a
-    // telling. Half-live controls were worse than none - a reader could pick a style and a
-    // date range, watch them change nothing, and only find out why at the last button.
-    // Delegated on the document (capture) so it also covers what the page draws later.
-    if (STORY) {{
+    // Generating content needs a live agent, so the WHOLE panel that asks for it is off in a
+    // snapshot: the story page's studio (voice, days, extra instruction, every button that
+    // would start or undo a telling) and the learn page's check-in (whose sessions, which
+    // branch, which period, how much time, how you feel, the note). Half-live controls are
+    // worse than none: a reader could set all of it, watch nothing change, and only find out
+    // why at the last button. Delegated on the document (capture phase) so it covers controls
+    // the page draws later too.
+    var lockPanel = function(panel, alsoMatching, why){{
+      var box = document.getElementById(panel);
+      if (!box) return;
+      var inside = "#" + panel + (alsoMatching ? ", " + alsoMatching : "");
       document.addEventListener("click", function(e){{
-        if (!e.target.closest) return;
-        if (!e.target.closest("#studio, .zpart, #e-save")) return;
+        if (!e.target.closest || !e.target.closest(inside)) return;
         e.preventDefault(); e.stopImmediatePropagation(); showNote();
       }}, true);
       // A select opens its menu on mousedown, before any click lands.
       document.addEventListener("mousedown", function(e){{
-        if (!e.target.closest || !e.target.closest("#studio")) return;
+        if (!e.target.closest || !e.target.closest(inside)) return;
         e.preventDefault(); showNote();
       }}, true);
-      // ...and the text box would still take a caret and typing.
-      var note = document.getElementById("f-note");
-      if (note) {{ note.readOnly = true; note.addEventListener("focus", function(){{ note.blur(); showNote(); }}); }}
-      // Say it before it is clicked, too: the whole panel reads as unavailable.
-      var studio = document.getElementById("studio");
-      if (studio) {{
-        studio.style.cursor = "not-allowed";
-        studio.title = "Telling a story needs a live install. " + NOTE;
-      }}
+      // ...and a text box would still take a caret and typing.
+      [].forEach.call(box.querySelectorAll("input[type=text], input:not([type]), textarea"), function(field){{
+        field.readOnly = true;
+        field.addEventListener("focus", function(){{ field.blur(); showNote(); }});
+      }});
+      // Say it before anything is clicked, too: the panel reads as unavailable.
+      box.style.cursor = "not-allowed";
+      box.title = why + " " + NOTE;
+    }};
+    if (STORY) {{
+      lockPanel("studio", ".zpart, #e-save", "Telling a story needs a live install.");
       // The page disables its buttons while it thinks a build is running or the engine is
       // missing; here they must stay clickable so the toast can explain why nothing happens.
       var keepLive = function(){{
@@ -442,6 +449,15 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
       }};
       keepLive();
       setInterval(keepLive, 500);
+    }}
+    if (LEARN) {{
+      lockPanel("checkin", "", "Writing a lesson needs a live install.");
+      var keepGoLive = function(){{
+        var go = document.getElementById("go");
+        if (go) go.disabled = false;
+      }};
+      keepGoLive();
+      setInterval(keepGoLive, 500);
     }}
     // The learn and story pages surface the demo note through their ERROR path (agent
     // actions return {{error: NOTE}}), which flashes red — but the dashboard shows the same
