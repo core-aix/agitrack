@@ -186,6 +186,82 @@ def test_switch_manual_to_auto_resets_stale_latent_chain(tmp_path):
     assert auto.repo.ref_sha(auto._manual_ref()) == auto.repo.rev_parse("HEAD")
 
 
+# --- the worktree guard and the PERSISTENT auto-track hook share one hook slot ----------------
+
+
+def _install_autotrack(repo: GitRepo) -> None:
+    import sys
+
+    git_hooks.install_autotrack_precommit_hook(
+        _hooks_dir(repo), invoke=[sys.executable, "-m", "agitrack"], repo_root=str(repo.repo)
+    )
+
+
+def test_worktree_guard_never_uninstalls_the_persistent_autotrack_hook(tmp_path, monkeypatch):
+    # A no-worktree/background run leaves the PERSISTENT auto-track hook as `pre-commit`, chaining
+    # the project's own hook at `pre-commit.agitrack-orig`. The worktree base-commit guard wants
+    # that same slot pair — and with the backup slot already taken, installing it on top used to
+    # OVERWRITE the auto-track hook, so a single worktree session silently uninstalled
+    # tracking-on-commit for good. It must be stepped aside and restored instead.
+    runner, repo, _ = _mode_runner(tmp_path, use_worktrees=True, manual=False)
+    (_hooks_dir(repo) / "pre-commit").write_text("#!/bin/sh\necho project\n", encoding="utf-8")
+    (_hooks_dir(repo) / "pre-commit").chmod(0o755)
+    _install_autotrack(repo)
+    monkeypatch.setattr(runner, "_base_commit_guard_active", lambda: True)
+
+    _slate_clean_and_install(runner)  # the worktree run's startup
+
+    assert _has_base_guard(repo)  # the guard owns the slot while the session runs
+    assert (_hooks_dir(repo) / "pre-commit.agitrack-orig").read_text() == "#!/bin/sh\necho project\n"
+
+    runner._remove_base_commit_guard()  # ...and teardown puts the persistent hook back
+
+    assert git_hooks.is_autotrack_hook(_hooks_dir(repo) / "pre-commit")
+    assert (_hooks_dir(repo) / "pre-commit.agitrack-orig").read_text() == "#!/bin/sh\necho project\n"
+
+
+def test_worktree_run_does_not_hand_out_an_autotrack_hook_that_was_never_there(tmp_path, monkeypatch):
+    # The restore is conditional on having displaced one: a pure-worktree user who never had the
+    # persistent hook must not acquire one just by running a session.
+    runner, repo, _ = _mode_runner(tmp_path, use_worktrees=True, manual=False)
+    monkeypatch.setattr(runner, "_base_commit_guard_active", lambda: True)
+
+    _slate_clean_and_install(runner)
+    assert _has_base_guard(repo)
+
+    runner._remove_base_commit_guard()
+    assert not (_hooks_dir(repo) / "pre-commit").exists()
+
+
+def test_background_start_clears_a_stale_worktree_guard_before_installing_autotrack(tmp_path):
+    # Background mode is always no-worktree, so a guard left by a crashed WORKTREE run is never
+    # wanted here — and it holds the slot the persistent auto-track hook needs. Clearing it first
+    # (mirroring the interactive proxy's slate-clean) means auto-track chains the PROJECT hook
+    # rather than burying a dead guard under it, which `--remove-hooks` would later "restore".
+    from agitrack.config.settings import GlobalConfig
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = _init_repo(tmp_path)
+    (_hooks_dir(repo) / "pre-commit").write_text("#!/bin/sh\necho project\n", encoding="utf-8")
+    (_hooks_dir(repo) / "pre-commit").chmod(0o755)
+    git_hooks.install_base_commit_guard(_hooks_dir(repo))  # left by a crashed worktree session
+    assert _has_base_guard(repo)
+
+    runner = BackgroundRunner(
+        repo,
+        _global_config=GlobalConfig(path=tmp_path / "gc.json"),
+        _state=AgitrackState(tmp_path, default_backend="claude"),
+    )
+    runner._clear_stale_worktree_guard()
+    assert (_hooks_dir(repo) / "pre-commit").read_text() == "#!/bin/sh\necho project\n"
+
+    runner._install_autotrack_hook()
+    assert git_hooks.is_autotrack_hook(_hooks_dir(repo) / "pre-commit")
+    chained = (_hooks_dir(repo) / "pre-commit.agitrack-orig").read_text()
+    assert chained == "#!/bin/sh\necho project\n"  # the project hook, not a dead guard
+    assert git_hooks._MARKER not in chained
+
+
 # --- background ↔ interactive: a dead handshake must read as "not running" --------------------
 
 

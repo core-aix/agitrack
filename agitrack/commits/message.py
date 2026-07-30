@@ -120,7 +120,14 @@ PATH_RE = re.compile(f"(?P<url>{_URL_RE})|(?:{_WINDOWS_PATH_RE}|{_TILDE_PATH_RE}
 # stop). Stripped off the match and re-appended after the mask.
 _PATH_TRAILING_PUNCT = ".,;:!?)]}\"'"
 
+# A well-formed SGR mouse report, and the defense-in-depth net under it: a MALFORMED one,
+# cut off or corrupted before its M/m terminator ever arrived (the proxy's own capture aborts
+# these now — see _escape_sequence_complete — but a trace item can reach here from elsewhere,
+# and this must not depend on capture being perfect). No real prompt starts "[<35;124;48": the
+# body is exactly digits and ';', so a run of that shape is stripped whether or not it happens
+# to end in M/m.
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
+MOUSE_REPORT_FRAGMENT_RE = re.compile(r"(?:\x1b)?\[<\d+(?:;\d+){1,2}[Mm]?")
 # Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).
 ANSI_SEQUENCE_RE = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"
@@ -823,6 +830,7 @@ def _mask_secrets(text: object) -> str:
     escapes and control characters, redact secrets, and mask absolute filesystem paths."""
     value = str(text or "")
     value = MOUSE_REPORT_RE.sub("", value)
+    value = MOUSE_REPORT_FRAGMENT_RE.sub("", value)
     value = ANSI_SEQUENCE_RE.sub("", value)
     value = CONTROL_CHAR_RE.sub("", value)
     value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)

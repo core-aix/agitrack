@@ -614,6 +614,47 @@ def test_popup_escape_sequence_consumer_waits_for_mouse_terminator():
     assert _escape_sequence_complete(b"\x1b[35;88;11M") is True
 
 
+def test_a_corrupted_mouse_report_aborts_instead_of_eating_everything_after_it():
+    """Real bug: a report cut off before its M/m terminator (a dropped byte, a multiplexer
+    splitting it oddly) left the consumer waiting for a terminator that would never arrive on
+    its own — so it kept swallowing every keystroke typed afterwards, INCLUDING an unrelated
+    'm' the user happened to type (the one in "model"), which satisfied the same check and got
+    mistaken for the sequence's own end. The result: "[<35;124;48" landed in a commit's
+    interaction trace looking like something the user typed, with the real keystrokes in
+    between silently eaten.
+
+    A genuine SGR report's body is only digits and ';'; anything else proves it has gone off
+    the rails, so the sequence is complete (aborted) the instant that appears — not eventually,
+    not after swallowing the rest of the sentence."""
+    # Still legitimately in progress: only digits and ';' seen so far.
+    assert _escape_sequence_complete(b"\x1b[<35;124;4") is False
+    assert _escape_sequence_complete(b"\x1b[<35;124;48") is False
+    # A byte that is not a digit, ';', 'M' or 'm' proves the report is corrupt: abort NOW,
+    # rather than continuing to wait (and consume) indefinitely.
+    assert _escape_sequence_complete(b"\x1b[<35;124;48/") is True
+    assert _escape_sequence_complete(b"\x1b[<35;124;48m") is True  # a real terminator still works
+    # The failure mode this guards against: something typed right after a corrupted report
+    # (here "/model") must not all be swallowed waiting for a terminator - it aborts on the
+    # very first byte that cannot belong to a mouse report ('/'), sacrificing only that byte.
+    assert _escape_sequence_complete(b"\x1b[<35;124;48/model") is True
+
+
+def test_a_corrupted_mouse_report_does_not_leak_into_the_reconstructed_prompt():
+    """End to end through the actual consumer the runner uses: a corrupted report followed by
+    real typing must not contaminate what gets recorded as the submitted prompt."""
+    runner = make_runner(passthrough_prompt=bytearray(), passthrough_escape=None)
+    # \x1b [ < 3 5 ; 1 2 4 ; 4 8  (never terminated) , then real keystrokes: "model please"
+    corrupted = [b"\x1b", b"[", b"<", b"3", b"5", b";", b"1", b"2", b"4", b";", b"4", b"8"]
+    typed = [b"m", b"o", b"d", b"e", b"l", b" ", b"p", b"l", b"e", b"a", b"s", b"e"]
+    runner._update_passthrough_prompt(corrupted + typed)
+    # The 'm' that would have looked like the report's own terminator is the casualty (the one
+    # byte sacrificed to abort the corrupted sequence); everything typed after it survives
+    # intact, and none of the mouse bytes appear anywhere in the reconstructed prompt.
+    result = runner.passthrough_prompt.decode()
+    assert "35" not in result and "124" not in result and "48" not in result
+    assert result == "odel please"
+
+
 def test_proxy_ctrl_c_starts_exit_flow_in_passthrough_mode():
     # A single Ctrl-C opens the exit confirmation popup (via _run_exit_flow);
     # a second press while that popup is open exits gracefully.
