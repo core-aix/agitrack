@@ -47,9 +47,29 @@ PASTE_END = b"\x1b[201~"
 
 
 def _escape_sequence_complete(sequence: bytes) -> bool:
-    """Return True when *sequence* is a complete ANSI/VT escape sequence."""
+    """Return True when *sequence* is a complete ANSI/VT escape sequence — including an
+    ABORTED one that will never legitimately complete.
+
+    An SGR mouse report (``\\x1b[<Cb;Cx;Cy`` + ``M``/``m``) is otherwise open-ended: the
+    caller keeps extending *sequence* byte by byte until this returns True, with no bound
+    other than the M/m terminator. A report that gets corrupted or cut off in flight (a
+    dropped byte, a multiplexer splitting it oddly) then never terminates — the accumulator
+    swallows every keystroke typed afterwards, waiting for an M/m that will never arrive on
+    its own, until an *unrelated* 'm' the user happens to type (e.g. the one in "model")
+    satisfies the check and gets treated as the sequence's own terminator. The result was a
+    stray ``[<35;124;48`` fragment landing in a commit's interaction trace as if someone had
+    typed it, with the keystrokes in between silently eaten.
+
+    The body of a real SGR report is only ASCII digits and ``;``, so any other byte proves
+    the sequence has gone off the rails — treat the sequence as complete (aborted) right
+    there instead of waiting forever. The offending byte is sacrificed along with it; that
+    is the cost of a corrupted report, and far better than eating everything after it."""
     if sequence.startswith(b"\x1b[<"):
-        return sequence[-1:] in {b"M", b"m"}
+        body = sequence[3:]
+        if not body:
+            return False
+        last = body[-1:]
+        return last in {b"M", b"m"} or not (last.isdigit() or last == b";")
     if sequence.startswith(b"\x1b[M"):
         return len(sequence) >= 6
     if sequence.startswith(b"\x1b["):
