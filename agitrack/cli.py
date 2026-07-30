@@ -892,14 +892,17 @@ def main(argv: list[str] | None = None) -> int:
             # But if that tracker is ALREADY the current version, there is no new code to load —
             # leave it running instead of tearing it down and respawning. This needless restart
             # churn is what made the daemon appear to "quit" on every unrelated aGiTrack invocation.
-            if _running_tracker_is_current(repo, owner_pid=owner_pid):
+            # A rerun asking for a DIFFERENT commit mode (`-b -m` over auto, `-b --auto-commit`
+            # over manual) is a mode switch, so it must replace the daemon rather than be told
+            # "already running" — otherwise the requested mode is silently ignored.
+            if _running_tracker_is_current(repo, owner_pid=owner_pid, manual=manual_commits):
                 print(
                     f"aGiTrack background tracker already running (PID {owner_pid}, current version) — left in place."
                 )
                 return 0
             replaced = replace_running_tracker(repo, owner_pid=owner_pid) and management_lock.acquire()
         if not replaced:
-            print(already_running_message(owner_pid))
+            print(already_running_message(owner_pid, repo_root=repo.repo))
             return 1
 
     try:

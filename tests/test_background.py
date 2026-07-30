@@ -5,6 +5,7 @@ as the proxy, so token/turn accounting is identical."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -732,6 +733,65 @@ def test_running_tracker_is_current_matches_only_the_live_current_version_tracke
     assert bg._running_tracker_is_current(repo) is False
 
 
+def test_running_tracker_is_not_current_when_a_different_commit_mode_is_requested(tmp_path, monkeypatch):
+    # A mode switch must replace the daemon, not be answered with "already running". `agitrack -b -m`
+    # over an auto-commit daemon (or `-b --auto-commit` over a manual one) used to hit the
+    # leave-it-in-place shortcut, so the requested commit mode was silently ignored.
+    import json
+
+    from agitrack import __version__
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits", "version": __version__}), encoding="utf-8")
+
+    assert bg._running_tracker_is_current(repo, manual=False) is True  # same mode ⇒ leave it
+    assert bg._running_tracker_is_current(repo, manual=True) is False  # switch to manual ⇒ replace
+    assert bg._running_tracker_is_current(repo) is True  # no mode asked for ⇒ version check only
+
+    path.write_text(json.dumps({"pid": 4241, "mode": "manual commits", "version": __version__}), encoding="utf-8")
+    assert bg._running_tracker_is_current(repo, manual=True) is True
+    assert bg._running_tracker_is_current(repo, manual=False) is False  # switch to auto ⇒ replace
+
+
+def test_start_background_daemon_restarts_a_daemon_running_the_other_commit_mode(tmp_path, capsys, monkeypatch):
+    # Same rule through the launcher: the forwarded --manual-commits/--auto-commit flag decides
+    # whether the live daemon can be reused.
+    import json
+
+    from agitrack import __version__
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits", "version": __version__}), encoding="utf-8")
+
+    alive = {4241, 4242}
+    terminated = []
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: (terminated.append(pid), alive.discard(pid)))
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_spawn(r, *, extra_args):
+        background_handshake_path(r).write_text(
+            json.dumps({"pid": 4242, "mode": "manual commits", "version": __version__}), encoding="utf-8"
+        )
+        return _FakeProc()
+
+    monkeypatch.setattr(bg, "spawn_background_daemon", fake_spawn)
+
+    assert bg.start_background_daemon(repo, extra_args=["--manual-commits"]) == 0
+    out = capsys.readouterr().out
+    assert terminated == [4241]  # the auto-commit daemon was replaced, not left in place
+    assert "manual commits" in out and "4242" in out
+
+
 def test_handshake_records_the_running_version(tmp_path, monkeypatch):
     import json
 
@@ -1208,6 +1268,99 @@ def test_daemon_never_retroactively_covers_preexisting_history(tmp_path):
     runner._process_once()
 
     assert repo.rev_parse("HEAD") == human_head  # the pre-existing human commit is NOT covered
+
+
+# --- mode switching: a stale watermark must not claim another mode's commits ---
+
+
+def _timed_turn(uid: str, aid: str, prompt: str, response: str, out: int, *, started_at: int) -> SessionTurn:
+    """A completed turn stamped with when its prompt arrived — what the turn-window gate reads."""
+    turn = _turn(uid, aid, prompt, response, out)
+    turn.started_at = started_at
+    turn.ended_at = started_at + 5
+    return turn
+
+
+def _commit_at(repo: GitRepo, path, name: str, message: str, *, when: int) -> str:
+    """Commit *name* with a fixed committer date so the turn-window gate can be exercised."""
+    path.write_text(f"{name} content\n", encoding="utf-8")
+    _git(repo, "add", name)
+    stamp = f"{when} +0000"
+    subprocess.run(
+        ["git", "-C", str(repo.repo), "commit", "-m", message],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp},
+    )
+    return repo.rev_parse("HEAD")
+
+
+@pytest.mark.parametrize("manual", [True, False])
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+def test_stale_watermark_never_claims_a_human_commit_from_another_mode(tmp_path, manual, backend_name):
+    # THE mode-switch regression. The coverage watermark is PERSISTENT (it must survive the daemon
+    # being down when a commit is made), so after a crash — or a switch to interactive/manual mode,
+    # or a plain `git commit` with no aGiTrack running — a purely human commit can sit between the
+    # stale watermark and HEAD. It predates the next turn's prompt, so it is NOT that turn's work
+    # and must never appear in covered_commits. Before the fix, a human commit made in another mode
+    # was attributed to the next AI turn on both the cover path (clean tree) and the latent path.
+    runner, repo, state, backend = _runner(tmp_path, manual=manual)
+    backend.name = backend_name  # both backends stamp turns, so the gate must hold for both
+    state.backend = backend_name
+    runner._manual.setup()
+    runner._load_tracked_head()
+    stale = repo.rev_parse("HEAD")  # watermark: where the crashed daemon last accounted
+
+    # The user commits their own work while nothing is tracking — LONG before the next prompt.
+    human = _commit_at(repo, tmp_path / "notes.md", "notes.md", "Human: document the project", when=1_700_000_000)
+    assert runner._tracked_head == stale  # still behind the human commit
+
+    # A new turn arrives and leaves its edits uncommitted (the latent path).
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_timed_turn("u1", "m1", "do x", "done", 42, started_at=1_700_100_000)])
+
+    assert runner._since_turn_start([human], [backend.sessions["s1"].turns[0]]) == []
+    assert runner._uncovered_agent_commits(backend.sessions["s1"].turns) == []
+    assert runner._agent_committed_own_work(backend.sessions["s1"].turns) == []
+
+    assert runner._process_once() is True
+    body = (runner._manual.pending_bodies() or [_git(repo, "log", "-1", "--format=%B", "HEAD")])[-1]
+    assert "covered_commits" not in body  # the human's commit is not claimed
+    assert human[:7] not in body
+
+
+def test_a_commit_made_after_the_prompt_is_still_covered_when_the_daemon_was_down(tmp_path):
+    # The other half of the gate: coverage of a commit made while the daemon wasn't watching is the
+    # whole reason the watermark persists, so a commit made AFTER the turn's prompt must still be
+    # claimed. Only commits predating the prompt are excluded.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    # The turn's prompt arrives, then its work is committed (by the agent or the user) — the daemon
+    # only sees both afterwards.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    own = _commit_at(repo, tmp_path / "a.txt", "a.txt", "the turn's work", when=1_700_100_030)
+    backend.set_session("s1", [_timed_turn("u1", "m1", "do x", "done", 42, started_at=1_700_100_000)])
+
+    assert runner._agent_committed_own_work(backend.sessions["s1"].turns) == [own]
+    assert runner._process_once() is True
+    head = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "covered_commits:" in head and own[:7] in head
+
+
+def test_turn_window_gate_is_skipped_when_the_transcript_has_no_timestamps(tmp_path):
+    # Backends/turns without timestamps must keep the old behavior rather than lose coverage:
+    # with nothing to compare against, every untracked commit past the watermark stays claimable.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    sha = _commit_at(repo, tmp_path / "a.txt", "a.txt", "some commit", when=1_700_000_000)
+
+    untimed = _turn("u1", "m1", "do x", "done", 42)
+    assert untimed.started_at is None
+    assert runner._since_turn_start([sha], [untimed]) == [sha]
 
 
 def test_repo_status_reports_each_mode(tmp_path, capsys):

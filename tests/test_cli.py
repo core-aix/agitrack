@@ -373,7 +373,9 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
             return 4321  # another instance holds it
 
     monkeypatch.setattr(cli, "RepoLock", _HeldLock)
-    monkeypatch.setattr(cli, "already_running_message", lambda pid: events.append(f"refused:{pid}") or "running")
+    monkeypatch.setattr(
+        cli, "already_running_message", lambda pid, **_kwargs: events.append(f"refused:{pid}") or "running"
+    )
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: events.append("privacy") or True)
 
     class Config:
@@ -418,7 +420,7 @@ def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
             pass
 
     monkeypatch.setattr(cli, "RepoLock", _HeldLock)
-    monkeypatch.setattr(cli, "already_running_message", lambda pid: "running")
+    monkeypatch.setattr(cli, "already_running_message", lambda pid, **_kwargs: "running")
 
     class Config:
         check_for_updates = False
@@ -500,6 +502,88 @@ def test_background_rerun_replaces_a_running_background_tracker(monkeypatch):
     assert rc == 0
     assert replaced == [999]  # the old tracker was stopped, not refused
     assert len(started) == 1  # and a fresh daemon was spawned
+
+
+def _bg_rerun_over_live_tracker(monkeypatch, argv: list[str]):
+    """Run `agitrack -b …` with the repo lock held by a live, current-version background tracker.
+    Returns ``(rc, replaced_pids, spawn_args)``."""
+    import pathlib
+    from types import SimpleNamespace
+
+    from agitrack.proxy import background as bg
+
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "BackgroundRunner", object())
+    monkeypatch.setattr(cli, "_maybe_prompt_background_hook", lambda *a, **k: None)
+
+    class _HeldOnceLock:
+        calls = 0
+
+        def __init__(self, _path):
+            pass
+
+        def acquire(self):
+            type(self).calls += 1
+            return type(self).calls > 1
+
+        def owner_pid(self):
+            return 999
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _HeldOnceLock)
+    replaced: list = []
+    started: list = []
+    monkeypatch.setattr(bg, "replace_running_tracker", lambda repo, *, owner_pid: replaced.append(owner_pid) or True)
+    monkeypatch.setattr(bg, "start_background_daemon", lambda repo, *, extra_args: started.append(extra_args) or 0)
+    # A live tracker on the current version, running AUTO commits.
+    monkeypatch.setattr(
+        bg, "_running_tracker_is_current", lambda repo, *, owner_pid=None, manual=None: manual in (None, False)
+    )
+
+    class Config:
+        check_for_updates = False
+        background = False
+        manual_commits = False
+
+        def has_default_backend(self):
+            return True
+
+        default_backend = "claude"
+
+        def load_repo_overlay(self, _root):
+            pass
+
+        def seed_defaults(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+    return cli.main(argv), replaced, started
+
+
+def test_background_rerun_in_the_same_commit_mode_leaves_the_tracker_in_place(monkeypatch, capsys):
+    # No new code to load and no mode change ⇒ don't churn (stop+respawn is what made the tracker
+    # look like it "quit" on unrelated invocations).
+    rc, replaced, started = _bg_rerun_over_live_tracker(monkeypatch, ["--background", "--backend", "claude"])
+
+    assert rc == 0
+    assert replaced == [] and started == []
+    assert "left in place" in capsys.readouterr().out
+
+
+def test_background_rerun_in_the_other_commit_mode_replaces_the_tracker(monkeypatch):
+    # `agitrack -b -m` over an auto-commit daemon is a MODE SWITCH: it must replace the daemon, not
+    # be told "already running" and silently keep the old mode.
+    rc, replaced, started = _bg_rerun_over_live_tracker(
+        monkeypatch, ["--background", "--manual-commits", "--backend", "claude"]
+    )
+
+    assert rc == 0
+    assert replaced == [999]
+    assert started and "--manual-commits" in started[0]  # the new mode is forwarded to the fresh daemon
+    assert "--auto-commit" not in started[0]
 
 
 def test_no_backend_configured_non_interactive_errors(monkeypatch, capsys):

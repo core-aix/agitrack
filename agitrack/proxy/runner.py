@@ -655,6 +655,10 @@ class ProxyRunner:
         self._manual_hooks_installed = False
         self._manual_last_head: str | None = None
         self._manual_pending_tree: str | None = None
+        # Whether installing the worktree base-commit guard had to step the PERSISTENT auto-track
+        # pre-commit hook aside (they share one hook slot). Drives its restore on teardown, so a
+        # worktree run after a background/no-worktree one never silently uninstalls it.
+        self._displaced_autotrack_hook = False
         # Facts about the turn the agent is currently running, refreshed from every session
         # export (see _note_in_flight). Lets the fold trailer attribute a commit the AGENT makes
         # ITSELF before that turn ends — a turn only becomes a pending latent turn once complete.
@@ -1436,7 +1440,9 @@ class ProxyRunner:
         if not self._ensure_backend_available():
             return 1
         if not self.management_lock.acquire():
-            print(already_running_message(self.management_lock.owner_pid()))
+            # repo_root lets the refusal name the holder's MODE (background vs interactive) and how
+            # to stop it; getattr keeps this a message-quality detail that can never break the refusal.
+            print(already_running_message(self.management_lock.owner_pid(), repo_root=getattr(self.repo, "repo", None)))
             return 1
         # Privacy warning LAST in the cooked-mode startup — after the backend
         # install/availability gate above, after the second-instance lock check (a refused
@@ -1451,11 +1457,15 @@ class ProxyRunner:
         self.state.save()
         # Record this interactive session's mode so `agitrack --status` can report it (cleared on
         # teardown). The shared repo lock only carries a pid, not the mode.
-        from agitrack.proxy.background import write_proxy_status
+        from agitrack.proxy.background import write_background_mode, write_proxy_status
 
         write_proxy_status(
             self.base_repo, commits="manual" if self._manual_commits else "auto", worktree=self._use_worktrees
         )
+        # Record the commit mode for a later auto-start on commit, so it resumes the mode the user
+        # LAST chose — not the last one a *background* run happened to use. Without this, switching
+        # to interactive auto and then committing would silently auto-start a manual-commit daemon.
+        write_background_mode(self.base_repo, manual=self._manual_commits)
         # Record this launch's CLI arguments so a later MSI self-update can re-launch with
         # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
         # Frozen-Windows only; a no-op everywhere else.
@@ -1851,7 +1861,19 @@ class ProxyRunner:
             if self.base_repo.core_hooks_path():
                 self._debug("base-commit guard skipped: core.hooksPath is set")
                 return
-            git_hooks.install_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+            # A previous no-worktree/background run leaves the PERSISTENT auto-track hook as
+            # `pre-commit`, chaining any project hook via `pre-commit.agitrack-orig`. The guard
+            # wants that same slot pair, and only ONE aGiTrack hook can occupy it — with the
+            # backup slot already taken by the project hook, installing the guard on top would
+            # overwrite (and permanently lose) the auto-track hook. So step it aside cleanly
+            # first (restoring the project hook), and put it back in `_remove_base_commit_guard`.
+            # Nothing is lost meanwhile: the auto-track hook defers to a live tracker anyway, and
+            # this session IS one.
+            hooks_dir = self.base_repo.hooks_dir()
+            if git_hooks.is_autotrack_hook(hooks_dir / "pre-commit"):
+                git_hooks.remove_autotrack_precommit_hook(hooks_dir, debug=self._debug)
+                self._displaced_autotrack_hook = True
+            git_hooks.install_base_commit_guard(hooks_dir, debug=self._debug)
         except Exception as error:  # never let hook setup block startup
             self._debug(f"base-commit guard install failed: {error!r}")
 
@@ -1859,8 +1881,38 @@ class ProxyRunner:
         try:
             if self.base_repo is not None and not self.base_repo.core_hooks_path():
                 git_hooks.remove_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+                if self._displaced_autotrack_hook:
+                    # Restore the persistent auto-track hook this worktree run stepped aside
+                    # (see `_install_base_commit_guard`) — it must OUTLIVE aGiTrack, so a worktree
+                    # session must not be what silently uninstalls it.
+                    self._displaced_autotrack_hook = False
+                    self._install_autotrack_precommit_hook()
         except Exception as error:
             self._debug(f"base-commit guard removal failed: {error!r}")
+
+    def _install_autotrack_precommit_hook(self) -> None:
+        """Install (or refresh) the PERSISTENT auto-track ``pre-commit`` hook, honoring the
+        repo's ``autotrack_hook`` opt-out. Shared by no-worktree startup and the worktree
+        guard's restore path."""
+        try:
+            if self.base_repo.core_hooks_path():
+                return
+            hooks_dir = self.base_repo.hooks_dir()
+            if getattr(self.global_config, "autotrack_hook", "auto") == "off":
+                git_hooks.remove_autotrack_precommit_hook(hooks_dir, debug=self._debug)
+                return
+            from agitrack import __version__
+            from agitrack.proc import agitrack_invocation
+
+            git_hooks.install_autotrack_precommit_hook(
+                hooks_dir,
+                invoke=agitrack_invocation(),
+                repo_root=str(self.base_repo.repo),
+                version=__version__,
+                debug=self._debug,
+            )
+        except Exception as error:
+            self._debug(f"autotrack hook install failed: {error!r}")
 
     # --- manual-commit mode (--manual-commits): hidden latent commits + a hook that ----
     # --- folds their tracking into the user's own commit (a strict addition, off by ----
@@ -1910,25 +1962,10 @@ class ProxyRunner:
         # Also install the PERSISTENT auto-track pre-commit hook so a commit made LATER — after
         # this aGiTrack exits (e.g. a reboot) — still records its AI work and folds it into that
         # commit. It defers to a live tracker (this session), so it's a no-op while we run; it earns
-        # its keep once aGiTrack is gone. No conflict with the worktree base-commit guard (that is
-        # worktree-mode only; this path is no-worktree/_latent_tracking).
-        try:
-            if not self.base_repo.core_hooks_path():
-                if getattr(self.global_config, "autotrack_hook", "auto") == "off":
-                    git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
-                else:
-                    from agitrack import __version__
-                    from agitrack.proc import agitrack_invocation
-
-                    git_hooks.install_autotrack_precommit_hook(
-                        self.base_repo.hooks_dir(),
-                        invoke=agitrack_invocation(),
-                        repo_root=str(self.base_repo.repo),
-                        version=__version__,
-                        debug=self._debug,
-                    )
-        except Exception as error:
-            self._debug(f"autotrack hook install failed: {error!r}")
+        # its keep once aGiTrack is gone. The worktree base-commit guard wants the same hook slot,
+        # so a worktree run steps this one aside and restores it on teardown (see
+        # `_install_base_commit_guard`); this path is no-worktree/_latent_tracking.
+        self._install_autotrack_precommit_hook()
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
         self._reset_stale_manual_ref()
