@@ -1466,6 +1466,10 @@ class ProxyRunner:
         # LAST chose — not the last one a *background* run happened to use. Without this, switching
         # to interactive auto and then committing would silently auto-start a manual-commit daemon.
         write_background_mode(self.base_repo, manual=self._manual_commits)
+        # Keep git's comment char off '#' for this repo, or editing one of our commit messages
+        # in an EDITOR (amend, rebase -i reword) silently deletes every '# ...' heading — the
+        # whole trace/metadata structure. Repo-local, idempotent, never overrides a set value.
+        self.base_repo.ensure_comment_char_preserves_headings()
         # Record this launch's CLI arguments so a later MSI self-update can re-launch with
         # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
         # Frozen-Windows only; a no-op everywhere else.

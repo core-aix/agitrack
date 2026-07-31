@@ -359,6 +359,15 @@ class CommitEngine:
             # transcript's clean version — equality re-added the same prompt as
             # if it were new (issue #8). Duplicate recordings also collapse.
             turn_prompts = [p for t in turns for p in ([t.user_prompt, *t.queued_followups]) if p]
+            # A message the user QUEUES mid-turn and the backend actually receives is recorded by
+            # the transcript (Claude writes it as an attachment row → `queued_followups`). So when
+            # these turns carry queued follow-ups, this backend is DEMONSTRABLY recording them, and
+            # a submit-time capture matching none of them never reached the agent: a message the
+            # user typed, queued, and then DELETED before it was sent. The user retracted it, so it
+            # must not be attributed to them in the trace — a stray prompt meant for another window
+            # once landed in a commit that way. (Without that evidence we keep the old behavior and
+            # carry the capture through, so a prompt from an earlier incomplete parse is never lost.)
+            transcript_records_queued = any(turn.queued_followups for turn in turns)
             leftovers: list[str] = []
             for pending_user in pending_users:
                 if not _norm(pending_user):
@@ -375,6 +384,8 @@ class CommitEngine:
                     for prompt in turn_prompts
                 ):
                     continue
+                if transcript_records_queued:
+                    continue  # never delivered (see above) — the user deleted it before it was sent
                 if any(_same_prompt(pending_user, prompt) for prompt in leftovers):
                     continue
                 leftovers.append(pending_user)

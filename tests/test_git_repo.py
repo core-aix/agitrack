@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 from agitrack.git import GitRepo
@@ -75,3 +76,78 @@ def test_untracked_entries_reports_untracked_files_in_a_partially_tracked_dir(tm
     (pkg / "new.py").write_text("n = 1\n")
 
     assert repo.untracked_entries() == ["pkg/new.py"]
+
+
+# --- git's comment char vs. aGiTrack's "#" section headings -----------------------------------
+
+
+def _amend_through_an_editor(path) -> str:
+    """Re-save the HEAD message through git's editor path (what `git commit --amend` does), then
+    return the resulting message. GIT_EDITOR=true leaves the file untouched, so anything missing
+    afterwards was removed by git's own message CLEANUP, not by an edit."""
+    subprocess.run(["git", "commit", "-q", "--amend"], cwd=path, check=True, env={**os.environ, "GIT_EDITOR": "true"})
+    return subprocess.run(
+        ["git", "log", "-1", "--format=%B"], cwd=path, capture_output=True, text=True, check=True
+    ).stdout
+
+
+_AGITRACK_STYLE_MESSAGE = (
+    "<aGiTrack> did the thing\n\n# Interaction Trace\n\n## User\n\nhello\n\n"
+    "## Agent\n\ndone\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+)
+
+
+def test_editing_a_commit_message_destroys_agitrack_headings_without_the_guard(tmp_path):
+    # The failure this guards against: git's default `core.commentChar = "#"` makes its message
+    # cleanup treat every aGiTrack section heading as a comment, so opening the message in an
+    # editor (amend / rebase -i reword) silently deletes the whole trace + metadata structure and
+    # the commit reads as untracked afterwards. Pinned so the guard below has a stated purpose.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "f.txt").write_text("changed\n")
+    repo.stage_paths(["f.txt"])
+    repo.commit(_AGITRACK_STYLE_MESSAGE)
+
+    message = _amend_through_an_editor(tmp_path)
+
+    assert "# Interaction Trace" not in message  # every heading stripped...
+    assert "# aGiTrack Metadata" not in message
+    assert "## User" not in message
+    assert "hello" in message and "done" in message  # ...while the prose survives, so it looks fine
+
+
+def test_ensure_comment_char_preserves_headings_keeps_them_through_an_edit(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert repo.ensure_comment_char_preserves_headings() is True
+    (tmp_path / "f.txt").write_text("changed\n")
+    repo.stage_paths(["f.txt"])
+    repo.commit(_AGITRACK_STYLE_MESSAGE)
+
+    message = _amend_through_an_editor(tmp_path)
+
+    assert "# Interaction Trace" in message
+    assert "# aGiTrack Metadata" in message
+    assert message.count("## User") == 1 and message.count("## Agent") == 1
+
+
+def test_ensure_comment_char_is_idempotent_and_repo_local(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert repo.ensure_comment_char_preserves_headings() is True
+    # Written to the REPO's config, never the user's global one.
+    local = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"], cwd=tmp_path, capture_output=True, text=True
+    ).stdout.strip()
+    assert local == "auto"
+    # A second call is a no-op (already set) rather than rewriting it.
+    assert repo.ensure_comment_char_preserves_headings() is False
+
+
+def test_ensure_comment_char_never_overrides_a_value_the_user_chose(tmp_path):
+    repo = _init_repo(tmp_path)
+    subprocess.run(["git", "config", "--local", "core.commentChar", ";"], cwd=tmp_path, check=True)
+
+    assert repo.ensure_comment_char_preserves_headings() is False
+
+    kept = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"], cwd=tmp_path, capture_output=True, text=True
+    ).stdout.strip()
+    assert kept == ";"  # the user's choice stands (and it already protects "#" headings)
