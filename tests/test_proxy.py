@@ -5544,6 +5544,43 @@ def test_warn_parallel_no_worktree_sessions_fires_once(tmp_path):
     assert "share this directory" in shown[0]
 
 
+def test_new_session_shows_its_dialog_before_swapping_the_active_session(tmp_path):
+    # THE "aGiTrack died" bug. `_new_session` replaces self.active with a BARE Session (no screen,
+    # no PTY), so a popup opened after that point renders NOTHING: the previous popup stays frozen
+    # on screen and every key does nothing visible, while the runner sits blocked on an invisible
+    # dialog. The --no-worktree shared-tree caveat was raised from inside the branch below the
+    # swap, so creating a second session under --no-worktree looked like a hard freeze (a blind
+    # second Enter was the only way out). Every dialog `_new_session` needs must precede the swap.
+    runner, _base, _events = _no_worktree_new_session_runner(tmp_path)
+    del runner._warn_parallel_no_worktree_sessions  # use the real method, which opens the popup
+    outgoing = runner.active
+    seen: list = []
+    runner._select_popup = lambda title, opts: seen.append(runner.active) or "Got it"
+
+    runner._new_session("second")
+
+    assert seen, "the shared-tree caveat was never shown"
+    # It ran while the OUTGOING session was still active, so it had a screen to paint on.
+    assert seen[0] is outgoing
+
+
+def test_new_session_name_prompt_matches_the_worktree_mode(tmp_path):
+    # The hint must not promise "its own git worktree" when worktrees are off — the sessions menu
+    # already offers "+ New session (shares this directory)" in that mode.
+    runner, _base, _ = _no_worktree_new_session_runner(tmp_path)
+    prompts: list = []
+    runner._prompt_popup = lambda title, prompt, **kw: prompts.append(prompt) or "picked"
+    runner._session_name_taken = lambda _name: False
+
+    assert runner._prompt_session_name("New Session", default="x") == "picked"
+    assert "shares this directory" in prompts[-1]
+    assert "worktree" not in prompts[-1]
+
+    runner._use_worktrees = True
+    runner._prompt_session_name("New Session", default="x")
+    assert "its own git worktree" in prompts[-1]
+
+
 # --- shared-session resume gives a local name (#71) ---
 
 
