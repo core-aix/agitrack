@@ -3486,8 +3486,13 @@ class ProxyRunner:
     def _prompt_session_name(self, title: str, *, default: str) -> str | None:
         # Ask for a session name, rejecting duplicates (a session and its worktree
         # are 1:1, so names must be unique). Returns the chosen name, or None on
-        # cancel / empty input.
-        prompt = "Name for the new session (its own git worktree):"
+        # cancel / empty input. The hint must match the MODE — under --no-worktree there is no
+        # worktree to promise, and the sessions menu already says "shares this directory".
+        prompt = (
+            "Name for the new session (its own git worktree):"
+            if self._use_worktrees
+            else "Name for the new session (shares this directory):"
+        )
         while True:
             name = self._prompt_popup(title, prompt, default=default)
             if name is None or not name.strip():
@@ -7287,6 +7292,14 @@ class ProxyRunner:
         backend: str | None = None,
         base_branch: str | None = None,
     ) -> None:
+        # Any dialog this method needs must be shown NOW, while the OUTGOING session is still
+        # active: `self.active = Session.bare()` below leaves the runner with no screen and no PTY,
+        # so a popup opened after it renders NOTHING. The user then sees the previous popup frozen
+        # on screen with every key doing nothing — aGiTrack looks dead, when it is really blocked
+        # on an invisible dialog that a blind Enter would dismiss. (Hit via the --no-worktree
+        # shared-tree caveat, which used to be raised from inside the branch below.)
+        if not self._use_worktrees:
+            self._warn_parallel_no_worktree_sessions()
         # Fresh per-session runtime state; the outgoing active session keeps
         # its state on its own Session object in self.sessions.
         self.active = Session.bare()
@@ -7315,10 +7328,10 @@ class ProxyRunner:
             started_msg = f"Started session '{info.name}' in .agitrack/worktrees/{info.path.name}"
         else:
             # --no-worktree: sessions run directly on the base tree with no isolation,
-            # editing the same files in parallel (the user accepts this; we warn once).
-            # There is no worktree and no per-session merge branch — commits land on the
-            # branch checked out in the directory, like the startup no-worktree session.
-            self._warn_parallel_no_worktree_sessions()
+            # editing the same files in parallel (the user accepts this; they were warned above,
+            # before the active session was swapped out). There is no worktree and no per-session
+            # merge branch — commits land on the branch checked out in the directory, like the
+            # startup no-worktree session.
             self.name = name
             self.worktree = None
             self.repo = self.base_repo
