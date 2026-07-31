@@ -362,6 +362,32 @@ class GitRepo:
         value = self._run(["git", "config", "--get", "core.hooksPath"], check=False).stdout.strip()
         return value or None
 
+    def ensure_comment_char_preserves_headings(self) -> bool:
+        """Make git's comment character something other than ``#`` for THIS repo, so editing an
+        aGiTrack commit message doesn't silently destroy it. Returns True when it set the config.
+
+        Every aGiTrack commit body is structured with ``#`` headings — ``# Interaction Trace``,
+        ``## User`` / ``## Agent``, ``# aGiTrack Metadata``. With git's default
+        ``core.commentChar = "#"``, any message the user opens in an EDITOR (``git commit --amend``,
+        ``rebase -i`` reword, ``git commit -e``) has every one of those lines stripped as a comment
+        on the way out — the trace runs together and the metadata block disappears, so the commit
+        reads as untracked to the dashboard/story. It is silent and unrecoverable from the new
+        commit alone.
+
+        ``auto`` (git ≥ 2.11) picks a character the message doesn't already use at line start, so
+        git's own editor comments still work and nothing else changes. Set with ``--local``: it is
+        scoped to the repo aGiTrack manages and never touches the user's global config. Idempotent,
+        and it never overrides a value the user (or another tool) already chose.
+        """
+        try:
+            if self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip():
+                return False  # already configured here — never override the user's choice
+            if self._run(["git", "config", "--get", "core.commentChar"], check=False).stdout.strip():
+                return False  # a global/system value the user picked already protects (or is theirs)
+            return self._run(["git", "config", "--local", "core.commentChar", "auto"], check=False).returncode == 0
+        except Exception:
+            return False  # never let a config tweak block startup
+
     def branch_exists(self, name: str) -> bool:
         return self._run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], check=False).returncode == 0
 
