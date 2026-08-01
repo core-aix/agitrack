@@ -127,6 +127,20 @@ _ABORTED_MOUSE_ESC_RE = re.compile(rb"(\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})\x1b(?
 # Escape does not land it glued to the end of half a kilobyte of wheel reports with nothing
 # after it. Used only to decide what a held lone ESC was, once its hold has expired.
 _MOUSE_REPORT_TAIL_RE = re.compile(rb"(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})$", re.DOTALL)
+# --- resynchronising after a mouse report we gave up on -------------------------------------
+# Giving up on a held partial (its remainder did not arrive within the hold) leaves the OTHER
+# half of that report still in the terminal's queue. It arrives as its own read, and it has no
+# ESC in it at all — so neither the tail-holding nor the debris-stripping above can see it, and
+# it reached the backend as literal text ("<65;80;26M" typed into the prompt box).
+#
+# So remember the prefix we dropped, and on the NEXT read consume the bytes that complete it.
+# The check is exact rather than a guess: the concatenation must form a whole, well-formed SGR
+# report. That is what stops it eating real input — a user typing "m" is only swallowed if the
+# prefix we dropped was already "\x1b[<65;80;26", which is precisely the case where that "m" IS
+# the report's terminator. One read only; anything else disarms it.
+_SGR_PREFIX_RE = re.compile(rb"^\x1b(?:\[(?:<[0-9;]*)?)?$")  # every strict prefix of a report
+_SGR_REMAINDER_RE = re.compile(rb"[\[<0-9;]*[Mm]")  # what the rest of one could look like
+_SGR_REPORT_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")  # what the two halves must add up to
 
 
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
@@ -634,6 +648,7 @@ class ProxyRunner:
     # `__init__`); both are rebound per instance, so nothing is shared.
     _last_git_pass = 0.0  # monotonic start of the last git-pipeline pass
     _pipeline_lock_wanted = 0  # main threads waiting on _pipeline_lock (the worker yields)
+    _mouse_resync: "bytes | None" = None  # half of a mouse report we gave up on (see _arm_mouse_resync)
     _stall_reported = 0.0  # longest stall already reported for the current loop iteration
     _stall_worst = 0.0  # worst reactor stall this run (reported in a crash report's context)
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
@@ -8175,6 +8190,7 @@ class ProxyRunner:
             # overflowed. Forwarding it is a spurious Escape at the backend — the thing that
             # takes Claude's session down mid-scroll. Drop it; it was never a keystroke.
             self._debug(f"dropped a truncated mouse report's ESC (tail={self._input_tail!r})")
+            self._arm_mouse_resync(self._input_tail)  # its other half is still in the queue
             self._input_tail, self._input_tail_at, self._input_tail_debris = b"", 0.0, False
             return None
         data = b"" if flush_tail else self._read_stdin(4096)
@@ -8215,7 +8231,14 @@ class ProxyRunner:
             self._debug("dropped a truncated mouse report's ESC on rejoin")
             self._input_tail, self._input_tail_debris = b"", False
         data = self._input_tail + data
+        if not flush_tail:
+            # A report we gave up on last time leaves its back half in the queue, arriving as
+            # its own ESC-less read. Consume it before anything else looks at these bytes.
+            data = self._consume_mouse_resync(data)
+        held = self._input_tail
         data, self._input_tail = self._hold_incomplete_tail(data, flush=flush_tail)
+        if flush_tail:
+            self._arm_mouse_resync(held)  # we just gave up mid-report; expect its other half
         self._input_tail_at = time.monotonic() if self._input_tail else 0.0
         # Remember WHY a lone ESC is being held, while the chunk it came from is still in hand:
         # sitting at the end of a run of wheel reports it is the head of one more report, not
@@ -8870,6 +8893,26 @@ class ProxyRunner:
             getattr(session, "process", None) is not None and session.process.pending_input()
             for session in self.sessions or []
         )
+
+    def _arm_mouse_resync(self, dropped: bytes) -> None:
+        """Remember that we just gave up on *dropped* mid-mouse-report, so the other half of it
+        can be recognised when it turns up on its own (see ``_SGR_PREFIX_RE``)."""
+        self._mouse_resync = dropped if _SGR_PREFIX_RE.match(dropped) else None
+
+    def _consume_mouse_resync(self, data: bytes) -> bytes:
+        """Strip the completion of the report we gave up on, if *data* starts with it.
+
+        Disarms unconditionally: the remainder is in the terminal's queue directly behind the
+        half we dropped, so it is either at the front of the very next read or it was discarded
+        too. Carrying the expectation any further would be guessing at unrelated input."""
+        prefix, self._mouse_resync = self._mouse_resync, None
+        if not prefix or not data:
+            return data
+        match = _SGR_REMAINDER_RE.match(data)
+        if not match or not _SGR_REPORT_RE.fullmatch(prefix + match.group()):
+            return data  # not the missing half — leave whatever this is alone
+        self._debug(f"resynced after a dropped mouse report: {prefix!r} + {match.group()!r}")
+        return data[match.end() :]
 
     def _input_tail_expired(self) -> bool:
         """True when a held escape-sequence tail has waited out ``INPUT_TAIL_HOLD`` and must
