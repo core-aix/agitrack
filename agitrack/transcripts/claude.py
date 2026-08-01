@@ -11,6 +11,7 @@ from pathlib import Path
 from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
+from agitrack.transcripts import capabilities
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
@@ -1186,6 +1187,9 @@ def parse_rows(
                 "started_at": stamp,
                 "ended_at": stamp,
                 "tool_ids": set(),
+                "tool_names": [],
+                "skills": [],
+                "subagents": [],
                 "compactions": pending_compactions,
                 "reasoning_effort": None,
                 "messages": [],
@@ -1215,6 +1219,9 @@ def parse_rows(
                         "started_at": stamp,
                         "ended_at": stamp,
                         "tool_ids": set(),
+                        "tool_names": [],
+                        "skills": [],
+                        "subagents": [],
                         "compactions": pending_compactions,
                         "reasoning_effort": None,
                         "messages": [],
@@ -1245,6 +1252,9 @@ def parse_rows(
                     "started_at": stamp,
                     "ended_at": stamp,
                     "tool_ids": set(),
+                    "tool_names": [],
+                    "skills": [],
+                    "subagents": [],
                     "compactions": pending_compactions,
                     "reasoning_effort": None,
                     "messages": [],
@@ -1284,6 +1294,7 @@ def parse_rows(
             if current["reasoning_effort"] is None and _has_thinking(message):
                 current["reasoning_effort"] = "on"
             _collect_tool_use_ids(message, current["tool_ids"])
+            _collect_capabilities(message, current)
             if collect_edits:
                 # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
@@ -1366,6 +1377,41 @@ def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
             tool_id = block.get("id")
             if isinstance(tool_id, str) and tool_id:
                 sink.add(tool_id)
+
+
+# Tool calls whose INPUT names the capability being used, rather than the tool name itself:
+# `Skill` invokes a named skill (a plugin's shows as "plugin:skill"), `Agent`/`Task` spawns a
+# named sub-agent type. Recorded so the commit says WHICH skill/sub-agent ran, not just that one did.
+_SKILL_TOOLS = {"Skill"}
+_SUBAGENT_TOOLS = {"Agent", "Task"}
+
+
+def _collect_capabilities(message: dict, turn: dict) -> None:
+    """Record the tool names this assistant message called, plus the skill / sub-agent each
+    capability-invoking call names, onto the turn in flight. Split into MCP servers/tools later
+    (see :mod:`agitrack.transcripts.capabilities`) so the naming convention lives in one place."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+            continue
+        name = str(block.get("name") or "")
+        if not name:
+            continue
+        turn.setdefault("tool_names", []).append(name)
+        payload = block.get("input")
+        payload = payload if isinstance(payload, dict) else {}
+        if name in _SKILL_TOOLS:
+            skill = payload.get("skill") or payload.get("name")
+            if isinstance(skill, str) and skill.strip():
+                turn.setdefault("skills", []).append(skill.strip())
+        elif name in _SUBAGENT_TOOLS:
+            # `subagent_type` is optional — an unnamed Agent call runs the default agent, which is
+            # still worth recording as a sub-agent (it is a separate context that did work).
+            agent_type = payload.get("subagent_type") or "default"
+            if isinstance(agent_type, str) and agent_type.strip():
+                turn.setdefault("subagents", []).append(agent_type.strip())
 
 
 def _whole_file_reads(message: dict) -> dict[str, str]:
@@ -1524,6 +1570,11 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         # NOT count as complete: the background tracker polls mid-window and would
         # commit a trace that is just the user's message with no agent response.
         in_flight = True
+    used = capabilities.collect(
+        tool_names=turn.get("tool_names") or [],
+        skills=turn.get("skills") or [],
+        subagents=turn.get("subagents") or [],
+    )
     return SessionTurn(
         user_message_id=turn["user_id"],
         assistant_message_id=turn["assistant_id"],
@@ -1539,6 +1590,11 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         reasoning_effort=turn.get("reasoning_effort"),
         agent_messages=list(turn.get("messages") or []),
         queued_followups=list(turn.get("queued_followups") or []),
+        mcp_servers=used.mcp_servers,
+        mcp_tools=used.mcp_tools,
+        skills=used.skills,
+        subagents=used.subagents,
+        plugins=used.plugins,
         edits=list(turn.get("edits") or []),
     )
 
