@@ -131,7 +131,16 @@ _ABORTED_CSI_PREFIX_RE = re.compile(rb"\x1b\[(?:<[0-9;]*|M[^\x1b]{0,2})?(?=\x1b)
 # Deliberately NOT extended to the bare ``ESC [`` arm — ``\x1b[A`` is an arrow key, and a
 # generic numeric CSI followed by a letter (``\x1b[200h``) is a legitimate sequence shape, so
 # a prefix glued to text is genuinely undecidable there.
-_ABORTED_SGR_BODY_RE = re.compile(rb"\x1b\[<[0-9;]*(?=[^0-9;Mm])")
+# Matched, then VALIDATED: anything introduced by ``ESC [ <`` is kept only if it is a whole,
+# well-formed report. Pattern-matching alone is not enough — a joined-up fragment can end in a
+# perfectly good ``M`` and still be junk (``\x1b[<65;43;25;43;28M`` has FOUR parameters), which
+# a "body followed by a non-body byte" rule cannot see. Arity is the discriminator, so check it.
+_SGR_CANDIDATE_RE = re.compile(rb"\x1b\[<[0-9;]*[Mm]?")
+# The other half of the same wreck, and the shape that keeps coming back: a report's TAIL with
+# its ``ESC [ <`` gone (``5;43;28M``, ``;28M``, ``8M``). The tty discards from the middle of the
+# stream, not only at read boundaries, so ONE read can carry a dozen of these interleaved with
+# whole reports — which is why holding a partial and resyncing one orphan cannot cover it.
+_SGR_ORPHAN_TAIL_RE = re.compile(rb"<?[0-9;]*[Mm]")
 _ABORTED_MOUSE_ESC_RE = re.compile(rb"(\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})\x1b(?=\x1b\[[<M])", re.DOTALL)
 # A chunk that ENDS with a whole mouse report. When the next byte after such a run is a lone
 # ESC that never continues, the tty dropped the rest of one more report: a person reaching for
@@ -8873,6 +8882,40 @@ class ProxyRunner:
         return data, b""
 
     @staticmethod
+    def _strip_orphaned_report_tails(data: bytes) -> bytes:
+        """Remove report TAILS whose ``ESC [ <`` the tty threw away (``5;43;28M``, ``;28M``,
+        ``8M``), of which one read can carry many, interleaved with intact reports.
+
+        Two guards keep this off real input, because these fragments are plain characters:
+
+        * the read must contain at least one WHOLE report — we only ever do this while
+          demonstrably mid-burst, never to a read that is just someone typing;
+        * each fragment must sit directly against a report (or against another fragment we
+          already dropped), which is how debris from a clipped burst actually appears.
+
+        A literal byte that is not a fragment resets that adjacency, so typing lands intact:
+        ``hello`` after a report keeps its ``h`` (no fragment matches there), and once ``h`` is
+        kept the rest is ordinary text again. The residue is a user typing something like
+        ``8M`` immediately against a wheel report, which is accepted."""
+        if not _SGR_MOUSE_RE.search(data):
+            return data
+        out = bytearray()
+        index, end, adjacent = 0, len(data), False
+        while index < end:
+            whole = _SGR_MOUSE_RE.match(data, index)
+            if whole:
+                out += whole.group()
+                index, adjacent = whole.end(), True
+                continue
+            orphan = _SGR_ORPHAN_TAIL_RE.match(data, index)
+            if orphan and orphan.group() and (adjacent or _SGR_MOUSE_RE.match(data, orphan.end())):
+                index, adjacent = orphan.end(), True  # dropped; still inside the burst
+                continue
+            out.append(data[index])
+            index, adjacent = index + 1, False
+        return bytes(out)
+
+    @staticmethod
     def _strip_aborted_mouse_reports(data: bytes) -> bytes:
         """Remove mouse reports the tty truncated (see ``_ABORTED_CSI_PREFIX_RE``).
 
@@ -8881,6 +8924,7 @@ class ProxyRunner:
         backtracking finds one — which is why this can run before the normal stripping, and
         for backends that own the mouse. The loop repeats because removing one orphan can
         bring an ESC into position behind another (a burst clipped repeatedly by the queue)."""
+        data = ProxyRunner._strip_orphaned_report_tails(data)
         if b"\x1b" not in data:
             return data
         while True:
