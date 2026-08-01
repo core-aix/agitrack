@@ -590,6 +590,12 @@ class ProxyRunner:
     BASE_DRIFT_CHECK_SECONDS = 2.0
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
+    # How long a trailing, not-yet-complete escape sequence (including a lone ESC) may be
+    # held before it is treated as final. This is the classic ESC-disambiguation timeout:
+    # long enough that the rest of a split sequence has certainly arrived (the remainder of
+    # a mouse report is microseconds behind), short enough that the Escape KEY is delivered
+    # imperceptibly late. See _hold_incomplete_tail for why holding the lone ESC matters.
+    INPUT_TAIL_HOLD = 0.05
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
     # On an INTERACTIVE exit we summarize the final turn's commit (see _start_commit_summary)
     # and wait up to this grace for the summary — whether freshly started at exit-finalize or
@@ -771,6 +777,7 @@ class ProxyRunner:
         self.sel_anchor: tuple[int, int] | None = None
         self.sel_point: tuple[int, int] | None = None
         self._input_tail = b""
+        self._input_tail_at = 0.0  # monotonic time the held tail was first held (INPUT_TAIL_HOLD)
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
@@ -8622,14 +8629,39 @@ class ProxyRunner:
     def _render_line(self, cells, sel: tuple[int, int] | None = None) -> str:
         return ScreenRenderer.render_line(self, cells, sel, cols=self.cols)
 
-    def _hold_incomplete_tail(self, data: bytes) -> tuple[bytes, bytes]:
-        # If the read ends mid escape-sequence (e.g. a mouse report split across
-        # reads), hold the trailing partial so it is completed on the next read
-        # rather than leaking to the backend as stray bytes (the "[<35;..." hex, or
-        # a half-delivered legacy "[M" X10 report).
+    def _hold_incomplete_tail(self, data: bytes, *, flush: bool = False) -> tuple[bytes, bytes]:
+        """Split *data* into (deliver now, hold for the next read).
+
+        If the read ends mid escape-sequence (e.g. a mouse report split across reads), the
+        trailing partial is held so it is completed on the next read rather than leaking to
+        the backend as stray bytes (the "[<35;..." hex, or a half-delivered legacy "[M" X10
+        report).
+
+        **The lone trailing ESC is held too**, and that is the point. A wheel report is
+        ``\\x1b[<64;10;10M``; the tty hands aGiTrack whatever bytes happen to be queued, so
+        one read in twelve ends exactly on that ESC. Forwarding it delivered a REAL Escape
+        keypress to the backend and then leaked the rest of the report as literal text —
+        measured at ~48 spurious Escapes per 20 000 wheel events. Escape is destructive in
+        both backends (it interrupts a turn, and on Claude's native session picker it quits
+        Claude outright), and three backend exits inside 12 s make aGiTrack stop relaunching
+        and exit normally — "aGiTrack dies when scrolling extensively", with no crash report
+        because nothing ever raised.
+
+        Holding it costs the Escape KEY at most ``INPUT_TAIL_HOLD``; ``flush=True`` (driven by
+        that timer in the reactor) then releases it, so Escape still works when nothing follows.
+        """
+        if flush:
+            # The hold expired. A lone ESC is the user's Escape key — deliver it. Anything
+            # longer is a partial sequence that never completed (its remainder was dropped
+            # when the tty's input queue overflowed): it can never be a keystroke, and
+            # prepending it to whatever the user types next is exactly how "[<35;124;48"
+            # fragments ended up in commit traces. Drop it.
+            return (data, b"") if data.endswith(b"\x1b") or not data else (data.rstrip(b"\x1b["), b"")
         match = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
         if match:
             return data[: match.start()], data[match.start() :]
+        if data.endswith(b"\x1b"):  # a bare trailing ESC: the start of a sequence, or the key
+            return data[:-1], b"\x1b"
         return data, b""
 
     def _intercept_scroll(self, data: bytes) -> bytes:
