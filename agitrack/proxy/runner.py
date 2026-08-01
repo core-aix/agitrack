@@ -111,12 +111,17 @@ _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 #     ESC. ``ESC [`` alone is never a complete keypress, so this can only be wreckage. A real
 #     arrow key (``ESC [ A``) or PageUp (``ESC [ 5 ~``) does not match: the optional body needs
 #     ``<`` or ``M``, so the lookahead lands on ``A``/``5``, not an ESC.
-#   * a report cut down to its bare ESC, recognisable only by what follows — the start of
-#     another mouse report. Deliberately narrow: a genuine double-Escape is ``ESC ESC``, whose
-#     second ESC is not a mouse report, so the rewind gesture both backends bind to it is
-#     untouched.
+#   * a report cut down to its bare ESC. This one is only safe to remove BETWEEN two reports —
+#     the queue drained partway, the terminal appended more, and the join left an orphan in the
+#     middle of a burst. Matching a lone ESC on the lookahead ALONE would eat the Escape KEY
+#     whenever a wheel report landed in the same read, and Escape is how the user interrupts a
+#     turn. So the preceding complete report is matched too and put back (Python has no
+#     variable-width lookbehind); an ESC anywhere else is left for the user.
+#     An orphan at the very START of a chunk has no report in front of it to key off — that one
+#     arrives via ``_input_tail`` and is settled by ``_input_tail_debris``, which knows what the
+#     ESC followed in the chunk it actually came from.
 _ABORTED_CSI_PREFIX_RE = re.compile(rb"\x1b\[(?:<[0-9;]*|M[^\x1b]{0,2})?(?=\x1b)")
-_ABORTED_MOUSE_ESC_RE = re.compile(rb"\x1b(?=\x1b\[[<M])")
+_ABORTED_MOUSE_ESC_RE = re.compile(rb"(\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})\x1b(?=\x1b\[[<M])", re.DOTALL)
 # A chunk that ENDS with a whole mouse report. When the next byte after such a run is a lone
 # ESC that never continues, the tty dropped the rest of one more report: a person reaching for
 # Escape does not land it glued to the end of half a kilobyte of wheel reports with nothing
@@ -621,6 +626,16 @@ class ProxyRunner:
     BASE_EDIT_CHECK_SECONDS = 3.0
     CWD_CHECK_SECONDS = 3.0
     BASE_DRIFT_CHECK_SECONDS = 2.0
+    # Floor on the gap between git-pipeline passes. The reactor sets `_git_wake` every loop
+    # iteration, so without this the worker ran ~74 passes/second, holding `_pipeline_lock`
+    # essentially continuously — for work whose own sub-checks are throttled to seconds.
+    GIT_PASS_MIN_INTERVAL = 0.25
+    # Class-level defaults so every construction path has them (`for_testing` does not run
+    # `__init__`); both are rebound per instance, so nothing is shared.
+    _last_git_pass = 0.0  # monotonic start of the last git-pipeline pass
+    _pipeline_lock_wanted = 0  # main threads waiting on _pipeline_lock (the worker yields)
+    _stall_reported = 0.0  # longest stall already reported for the current loop iteration
+    _stall_worst = 0.0  # worst reactor stall this run (reported in a crash report's context)
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     # How long a trailing, not-yet-complete escape sequence (including a lone ESC) may be
@@ -812,6 +827,8 @@ class ProxyRunner:
         self._input_tail = b""
         self._input_tail_at = 0.0  # monotonic time the held tail was first held (INPUT_TAIL_HOLD)
         self._input_tail_debris = False  # the held tail is a dropped mouse report, not a keypress
+        self._last_git_pass = 0.0  # monotonic start of the last git-pipeline pass
+        self._pipeline_lock_wanted = 0  # main threads waiting on _pipeline_lock (worker yields)
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
@@ -1629,6 +1646,7 @@ class ProxyRunner:
                     "session": self._session_label(),
                     "scrollback": self.scroll_back,
                     "history": self._history_len(),
+                    "worst_reactor_stall": f"{self._stall_worst:.1f}s",
                 },
             )
             self._crash_notice = crash_message(path, error)
@@ -7811,13 +7829,41 @@ class ProxyRunner:
         """The git thread's main loop: sleep on `_git_wake` (set by the file watcher
         on worktree writes, and once per reactor tick), then run one foreground
         pipeline pass under `_pipeline_lock`. Backs off to the idle cadence when the
-        user has stepped away, so it doesn't spin (preserving the battery win)."""
+        user has stepped away, so it doesn't spin (preserving the battery win).
+
+        Two things keep this thread from getting in the user's way, because it holds the
+        lock the SUBMIT path needs (`_acquire_pipeline_lock_from_main`):
+
+        * ``GIT_PASS_MIN_INTERVAL`` floors the gap between passes. The reactor sets
+          ``_git_wake`` once per loop iteration, so ``wait`` returned instantly and passes
+          ran back to back — measured at ~74 per second, holding the lock essentially
+          continuously for work whose own sub-checks are throttled to seconds anyway.
+        * ``_pipeline_lock_wanted`` is the main thread saying "I need this now". Python
+          locks are not fair, and a worker that re-acquires the instant it releases will
+          barge ahead of a thread already waiting: with half-second passes the submit path
+          waited up to 1.8 s. Yielding to it costs one deferred pass.
+        """
         while self.running and not self._stop_worker:
             timeout = self.IDLE_POLL_SECONDS if self._is_idle() else self.POLL_SECONDS
             self._git_wake.wait(timeout=timeout)
             self._git_wake.clear()
             if not self.running or self._stop_worker:
                 break
+            # Sleep out the remainder of the interval in slices. NOT `_git_wake.wait()`: the
+            # reactor re-sets that event every loop iteration, so waiting on it returns at once
+            # and the floor never applies — which is how the rate got to ~74 passes/second in
+            # the first place. Slices keep a stop responsive.
+            deadline = self._last_git_pass + self.GIT_PASS_MIN_INTERVAL
+            while self.running and not self._stop_worker:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.02, remaining))
+            if not self.running or self._stop_worker:
+                break
+            while self._pipeline_lock_wanted and self.running and not self._stop_worker:
+                time.sleep(0.005)  # the user is submitting; let the main thread through first
+            self._last_git_pass = time.monotonic()
             try:
                 with self._pipeline_lock:
                     if self.running and not self._stop_worker and self.master_fd is not None:
@@ -7871,14 +7917,18 @@ class ProxyRunner:
         while self.running:
             # --- phase 1: select ------------------------------------------
             background, readable = self._reactor_select_phase()
+            started = time.monotonic()  # everything after select is work, not waiting
+            self._stall_reported = 0.0
             # --- phase 2: pty-output --------------------------------------
             sentinel: str | int | None = self._reactor_pty_output_phase(readable)
+            self._note_phase("pty-output", started)
             if sentinel == "continue":
                 continue
             if sentinel == "break":
                 break
             # --- phase 3: stdin -------------------------------------------
             sentinel = self._reactor_stdin_phase(readable)
+            self._note_phase("stdin", started)
             if sentinel == "continue":
                 continue
             if sentinel == "break":
@@ -7892,17 +7942,48 @@ class ProxyRunner:
                 break
             # --- phase 4: timers / background tasks -----------------------
             self._reactor_timers_phase()
+            self._note_phase("timers", started)
             # A deferred update can apply here (sessions just went idle), tearing the
             # worktree down mid-phase; don't reap/inspect children against it.
             if not self.running:
                 break
             # --- phase 5: child-exit --------------------------------------
             sentinel = self._reactor_child_exit_phase()
+            self._note_phase("child-exit", started)
             if sentinel == "continue":
                 continue
             if isinstance(sentinel, int):
                 return sentinel
         return 0
+
+    # How long one pass through the reactor's work phases may take before it is recorded as a
+    # stall. While the loop is inside a phase it is NOT reading stdin, so the terminal's ~1 KB
+    # input queue fills and then DISCARDS — which is why a stall surfaces to the user as stray
+    # keystrokes and half a mouse report appearing all at once when it finally unblocks.
+    STALL_WARN_SECONDS = 2.0
+
+    def _note_phase(self, phase: str, started: float) -> None:
+        """Record how long the reactor has been away from ``select`` this iteration.
+
+        A user-visible freeze ("pressing Enter took half a minute") is always some call inside
+        one of these phases refusing to return, and after the fact there is nothing left to say
+        which. This names the phase and the elapsed time, unconditionally — the whole point is
+        to catch a stall nobody can reproduce on demand, so it must not need DEBUG_PROXY to
+        have been set in advance. It costs one ``monotonic()`` per phase."""
+        elapsed = time.monotonic() - started
+        if elapsed < self.STALL_WARN_SECONDS:
+            return
+        if elapsed <= self._stall_reported:
+            return  # already reported this iteration at a shorter prefix; only report growth
+        self._stall_reported = elapsed
+        self._stall_worst = max(self._stall_worst, elapsed)
+        self._debug(f"reactor stalled {elapsed:.1f}s through phase {phase}")
+        try:
+            from agitrack.proxy.crash import write_stall_note
+
+            write_stall_note(self._crash_report_root(), phase, elapsed)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Reactor phases (called exclusively from _loop)
@@ -8125,6 +8206,14 @@ class ProxyRunner:
         # remove the popup even if the key produces no child echo.
         if self._clear_sticky_message_on_input():
             self._render_pending = True
+        # A held ESC already known to be the head of a report the tty truncated is dropped as
+        # it rejoins the stream. It has no complete report in FRONT of it here (it leads the
+        # chunk), so _strip_aborted_mouse_reports cannot recognise it — and widening that
+        # pattern to catch it would eat the Escape KEY whenever a wheel report shared the read.
+        # The flag settles it instead: it was decided against the chunk the ESC really came from.
+        if self._input_tail == b"\x1b" and self._input_tail_debris:
+            self._debug("dropped a truncated mouse report's ESC on rejoin")
+            self._input_tail, self._input_tail_debris = b"", False
         data = self._input_tail + data
         data, self._input_tail = self._hold_incomplete_tail(data, flush=flush_tail)
         self._input_tail_at = time.monotonic() if self._input_tail else 0.0
@@ -8751,7 +8840,9 @@ class ProxyRunner:
         if b"\x1b" not in data:
             return data
         while True:
-            stripped = _ABORTED_MOUSE_ESC_RE.sub(b"", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
+            # ``\1`` puts the preceding complete report back: it is matched only to prove the
+            # orphan sits INSIDE a burst, and is not itself debris.
+            stripped = _ABORTED_MOUSE_ESC_RE.sub(rb"\1", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
             if stripped == data:
                 return data
             data = stripped
@@ -9912,9 +10003,18 @@ class ProxyRunner:
         """Acquire ``_pipeline_lock`` from the main thread WITHOUT deadlocking on a
         worker that holds it while blocked on a modal: keep draining the modal
         mailbox while we wait, so the worker's dialog is serviced and it can release.
-        Pair every call with ``self._pipeline_lock.release()``."""
-        while not self._pipeline_lock.acquire(timeout=0.02):
-            self._drain_modal_mailbox()
+        Pair every call with ``self._pipeline_lock.release()``.
+
+        ``_pipeline_lock_wanted`` asks the git worker to stop taking the lock until we have
+        had it. Python locks are not fair: a worker that re-acquires the instant it releases
+        barges ahead of a thread already waiting, and this call is on the SUBMIT path, so
+        that shows up directly as the delay between pressing Enter and anything happening."""
+        self._pipeline_lock_wanted += 1
+        try:
+            while not self._pipeline_lock.acquire(timeout=0.02):
+                self._drain_modal_mailbox()
+        finally:
+            self._pipeline_lock_wanted -= 1
         self._drain_modal_mailbox()
 
     def _prompt_popup(
