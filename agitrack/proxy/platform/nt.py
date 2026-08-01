@@ -393,6 +393,15 @@ class NtChildProcess:
             except Exception:  # noqa: BLE001 - match os.write's "let the caller decide" is N/A here
                 pass
 
+    def flush_input(self) -> bool:
+        """Nothing is ever queued here: the ConPTY write pipe does its own buffering, so
+        ``write`` always completes. Present to satisfy the ChildProcess contract, whose POSIX
+        side must queue what a full PTY input queue refuses (see ``BackendProcess.write``)."""
+        return False
+
+    def pending_input(self) -> int:
+        return 0
+
     def resize(self, rows: int, cols: int) -> None:
         if self._closed:
             return
