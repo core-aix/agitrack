@@ -2571,6 +2571,37 @@ def test_drain_child_output_reads_all_available():
         os.close(write_fd)
 
 
+def test_writing_to_a_backend_that_stopped_reading_never_blocks_the_reactor():
+    """A PTY's input queue is ~1 KB and the reactor is single-threaded, so a blocking write
+    to a child that is not reading stops aGiTrack draining that child's OUTPUT — and then the
+    child blocks writing too and neither side ever moves again. Measured live against a
+    mouse-owning backend: 255 forwarded wheel events wedged the reactor permanently on
+    os_write, screen frozen, no crash report. The write must queue instead."""
+    import pty
+    import threading
+    import tty
+
+    from agitrack.proxy.process import BackendProcess
+
+    # The slave stands in for a backend that has stopped reading its stdin. Raw mode matters:
+    # a CANONICAL tty DISCARDS input it cannot hold, so its queue never fills and the deadlock
+    # hides — which is exactly why a naive harness sees nothing wrong.
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    process = BackendProcess(master_fd=master, child_pid=None)
+    try:
+        flood = b"\x1b[<64;10;10M" * 4000  # ~48 KB: far more than any PTY queue holds
+        done = threading.Event()
+        threading.Thread(target=lambda: (process.write(flood), done.set()), daemon=True).start()
+        assert done.wait(5.0), "write() blocked the caller — this is the reactor deadlock"
+        assert process.pending_input() > 0  # it took what fit; the rest is queued, not lost
+        assert process.pending_input() <= BackendProcess.MAX_PENDING_INPUT  # and stays bounded
+        assert process.flush_input() is True  # retrying is safe and still does not block
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
 def test_drain_child_output_returns_none_on_eof():
     read_fd, write_fd = os.pipe()
     os.close(write_fd)  # EOF, nothing buffered
@@ -2652,6 +2683,134 @@ def test_a_sustained_scroll_is_held_to_the_frame_budget():
     runner._last_render = time.monotonic() - 1  # a frame's worth of time passes
     runner._intercept_scroll(b"\x1b[<64;5;5M")
     assert len(frames) == 1 and runner._render_pending is False
+
+
+def test_a_wheel_report_split_on_its_esc_never_reaches_the_backend():
+    """The read boundary lands wherever the tty's input queue happened to fill, so one read
+    in twelve ends exactly on a wheel report's ESC. That ESC used to be forwarded as a REAL
+    Escape keypress and the rest of the report leaked after it as literal text — and Escape
+    quits Claude's native session picker, which is how "aGiTrack dies when scrolling
+    extensively" ends in a normal exit with no crash report."""
+    runner = _history_runner()
+    report = b"\x1b[<64;5;5M"
+
+    def deliver(chunk, *, flush=False):
+        data = runner._input_tail + chunk
+        data, runner._input_tail = runner._hold_incomplete_tail(data, flush=flush)
+        runner._input_tail_at = time.monotonic() if runner._input_tail else 0.0
+        return runner._intercept_scroll(data)
+
+    # Split immediately after the ESC — the boundary that used to leak.
+    assert deliver(report + report[:1]) == b""
+    assert runner._input_tail == b"\x1b"  # held, not forwarded
+    assert deliver(report[1:]) == b""  # the rejoined report is recognised and consumed
+    assert runner._input_tail == b""
+    assert runner.scroll_back == 6  # both notches still scrolled
+
+    # A whole flick, cut at every possible offset: not one byte may reach the backend.
+    for cut in range(1, len(report)):
+        runner._input_tail = b""
+        stream = report * 8
+        leaked = deliver(stream[:cut]) + deliver(stream[cut:])
+        assert leaked == b"", f"cut after {cut} byte(s) leaked {leaked!r} to the backend"
+
+
+def test_a_mouse_report_the_tty_truncated_never_reaches_the_backend():
+    """The terminal's input queue is ~590-1022 bytes and the tty DISCARDS what does not fit,
+    so scrolling faster than aGiTrack drains stdin chops reports in half and drops the tail.
+    The orphan used to reach the backend as a real Escape keypress plus visible junk, and
+    Escape quits Claude's native session picker."""
+    runner = _history_runner()
+    report = b"\x1b[<64;120;45M"
+    for keep in range(1, len(report)):
+        runner._input_tail = b""
+        leaked = b""
+        # read 1 ends on a report the queue cut off; its remainder is gone for good, and the
+        # queue resumes with whole reports.
+        for chunk in (b"\x1b[<64;10;10M" + report[:keep], b"\x1b[<65;30;20M" * 3):
+            data = runner._input_tail + chunk
+            data, runner._input_tail = runner._hold_incomplete_tail(data)
+            leaked += runner._intercept_scroll(data)
+        assert leaked == b"", f"a report cut after {keep} byte(s) leaked {leaked!r} to the backend"
+
+
+def test_stripping_truncated_mouse_debris_leaves_real_keys_alone():
+    """The debris strip must only ever remove wreckage. In particular ESC ESC — the rewind
+    gesture both backends bind — is not a truncated report and must survive intact."""
+    for intact in (
+        b"\x1b\x1b",  # double Escape
+        b"\x1b\x1b[A",  # Alt+Up
+        b"\x1b[A\x1b",  # arrow key, then Escape
+        b"\x1b[5~\x1b",  # PageUp, then Escape
+        b"\x1b[<64;10;10M\x1b[<65;30;20M",  # two whole wheel reports
+        b"\x1b[M" + bytes([96, 37, 37]) + b"\x1b[<64;1;1M",  # whole X10, then SGR
+        b"\x1b[200~pasted\x1b[201~",  # bracketed paste
+        b"hello world",
+    ):
+        assert ProxyRunner._strip_aborted_mouse_reports(intact) == intact, f"mangled {intact!r}"
+
+
+def _stdin_phase_runner(monkeypatch, reads):
+    """A _history_runner wired so _reactor_stdin_phase can be driven read-by-read, with
+    everything the backend would receive collected."""
+    runner = _history_runner()
+    forwarded = bytearray()
+    monkeypatch.setattr(runner, "_stdin_fileno", lambda: 0)
+    monkeypatch.setattr(runner, "_read_stdin", lambda n: reads.pop(0) if reads else b"")
+    monkeypatch.setattr(runner.active.process, "write", lambda data: forwarded.extend(data))
+    return runner, forwarded
+
+
+def test_the_esc_of_a_report_the_tty_dropped_is_not_forwarded_as_escape(monkeypatch):
+    """The overflow case the timeout alone cannot settle. The tty discards the rest of a
+    report AND the stream then pauses, so the held ESC ages out looking exactly like a
+    keypress. It is not: a person does not land Escape glued to the end of half a kilobyte
+    of wheel reports with nothing after it. Measured live before this: ~30 000 wheel events
+    delivered 22 spurious Escapes to the backend."""
+    chunk = b"\x1b[<64;44;30M" * 20 + b"\x1b"  # a burst the queue cut mid-report
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [chunk])
+
+    runner._reactor_stdin_phase([0])  # stdin readable: the burst arrives
+    assert runner._input_tail == b"\x1b"  # the orphan ESC is held, not forwarded
+    assert runner._input_tail_debris is True  # ...and recognised as a dropped report
+
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])  # nothing readable, the hold expires
+    assert runner._input_tail == b""
+    assert bytes(forwarded) == b"", f"backend got {bytes(forwarded)!r}"
+
+
+def test_a_real_escape_keypress_is_still_forwarded(monkeypatch):
+    """The other side of the same coin: Escape typed on its own must reach the backend, or
+    the fix above would break cancelling a turn."""
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b"])
+
+    runner._reactor_stdin_phase([0])
+    assert runner._input_tail == b"\x1b" and runner._input_tail_debris is False
+
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    assert bytes(forwarded) == b"\x1b"  # delivered, just INPUT_TAIL_HOLD late
+
+
+def test_a_held_escape_is_still_delivered_when_nothing_follows():
+    """Holding the lone ESC must not swallow the Escape KEY: once INPUT_TAIL_HOLD has passed
+    with no further input, the reactor flushes it. A partial sequence whose remainder never
+    arrived (the tty dropped it) is discarded instead — it can never be a keystroke, and
+    prepending it to the next keystroke is how "[<35;124;48" fragments reached commit traces."""
+    runner = _history_runner()
+
+    runner._input_tail, runner._input_tail_at = b"\x1b", time.monotonic()
+    assert runner._input_tail_expired() is False  # still inside the hold
+    assert runner._select_timeout() <= runner.INPUT_TAIL_HOLD  # ...and the loop wakes for it
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    assert runner._input_tail_expired() is True
+    data, tail = runner._hold_incomplete_tail(runner._input_tail, flush=True)
+    assert data == b"\x1b" and tail == b""  # the Escape key lands
+
+    # A truncated report that never completed is dropped, not forwarded as text.
+    data, tail = runner._hold_incomplete_tail(b"\x1b[<64;5", flush=True)
+    assert data == b"" and tail == b""
 
 
 def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
@@ -10725,3 +10884,22 @@ def test_a_dying_thread_is_recorded_not_painted_over_the_session(tmp_path, monke
     assert any("died" in line and "worker exploded" in line for line in logged)
     reports = list((tmp_path / ".agitrack").glob("crash-*.log"))
     assert reports and "worker exploded" in reports[0].read_text(encoding="utf-8")
+
+
+def test_a_crash_report_lands_in_the_base_repo_not_the_session_worktree(tmp_path):
+    """The worktree is removed on exit, so a report written there is destroyed by the very
+    teardown that follows the crash — which is how a reported death left nothing to look at."""
+    from agitrack.git import GitRepo
+
+    base = GitRepo.init(tmp_path / "base")
+    worktree = GitRepo.init(tmp_path / "base" / ".agitrack" / "worktrees" / "session-1")
+    runner = make_runner(repo=worktree)
+    runner.base_repo = base
+
+    assert runner._crash_report_root() == base.repo
+
+    from agitrack.proxy.crash import write_crash_report
+
+    write_crash_report(runner._crash_report_root(), RuntimeError("reactor died"))
+    assert list((base.repo / ".agitrack").glob("crash-*.log"))
+    assert not list((worktree.repo / ".agitrack").glob("crash-*.log"))

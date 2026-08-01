@@ -89,6 +89,39 @@ _X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
 # A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
 # held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
 _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
+# A mouse report that was CUT OFF in flight: its body is followed by the start of another
+# escape sequence instead of its own terminator, which proves the remainder is never coming.
+#
+# This is not hypothetical. A terminal's input queue is small (measured: ~590-1022 bytes on
+# macOS) and the tty DISCARDS whatever does not fit, so scrolling faster than aGiTrack drains
+# stdin — which is what "scrolling extensively" is — chops reports in half and drops the tail.
+# The orphaned prefix then reaches the backend as a REAL Escape keypress followed by visible
+# junk ("[<64;120;45"). Escape is destructive in both backends: it interrupts the turn, and on
+# Claude's native session picker it quits Claude, which after three exits inside 12 s makes
+# aGiTrack stop relaunching and exit normally — "aGiTrack dies when scrolling extensively",
+# with no crash report because nothing ever raised.
+#
+# The lookahead is what makes this safe: neither report form can contain an ESC (SGR bodies are
+# digits and ';', X10 coordinates are the value plus 32, so always >= 32). An ESC there is
+# therefore always debris, never input the user meant. Complete reports are stripped first, so
+# these patterns only ever see leftovers.
+#
+# Two shapes, kept separate so each stays provably safe:
+#   * a CSI that got as far as ``ESC [`` (optionally into a mouse body) and is followed by ANY
+#     ESC. ``ESC [`` alone is never a complete keypress, so this can only be wreckage. A real
+#     arrow key (``ESC [ A``) or PageUp (``ESC [ 5 ~``) does not match: the optional body needs
+#     ``<`` or ``M``, so the lookahead lands on ``A``/``5``, not an ESC.
+#   * a report cut down to its bare ESC, recognisable only by what follows — the start of
+#     another mouse report. Deliberately narrow: a genuine double-Escape is ``ESC ESC``, whose
+#     second ESC is not a mouse report, so the rewind gesture both backends bind to it is
+#     untouched.
+_ABORTED_CSI_PREFIX_RE = re.compile(rb"\x1b\[(?:<[0-9;]*|M[^\x1b]{0,2})?(?=\x1b)")
+_ABORTED_MOUSE_ESC_RE = re.compile(rb"\x1b(?=\x1b\[[<M])")
+# A chunk that ENDS with a whole mouse report. When the next byte after such a run is a lone
+# ESC that never continues, the tty dropped the rest of one more report: a person reaching for
+# Escape does not land it glued to the end of half a kilobyte of wheel reports with nothing
+# after it. Used only to decide what a held lone ESC was, once its hold has expired.
+_MOUSE_REPORT_TAIL_RE = re.compile(rb"(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})$", re.DOTALL)
 
 
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
@@ -778,6 +811,7 @@ class ProxyRunner:
         self.sel_point: tuple[int, int] | None = None
         self._input_tail = b""
         self._input_tail_at = 0.0  # monotonic time the held tail was first held (INPUT_TAIL_HOLD)
+        self._input_tail_debris = False  # the held tail is a dropped mouse report, not a keypress
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
@@ -1587,7 +1621,7 @@ class ProxyRunner:
 
             exit_code = 1
             path = write_crash_report(
-                self.repo.repo,
+                self._crash_report_root(),
                 error,
                 context={
                     "terminal": f"{self.rows}x{self.cols}",
@@ -6150,6 +6184,10 @@ class ProxyRunner:
                     # a backend switch land here while the new session's fetch is in flight).
                     elif chunk:
                         self._input_tail = self._input_tail + chunk
+                        # Restamp the hold: these are real keystrokes parked for the reactor,
+                        # not a sequence caught mid-flight, so they must not look already
+                        # expired to _input_tail_expired the moment the wait ends.
+                        self._input_tail_at = time.monotonic()
                 elif fd == master:
                     output = self._drain_child_output()
                     if output is not None:
@@ -7891,7 +7929,13 @@ class ProxyRunner:
         Every background sweep self-throttles to its own interval (≥2s), so the
         active poll being a coarse 1s never makes any check run more often.
         """
-        if self._render_pending:
+        if self._input_tail:
+            # A partial escape sequence is being held. Wake when its hold expires so the
+            # Escape key is delivered on time even if no other input ever arrives.
+            return max(0.0, self._input_tail_at + self.INPUT_TAIL_HOLD - time.monotonic())
+        if self._render_pending or self._child_input_pending():
+            # Input a backend's full PTY queue refused is owed to it: come back promptly to
+            # push the rest rather than leaving the user's keystrokes parked for a whole tick.
             return 0.016
         if self._pending_enter_at is not None:
             remaining = self._pending_enter_at - time.monotonic()
@@ -8028,7 +8072,11 @@ class ProxyRunner:
         Returns a loop-control sentinel or None to continue normally.
         """
         stdin_fd = self._stdin_fileno()
-        if stdin_fd not in readable:
+        # A held escape-sequence tail whose hold has expired is delivered even though nothing
+        # is readable — that is what keeps the Escape KEY working now that a lone trailing ESC
+        # is held (see _hold_incomplete_tail). Everything below then runs on an empty read.
+        flush_tail = stdin_fd not in readable and self._input_tail_expired()
+        if stdin_fd not in readable and not flush_tail:
             # Diagnostic (throttled): if a hang ever recurs where the loop spins but no keystroke
             # is delivered, this records whether the host's console→bridge reader thread is alive.
             if self.debug_proxy:
@@ -8040,13 +8088,23 @@ class ProxyRunner:
                         stats = self._host.stdin_reader_stats()
                     self._debug(f"stdin idle: fd={stdin_fd} reader[{stats}]")
             return None
-        data = self._read_stdin(4096)
+        if flush_tail and self._input_tail_debris:
+            # The hold expired on an ESC that arrived glued to a run of wheel reports and was
+            # never continued: the tty threw the rest of that report away when its queue
+            # overflowed. Forwarding it is a spurious Escape at the backend — the thing that
+            # takes Claude's session down mid-scroll. Drop it; it was never a keystroke.
+            self._debug(f"dropped a truncated mouse report's ESC (tail={self._input_tail!r})")
+            self._input_tail, self._input_tail_at, self._input_tail_debris = b"", 0.0, False
+            return None
+        data = b"" if flush_tail else self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
         # click or a focus in/out report. Scrolling history is passive reading: it
         # needs no commits or background polling, so it must not pin aGiTrack in the
         # active loop. (select still woke instantly to redraw the scrolled view; this
         # only governs whether we then drop back to the low-power idle cadence.)
-        if self._is_real_keypress(data):
+        # On a tail flush the read is empty and the keystroke (an Escape) is the held tail,
+        # so judge that instead — otherwise pressing Escape would not count as user activity.
+        if self._is_real_keypress(data or (self._input_tail if flush_tail else b"")):
             self.last_user_input = time.monotonic()
         # (stdin bytes are raw-captured centrally in _read_stdin so modal/wait reads are logged too)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
@@ -8068,7 +8126,12 @@ class ProxyRunner:
         if self._clear_sticky_message_on_input():
             self._render_pending = True
         data = self._input_tail + data
-        data, self._input_tail = self._hold_incomplete_tail(data)
+        data, self._input_tail = self._hold_incomplete_tail(data, flush=flush_tail)
+        self._input_tail_at = time.monotonic() if self._input_tail else 0.0
+        # Remember WHY a lone ESC is being held, while the chunk it came from is still in hand:
+        # sitting at the end of a run of wheel reports it is the head of one more report, not
+        # the user pressing Escape (which arrives in a read of its own).
+        self._input_tail_debris = self._input_tail == b"\x1b" and _MOUSE_REPORT_TAIL_RE.search(data) is not None
         data = self._intercept_scroll(data)
         self._debug(f"after intercept: {data!r}")
         # Decode kitty keyboard protocol control keys back to plain bytes.
@@ -8176,6 +8239,7 @@ class ProxyRunner:
         if not self.running:
             return  # an external graceful-shutdown request just fired
         self._run_pending_session_switch()  # a cross-backend switch deferred out of the sessions modal
+        self._flush_child_input()  # input a backend's full PTY queue would not take yet
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
@@ -8552,9 +8616,19 @@ class ProxyRunner:
             if args.exc_value is not None:
                 from agitrack.proxy.crash import write_crash_report
 
-                write_crash_report(self.repo.repo, args.exc_value, context={"thread": name, "fatal": False})
+                write_crash_report(self._crash_report_root(), args.exc_value, context={"thread": name, "fatal": False})
         except Exception:
             pass
+
+    def _crash_report_root(self) -> "Path":
+        """Where a crash report goes: the BASE repo, never the session worktree.
+
+        The worktree under ``.agitrack/worktrees/`` is removed on exit, so a report written
+        there is destroyed by the very teardown that follows the crash — which is why a
+        reported death could leave no trace at all to investigate. Matches ``_diag_path``,
+        which puts the DEBUG_PROXY/DEBUG_RAW logs in the base repo for the same reason."""
+        base = getattr(self.base_repo, "repo", None)
+        return base if base is not None else self.repo.repo
 
     # Set while a frame is being written. A SIGWINCH handler repaints (see _resize_child),
     # and a signal can land on ANY bytecode boundary: without this, that repaint would
@@ -8651,12 +8725,13 @@ class ProxyRunner:
         that timer in the reactor) then releases it, so Escape still works when nothing follows.
         """
         if flush:
-            # The hold expired. A lone ESC is the user's Escape key — deliver it. Anything
-            # longer is a partial sequence that never completed (its remainder was dropped
-            # when the tty's input queue overflowed): it can never be a keystroke, and
-            # prepending it to whatever the user types next is exactly how "[<35;124;48"
-            # fragments ended up in commit traces. Drop it.
-            return (data, b"") if data.endswith(b"\x1b") or not data else (data.rstrip(b"\x1b["), b"")
+            # The hold expired, so nothing more is coming. A CSI/X10 partial that never
+            # completed lost its remainder when the tty's input queue overflowed: it can
+            # never be a keystroke, and prepending it to whatever the user types next is
+            # exactly how "[<35;124;48" fragments ended up in commit traces — drop it.
+            # A lone ESC matches neither pattern and falls through: that is the Escape key.
+            expired = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
+            return (data[: expired.start()] if expired else data), b""
         match = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
         if match:
             return data[: match.start()], data[match.start() :]
@@ -8664,7 +8739,59 @@ class ProxyRunner:
             return data[:-1], b"\x1b"
         return data, b""
 
+    @staticmethod
+    def _strip_aborted_mouse_reports(data: bytes) -> bytes:
+        """Remove mouse reports the tty truncated (see ``_ABORTED_CSI_PREFIX_RE``).
+
+        A COMPLETE report can never match: the lookahead demands an ESC where its own
+        terminator (``M``/``m``, or the third X10 coordinate) actually sits, and no amount of
+        backtracking finds one — which is why this can run before the normal stripping, and
+        for backends that own the mouse. The loop repeats because removing one orphan can
+        bring an ESC into position behind another (a burst clipped repeatedly by the queue)."""
+        if b"\x1b" not in data:
+            return data
+        while True:
+            stripped = _ABORTED_MOUSE_ESC_RE.sub(b"", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
+            if stripped == data:
+                return data
+            data = stripped
+
+    def _flush_child_input(self) -> bool:
+        """Retry input a backend's PTY would not accept earlier (see ``BackendProcess.write``).
+
+        Every session, not just the active one: a session backgrounded mid-flood still owes its
+        child whatever was queued, and nothing else would ever deliver it. Returns whether any
+        session is still owed, which keeps the reactor on the fast poll until it drains."""
+        owed = False
+        for session in self.sessions or []:
+            process = getattr(session, "process", None)
+            if process is None:
+                continue
+            try:
+                owed = process.flush_input() or owed
+            except OSError as error:
+                # The child is gone; the read path detects the exit and tears the session down.
+                self._debug(f"flush to backend failed: {error!r}")
+        return owed
+
+    def _child_input_pending(self) -> bool:
+        return any(
+            getattr(session, "process", None) is not None and session.process.pending_input()
+            for session in self.sessions or []
+        )
+
+    def _input_tail_expired(self) -> bool:
+        """True when a held escape-sequence tail has waited out ``INPUT_TAIL_HOLD`` and must
+        now be treated as final (delivered, if it is a lone ESC; dropped if it is a partial
+        sequence whose remainder never arrived)."""
+        return bool(self._input_tail) and time.monotonic() - self._input_tail_at >= self.INPUT_TAIL_HOLD
+
     def _intercept_scroll(self, data: bytes) -> bytes:
+        # Debris first, and for EVERY backend. A mouse report the tty chopped in half is not
+        # input any backend should see: forwarded, its leading ESC is a real Escape keypress
+        # (see _ABORTED_CSI_PREFIX_RE). Backends that drive the mouse themselves get the rest
+        # of the stream untouched, so this only ever removes bytes that were already garbage.
+        data = self._strip_aborted_mouse_reports(data)
         # Backends that drive the mouse (OpenCode) get all input forwarded so they
         # scroll themselves. For backends that do not (Claude), aGiTrack handles the
         # mouse: the wheel scrolls history, drag selects-and-copies, and
