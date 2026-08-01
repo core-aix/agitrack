@@ -388,6 +388,30 @@ class GitRepo:
         except Exception:
             return False  # never let a config tweak block startup
 
+    def unlanded_commits(self, ref: str) -> list[str]:
+        """Commits on *ref* that no branch, tag or remote-tracking ref contains — oldest first.
+
+        aGiTrack's manual mode keeps each turn as a hidden *latent* commit that exists ONLY on
+        ``refs/agitrack/manual/<session>``; folding it into the user's commit puts its content on
+        a branch and advances the ref there. A plain ``HEAD..<ref>`` walk then mis-reports those
+        landed commits as pending again the moment HEAD moves to a branch that doesn't contain
+        them (switch branches after a commit and the previous branch's turns fold a SECOND time —
+        trace duplicated, tokens double-counted). "Reachable from no branch" is the exact test for
+        "not yet folded anywhere", and it costs one rev-list.
+        """
+        result = self._run(
+            ["git", "rev-list", "--reverse", ref, "--not", "--branches", "--tags", "--remotes"],
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def list_refs(self, prefix: str) -> list[str]:
+        """Full names of the refs under *prefix* (e.g. ``refs/agitrack/manual/``), or ``[]``."""
+        output = self._run(["git", "for-each-ref", "--format=%(refname)", prefix], check=False).stdout
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
     def branch_exists(self, name: str) -> bool:
         return self._run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], check=False).returncode == 0
 

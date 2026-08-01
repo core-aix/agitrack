@@ -259,6 +259,99 @@ def test_in_flight_attribution_requires_both_a_running_turn_and_tree_changes(tmp
     assert ManualCommitTracker(repo, repo, state).in_flight_attribution() is None
 
 
+# --- the trace between two commits must be WHOLE, across session and branch switches ---------
+
+
+def _record(tracker, name: str, tokens: int) -> None:
+    tracker.gate()
+    tracker.record(
+        f"<aGiTrack> {name}\n\n# Interaction Trace\n\n## User\n\n{name} prompt\n\n"
+        f"# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: {tokens}\n"
+    )
+
+
+def test_a_session_switch_does_not_orphan_the_turns_recorded_before_it(tmp_path):
+    # THE gap. A session's turns live on `refs/agitrack/manual/<agitrack_session_id>`, and that id
+    # changes when the user starts a new session (or a backend switch opens one). Folding only the
+    # CURRENT session's ref silently dropped every turn recorded before the switch, so the trace
+    # between the previous commit and the new one had a hole in it. Manual mode is always
+    # no-worktree, so all those sessions edited the same tree and the commit captures all of their
+    # work — the trace must cover all of them.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    first = ManualCommitTracker(repo, repo, state)
+    first.setup()
+    (tmp_path / "a.txt").write_text("one\nturn one\n", encoding="utf-8")
+    _record(first, "one", 100)
+    first_ref = first.ref()  # captured before the switch: `first` shares the mutated state object
+
+    state.new_agitrack_session_id()  # the user starts a new session
+    second = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    assert second.ref() != first_ref
+    (tmp_path / "a.txt").write_text("one\nturn one\nturn two\n", encoding="utf-8")
+    _record(second, "two", 200)
+    second.render_trailer()
+
+    assert second.pending_count() == 2  # BOTH sessions' turns are pending
+    trailer = (tmp_path / ".agitrack" / "manual-pending-trailer").read_text(encoding="utf-8")
+    assert "one prompt" in trailer and "two prompt" in trailer
+    # Every ref the commit will fold is listed for the post-commit hook to advance, or the older
+    # session's turns would stay "pending" and fold a second time into the NEXT commit.
+    listed = (tmp_path / ".agitrack" / "manual-ref").read_text(encoding="utf-8").split()
+    assert set(listed) == {first_ref, second.ref()}
+
+
+def test_work_already_folded_on_another_branch_is_never_folded_again(tmp_path):
+    # THE double-count. After a fold the post-commit hook advances the latent ref to the new
+    # commit — a real branch commit. Switching to a branch that does not contain it made a plain
+    # `HEAD..ref` walk report that already-folded work as pending, so it folded a SECOND time:
+    # the trace duplicated and its tokens counted twice (exactly the two-branches-then-merge case).
+    # "Reachable from no branch" is the exact test for "still latent".
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    state.ensure_local_ignore()  # as a real run does, so `git add -A` never stages .agitrack/
+    tracker = ManualCommitTracker(repo, repo, state)
+    tracker.setup()
+
+    _git(repo, "checkout", "-qb", "featX")
+    (tmp_path / "x.py").write_text("X = 1\n", encoding="utf-8")
+    _record(tracker, "X", 100)
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "commit on X")
+    assert "X prompt" in _git(repo, "log", "-1", "--format=%B")
+
+    # A different branch, diverged from before X's commit.
+    _git(repo, "checkout", "-q", "master" if repo.branch_exists("master") else "main")
+    _git(repo, "checkout", "-qb", "featY")
+    tracker.render_trailer()
+    assert tracker.pending_count() == 0  # X's work already landed on a branch — not pending
+
+    (tmp_path / "y.py").write_text("Y = 1\n", encoding="utf-8")
+    _record(tracker, "Y", 200)
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "commit on Y")
+
+    message = _git(repo, "log", "-1", "--format=%B")
+    assert "Y prompt" in message
+    assert "X prompt" not in message  # X's turn is NOT folded a second time
+    assert message.count("tokens_since_last_commit_output") == 1
+
+
+def test_unlanded_commits_reports_only_what_no_branch_contains(tmp_path):
+    # The primitive the fold rests on, pinned directly.
+    repo = _init_repo(tmp_path)
+    head = repo.rev_parse("HEAD")
+    latent = repo.commit_tree(repo.rev_parse("HEAD^{tree}"), parents=[head], message="latent turn")
+    repo.update_ref("refs/agitrack/manual/s1", latent)
+
+    assert repo.unlanded_commits("refs/agitrack/manual/s1") == [latent]  # on no branch yet
+
+    _git(repo, "branch", "landed", latent)  # now a branch contains it
+    assert repo.unlanded_commits("refs/agitrack/manual/s1") == []
+
+
 def _noworktree_proxy(tmp_path, *, manual: bool):
     """An interactive proxy runner in no-worktree mode over a real repo — the mode that folds
     via the prepare-commit-msg hook (manual OR auto; worktree mode covers instead)."""

@@ -103,13 +103,17 @@ _agitrack_chain "$@"
 _POST_COMMIT_SCRIPT = f"""#!/bin/sh
 {_MANUAL_DONE_MARKER}
 # Installed by aGiTrack manual-commit mode. After a commit folds in the pending
-# agent turns, advance the latent ref to the new commit (pending turns are now 0),
-# clear the pre-rendered trailer, and signal aGiTrack to re-render it.
+# agent turns, advance EVERY latent ref that was folded to the new commit (pending
+# turns are now 0), clear the pre-rendered trailer, and signal aGiTrack to re-render it.
+# One ref per line: a commit folds the pending turns of every session that ran in this
+# working tree (a new session / backend switch moves the ref), so each must be advanced
+# or its turns would be folded again into the NEXT commit.
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _reffile="$_root/{_MANUAL_REF_REL}"
 if [ -f "$_reffile" ]; then
-  _ref="$(cat "$_reffile" 2>/dev/null)"
-  [ -n "$_ref" ] && git update-ref "$_ref" HEAD 2>/dev/null || true
+  while IFS= read -r _ref || [ -n "$_ref" ]; do
+    [ -n "$_ref" ] && git update-ref "$_ref" HEAD 2>/dev/null || true
+  done < "$_reffile"
 fi
 : > "$_root/{_PENDING_TRAILER_REL}" 2>/dev/null || true
 touch "$_root/{_MANUAL_SIGNAL_REL}" 2>/dev/null || true
