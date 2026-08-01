@@ -312,6 +312,7 @@ def test_work_already_folded_on_another_branch_is_never_folded_again(tmp_path):
     state.ensure_local_ignore()  # as a real run does, so `git add -A` never stages .agitrack/
     tracker = ManualCommitTracker(repo, repo, state)
     tracker.setup()
+    base = repo.current_branch()  # captured, not assumed: `init.defaultBranch` varies per machine
 
     _git(repo, "checkout", "-qb", "featX")
     (tmp_path / "x.py").write_text("X = 1\n", encoding="utf-8")
@@ -322,7 +323,7 @@ def test_work_already_folded_on_another_branch_is_never_folded_again(tmp_path):
     assert "X prompt" in _git(repo, "log", "-1", "--format=%B")
 
     # A different branch, diverged from before X's commit.
-    _git(repo, "checkout", "-q", "master" if repo.branch_exists("master") else "main")
+    _git(repo, "checkout", "-q", base)
     _git(repo, "checkout", "-qb", "featY")
     tracker.render_trailer()
     assert tracker.pending_count() == 0  # X's work already landed on a branch — not pending
@@ -520,6 +521,45 @@ def test_hooks_fold_trailer_into_commit_and_reset_ref(tmp_path):
     assert (repo.repo / ".agitrack" / "manual-pending-trailer").read_text() == ""  # cleared
     # Exactly one commit was added (no separate cover commit).
     assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+
+def test_post_commit_hook_resets_refs_written_with_windows_line_endings(tmp_path):
+    # Windows-only regression, pinned on every platform. `Path.write_text` uses newline=None, which
+    # rewrites "\n" as "\r\n" on Windows, and the hook's `read -r` keeps that CR — so the ref name
+    # was invalid, `git update-ref` silently refused, the latent refs were never advanced, and the
+    # turns folded a SECOND time into the next commit. aGiTrack now writes these hook-read files
+    # with LF, and the hook strips a trailing CR so a file left by an OLDER aGiTrack still resets.
+    repo = _init_repo(tmp_path)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    trailer = build_manual_squash_trailer(agitrack_session_id="s", latent_bodies=[_agent_body("do x", 10)])
+    _setup_manual_ref_and_trailer(repo, trailer)
+    agit = repo.repo / ".agitrack"
+    # Exactly what an older aGiTrack on Windows left behind: CRLF endings, two refs.
+    repo.update_ref("refs/agitrack/manual/other", repo.rev_parse("HEAD"))
+    (agit / "manual-ref").write_bytes(b"refs/agitrack/manual/s\r\nrefs/agitrack/manual/other\r\n")
+
+    (tmp_path / "a.txt").write_text("one\nedit\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My change")
+
+    head = repo.rev_parse("HEAD")
+    assert repo.rev_parse("refs/agitrack/manual/s") == head  # CR tolerated, ref advanced
+    assert repo.rev_parse("refs/agitrack/manual/other") == head  # every listed ref, not just the first
+
+
+def test_hook_read_files_are_written_with_lf_on_every_platform(tmp_path):
+    # The files the sh hooks read must never carry CRLF: `manual-ref` a line at a time, and
+    # `manual-pending-trailer` straight into the commit message.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+    tracker.gate()
+    tracker.record("<aGiTrack> t\n\n# aGiTrack Metadata\ncommit_type: agent\n")
+    tracker.render_trailer()
+
+    for name in ("manual-ref", "manual-pending-trailer"):
+        assert b"\r\n" not in (tmp_path / ".agitrack" / name).read_bytes(), name
 
 
 def test_hook_leaves_commit_untouched_when_no_pending_turns(tmp_path):

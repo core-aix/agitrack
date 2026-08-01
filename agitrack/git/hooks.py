@@ -110,8 +110,12 @@ _POST_COMMIT_SCRIPT = f"""#!/bin/sh
 # or its turns would be folded again into the NEXT commit.
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _reffile="$_root/{_MANUAL_REF_REL}"
+_agitrack_cr="$(printf '\\r')"
 if [ -f "$_reffile" ]; then
   while IFS= read -r _ref || [ -n "$_ref" ]; do
+    # Strip a trailing CR: a file written by an older aGiTrack on Windows has CRLF endings, and
+    # `read -r` keeps the CR, which makes the ref name invalid and silently skips the reset.
+    _ref="${{_ref%$_agitrack_cr}}"
     [ -n "$_ref" ] && git update-ref "$_ref" HEAD 2>/dev/null || true
   done < "$_reffile"
 fi
@@ -285,7 +289,11 @@ def _install_hook(
             if not orig.exists():
                 hook.rename(orig)
                 _make_executable(orig)
-        hook.write_text(script, encoding="utf-8")
+        # LF endings, always: these are POSIX `sh` scripts. Path.write_text uses newline=None,
+        # which on Windows would give the shebang a trailing CR — Git-for-Windows' bundled sh
+        # tolerates that, but nothing else does (a plain `sh` reports "cannot exec: /bin/sh\r").
+        with open(hook, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(script)
         _make_executable(hook)
         return True
     except OSError as error:

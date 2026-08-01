@@ -25,6 +25,19 @@ from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 
 
+def write_lf(path, text: str) -> None:
+    """Write *text* with LF endings on every platform.
+
+    These files are read by the POSIX ``sh`` commit hooks: ``manual-ref`` a line at a time, and
+    ``manual-pending-trailer`` straight into the commit message. ``Path.write_text`` uses
+    ``newline=None``, which on Windows rewrites every ``\n`` as ``\r\n`` — the hook then reads a
+    ref name with a trailing CR and ``git update-ref`` rejects it, so the latent refs are never
+    advanced and the turns fold a SECOND time into the next commit (caught by Windows CI).
+    """
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
 class ManualCommitTracker:
     def __init__(
         self,
@@ -208,13 +221,13 @@ class ManualCommitTracker:
             refs = self.pending_refs()
             if self.ref() not in refs:
                 refs.append(self.ref())
-            (agit_dir / "manual-ref").write_text("\n".join(refs) + "\n", encoding="utf-8")
+            write_lf(agit_dir / "manual-ref", "\n".join(refs) + "\n")
             trailer = build_pending_trailer(
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self.pending_bodies(),
                 in_flight=self.in_flight_attribution(),
             )
-            (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
+            write_lf(agit_dir / "manual-pending-trailer", trailer)
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
 

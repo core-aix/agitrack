@@ -40,6 +40,7 @@ from agitrack.commits import (
     is_fully_tracked_message,
     build_user_commit_message,
     summary_metadata_lines,
+    write_lf,
 )
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
@@ -2005,6 +2006,46 @@ class ProxyRunner:
         except Exception:
             return 0
 
+    def _manual_pending_refs(self) -> list[str]:
+        """Every latent ref still holding turns that no branch contains — not just this session's.
+
+        Mirrors :meth:`ManualCommitTracker.pending_refs` (the proxy keeps its own copy of the
+        latent machinery): the ref name embeds the agitrack session id, so a new session or a
+        backend switch moves it and folding only the current ref would drop the turns recorded
+        before the switch."""
+        try:
+            refs = self.base_repo.list_refs("refs/agitrack/manual/")
+        except Exception as error:
+            self._debug(f"manual ref enumeration failed: {error!r}")
+            refs = []
+        current = self._manual_ref()
+        if current not in refs:
+            refs.append(current)
+        return [ref for ref in refs if self.repo.ref_sha(ref)]
+
+    def _manual_pending_shas(self) -> list[str]:
+        """The latent commits awaiting a fold across every session's ref, oldest first.
+
+        "Reachable from no branch" — not ``HEAD..ref`` — is what makes this correct after a fold:
+        the post-commit hook advances the ref to a real branch commit, so a plain range walk
+        reported that already-folded work as pending again the moment HEAD moved to another
+        branch, and it folded (and billed) a second time."""
+        seen: set[str] = set()
+        stamped: list[tuple[int, str]] = []
+        for ref in self._manual_pending_refs():
+            try:
+                shas = self.repo.unlanded_commits(ref)
+            except Exception as error:
+                self._debug(f"manual pending walk failed for {ref}: {error!r}")
+                continue
+            for sha in shas:
+                if sha in seen:
+                    continue
+                seen.add(sha)
+                stamped.append((self.repo.commit_timestamp(sha) or 0, sha))
+        stamped.sort(key=lambda item: item[0])
+        return [sha for _stamp, sha in stamped]
+
     def _manual_pending_bodies(self) -> list[str]:
         """Commit-message bodies of the pending latent turns (oldest first): the commits on
         the latent ref that HEAD does not yet contain.
@@ -2016,16 +2057,8 @@ class ProxyRunner:
         here when it has arrived, so the user's commit gets the summarized message. If the user
         commits before a summary finishes, it is simply omitted — the metadata/trace are still
         there."""
-        tip = self.repo.ref_sha(self._manual_ref())
-        if not tip:
-            return []
-        try:
-            shas = self.repo.log_shas("HEAD", tip)  # HEAD..tip, oldest first
-        except Exception as error:
-            self._debug(f"manual pending walk failed: {error!r}")
-            return []
         bodies: list[str] = []
-        for sha in shas:
+        for sha in self._manual_pending_shas():
             body = self.repo.commit_message(sha)
             if not body:
                 continue
@@ -2079,13 +2112,18 @@ class ProxyRunner:
         try:
             agit_dir = self._manual_agit_dir()
             agit_dir.mkdir(parents=True, exist_ok=True)
-            (agit_dir / "manual-ref").write_text(self._manual_ref() + "\n", encoding="utf-8")
+            # Every ref this commit will fold, one per line, LF-terminated (see commits.write_lf:
+            # a CRLF name makes `git update-ref` refuse and the refs never advance on Windows).
+            refs = self._manual_pending_refs()
+            if self._manual_ref() not in refs:
+                refs.append(self._manual_ref())
+            write_lf(agit_dir / "manual-ref", "\n".join(refs) + "\n")
             trailer = build_pending_trailer(
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self._manual_pending_bodies(),
                 in_flight=self._in_flight_attribution(),
             )
-            (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
+            write_lf(agit_dir / "manual-pending-trailer", trailer)
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
 
