@@ -2,7 +2,7 @@
 user/agent commit helpers."""
 
 from agitrack.commits.actions import AgitrackActions
-from agitrack.commits.manual import ManualCommitTracker
+from agitrack.commits.manual import ManualCommitTracker, write_lf
 from agitrack.commits.message import (
     IN_FLIGHT_MARKER,
     METADATA_HEADER,
@@ -22,6 +22,7 @@ from agitrack.commits.message import (
 __all__ = [
     "AgitrackActions",
     "ManualCommitTracker",
+    "write_lf",
     "IN_FLIGHT_MARKER",
     "METADATA_HEADER",
     "apply_summary_to_message",

@@ -2001,3 +2001,93 @@ def test_a_long_diff_line_wraps_instead_of_widening_the_page():
 
     assert "white-space:pre-wrap;overflow-wrap:anywhere" in html
     assert "max-height:460px" not in html  # no scroll box either
+
+
+# --- one turn is billed once, however many times its commit reaches the branch -----------------
+
+
+def _turn_message(prompt: str, *, anchor: str, output: int) -> str:
+    return build_agent_commit_message(
+        latest_prompt=prompt,
+        trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "done"}],
+        backend="claude",
+        backend_session_id="ses-dup",
+        agitrack_session_id="agit-dup",
+        model="m",
+        conversation_anchor=anchor,
+        token_usage={**_TOKENS, "output": output},
+    )
+
+
+def _git(repo: GitRepo, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(repo.repo), *args], capture_output=True, text=True).stdout
+
+
+def _output_tokens(repo: GitRepo) -> int:
+    return sum(stat.tokens.get("output", 0) for stat in build_dashboard(repo).stats)
+
+
+def test_a_cherry_picked_turn_is_not_billed_twice_when_its_branch_is_also_merged(tmp_path):
+    # THE double count. A cherry-pick copies the commit message byte for byte, so when the branch
+    # it came from is ALSO merged, the identical aGiTrack metadata sits on the branch twice and the
+    # same code change was billed twice. History here is LINEAR, so the merge-only inherited-block
+    # rule never sees it. `git cherry-pick -x` also appends a "(cherry picked from …)" line, so the
+    # match is made on the block's key/value lines rather than its raw text.
+    repo = GitRepo.init(tmp_path)
+    _git(repo, "checkout", "-qb", "feature")
+    _write_lines(repo, "f.txt", 5)
+    repo.commit(_turn_message("add the thing", anchor="msg-1", output=200))
+
+    _git(repo, "checkout", "-q", repo.current_branch() and "main" if repo.branch_exists("main") else "master")
+    _git(repo, "cherry-pick", "-x", "feature")
+    assert _output_tokens(repo) == 200  # one copy on the branch: counted once
+
+    _git(repo, "merge", "--no-ff", "-q", "-m", "Merge feature", "feature")
+    assert _output_tokens(repo) == 200  # BOTH copies reachable, still ONE turn's tokens
+
+
+def test_two_distinct_turns_on_merged_branches_are_both_counted(tmp_path):
+    # The other side of the rule: merging two branches that did DIFFERENT work must still sum. The
+    # suppression keys on a per-turn identity (`conversation_anchor`), so distinct turns never
+    # collide however similar their commits look.
+    repo = GitRepo.init(tmp_path)
+    base = repo.current_branch()
+    _git(repo, "checkout", "-qb", "featA")
+    _write_lines(repo, "a.txt", 5)
+    repo.commit(_turn_message("do A", anchor="msg-A", output=100))
+    _git(repo, "checkout", "-q", base)
+    _git(repo, "checkout", "-qb", "featB")
+    _write_lines(repo, "b.txt", 5)
+    repo.commit(_turn_message("do B", anchor="msg-B", output=250))
+
+    _git(repo, "checkout", "-q", base)
+    _git(repo, "merge", "--no-ff", "-q", "-m", "Merge featA", "featA")
+    _git(repo, "merge", "--no-ff", "-q", "-m", "Merge featB", "featB")
+
+    assert _output_tokens(repo) == 350
+
+
+def test_a_block_without_a_conversation_anchor_is_never_suppressed(tmp_path):
+    # Without a per-turn identity there is nothing safe to match on, so the old behaviour stands
+    # rather than risk erasing an honest turn's tokens (a repeated prompt CAN produce near-identical
+    # metadata on a linear history — that is a real repeated turn, not a copy).
+    from agitrack.metrics.collect import CommitStat, _suppress_copied_turns
+
+    block = "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 10"
+    stats = [
+        CommitStat(
+            sha=f"s{i}",
+            author="a",
+            email="e",
+            subject="s",
+            kind="agent",
+            timestamp=i,
+            tokens={"output": 10},
+            metadata_block=block,
+        )
+        for i in range(2)
+    ]
+    _suppress_copied_turns(stats)
+    assert [s.tokens for s in stats] == [{"output": 10}, {"output": 10}]

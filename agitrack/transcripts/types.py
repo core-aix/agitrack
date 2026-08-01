@@ -54,6 +54,20 @@ class SessionTurn:
     # already said something, so the trace renders each as its OWN ``## User`` heading (rather than
     # merged into ``user_prompt``). Empty for a plain single-prompt turn.
     queued_followups: list[str] = field(default_factory=list)
+    # The capabilities BEYOND the backend's built-in toolset that this turn actually used —
+    # MCP server tools, skills, and sub-agent types. A repo can hand the agent extra tools via
+    # MCP servers or plugins, and those shape the change as much as the model does, so the commit
+    # must say which were in play (an `mcp__github__create_pr` call is a very different provenance
+    # from a plain `Edit`). Deliberately what the turn USED, not what was merely configured:
+    # usage is provable from the transcript and is what actually produced the commit.
+    # ``mcp_tools`` entries are ``server/tool``; ``mcp_servers`` is derived from them.
+    mcp_servers: list[str] = field(default_factory=list)
+    mcp_tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    subagents: list[str] = field(default_factory=list)
+    # Plugins whose capabilities the turn used, lifted from the ``<plugin>:<skill>`` namespacing
+    # Claude gives a plugin-supplied skill — the only place a plugin names itself in a transcript.
+    plugins: list[str] = field(default_factory=list)
     # The file edits the agent made during this turn (Edit/Write/MultiEdit tool calls),
     # recovered from the raw transcript's tool-call inputs — the one signal the plain parse
     # deliberately drops. Populated ONLY when a session is exported with ``collect_edits=True``
