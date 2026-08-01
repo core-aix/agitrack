@@ -121,6 +121,17 @@ _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 #     arrives via ``_input_tail`` and is settled by ``_input_tail_debris``, which knows what the
 #     ESC followed in the chunk it actually came from.
 _ABORTED_CSI_PREFIX_RE = re.compile(rb"\x1b\[(?:<[0-9;]*|M[^\x1b]{0,2})?(?=\x1b)")
+# The mirror image: a report prefix whose remainder never came, followed by the user TYPING
+# inside the hold window, so the two are joined and forwarded together ("\x1b[<65;80hello").
+# Only the ``<`` form can be decided, and that is what makes this safe: ``ESC [ <`` is a mouse
+# report and nothing else in the host→app direction, and a report's body is digits and ``;``
+# until its ``M``/``m``. Any OTHER byte there proves the report died — the same reasoning
+# `_escape_sequence_complete` already uses. A complete report can never match: the lookahead
+# demands a non-body byte exactly where its own terminator sits, and no backtracking finds one.
+# Deliberately NOT extended to the bare ``ESC [`` arm — ``\x1b[A`` is an arrow key, and a
+# generic numeric CSI followed by a letter (``\x1b[200h``) is a legitimate sequence shape, so
+# a prefix glued to text is genuinely undecidable there.
+_ABORTED_SGR_BODY_RE = re.compile(rb"\x1b\[<[0-9;]*(?=[^0-9;Mm])")
 _ABORTED_MOUSE_ESC_RE = re.compile(rb"(\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})\x1b(?=\x1b\[[<M])", re.DOTALL)
 # A chunk that ENDS with a whole mouse report. When the next byte after such a run is a lone
 # ESC that never continues, the tty dropped the rest of one more report: a person reaching for
@@ -8875,7 +8886,9 @@ class ProxyRunner:
         while True:
             # ``\1`` puts the preceding complete report back: it is matched only to prove the
             # orphan sits INSIDE a burst, and is not itself debris.
-            stripped = _ABORTED_MOUSE_ESC_RE.sub(rb"\1", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
+            stripped = _ABORTED_MOUSE_ESC_RE.sub(
+                rb"\1", _ABORTED_SGR_BODY_RE.sub(b"", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
+            )
             if stripped == data:
                 return data
             data = stripped

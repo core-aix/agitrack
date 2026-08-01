@@ -2901,6 +2901,38 @@ def test_the_back_half_of_a_dropped_paste_marker_is_resynced_too(monkeypatch):
     assert bytes(forwarded) == PASTE_START + b"text" + PASTE_END
 
 
+def test_a_dead_report_prefix_is_not_glued_onto_what_the_user_types(monkeypatch):
+    """The mirror image of the back-half case: the remainder never comes, but the user types
+    INSIDE the hold window, so the two are joined and forwarded together ("\\x1b[<65;80hello").
+    That is the "[<35;124;48 fragment in the input" shape exactly. The join has to be validated:
+    a report body is digits and ';' until its M/m, so any other byte there proves it died."""
+    for prefix in (b"\x1b[<", b"\x1b[<6", b"\x1b[<65;", b"\x1b[<65;80", b"\x1b[<65;80;2"):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [prefix, b"hello"])
+        runner._reactor_stdin_phase([0])  # the prefix is held...
+        runner._reactor_stdin_phase([0])  # ...and the user types before the hold expires
+        assert bytes(forwarded) == b"hello", f"{prefix!r} leaked into typing: {bytes(forwarded)!r}"
+
+    # The in-time continuation must still JOIN — validating the join must not become dropping it.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b";26M"])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b""  # recognised as a whole wheel report and consumed
+
+
+def test_the_resync_expectation_never_outlives_the_read_it_was_armed_for(monkeypatch):
+    """Asserted rather than trusted to the docstring: an armed resync must not sit waiting to
+    swallow the first character of whatever the user types next."""
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b"more text"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])  # gives up mid-report and arms the resync
+    assert runner._mouse_resync is not None
+
+    runner._reactor_stdin_phase([0])  # the user types instead of the remainder arriving
+    assert runner._mouse_resync is None, "the expectation survived the read it was armed for"
+    assert bytes(forwarded) == b"more text"  # and took none of their characters with it
+
+
 def test_resyncing_after_a_dropped_report_does_not_eat_real_input(monkeypatch):
     """The resync is armed by giving up mid-report, so it must only ever consume bytes that
     genuinely complete THAT report. A user typing is not the missing half."""
