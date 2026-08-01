@@ -153,6 +153,10 @@ class CommitStat:
     # pre-fix aGiTrack re-exported whole conversations, 3M+ tokens in one commit). Its
     # token counts are excluded from every aggregate; the log flags it (#token-anomaly).
     token_anomaly: bool = False
+    # This commit carries a metadata block already seen EARLIER on this ref — the same turn
+    # reaching the branch twice via a cherry-pick/rebase copy plus a merge of its source branch.
+    # Its tokens are excluded so one turn is billed once; its lines/commit still count.
+    token_copy: bool = False
     # Backtrace only: this reconstructed turn is ALREADY committed to git with aGiTrack metadata
     # (matched to a real aGiTrack commit's covered range), so the log can distinguish what is
     # already tracked from what a `--backtrace commit` would still add. Always False elsewhere.
@@ -638,6 +642,7 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
 
     stats.reverse()  # oldest first
     _dedupe_squash_constituents(stats)
+    _suppress_copied_turns(stats)
     _flag_token_anomalies(stats)
     return stats
 
@@ -703,6 +708,54 @@ def _dedupe_squash_constituents(stats: list[CommitStat]) -> None:
         if len(kept) != len(stat.constituents):
             stat.constituents = kept
             stat.tokens = _sum_tokens(kept)
+
+
+def _metadata_identity(block: str) -> str:
+    """A metadata block reduced to its ``key: value`` lines.
+
+    `git cherry-pick -x` appends a "(cherry picked from commit …)" line after the block, and a
+    rebase/merge can add trailers of its own, so the RAW text of a copied block differs from the
+    original's even though every recorded fact is identical. Comparing only the key/value lines
+    makes the copy recognisable while still keeping every fact that distinguishes real turns.
+    """
+    keep: list[str] = []
+    for line in block.splitlines():
+        key, separator, _value = line.partition(":")
+        if separator and key.strip() and not key.startswith(("#", " ", "\t")):
+            keep.append(line.strip())
+    return "\n".join(keep)
+
+
+def _suppress_copied_turns(stats: list[CommitStat]) -> None:
+    """Count a turn ONCE when the same commit message reaches this ref twice.
+
+    A cherry-pick (or a rebase copy) duplicates a commit's message byte for byte, so when the
+    branch it came from is ALSO merged, the identical aGiTrack metadata sits on the ref twice and
+    its tokens were counted twice — the same code change, billed double. This is linear history,
+    so :func:`_neutralize_inherited_metadata` (deliberately restricted to merges, where an
+    identical NEIGHBOURING block means a real repeated turn rather than a copy) does not see it.
+
+    The identity used is the whole metadata block, and only for blocks carrying a
+    ``conversation_anchor`` — the backend message id of the last turn the commit covers. That is a
+    real per-turn identity, and two DISTINCT turns can never share it (nor the session ids and
+    timestamps the rest of the block carries), so a match is a copy and not a repeat. A block
+    without an anchor is left alone: without an identity to match on, the old behaviour stands
+    rather than risk erasing an honest turn's tokens.
+
+    The FIRST occurrence in history order keeps its figures — the work happened there; the copy is
+    left in the log (so the commit count still matches git) with its tokens cleared.
+    """
+    seen: set[str] = set()
+    for stat in stats:
+        for target in (stat, *stat.constituents):
+            block = _metadata_identity(target.metadata_block or "")
+            if not block or "conversation_anchor:" not in block:
+                continue
+            if block in seen:
+                target.tokens = {}
+                target.token_copy = True
+            else:
+                seen.add(block)
 
 
 def _neutralize_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -> None:
