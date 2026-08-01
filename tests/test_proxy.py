@@ -2571,6 +2571,12 @@ def test_drain_child_output_reads_all_available():
         os.close(write_fd)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX PTY only: the deadlock needs a real pty input queue to fill, and the "
+    "Windows side cannot have it — ConPTY's write pipe buffers, so NtChildProcess.write "
+    "always completes and its flush_input/pending_input are no-ops by contract.",
+)
 def test_writing_to_a_backend_that_stopped_reading_never_blocks_the_reactor():
     """A PTY's input queue is ~1 KB and the reactor is single-threaded, so a blocking write
     to a child that is not reading stops aGiTrack draining that child's OUTPUT — and then the
