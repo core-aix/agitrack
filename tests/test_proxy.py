@@ -2860,6 +2860,68 @@ def test_an_escape_keypress_that_shares_a_read_with_a_wheel_report_survives():
     assert ProxyRunner._strip_aborted_mouse_reports(burst) == b"\x1b[<64;1;1M\x1b[<64;2;2M\x1b[<64;3;3M"
 
 
+def test_the_back_half_of_a_report_we_gave_up_on_never_reaches_the_backend(monkeypatch):
+    """The half we DON'T hold. A read ends mid-report, the remainder does not arrive within
+    INPUT_TAIL_HOLD, so the front half is correctly dropped — and then the remainder turns up
+    as its own read containing no ESC at all, which nothing keyed on ESC can see. It reached
+    the user's input box as literal text ("<65;80;26M"), on the fixed code, in a real session.
+
+    Every split point, with the hold expiring between the two halves."""
+    report = b"\x1b[<65;80;26M"
+    burst = b"\x1b[<64;10;10M" * 3  # scrolling: what a real report is always surrounded by
+    for cut in range(1, len(report)):
+        reads = [burst + report[:cut], report[cut:]]
+        runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+        runner._reactor_stdin_phase([0])
+        # nothing readable for longer than the hold: the front half is given up on
+        runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+        runner._reactor_stdin_phase([])
+        runner._reactor_stdin_phase([0])  # ...and the remainder arrives on its own
+        assert bytes(forwarded) == b"", f"split at {cut} leaked {bytes(forwarded)!r} to the backend"
+
+
+def test_the_back_half_of_a_dropped_paste_marker_is_resynced_too(monkeypatch):
+    """Same failure, same fix, and here the missing half is exact: the markers are fixed
+    strings, so a dropped prefix has exactly one possible remainder. (The X10 form is
+    deliberately NOT resynced — its remainder is raw bytes indistinguishable from typing.)"""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    marker = PASTE_START
+    for cut in range(2, len(marker)):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [marker[:cut], marker[cut:] + b"hi"])
+        runner._reactor_stdin_phase([0])
+        runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+        runner._reactor_stdin_phase([])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == b"hi", f"split at {cut} forwarded {bytes(forwarded)!r}"
+
+    # A paste that arrives whole is untouched.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [PASTE_START + b"text" + PASTE_END])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == PASTE_START + b"text" + PASTE_END
+
+
+def test_resyncing_after_a_dropped_report_does_not_eat_real_input(monkeypatch):
+    """The resync is armed by giving up mid-report, so it must only ever consume bytes that
+    genuinely complete THAT report. A user typing is not the missing half."""
+    # "m" completes "\x1b[<65;80;26" and nothing else: consumed there, kept everywhere else.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b"m hello"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"m hello"  # "65;80" + "m" is not a whole report — left alone
+
+    # And the expectation lasts exactly one read: it must not sit waiting to eat something later.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80;26", b"x", b"M"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"xM", f"resync outlived its read: {bytes(forwarded)!r}"
+
+
 def test_a_held_debris_esc_is_dropped_when_it_rejoins_the_stream(monkeypatch):
     """An orphan leading a chunk has no report in front of it to be recognised by, so the flag
     set when it was held has to settle it — otherwise it survives the strip and is forwarded."""

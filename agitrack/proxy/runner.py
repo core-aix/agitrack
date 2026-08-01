@@ -138,7 +138,15 @@ _MOUSE_REPORT_TAIL_RE = re.compile(rb"(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})$", 
 # report. That is what stops it eating real input — a user typing "m" is only swallowed if the
 # prefix we dropped was already "\x1b[<65;80;26", which is precisely the case where that "m" IS
 # the report's terminator. One read only; anything else disarms it.
-_SGR_PREFIX_RE = re.compile(rb"^\x1b(?:\[(?:<[0-9;]*)?)?$")  # every strict prefix of a report
+#
+# The bracketed-paste markers get the same treatment, and just as exactly: they are fixed
+# strings, so the missing half is a literal suffix. The X10 form (``ESC [ M`` + three RAW
+# coordinate bytes) deliberately does NOT resync — its remainder is 1-3 bytes of any value
+# from 0x20 up, indistinguishable from the user typing, so consuming them would risk eating
+# real keystrokes to save a couple of stray characters. X10 only appears on terminals that
+# ignore the SGR request, and unlike the SGR case its leak carries no ESC, so it cannot
+# interrupt a turn or quit a picker — leaking is the safer side to err on there.
+_SGR_PREFIX_RE = re.compile(rb"^\x1b\[?[<0-9;]*$")  # every strict prefix of a report or marker
 _SGR_REMAINDER_RE = re.compile(rb"[\[<0-9;]*[Mm]")  # what the rest of one could look like
 _SGR_REPORT_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")  # what the two halves must add up to
 
@@ -8227,7 +8235,9 @@ class ProxyRunner:
         # chunk), so _strip_aborted_mouse_reports cannot recognise it — and widening that
         # pattern to catch it would eat the Escape KEY whenever a wheel report shared the read.
         # The flag settles it instead: it was decided against the chunk the ESC really came from.
-        if self._input_tail == b"\x1b" and self._input_tail_debris:
+        # ...unless the missing remainder turned up after all: joining them back into a whole
+        # report is strictly better than dropping the ESC and orphaning the rest as literal text.
+        if self._input_tail == b"\x1b" and self._input_tail_debris and not _SGR_REPORT_RE.match(b"\x1b" + data):
             self._debug("dropped a truncated mouse report's ESC on rejoin")
             self._input_tail, self._input_tail_debris = b"", False
         data = self._input_tail + data
@@ -8908,6 +8918,10 @@ class ProxyRunner:
         prefix, self._mouse_resync = self._mouse_resync, None
         if not prefix or not data:
             return data
+        for marker in (PASTE_START, PASTE_END):  # fixed strings: the suffix is exact
+            if marker.startswith(prefix) and data.startswith(marker[len(prefix) :]):
+                self._debug(f"resynced after a dropped paste marker: {prefix!r} + {marker[len(prefix) :]!r}")
+                return data[len(marker) - len(prefix) :]
         match = _SGR_REMAINDER_RE.match(data)
         if not match or not _SGR_REPORT_RE.fullmatch(prefix + match.group()):
             return data  # not the missing half — leave whatever this is alone
