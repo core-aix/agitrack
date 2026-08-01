@@ -25,6 +25,19 @@ from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 
 
+def write_lf(path, text: str) -> None:
+    """Write *text* with LF endings on every platform.
+
+    These files are read by the POSIX ``sh`` commit hooks: ``manual-ref`` a line at a time, and
+    ``manual-pending-trailer`` straight into the commit message. ``Path.write_text`` uses
+    ``newline=None``, which on Windows rewrites every ``\n`` as ``\r\n`` — the hook then reads a
+    ref name with a trailing CR and ``git update-ref`` rejects it, so the latent refs are never
+    advanced and the turns fold a SECOND time into the next commit (caught by Windows CI).
+    """
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
 class ManualCommitTracker:
     def __init__(
         self,
@@ -92,30 +105,67 @@ class ManualCommitTracker:
 
     # --- pending turns ------------------------------------------------------
 
-    def pending_count(self) -> int:
-        """How many latent turns are recorded but not yet folded into a commit (cheap: no
-        message reads)."""
-        tip = self.repo.ref_sha(self.ref())
-        if not tip:
-            return 0
+    def pending_refs(self) -> list[str]:
+        """EVERY latent ref that still holds turns HEAD does not contain — not just this
+        session's.
+
+        A session's turns live on ``refs/agitrack/manual/<agitrack_session_id>``, and that id
+        changes when the user starts a new session (Ctrl-G → + New session mints a fresh one) or
+        when a backend switch opens one. Folding only ``self.ref()`` therefore DROPPED every turn
+        recorded before the switch: the trace between the previous commit and the new one had a
+        hole in it, silently. Manual mode is always no-worktree, so all of those sessions edited
+        the SAME working tree and the user's commit captures all of their work — the trace must
+        cover all of them too. (The dashboard's pending view has always enumerated the refs this
+        way; the fold is what lagged behind.)
+        """
         try:
-            return len(self.repo.log_shas("HEAD", tip))
-        except Exception:
-            return 0
+            refs = self.repo.list_refs("refs/agitrack/manual/")
+        except Exception as error:
+            self._debug(f"manual ref enumeration failed: {error!r}")
+            refs = []
+        current = self.ref()
+        if current not in refs:
+            refs.append(current)
+        return [ref for ref in refs if self.repo.ref_sha(ref)]
+
+    def _pending_shas(self) -> list[str]:
+        """The latent commits awaiting a fold across every session's ref, oldest first.
+
+        Ordered by commit time rather than per-ref, so turns from two sessions interleave in the
+        order they actually happened; deduplicated because a reset ref can leave two names on one
+        chain."""
+        seen: set[str] = set()
+        stamped: list[tuple[int, str]] = []
+        for ref in self.pending_refs():
+            try:
+                # Commits reachable from NO branch — the ones that are genuinely still latent.
+                # `HEAD..ref` is not enough: after a fold the ref points at a real branch commit,
+                # so switching to another branch made that (already-folded) work look pending and
+                # it folded a second time — duplicating the trace and double-counting its tokens.
+                shas = self.repo.unlanded_commits(ref)
+            except Exception as error:
+                self._debug(f"manual pending walk failed for {ref}: {error!r}")
+                continue
+            for sha in shas:
+                if sha in seen:
+                    continue
+                seen.add(sha)
+                stamped.append((self.repo.commit_timestamp(sha) or 0, sha))
+        stamped.sort(key=lambda item: item[0])
+        return [sha for _stamp, sha in stamped]
+
+    def pending_count(self) -> int:
+        """How many latent turns are recorded but not yet folded into a commit, across every
+        session's ref (cheap: no message reads)."""
+        return len(self._pending_shas())
 
     def pending_bodies(self) -> list[str]:
-        """Commit-message bodies of the pending latent turns (oldest first): the commits on the
-        latent ref that HEAD does not yet contain. Each body already carries the turn's full
+        """Commit-message bodies of the pending latent turns (oldest first): the commits on
+        EVERY session's latent ref that HEAD does not yet contain (see :meth:`pending_refs` — a
+        session or backend switch moves the ref, and those turns must still be folded). Each body already carries the turn's full
         metadata + interaction trace; the LLM summary (a git note on the latent commit) is folded
         into the body here when it has arrived, so the user's commit gets the summarized message."""
-        tip = self.repo.ref_sha(self.ref())
-        if not tip:
-            return []
-        try:
-            shas = self.repo.log_shas("HEAD", tip)  # HEAD..tip, oldest first
-        except Exception as error:
-            self._debug(f"manual pending walk failed: {error!r}")
-            return []
+        shas = self._pending_shas()
         bodies: list[str] = []
         for sha in shas:
             body = self.repo.commit_message(sha)
@@ -165,13 +215,19 @@ class ManualCommitTracker:
         try:
             agit_dir = self.agit_dir()
             agit_dir.mkdir(parents=True, exist_ok=True)
-            (agit_dir / "manual-ref").write_text(self.ref() + "\n", encoding="utf-8")
+            # EVERY ref whose turns this commit will fold, one per line — the post-commit hook
+            # advances each. Writing only the current session's ref left an earlier session's
+            # already-folded turns pending, so the next commit folded them a second time.
+            refs = self.pending_refs()
+            if self.ref() not in refs:
+                refs.append(self.ref())
+            write_lf(agit_dir / "manual-ref", "\n".join(refs) + "\n")
             trailer = build_pending_trailer(
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self.pending_bodies(),
                 in_flight=self.in_flight_attribution(),
             )
-            (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
+            write_lf(agit_dir / "manual-pending-trailer", trailer)
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
 

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.commits import METADATA_HEADER
+from agitrack.transcripts import capabilities
 from agitrack.commits.message import _trace_and_metadata_lines
 from agitrack.metrics import backtrace as bt
 from agitrack.metrics import files as filesmod
@@ -46,6 +47,12 @@ class _TurnRec:
     queued_followups: list[str] = field(default_factory=list)
     session_id: str = ""
     reasoning_effort: str | None = None
+    # The extensions this turn used (MCP servers/tools, skills, sub-agents) — carried through so a
+    # backtraced commit records the same provenance a live aGiTrack commit would.
+    mcp_servers: list[str] = field(default_factory=list)
+    mcp_tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    subagents: list[str] = field(default_factory=list)
     # The turn's true identity, from the backend API. Resuming or rewinding a conversation
     # FORKS it into a new session that replays the earlier turns, so the same turn is read
     # several times; this is what tells those copies apart from genuinely distinct work.
@@ -280,6 +287,10 @@ def _gather_turns(root: Path) -> list[_TurnRec]:
                     queued_followups=list(turn.queued_followups),
                     session_id=exported.session_id,
                     reasoning_effort=turn.reasoning_effort,
+                    mcp_servers=list(turn.mcp_servers),
+                    mcp_tools=list(turn.mcp_tools),
+                    skills=list(turn.skills),
+                    subagents=list(turn.subagents),
                 )
             )
     return out
@@ -359,6 +370,7 @@ def _annotation(turns: list[_TurnRec]) -> str:
         session_name="backtrace",
         model=model,
         reasoning_effort=effort,
+        capabilities=capabilities.merge_turns(ordered),
         token_usage=tokens.to_dict(),
         trace_turn_limit=len(trace) + 1,
         covered_commits=None,

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from textwrap import wrap
 
 from agitrack import __version__
+from agitrack.transcripts.capabilities import FIELDS as CAPABILITY_FIELDS
 
 
 def _system_info() -> str:
@@ -192,6 +193,7 @@ def build_agent_commit_message(
     ended_at: int | None = None,
     compactions: int = 0,
     origin_event: dict | None = None,
+    capabilities: dict[str, list[str]] | None = None,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
@@ -227,6 +229,7 @@ def build_agent_commit_message(
             ended_at=ended_at,
             compactions=compactions,
             origin_event=origin_event,
+            capabilities=capabilities,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -369,6 +372,7 @@ def _trace_and_metadata_lines(
     ended_at: int | None = None,
     compactions: int = 0,
     origin_event: dict | None = None,
+    capabilities: dict[str, list[str]] | None = None,
 ) -> list[str]:
     lines: list[str] = ["# Interaction Trace", ""]
     # Session-level events (a fork/copy this session began from, any context
@@ -398,6 +402,12 @@ def _trace_and_metadata_lines(
     # backend transcript revealed it (see SessionTurn.reasoning_effort).
     if reasoning_effort:
         lines.append(f"reasoning_effort: {reasoning_effort}")
+    # Capabilities beyond the backend's built-in toolset that these turns USED — MCP servers and
+    # their tools, skills, sub-agents. A repo can hand the agent extra powers via MCP servers or
+    # plugins, and those shape the change as much as the model does, so the provenance is
+    # incomplete without them. Omitted entirely when a turn used none, so an ordinary commit's
+    # metadata is unchanged.
+    lines.extend(_capability_lines(capabilities))
     lines.extend(
         [
             f"session_name: {session_name or 'unknown'}",
@@ -429,6 +439,31 @@ def _trace_and_metadata_lines(
         lines.extend(summary_metadata)
     lines.append(f"system: {_system_info()}")
     lines.append(f"agitrack_version: {__version__}")
+    return lines
+
+
+# A commit trailer must stay readable: a turn that fans out over many tools would otherwise
+# bury the rest of the metadata. Beyond this many entries the list is truncated with a
+# "+N more" marker, so the field still reports the true breadth without dominating the message.
+_CAPABILITY_LIST_LIMIT = 12
+
+
+def _capability_line(key: str, values: list[str]) -> str:
+    shown = values[:_CAPABILITY_LIST_LIMIT]
+    extra = len(values) - len(shown)
+    joined = " ".join(shown) + (f" +{extra} more" if extra > 0 else "")
+    return f"{key}: {joined}"
+
+
+def _capability_lines(capabilities: dict[str, list[str]] | None) -> list[str]:
+    """One ``key: a b c`` line per non-empty capability list, in a fixed field order."""
+    if not capabilities:
+        return []
+    lines: list[str] = []
+    for key in CAPABILITY_FIELDS:
+        values = [str(v).strip() for v in (capabilities.get(key) or []) if str(v).strip()]
+        if values:
+            lines.append(_capability_line(key, values))
     return lines
 
 

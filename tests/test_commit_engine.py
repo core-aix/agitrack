@@ -465,6 +465,51 @@ def test_queued_followups_render_as_separate_user_headings_without_duplication(t
     assert "tokens_since_last_commit_output: 80" not in msg
 
 
+def test_queued_message_the_user_deleted_before_sending_is_not_traced(tmp_path):
+    # A message typed into the composer, queued, and then DELETED never reaches the agent, so the
+    # backend transcript has no record of it — but the proxy captured it at submit time and it used
+    # to survive as a "leftover" ## User block. The user RETRACTED that text; attributing it to
+    # them is wrong (a prompt meant for another window once landed in a commit this way). When the
+    # turn carries queued follow-ups, the transcript is proven to record delivered queued messages,
+    # so a capture matching none of them was never delivered — drop it.
+    engine, repo, state = _engine(tmp_path)
+    base = "When I created a new session in no worktree mode, aGiTrack died"
+    state.append_trace("user", base)  # submit-time capture of the base prompt
+    state.append_trace("user", "Once fixed, please run the TUI yourself on a dummy repo")
+    state.append_trace("user", "Is this the minimum amount of maths needed/mo")  # queued, then deleted
+    turn = _turn(base, "done")
+    turn.queued_followups = ["Once fixed, please run the TUI yourself on a dummy repo"]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    msg = repo.message
+    assert msg is not None
+    assert "minimum amount of maths" not in msg  # neither in the trace nor in the subject
+    body = msg.split("# Interaction Trace", 1)[1]
+    assert body.count("## User") == 2  # the base prompt and the DELIVERED queued follow-up
+    assert base in body and "run the TUI yourself" in body
+
+
+def test_pending_capture_is_still_kept_when_the_turn_has_no_queued_followups(tmp_path):
+    # The safety net stays where there is no evidence either way: with no queued follow-ups on the
+    # turn, a capture the transcript doesn't show may be a genuine mid-turn message (or one from an
+    # earlier incomplete parse), so it is still carried into the commit rather than dropped.
+    engine, repo, state = _engine(tmp_path)
+    state.append_trace("user", "wait, also handle the edge case")
+    engine.commit_turns(
+        turns=[_turn("add the feature", "all done")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert "wait, also handle the edge case" in repo.message
+
+
 def test_commit_turns_stage_untracked_fn_receives_repo_and_state(tmp_path):
     engine, repo, state = _engine(tmp_path)
     calls = []

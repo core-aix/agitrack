@@ -262,6 +262,37 @@ def test_background_start_clears_a_stale_worktree_guard_before_installing_autotr
     assert git_hooks._MARKER not in chained
 
 
+# --- the interactive proxy's own latent copy must behave like the tracker's -------------------
+
+
+def test_proxy_latent_copy_matches_the_tracker_across_sessions_and_branches(tmp_path):
+    # The proxy keeps its OWN copy of the manual/latent machinery (`_manual_*`), and it had the
+    # same two defects the tracker did: it folded only the CURRENT session's ref (dropping turns
+    # recorded before a session/backend switch) and walked `HEAD..ref` (so work already folded on
+    # another branch looked pending and folded — and billed — twice). Interactive `-m` is the path
+    # a user actually types in, so the two copies must not diverge.
+    from agitrack.commits import ManualCommitTracker
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path)
+    runner = _runner_over(repo, state, use_worktrees=False, manual=True)
+    tracker = ManualCommitTracker(repo, repo, state)
+
+    # A latent turn on THIS session's ref, plus one left by an EARLIER session.
+    latent = repo.commit_tree(repo.rev_parse("HEAD^{tree}"), parents=[repo.rev_parse("HEAD")], message="turn A")
+    repo.update_ref(runner._manual_ref(), latent)
+    older = repo.commit_tree(repo.rev_parse("HEAD^{tree}"), parents=[repo.rev_parse("HEAD")], message="turn B")
+    repo.update_ref("refs/agitrack/manual/agitrack-earlier-session", older)
+
+    assert set(runner._manual_pending_refs()) == set(tracker.pending_refs())
+    assert runner._manual_pending_shas() == tracker._pending_shas()
+    assert set(runner._manual_pending_shas()) == {latent, older}  # both sessions' turns
+
+    # Once a branch contains a latent commit it has been folded — never pending again.
+    subprocess.run(["git", "-C", str(repo.repo), "branch", "landed", latent], check=True)
+    assert runner._manual_pending_shas() == [older] == tracker._pending_shas()
+
+
 # --- background ↔ interactive: a dead handshake must read as "not running" --------------------
 
 

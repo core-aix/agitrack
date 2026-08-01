@@ -471,6 +471,9 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         if not backend_installed(runner.state.backend):
             return 0
         runner.state.ensure_local_ignore()  # git-ignore .agitrack/ before writing the trailer/ref
+        # This hook path folds a trace + metadata into a commit the user is writing THEMSELVES, so
+        # they are the most likely to re-edit it — protect its '#' headings from git's cleanup.
+        repo.ensure_comment_char_preserves_headings()
         runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
         runner._process_once()  # parse the repo's own backend session, record NEW pending turns
         runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
@@ -614,6 +617,9 @@ class BackgroundRunner:
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
         self.state.ensure_local_ignore()  # git-ignore .agitrack/ before we write any state there
+        # Keep git's comment char off '#', or editing any commit we write (amend, rebase reword)
+        # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
+        self.repo.ensure_comment_char_preserves_headings()
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
         self._write_handshake()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
