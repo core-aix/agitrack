@@ -8900,19 +8900,25 @@ class ProxyRunner:
         if not _SGR_MOUSE_RE.search(data):
             return data
         out = bytearray()
-        index, end, adjacent = 0, len(data), False
+        index, end, after_report = 0, len(data), False
         while index < end:
             whole = _SGR_MOUSE_RE.match(data, index)
             if whole:
                 out += whole.group()
-                index, adjacent = whole.end(), True
+                index, after_report = whole.end(), True
                 continue
-            orphan = _SGR_ORPHAN_TAIL_RE.match(data, index)
-            if orphan and orphan.group() and (adjacent or _SGR_MOUSE_RE.match(data, orphan.end())):
-                index, adjacent = orphan.end(), True  # dropped; still inside the burst
+            # Consume the whole RUN of fragments, not one at a time: a clipped burst leaves
+            # several back to back, and judging them individually breaks the chain — the first
+            # of a run has no report directly behind or in front of it, so it survives and
+            # every fragment after it survives with it.
+            run = index
+            while (orphan := _SGR_ORPHAN_TAIL_RE.match(data, run)) and orphan.group():
+                run = orphan.end()
+            if run > index and (after_report or _SGR_MOUSE_RE.match(data, run)):
+                index, after_report = run, True  # the run is debris from this burst
                 continue
             out.append(data[index])
-            index, adjacent = index + 1, False
+            index, after_report = index + 1, False
         return bytes(out)
 
     @staticmethod
@@ -8931,7 +8937,11 @@ class ProxyRunner:
             # ``\1`` puts the preceding complete report back: it is matched only to prove the
             # orphan sits INSIDE a burst, and is not itself debris.
             stripped = _ABORTED_MOUSE_ESC_RE.sub(
-                rb"\1", _ABORTED_SGR_BODY_RE.sub(b"", _ABORTED_CSI_PREFIX_RE.sub(b"", data))
+                rb"\1",
+                _SGR_CANDIDATE_RE.sub(
+                    lambda m: m.group() if _SGR_REPORT_RE.fullmatch(m.group()) else b"",
+                    _ABORTED_CSI_PREFIX_RE.sub(b"", data),
+                ),
             )
             if stripped == data:
                 return data

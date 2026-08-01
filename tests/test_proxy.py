@@ -2925,6 +2925,61 @@ def test_a_dead_report_prefix_is_not_glued_onto_what_the_user_types(monkeypatch)
     assert bytes(forwarded) == b""  # recognised as a whole wheel report and consumed
 
 
+def test_many_orphaned_report_tails_in_one_read_are_all_removed(monkeypatch):
+    """The tty discards from the MIDDLE of the stream, not only at read boundaries, so a single
+    read carries a dozen headless report tails interleaved with intact reports. Holding a
+    partial and resyncing ONE orphan cannot cover that — the user got 15 of them at once:
+    "5;43;28M<65;43;28M5;43;28M43;28M;28M8M<64;43;29M..." in their input box."""
+    import random
+
+    up = b"\x1b[<64;43;29M"
+
+    # Two orphans around intact reports.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"5;43;28M" + up + b"5;43;28M" + up + b"43;28M"])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"leaked {bytes(forwarded)!r}"
+
+    # A whole burst with a random slice missing from each report's head — the user's shape.
+    random.seed(5)
+    reports = [b"\x1b[<6%d;43;2%dM" % (4 + i % 2, 8 + i % 2) for i in range(12)]
+    chunk = b"".join(r[random.choice([0, 2, 4, 6, 8, 10]) :] for r in reports)
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [chunk])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"leaked {bytes(forwarded)!r}"
+
+    # Typing survives a burst: no fragment matches at "h", and keeping it resets the run.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [up + b"hello" + up])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"hello"
+
+    # ...and a read with no mouse report in it is never touched, whatever it looks like.
+    for typed in (b"12345", b"hello", b";28M", b"8M"):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [typed])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == typed, f"typing {typed!r} was eaten"
+
+
+def test_a_joined_fragment_with_the_wrong_arity_is_not_taken_for_a_report(monkeypatch):
+    """A fragment can end in a perfectly good "M" and still be junk: joining a held prefix to a
+    headless tail gave "\\x1b[<65;43;25;43;28M" — FOUR parameters — which every "body followed by
+    a non-body byte" rule accepts. Arity is what tells them apart, so it has to be checked."""
+    from agitrack.proxy.runner import _SGR_MOUSE_RE, _SGR_REPORT_RE
+
+    assert _SGR_REPORT_RE.fullmatch(b"\x1b[<65;43;28M")  # three parameters: a real report
+    assert not _SGR_REPORT_RE.fullmatch(b"\x1b[<65;43;25;43;28M")  # four: wreckage
+
+    # On its own — no intact report alongside it, so the run-stripper's guard is off and only
+    # the arity check can reject it.
+    wreck = b"\x1b[<65;43;25;43;28M"
+    assert not _SGR_MOUSE_RE.search(wreck)  # nothing here is a report...
+    assert ProxyRunner._strip_aborted_mouse_reports(wreck) == b""  # ...so all of it must go
+
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;43;2", b"5;43;28M\x1b[<64;43;29M"])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"forwarded a four-parameter fragment: {bytes(forwarded)!r}"
+
+
 def test_the_resync_expectation_never_outlives_the_read_it_was_armed_for(monkeypatch):
     """Asserted rather than trusted to the docstring: an armed resync must not sit waiting to
     swallow the first character of whatever the user types next."""
