@@ -16,6 +16,7 @@ from agitrack.backends.base import TokenUsage
 # them) BEFORE importing ``agitrack.sessions`` below: that package pulls in
 # ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
 # names must already exist here or that cycle fails when opencode is the first module imported.
+from agitrack.transcripts import capabilities
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
 from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
@@ -215,7 +216,12 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     # the child id the parent's task part records) and fold its tokens into the turn that
     # launched it, so sub-agent consumption is fully accounted (issue: subagent tokens).
     subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
-    return parse_exported_session(data, subagent_tokens=subagent_tokens, collect_edits=collect_edits)
+    return parse_exported_session(
+        data,
+        subagent_tokens=subagent_tokens,
+        collect_edits=collect_edits,
+        mcp_servers=configured_mcp_servers(repo),
+    )
 
 
 def _export_data(repo: Path, session_id: str) -> dict | None:
@@ -562,6 +568,7 @@ def parse_exported_session(
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
     collect_edits: bool = False,
+    mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> ExportedSession:
     # `subagent_tokens` maps a sub-agent child session id -> its token usage (in the
     # sub-agent buckets); each is added to the turn whose `task` part launched that child
@@ -586,7 +593,14 @@ def parse_exported_session(
         nonlocal compactions
         if current_user is None or not assistant_group:
             return
-        turn = _build_turn(current_user, assistant_group, model, collect_edits=collect_edits, file_state=file_state)
+        turn = _build_turn(
+            current_user,
+            assistant_group,
+            model,
+            collect_edits=collect_edits,
+            file_state=file_state,
+            mcp_servers=mcp_servers,
+        )
         if turn:
             turn.compaction_count = compactions
             turns.append(turn)
@@ -646,6 +660,7 @@ def _build_turn(
     *,
     collect_edits: bool = False,
     file_state: dict[str, str] | None = None,
+    mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> SessionTurn | None:
     user_info = _as_dict(user_message.get("info"))
     user_id = str(user_info.get("id") or "")
@@ -659,6 +674,8 @@ def _build_turn(
     tokens = TokenUsage()
     model = session_model
     effort: str | None = None
+    tool_names: list[str] = []
+    subagents: list[str] = []
     last_assistant = assistants[-1] if assistants else None
     for assistant in assistants:
         assistant_info = _as_dict(assistant.get("info"))
@@ -667,6 +684,7 @@ def _build_turn(
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
             edits.extend(_edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}))
+        _collect_capabilities(assistant.get("parts"), tool_names, subagents)
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
             final_response = response
@@ -677,6 +695,9 @@ def _build_turn(
 
     final_info = (final_assistant or last_assistant or {}).get("info", {})
     assistant_id = str(final_info.get("id") or "")
+    # OpenCode has no skills concept, so `skills` stays empty; MCP tools and `task` sub-agents
+    # are the extensions it can carry.
+    used = capabilities.collect(tool_names=tool_names, subagents=subagents, mcp_servers=mcp_servers)
     return SessionTurn(
         user_message_id=user_id,
         assistant_message_id=assistant_id,
@@ -692,7 +713,39 @@ def _build_turn(
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
         agent_messages=agent_messages,
         edits=edits,
+        mcp_servers=used.mcp_servers,
+        mcp_tools=used.mcp_tools,
+        subagents=used.subagents,
+        plugins=used.plugins,
     )
+
+
+# OpenCode's sub-agent tool. Its input names the agent being run, when one was chosen.
+_SUBAGENT_TOOL = "task"
+
+
+def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[str]) -> None:
+    """Record the tool names an assistant message called, plus the sub-agent each `task` call
+    ran. MCP tools are separated from built-ins later, against the repo's configured servers
+    (OpenCode's `<server>_<tool>` naming is not self-describing — see
+    :mod:`agitrack.transcripts.capabilities`)."""
+    if not isinstance(parts, list):
+        return
+    for part in parts:
+        if not (isinstance(part, dict) and part.get("type") == "tool"):
+            continue
+        tool = str(part.get("tool") or "").strip()
+        if not tool:
+            continue
+        tool_names.append(tool)
+        if tool.lower() != _SUBAGENT_TOOL:
+            continue
+        state = part.get("state")
+        payload = state.get("input") if isinstance(state, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        agent = payload.get("subagent_type") or payload.get("agent") or "default"
+        if isinstance(agent, str) and agent.strip():
+            subagents.append(agent.strip())
 
 
 def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdit]:
@@ -890,3 +943,35 @@ def _as_list(value: object) -> list:
 
 def _int(value: object) -> int:
     return value if isinstance(value, int) else 0
+
+
+# OpenCode config files that may declare MCP servers, nearest-first. The project file wins for
+# a repo, but a server configured globally is just as real, so both are read and unioned.
+_MCP_CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
+
+
+def configured_mcp_servers(repo: Path) -> frozenset[str]:
+    """Names of the MCP servers configured for *repo* (project + global config).
+
+    Needed because OpenCode names an MCP tool ``<server>_<tool>``, which is indistinguishable by
+    shape from a built-in like ``apply_patch`` — the configured names are what makes the split
+    exact. Read straight from the JSON config (no CLI spawn: this runs on every parse). Failures
+    are swallowed and yield an empty set, which only means MCP usage goes unrecorded — never a
+    wrong server name in a commit.
+    """
+    servers: set[str] = set()
+    candidates = [repo / name for name in _MCP_CONFIG_NAMES]
+    candidates += [Path.home() / ".config" / "opencode" / name for name in _MCP_CONFIG_NAMES]
+    for path in candidates:
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        section = data.get("mcp") if isinstance(data, dict) else None
+        if isinstance(section, dict):
+            servers.update(str(name).strip() for name in section if str(name).strip())
+    return frozenset(servers)

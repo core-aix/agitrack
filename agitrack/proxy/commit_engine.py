@@ -72,6 +72,7 @@ from typing import Callable
 from agitrack.commits import build_agent_commit_message, render_interaction_trace
 from agitrack.git import GitRepo
 from agitrack.transcripts.opencode import SessionTurn
+from agitrack.transcripts import capabilities
 from agitrack.transcripts import turns_after
 from agitrack.config import AgitrackState
 
@@ -471,6 +472,10 @@ class CommitEngine:
             (turn.assistant_message_id for turn in reversed(turns) if getattr(turn, "assistant_message_id", None)),
             None,
         )
+        # Capabilities beyond the backend's built-ins that these turns used — MCP servers/tools,
+        # skills, sub-agents. Unioned across the span (each is a set of things that were in play,
+        # not a "latest wins" setting), in first-seen order so identical spans render identically.
+        capability_metadata = capabilities.merge_turns(turns)
         origin_event = self.state.session_origin_event()
         # Render the interaction trace once — it is the summarizer's sole input and what
         # on_commit_fn hands off below. When a summarize_fn is supplied (the background daemon's
@@ -507,6 +512,7 @@ class CommitEngine:
             ended_at=max(ends) if ends else None,
             compactions=compactions,
             origin_event=origin_event,
+            capabilities=capability_metadata,
         )
         if manual_record_fn is not None:
             # Manual-commit mode: record the turn as a hidden latent commit on the side
