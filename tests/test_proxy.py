@@ -2602,6 +2602,98 @@ def test_writing_to_a_backend_that_stopped_reading_never_blocks_the_reactor():
         os.close(master)
 
 
+def test_the_git_worker_does_not_run_passes_back_to_back():
+    """The reactor sets `_git_wake` once per loop iteration, so the worker's wait returned
+    instantly and passes ran back to back — measured at ~74 per second, holding the pipeline
+    lock essentially continuously for work whose own sub-checks are throttled to seconds."""
+    import threading
+
+    runner = make_runner(master_fd=1)
+    runner.running = True
+    runner._stop_worker = False
+    runner._git_wake = threading.Event()
+    runner._pipeline_lock = threading.Lock()
+    runner._is_idle = lambda: False
+    passes = []
+    runner._run_git_pipeline = lambda: passes.append(time.monotonic())
+
+    stop = threading.Event()
+
+    def reactor():  # what _reactor_timers_phase does every iteration
+        while not stop.is_set():
+            runner._git_wake.set()
+            time.sleep(0.005)
+
+    threading.Thread(target=reactor, daemon=True).start()
+    worker = threading.Thread(target=runner._git_worker_loop, daemon=True)
+    worker.start()
+    time.sleep(1.5)
+    runner._stop_worker = True
+    stop.set()
+    runner._git_wake.set()
+    worker.join(timeout=5)
+
+    rate = len(passes) / 1.5
+    assert rate <= 1.5 / runner.GIT_PASS_MIN_INTERVAL / 1.5 + 2, f"{rate:.1f} passes/s is unthrottled"
+    gaps = [b - a for a, b in zip(passes, passes[1:])]
+    assert all(g >= runner.GIT_PASS_MIN_INTERVAL * 0.8 for g in gaps), f"gaps too short: {gaps}"
+
+
+def test_the_submit_path_is_not_starved_by_the_git_worker():
+    """`_acquire_pipeline_lock_from_main` is on the Enter path. Python locks are not fair, so a
+    worker that re-acquires the instant it releases barges ahead of a thread already waiting —
+    measured at up to 1.8 s of dead time after a keypress. The wanted-flag hands it over."""
+    import threading
+
+    runner = make_runner()
+    runner._pipeline_lock = threading.Lock()
+    runner._drain_modal_mailbox = lambda: None
+    seen = []
+    stop = threading.Event()
+
+    def worker():  # the yield the real _git_worker_loop performs before taking the lock
+        while not stop.is_set():
+            while runner._pipeline_lock_wanted and not stop.is_set():
+                time.sleep(0.005)
+            seen.append(runner._pipeline_lock_wanted)
+            with runner._pipeline_lock:
+                time.sleep(0.3)  # a pass long enough that barging actually costs the user
+
+    threading.Thread(target=worker, daemon=True).start()
+    time.sleep(0.1)
+    waits = []
+    for _ in range(6):
+        start = time.monotonic()
+        runner._acquire_pipeline_lock_from_main()
+        waits.append(time.monotonic() - start)
+        runner._pipeline_lock.release()
+        time.sleep(0.02)
+    stop.set()
+
+    assert runner._pipeline_lock_wanted == 0  # the counter is always given back
+    assert max(waits) < 0.5, f"submit path starved: worst wait {max(waits):.2f}s"
+
+
+def test_a_reactor_stall_is_recorded_without_debug_being_enabled(tmp_path):
+    """A freeze leaves the user nothing to report but "it hung, then stray keys appeared". The
+    note names the phase and must be written on the FIRST occurrence — a stall nobody can
+    reproduce on demand is exactly the one that cannot wait for DEBUG_PROXY to be set."""
+    from agitrack.git import GitRepo
+
+    runner = make_runner(repo=GitRepo.init(tmp_path))
+    runner.base_repo = runner.repo
+    runner.debug_proxy = False
+
+    runner._stall_reported = 0.0
+    runner._note_phase("timers", time.monotonic() - 0.1)  # under the threshold: silent
+    assert not (tmp_path / ".agitrack" / "stalls.log").exists()
+
+    runner._note_phase("timers", time.monotonic() - 30.0)  # the reported symptom
+    logged = (tmp_path / ".agitrack" / "stalls.log").read_text(encoding="utf-8")
+    assert "30.0s" in logged and "timers" in logged
+    assert runner._stall_worst >= 30.0  # and it reaches a crash report's context
+
+
 def test_drain_child_output_returns_none_on_eof():
     read_fd, write_fd = os.pipe()
     os.close(write_fd)  # EOF, nothing buffered
@@ -2715,23 +2807,23 @@ def test_a_wheel_report_split_on_its_esc_never_reaches_the_backend():
         assert leaked == b"", f"cut after {cut} byte(s) leaked {leaked!r} to the backend"
 
 
-def test_a_mouse_report_the_tty_truncated_never_reaches_the_backend():
+def test_a_mouse_report_the_tty_truncated_never_reaches_the_backend(monkeypatch):
     """The terminal's input queue is ~590-1022 bytes and the tty DISCARDS what does not fit,
     so scrolling faster than aGiTrack drains stdin chops reports in half and drops the tail.
     The orphan used to reach the backend as a real Escape keypress plus visible junk, and
-    Escape quits Claude's native session picker."""
-    runner = _history_runner()
+    Escape quits Claude's native session picker.
+
+    Driven through the real reactor phase, because the cut-after-one-byte case is settled by
+    state the phase carries (``_input_tail_debris``) rather than by inspecting bytes alone."""
     report = b"\x1b[<64;120;45M"
     for keep in range(1, len(report)):
-        runner._input_tail = b""
-        leaked = b""
         # read 1 ends on a report the queue cut off; its remainder is gone for good, and the
         # queue resumes with whole reports.
-        for chunk in (b"\x1b[<64;10;10M" + report[:keep], b"\x1b[<65;30;20M" * 3):
-            data = runner._input_tail + chunk
-            data, runner._input_tail = runner._hold_incomplete_tail(data)
-            leaked += runner._intercept_scroll(data)
-        assert leaked == b"", f"a report cut after {keep} byte(s) leaked {leaked!r} to the backend"
+        reads = [b"\x1b[<64;10;10M" + report[:keep], b"\x1b[<65;30;20M" * 3]
+        runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+        runner._reactor_stdin_phase([0])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == b"", f"a report cut after {keep} byte(s) leaked {bytes(forwarded)!r}"
 
 
 def test_stripping_truncated_mouse_debris_leaves_real_keys_alone():
@@ -2748,6 +2840,37 @@ def test_stripping_truncated_mouse_debris_leaves_real_keys_alone():
         b"hello world",
     ):
         assert ProxyRunner._strip_aborted_mouse_reports(intact) == intact, f"mangled {intact!r}"
+
+
+def test_an_escape_keypress_that_shares_a_read_with_a_wheel_report_survives():
+    """Escape is how the user interrupts a turn, so it may never be swallowed as debris.
+    Recognising a lone ESC purely by what FOLLOWS it did exactly that: press Escape at the
+    moment a wheel report lands in the same read and the keypress vanished. An orphan is only
+    identifiable between two reports, so that is the only place it may be removed."""
+    wheel, other = b"\x1b[<64;10;10M", b"\x1b[<65;30;20M"
+
+    # The keypress: nothing in front of it, so it is the user's and must be kept.
+    assert ProxyRunner._strip_aborted_mouse_reports(b"\x1b" + wheel) == b"\x1b" + wheel
+    assert ProxyRunner._strip_aborted_mouse_reports(b"hi\x1b" + wheel) == b"hi\x1b" + wheel
+
+    # The orphan: sandwiched between reports, so it is wreckage — and the report in FRONT of
+    # it is only matched as evidence and must be put back, not swallowed with it.
+    assert ProxyRunner._strip_aborted_mouse_reports(wheel + b"\x1b" + other) == wheel + other
+    burst = b"\x1b[<64;1;1M\x1b\x1b[<64;2;2M\x1b\x1b[<64;3;3M"
+    assert ProxyRunner._strip_aborted_mouse_reports(burst) == b"\x1b[<64;1;1M\x1b[<64;2;2M\x1b[<64;3;3M"
+
+
+def test_a_held_debris_esc_is_dropped_when_it_rejoins_the_stream(monkeypatch):
+    """An orphan leading a chunk has no report in front of it to be recognised by, so the flag
+    set when it was held has to settle it — otherwise it survives the strip and is forwarded."""
+    chunk = b"\x1b[<64;44;30M" * 20 + b"\x1b"  # a burst the queue cut mid-report
+    reads = [chunk, b"\x1b[<65;30;20M" * 3]  # ...then the queue resumes with whole reports
+    runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+
+    runner._reactor_stdin_phase([0])
+    assert runner._input_tail == b"\x1b" and runner._input_tail_debris is True
+    runner._reactor_stdin_phase([0])  # more input arrives well before the hold expires
+    assert bytes(forwarded) == b"", f"backend got {bytes(forwarded)!r}"
 
 
 def _stdin_phase_runner(monkeypatch, reads):

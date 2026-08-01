@@ -53,6 +53,33 @@ def write_crash_report(root: Path, error: BaseException, *, context: dict[str, o
         return None
 
 
+_STALL_LOG = "stalls.log"
+_MAX_STALL_LINES = 200
+
+
+def write_stall_note(root: Path, phase: str, seconds: float) -> None:
+    """Append one line recording that the reactor stopped servicing the terminal.
+
+    Separate from a crash report because a stall is not a death: the session carries on, and
+    the only trace the user has is "it froze for a while, then stray keys appeared". This is
+    the artifact to ask for when that gets reported, and it has to be written WITHOUT anyone
+    having set DEBUG_PROXY beforehand — a stall nobody can reproduce on demand is exactly the
+    case that needs evidence captured on the first occurrence. Never raises: a diagnostic must
+    not be able to take down the session it is describing."""
+    try:
+        directory = crash_dir(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / _STALL_LOG
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} reactor stalled {seconds:.1f}s in phase {phase} (v{_version()})\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > _MAX_STALL_LINES:  # keep the file from growing forever
+            path.write_text("\n".join(lines[-_MAX_STALL_LINES:]) + "\n", encoding="utf-8")
+    except Exception:
+        return
+
+
 def _version() -> str:
     try:
         from agitrack import __version__
