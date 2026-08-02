@@ -183,6 +183,78 @@ def _nearest_ansi16(red: int, green: int, blue: int) -> int:
     return best_index
 
 
+_ANSI_COLOR_NAMES: dict[str, int] = {
+    "black": 0,
+    "red": 1,
+    "green": 2,
+    "brown": 3,
+    "yellow": 3,
+    "blue": 4,
+    "magenta": 5,
+    "cyan": 6,
+    "white": 7,
+    "grey": 7,
+    "gray": 7,
+}
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# WHY THESE ARE CACHED. A cell's colour -> SGR conversion is a PURE function of
+# (colour, foreground, colour mode), but it was recomputed for every cell of every frame:
+# 40x120 cells x 2 (fg+bg) = 9600 conversions per repaint. On a truecolor terminal that is
+# only string formatting, but on a 256- or 16-colour terminal (Apple Terminal sets
+# TERM=xterm-256color and no COLORTERM, so `detect_color_mode` returns "256") every hex
+# colour that is not an exact palette entry — which is every colour in a diff-coloured code
+# block — fell through to `_nearest_256`, a 256-iteration scan. That is 2.4 MILLION inner
+# iterations per frame: measured 176 ms to paint one 40x120 frame of diff-coloured
+# scrollback, against a 1.0 ms plain frame and a RENDER_MIN_INTERVAL budget of 33 ms.
+#
+# The throttle cannot save a frame that costs 5.3x the whole frame interval: the reactor
+# then holds the GIL essentially 100% of the time while scrolling, which is precisely the
+# regime where the stdin reader thread loses bytes off the tty's ~1 KB input queue and
+# mouse reports are chopped in half (see AGENTS.md, "Scrolling and repaint budget"). The
+# number of DISTINCT colours on a screen is tiny, so a cache collapses the whole cost.
+_COLOR_CACHE_SIZE = 4096  # distinct colours per mode; far more than any real screen shows
+
+
+@functools.lru_cache(maxsize=_COLOR_CACHE_SIZE)
+def _hex_color_code(color: str, foreground: bool, mode: str) -> str:
+    # Re-emit a hex colour in the same encoding OpenCode used, decided by the
+    # shared terminal colour depth. Truecolor terminals get 24-bit colour;
+    # 256-colour terminals (e.g. Apple Terminal) get the original palette
+    # index so their own palette renders it, exactly like a native session.
+    red = int(color[0:2], 16)
+    green = int(color[2:4], 16)
+    blue = int(color[4:6], 16)
+    prefix = "38" if foreground else "48"
+    if mode == "truecolor":
+        return f"{prefix};2;{red};{green};{blue}"
+    index = _REVERSE_256.get(color)
+    if index is None:
+        index = _nearest_256(red, green, blue)
+    if mode == "256":
+        return f"{prefix};5;{index}"
+    # 16-colour terminals: fall back to the nearest ANSI base/bright code.
+    ansi = index if index < 16 else _nearest_ansi16(red, green, blue)
+    base = 30 if foreground else 40
+    bright_base = 90 if foreground else 100
+    return str(base + ansi) if ansi < 8 else str(bright_base + ansi - 8)
+
+
+@functools.lru_cache(maxsize=_COLOR_CACHE_SIZE)
+def _color_code(color: str, foreground: bool, mode: str) -> str | None:
+    if color in {"default", ""}:
+        return None
+    base = 30 if foreground else 40
+    bright_base = 90 if foreground else 100
+    if len(color) == 6 and all(char in _HEX_DIGITS for char in color):
+        return _hex_color_code(color.lower(), foreground, mode)
+    if color.startswith("bright"):
+        key = color.removeprefix("bright")
+        return str(bright_base + _ANSI_COLOR_NAMES[key]) if key in _ANSI_COLOR_NAMES else None
+    return str(base + _ANSI_COLOR_NAMES[color]) if color in _ANSI_COLOR_NAMES else None
+
+
 def detect_color_mode(environ=None) -> str:
     # Mirror the colour-depth detection OpenCode itself uses so that aGiTrack
     # re-emits colours in the exact encoding OpenCode produced. aGiTrack and the
@@ -704,52 +776,10 @@ class ScreenRenderer:
         return ";".join(codes)
 
     def color_code(self: RendererHost, color: str, *, foreground: bool) -> str | None:
-        if color in {"default", ""}:
-            return None
-        base = 30 if foreground else 40
-        bright_base = 90 if foreground else 100
-        colors = {
-            "black": 0,
-            "red": 1,
-            "green": 2,
-            "brown": 3,
-            "yellow": 3,
-            "blue": 4,
-            "magenta": 5,
-            "cyan": 6,
-            "white": 7,
-            "grey": 7,
-            "gray": 7,
-        }
-        if len(color) == 6 and all(char in "0123456789abcdefABCDEF" for char in color):
-            return self.hex_color_code(color.lower(), foreground=foreground)
-        if color.startswith("bright"):
-            key = color.removeprefix("bright")
-            return str(bright_base + colors[key]) if key in colors else None
-        return str(base + colors[color]) if color in colors else None
+        return _color_code(color, foreground, getattr(self, "color_mode", "truecolor"))
 
     def hex_color_code(self: RendererHost, color: str, *, foreground: bool) -> str:
-        # Re-emit a hex colour in the same encoding OpenCode used, decided by the
-        # shared terminal colour depth. Truecolor terminals get 24-bit colour;
-        # 256-colour terminals (e.g. Apple Terminal) get the original palette
-        # index so their own palette renders it, exactly like a native session.
-        red = int(color[0:2], 16)
-        green = int(color[2:4], 16)
-        blue = int(color[4:6], 16)
-        prefix = "38" if foreground else "48"
-        mode = getattr(self, "color_mode", "truecolor")
-        if mode == "truecolor":
-            return f"{prefix};2;{red};{green};{blue}"
-        index = _REVERSE_256.get(color)
-        if index is None:
-            index = _nearest_256(red, green, blue)
-        if mode == "256":
-            return f"{prefix};5;{index}"
-        # 16-colour terminals: fall back to the nearest ANSI base/bright code.
-        ansi = index if index < 16 else _nearest_ansi16(red, green, blue)
-        base = 30 if foreground else 40
-        bright_base = 90 if foreground else 100
-        return str(base + ansi) if ansi < 8 else str(bright_base + ansi - 8)
+        return _hex_color_code(color, foreground, getattr(self, "color_mode", "truecolor"))
 
     def render_line(self: RendererHost, cells, sel: tuple[int, int] | None = None, *, cols: int) -> str:
         rendered = []
