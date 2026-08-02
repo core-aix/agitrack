@@ -11438,6 +11438,7 @@ def test_backend_output_is_parsed_in_bounded_slices_without_changing_the_screen(
 # adapts its whole theme to them. Two bugs met here, and they share a cause.
 
 
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
 def test_the_stdin_reader_does_not_race_the_capability_round_trip(monkeypatch):
     """The pump thread starts with RAW MODE, and `run()` sets raw BEFORE detecting — so both the
     pump and the detection loop were reading fd 0 at once and the terminal's replies were split

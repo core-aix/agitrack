@@ -1277,7 +1277,7 @@ __UPDATE_BANNER__
   </div>
 
   <h2 class="section" id="insights-head">agent efficiency</h2>
-  <a class="learncta" href="learn" title="Open the learn page">
+  <a class="learncta" id="learncta" href="learn" title="Open the learn page">
     <span class="lc-icon">&#127891;</span>
     <span class="lc-text"><b>Learn from these traces.</b>
     Your agent reads how you drive it and writes small lessons on agent skills and this
@@ -1590,12 +1590,18 @@ function renderInsights(){
   // becomes visible instead of being diluted by the whole history. Each card carries the trend
   // between the earlier and later half of the range; a habit that stopped shows as "improved".
   // Only the worst few are expanded, the rest fold away, so the panel stays readable.
-  const host = $("insights"), head = $("insights-head");
+  const host = $("insights"), head = $("insights-head"), cta = $("learncta");
   if(!host) return;
   const items = INSIGHTS || [];
   const show = items.length > 0;
   host.style.display = show ? "" : "none";
   if(head) head.style.display = show ? "" : "none";
+  // The learn call-to-action goes with the section, not just with the heading. Both are fed by
+  // the same thing: too little history to read a pattern out of means there is also too little
+  // for the agent to write lessons FROM, so the big green "open learn" promised something the
+  // page could not deliver — and it was the most prominent element left once the section it sits
+  // inside had hidden itself. (The small "learn" link in the header stays: that is navigation.)
+  if(cta) cta.style.display = show ? "" : "none";
   if(!show){ host.innerHTML = ""; return; }
   const lead = items.slice(0, INSIGHTS_VISIBLE), rest = items.slice(INSIGHTS_VISIBLE);
   const t = (items.find(i => i.trend) || {}).trend;
