@@ -1,5 +1,6 @@
 import errno
 import os
+import re
 import sys
 import threading
 import time
@@ -2334,6 +2335,107 @@ def test_proxy_hex_color_falls_back_to_ansi16_in_16_mode():
     assert runner._hex_color_code("ff0000", foreground=True) == "91"
     assert runner._hex_color_code("ffffff", foreground=False) == "107"
     assert runner._hex_color_code("123456", foreground=True) == "30"
+
+
+def _diff_coloured_scrollback(lines: int) -> bytes:
+    """Output shaped like an agent's diff-coloured code block: a per-line green/red
+    truecolor background with per-token truecolor foregrounds on top. None of these hexes
+    is an exact xterm-256 palette entry, which is what makes them expensive to re-encode."""
+    words = ["def", "render", "rows", "return", "cell", "for", "row", "in", "buffer", "diff"]
+    out = []
+    for index in range(lines):
+        background = "\x1b[48;2;20;60;30m" if index % 2 == 0 else "\x1b[48;2;70;25;25m"
+        parts = [background, f"\x1b[38;2;180;180;180m{index:5d} {'+' if index % 2 == 0 else '-'} "]
+        for offset, word in enumerate(words):
+            parts.append(f"\x1b[38;2;{120 + offset};{220 - offset * 3};{140 + offset * 2}m")
+            parts.append(word + " ")
+        parts.append("\x1b[0m\r\n")
+        out.append("".join(parts))
+    return "".join(out).encode()
+
+
+def test_render_frame_colour_conversion_is_bounded_by_distinct_colours():
+    """A repaint must convert each distinct colour ONCE, not once per cell per frame.
+
+    The conversion is a pure function of (colour, foreground, colour mode), but it used to
+    be recomputed for all 40x120 cells x 2 (fg+bg) = 9600 times per frame. On a 256- or
+    16-colour terminal — Apple Terminal sets TERM=xterm-256color and no COLORTERM, so
+    ``detect_color_mode`` returns "256" — every non-palette hex fell through to the
+    256-entry ``_nearest_256`` scan: 2.4 million inner iterations, a measured 176 ms to
+    paint ONE frame of diff-coloured scrollback against a 1.0 ms plain frame and a 33 ms
+    ``RENDER_MIN_INTERVAL`` budget. A frame costing 5.3x the frame interval pins the GIL
+    at ~100% while the user scrolls, which is the regime where the stdin reader thread
+    loses bytes off the tty's ~1 KB input queue and mouse reports arrive chopped in half.
+    """
+    from agitrack.proxy import renderer as renderer_module
+
+    scanned: list[tuple[int, int, int]] = []
+    real_nearest = renderer_module._nearest_256
+
+    def counting_nearest(red, green, blue):
+        scanned.append((red, green, blue))
+        return real_nearest(red, green, blue)
+
+    frames: list[bytes] = []
+    real_write_frame = renderer_module.write_frame
+    original_hex, original_code = renderer_module._hex_color_code, renderer_module._color_code
+    try:
+        renderer_module._nearest_256 = counting_nearest
+        renderer_module.write_frame = frames.append
+        # Start from a cold cache so the first frame's conversions are all counted.
+        for cached in (renderer_module._hex_color_code, renderer_module._color_code):
+            if hasattr(cached, "cache_clear"):
+                cached.cache_clear()
+
+        screen_renderer = renderer_module.ScreenRenderer(40, 120, color_mode="256")
+        renderer_module.ScreenRenderer.init_screen(screen_renderer, 40, 120)
+        renderer_module.ScreenRenderer.feed(
+            screen_renderer, _diff_coloured_scrollback(400), pyte_hostile_csi_re=re.compile(rb"(?!x)x")
+        )
+        # Scroll into the history so the frame is painted from scrollback, not the live screen.
+        screen_renderer.scroll_back = renderer_module.ScreenRenderer.history_len(screen_renderer) // 2
+        assert screen_renderer.scroll_back > 0
+
+        paint = lambda: renderer_module.ScreenRenderer.render(  # noqa: E731
+            screen_renderer,
+            rows=40,
+            cols=120,
+            scroll_back=screen_renderer.scroll_back,
+            status_line_str="status",
+            input_capturing=False,
+            input_text="",
+            input_matches=[],
+            input_selected=None,
+            message=None,
+            message_sticky=False,
+            message_until=0.0,
+        )
+
+        paint()
+        cold = len(scanned)
+        distinct = len(set(scanned))
+        scanned.clear()
+        paint()
+        warm = len(scanned)
+    finally:
+        renderer_module._nearest_256 = real_nearest
+        renderer_module.write_frame = real_write_frame
+        renderer_module._hex_color_code, renderer_module._color_code = original_hex, original_code
+
+    # The frame really is a full, densely coloured screen (not an empty one that would pass
+    # trivially): 39 body rows of 120 cells, each carrying a truecolor fg and bg.
+    assert len(frames) == 2
+    assert len(frames[0]) > 8000
+    # Still the 256-colour encoding the host terminal's own palette renders — a cache that
+    # returned the wrong code, or leaked truecolor, fails here.
+    assert b"38;5;" in frames[0] and b"48;5;" in frames[0]
+    assert b"38;2;" not in frames[0] and b"48;2;" not in frames[0]
+    assert frames[0] == frames[1]  # the cache must not change a single byte of output
+
+    # Cold: one scan per DISTINCT colour, not one per cell. Warm: none at all.
+    assert cold == distinct, f"a colour was converted more than once in one frame ({cold} > {distinct})"
+    assert cold < 200, f"colour conversions scale with cells, not distinct colours: {cold}"
+    assert warm == 0, f"repainting reconverted {warm} colours that were already known"
 
 
 def test_proxy_named_color_codes():
