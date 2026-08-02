@@ -9884,6 +9884,11 @@ class ProxyRunner:
             )
             self._render()
             return
+        # Nothing tracked yet, but the backends' own transcripts hold history we can
+        # reconstruct? Serve THAT rather than an empty page (see metrics.suggest). The probe
+        # costs one `git log` once anything is tracked, which is the overwhelmingly common case.
+        if self._start_backtrace_instead_of_empty_dashboard():
+            return
         try:
             clear_handshake(self.base_repo)  # drop any record from a dead earlier daemon
             # No owner pid: the dashboard is a free-standing daemon (exactly like
@@ -9924,6 +9929,68 @@ class ProxyRunner:
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
         self._render()
+
+    # How long the Ctrl-G path waits for a freshly spawned backtrace daemon to publish its URL.
+    # Deliberately short: the reconstruction exports every local session (OpenCode shells out per
+    # session) and can take MINUTES, and the reactor must never be blocked for that — the daemon is
+    # detached and keeps building either way, so a slow one just means we hand over the command
+    # to check on it instead of the URL.
+    BACKTRACE_URL_WAIT = 3.0
+
+    def _start_backtrace_instead_of_empty_dashboard(self) -> bool:
+        """Serve the reconstruction when the live dashboard would be empty and it would not.
+
+        True when it took over, so the caller stops. Someone who has been coding with Claude or
+        OpenCode before adopting aGiTrack has no tracked commits yet, and showing them an empty
+        dashboard says "nothing to see" when their own transcripts say otherwise."""
+        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
+
+        try:
+            if not should_show_backtrace(self.base_repo):
+                return False
+            from agitrack.metrics import open_dashboard_in_browser
+            from agitrack.metrics.backtrace import (
+                _running_handshake,
+                _spawn_backtrace_child,
+                _read_handshake,
+            )
+
+            directory = self.base_repo.repo
+            record = _running_handshake(directory)  # one may already be up — reuse, never restart
+            if record is None:
+                _spawn_backtrace_child(directory)
+                deadline = time.monotonic() + self.BACKTRACE_URL_WAIT
+                while time.monotonic() < deadline and record is None:
+                    time.sleep(0.1)
+                    record = _read_handshake(directory)
+            detail = SUBSTITUTION_NOTICE.splitlines()
+            if record is None or not record.get("url"):
+                # Still reconstructing. It is detached, so it carries on without us.
+                self._select_popup(
+                    "Reconstructing your history from local sessions…",
+                    ["ok"],
+                    detail=detail
+                    + [
+                        "",
+                        "It is still building (this can take a few minutes for a big directory).",
+                        "Check on it with:  agitrack --backtrace status",
+                    ],
+                )
+                self._set_message("Backtrace view is building in the background.")
+            else:
+                url = str(record.get("url", ""))
+                opened = open_dashboard_in_browser(url)
+                self._select_popup(f"Backtrace view live at {url}", ["ok"], detail=detail)
+                self._set_message(
+                    f"Backtrace view live at {url} — opening in your browser."
+                    if opened
+                    else f"Backtrace view live at {url}."
+                )
+        except Exception as error:
+            self._debug(f"backtrace substitution failed: {error!r}")
+            return False  # never let this block the dashboard the user actually asked for
+        self._render()
+        return True
 
     def _dashboard_email_logins(self) -> dict[str, str]:
         """Map the current user's git email → their GitHub login, so the dashboard can
