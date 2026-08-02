@@ -1,5 +1,6 @@
 import errno
 import os
+import re
 import sys
 import threading
 import time
@@ -2336,6 +2337,107 @@ def test_proxy_hex_color_falls_back_to_ansi16_in_16_mode():
     assert runner._hex_color_code("123456", foreground=True) == "30"
 
 
+def _diff_coloured_scrollback(lines: int) -> bytes:
+    """Output shaped like an agent's diff-coloured code block: a per-line green/red
+    truecolor background with per-token truecolor foregrounds on top. None of these hexes
+    is an exact xterm-256 palette entry, which is what makes them expensive to re-encode."""
+    words = ["def", "render", "rows", "return", "cell", "for", "row", "in", "buffer", "diff"]
+    out = []
+    for index in range(lines):
+        background = "\x1b[48;2;20;60;30m" if index % 2 == 0 else "\x1b[48;2;70;25;25m"
+        parts = [background, f"\x1b[38;2;180;180;180m{index:5d} {'+' if index % 2 == 0 else '-'} "]
+        for offset, word in enumerate(words):
+            parts.append(f"\x1b[38;2;{120 + offset};{220 - offset * 3};{140 + offset * 2}m")
+            parts.append(word + " ")
+        parts.append("\x1b[0m\r\n")
+        out.append("".join(parts))
+    return "".join(out).encode()
+
+
+def test_render_frame_colour_conversion_is_bounded_by_distinct_colours():
+    """A repaint must convert each distinct colour ONCE, not once per cell per frame.
+
+    The conversion is a pure function of (colour, foreground, colour mode), but it used to
+    be recomputed for all 40x120 cells x 2 (fg+bg) = 9600 times per frame. On a 256- or
+    16-colour terminal — Apple Terminal sets TERM=xterm-256color and no COLORTERM, so
+    ``detect_color_mode`` returns "256" — every non-palette hex fell through to the
+    256-entry ``_nearest_256`` scan: 2.4 million inner iterations, a measured 176 ms to
+    paint ONE frame of diff-coloured scrollback against a 1.0 ms plain frame and a 33 ms
+    ``RENDER_MIN_INTERVAL`` budget. A frame costing 5.3x the frame interval pins the GIL
+    at ~100% while the user scrolls, which is the regime where the stdin reader thread
+    loses bytes off the tty's ~1 KB input queue and mouse reports arrive chopped in half.
+    """
+    from agitrack.proxy import renderer as renderer_module
+
+    scanned: list[tuple[int, int, int]] = []
+    real_nearest = renderer_module._nearest_256
+
+    def counting_nearest(red, green, blue):
+        scanned.append((red, green, blue))
+        return real_nearest(red, green, blue)
+
+    frames: list[bytes] = []
+    real_write_frame = renderer_module.write_frame
+    original_hex, original_code = renderer_module._hex_color_code, renderer_module._color_code
+    try:
+        renderer_module._nearest_256 = counting_nearest
+        renderer_module.write_frame = frames.append
+        # Start from a cold cache so the first frame's conversions are all counted.
+        for cached in (renderer_module._hex_color_code, renderer_module._color_code):
+            if hasattr(cached, "cache_clear"):
+                cached.cache_clear()
+
+        screen_renderer = renderer_module.ScreenRenderer(40, 120, color_mode="256")
+        renderer_module.ScreenRenderer.init_screen(screen_renderer, 40, 120)
+        renderer_module.ScreenRenderer.feed(
+            screen_renderer, _diff_coloured_scrollback(400), pyte_hostile_csi_re=re.compile(rb"(?!x)x")
+        )
+        # Scroll into the history so the frame is painted from scrollback, not the live screen.
+        screen_renderer.scroll_back = renderer_module.ScreenRenderer.history_len(screen_renderer) // 2
+        assert screen_renderer.scroll_back > 0
+
+        paint = lambda: renderer_module.ScreenRenderer.render(  # noqa: E731
+            screen_renderer,
+            rows=40,
+            cols=120,
+            scroll_back=screen_renderer.scroll_back,
+            status_line_str="status",
+            input_capturing=False,
+            input_text="",
+            input_matches=[],
+            input_selected=None,
+            message=None,
+            message_sticky=False,
+            message_until=0.0,
+        )
+
+        paint()
+        cold = len(scanned)
+        distinct = len(set(scanned))
+        scanned.clear()
+        paint()
+        warm = len(scanned)
+    finally:
+        renderer_module._nearest_256 = real_nearest
+        renderer_module.write_frame = real_write_frame
+        renderer_module._hex_color_code, renderer_module._color_code = original_hex, original_code
+
+    # The frame really is a full, densely coloured screen (not an empty one that would pass
+    # trivially): 39 body rows of 120 cells, each carrying a truecolor fg and bg.
+    assert len(frames) == 2
+    assert len(frames[0]) > 8000
+    # Still the 256-colour encoding the host terminal's own palette renders — a cache that
+    # returned the wrong code, or leaked truecolor, fails here.
+    assert b"38;5;" in frames[0] and b"48;5;" in frames[0]
+    assert b"38;2;" not in frames[0] and b"48;2;" not in frames[0]
+    assert frames[0] == frames[1]  # the cache must not change a single byte of output
+
+    # Cold: one scan per DISTINCT colour, not one per cell. Warm: none at all.
+    assert cold == distinct, f"a colour was converted more than once in one frame ({cold} > {distinct})"
+    assert cold < 200, f"colour conversions scale with cells, not distinct colours: {cold}"
+    assert warm == 0, f"repainting reconverted {warm} colours that were already known"
+
+
 def test_proxy_named_color_codes():
     runner = make_runner()
     assert runner._color_code("red", foreground=True) == "31"
@@ -2571,6 +2673,135 @@ def test_drain_child_output_reads_all_available():
         os.close(write_fd)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX PTY only: the deadlock needs a real pty input queue to fill, and the "
+    "Windows side cannot have it — ConPTY's write pipe buffers, so NtChildProcess.write "
+    "always completes and its flush_input/pending_input are no-ops by contract.",
+)
+def test_writing_to_a_backend_that_stopped_reading_never_blocks_the_reactor():
+    """A PTY's input queue is ~1 KB and the reactor is single-threaded, so a blocking write
+    to a child that is not reading stops aGiTrack draining that child's OUTPUT — and then the
+    child blocks writing too and neither side ever moves again. Measured live against a
+    mouse-owning backend: 255 forwarded wheel events wedged the reactor permanently on
+    os_write, screen frozen, no crash report. The write must queue instead."""
+    import pty
+    import threading
+    import tty
+
+    from agitrack.proxy.process import BackendProcess
+
+    # The slave stands in for a backend that has stopped reading its stdin. Raw mode matters:
+    # a CANONICAL tty DISCARDS input it cannot hold, so its queue never fills and the deadlock
+    # hides — which is exactly why a naive harness sees nothing wrong.
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    process = BackendProcess(master_fd=master, child_pid=None)
+    try:
+        flood = b"\x1b[<64;10;10M" * 4000  # ~48 KB: far more than any PTY queue holds
+        done = threading.Event()
+        threading.Thread(target=lambda: (process.write(flood), done.set()), daemon=True).start()
+        assert done.wait(5.0), "write() blocked the caller — this is the reactor deadlock"
+        assert process.pending_input() > 0  # it took what fit; the rest is queued, not lost
+        assert process.pending_input() <= BackendProcess.MAX_PENDING_INPUT  # and stays bounded
+        assert process.flush_input() is True  # retrying is safe and still does not block
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+def test_the_git_worker_does_not_run_passes_back_to_back():
+    """The reactor sets `_git_wake` once per loop iteration, so the worker's wait returned
+    instantly and passes ran back to back — measured at ~74 per second, holding the pipeline
+    lock essentially continuously for work whose own sub-checks are throttled to seconds."""
+    import threading
+
+    runner = make_runner(master_fd=1)
+    runner.running = True
+    runner._stop_worker = False
+    runner._git_wake = threading.Event()
+    runner._pipeline_lock = threading.Lock()
+    runner._is_idle = lambda: False
+    passes = []
+    runner._run_git_pipeline = lambda: passes.append(time.monotonic())
+
+    stop = threading.Event()
+
+    def reactor():  # what _reactor_timers_phase does every iteration
+        while not stop.is_set():
+            runner._git_wake.set()
+            time.sleep(0.005)
+
+    threading.Thread(target=reactor, daemon=True).start()
+    worker = threading.Thread(target=runner._git_worker_loop, daemon=True)
+    worker.start()
+    time.sleep(1.5)
+    runner._stop_worker = True
+    stop.set()
+    runner._git_wake.set()
+    worker.join(timeout=5)
+
+    rate = len(passes) / 1.5
+    assert rate <= 1.5 / runner.GIT_PASS_MIN_INTERVAL / 1.5 + 2, f"{rate:.1f} passes/s is unthrottled"
+    gaps = [b - a for a, b in zip(passes, passes[1:])]
+    assert all(g >= runner.GIT_PASS_MIN_INTERVAL * 0.8 for g in gaps), f"gaps too short: {gaps}"
+
+
+def test_the_submit_path_is_not_starved_by_the_git_worker():
+    """`_acquire_pipeline_lock_from_main` is on the Enter path. Python locks are not fair, so a
+    worker that re-acquires the instant it releases barges ahead of a thread already waiting —
+    measured at up to 1.8 s of dead time after a keypress. The wanted-flag hands it over."""
+    import threading
+
+    runner = make_runner()
+    runner._pipeline_lock = threading.Lock()
+    runner._drain_modal_mailbox = lambda: None
+    seen = []
+    stop = threading.Event()
+
+    def worker():  # the yield the real _git_worker_loop performs before taking the lock
+        while not stop.is_set():
+            while runner._pipeline_lock_wanted and not stop.is_set():
+                time.sleep(0.005)
+            seen.append(runner._pipeline_lock_wanted)
+            with runner._pipeline_lock:
+                time.sleep(0.3)  # a pass long enough that barging actually costs the user
+
+    threading.Thread(target=worker, daemon=True).start()
+    time.sleep(0.1)
+    waits = []
+    for _ in range(6):
+        start = time.monotonic()
+        runner._acquire_pipeline_lock_from_main()
+        waits.append(time.monotonic() - start)
+        runner._pipeline_lock.release()
+        time.sleep(0.02)
+    stop.set()
+
+    assert runner._pipeline_lock_wanted == 0  # the counter is always given back
+    assert max(waits) < 0.5, f"submit path starved: worst wait {max(waits):.2f}s"
+
+
+def test_a_reactor_stall_is_recorded_without_debug_being_enabled(tmp_path):
+    """A freeze leaves the user nothing to report but "it hung, then stray keys appeared". The
+    note names the phase and must be written on the FIRST occurrence — a stall nobody can
+    reproduce on demand is exactly the one that cannot wait for DEBUG_PROXY to be set."""
+    from agitrack.git import GitRepo
+
+    runner = make_runner(repo=GitRepo.init(tmp_path))
+    runner.base_repo = runner.repo
+    runner.debug_proxy = False
+
+    runner._stall_reported = 0.0
+    runner._note_phase("timers", time.monotonic() - 0.1)  # under the threshold: silent
+    assert not (tmp_path / ".agitrack" / "stalls.log").exists()
+
+    runner._note_phase("timers", time.monotonic() - 30.0)  # the reported symptom
+    logged = (tmp_path / ".agitrack" / "stalls.log").read_text(encoding="utf-8")
+    assert "30.0s" in logged and "timers" in logged
+    assert runner._stall_worst >= 30.0  # and it reaches a crash report's context
+
+
 def test_drain_child_output_returns_none_on_eof():
     read_fd, write_fd = os.pipe()
     os.close(write_fd)  # EOF, nothing buffered
@@ -2652,6 +2883,314 @@ def test_a_sustained_scroll_is_held_to_the_frame_budget():
     runner._last_render = time.monotonic() - 1  # a frame's worth of time passes
     runner._intercept_scroll(b"\x1b[<64;5;5M")
     assert len(frames) == 1 and runner._render_pending is False
+
+
+def test_a_wheel_report_split_on_its_esc_never_reaches_the_backend():
+    """The read boundary lands wherever the tty's input queue happened to fill, so one read
+    in twelve ends exactly on a wheel report's ESC. That ESC used to be forwarded as a REAL
+    Escape keypress and the rest of the report leaked after it as literal text — and Escape
+    quits Claude's native session picker, which is how "aGiTrack dies when scrolling
+    extensively" ends in a normal exit with no crash report."""
+    runner = _history_runner()
+    report = b"\x1b[<64;5;5M"
+
+    def deliver(chunk, *, flush=False):
+        data = runner._input_tail + chunk
+        data, runner._input_tail = runner._hold_incomplete_tail(data, flush=flush)
+        runner._input_tail_at = time.monotonic() if runner._input_tail else 0.0
+        return runner._intercept_scroll(data)
+
+    # Split immediately after the ESC — the boundary that used to leak.
+    assert deliver(report + report[:1]) == b""
+    assert runner._input_tail == b"\x1b"  # held, not forwarded
+    assert deliver(report[1:]) == b""  # the rejoined report is recognised and consumed
+    assert runner._input_tail == b""
+    assert runner.scroll_back == 6  # both notches still scrolled
+
+    # A whole flick, cut at every possible offset: not one byte may reach the backend.
+    for cut in range(1, len(report)):
+        runner._input_tail = b""
+        stream = report * 8
+        leaked = deliver(stream[:cut]) + deliver(stream[cut:])
+        assert leaked == b"", f"cut after {cut} byte(s) leaked {leaked!r} to the backend"
+
+
+def test_a_mouse_report_the_tty_truncated_never_reaches_the_backend(monkeypatch):
+    """The terminal's input queue is ~590-1022 bytes and the tty DISCARDS what does not fit,
+    so scrolling faster than aGiTrack drains stdin chops reports in half and drops the tail.
+    The orphan used to reach the backend as a real Escape keypress plus visible junk, and
+    Escape quits Claude's native session picker.
+
+    Driven through the real reactor phase, because the cut-after-one-byte case is settled by
+    state the phase carries (``_input_tail_debris``) rather than by inspecting bytes alone."""
+    report = b"\x1b[<64;120;45M"
+    for keep in range(1, len(report)):
+        # read 1 ends on a report the queue cut off; its remainder is gone for good, and the
+        # queue resumes with whole reports.
+        reads = [b"\x1b[<64;10;10M" + report[:keep], b"\x1b[<65;30;20M" * 3]
+        runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+        runner._reactor_stdin_phase([0])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == b"", f"a report cut after {keep} byte(s) leaked {bytes(forwarded)!r}"
+
+
+def test_stripping_truncated_mouse_debris_leaves_real_keys_alone():
+    """The debris strip must only ever remove wreckage. In particular ESC ESC — the rewind
+    gesture both backends bind — is not a truncated report and must survive intact."""
+    for intact in (
+        b"\x1b\x1b",  # double Escape
+        b"\x1b\x1b[A",  # Alt+Up
+        b"\x1b[A\x1b",  # arrow key, then Escape
+        b"\x1b[5~\x1b",  # PageUp, then Escape
+        b"\x1b[<64;10;10M\x1b[<65;30;20M",  # two whole wheel reports
+        b"\x1b[M" + bytes([96, 37, 37]) + b"\x1b[<64;1;1M",  # whole X10, then SGR
+        b"\x1b[200~pasted\x1b[201~",  # bracketed paste
+        b"hello world",
+    ):
+        assert ProxyRunner._strip_aborted_mouse_reports(intact) == intact, f"mangled {intact!r}"
+
+
+def test_an_escape_keypress_that_shares_a_read_with_a_wheel_report_survives():
+    """Escape is how the user interrupts a turn, so it may never be swallowed as debris.
+    Recognising a lone ESC purely by what FOLLOWS it did exactly that: press Escape at the
+    moment a wheel report lands in the same read and the keypress vanished. An orphan is only
+    identifiable between two reports, so that is the only place it may be removed."""
+    wheel, other = b"\x1b[<64;10;10M", b"\x1b[<65;30;20M"
+
+    # The keypress: nothing in front of it, so it is the user's and must be kept.
+    assert ProxyRunner._strip_aborted_mouse_reports(b"\x1b" + wheel) == b"\x1b" + wheel
+    assert ProxyRunner._strip_aborted_mouse_reports(b"hi\x1b" + wheel) == b"hi\x1b" + wheel
+
+    # The orphan: sandwiched between reports, so it is wreckage — and the report in FRONT of
+    # it is only matched as evidence and must be put back, not swallowed with it.
+    assert ProxyRunner._strip_aborted_mouse_reports(wheel + b"\x1b" + other) == wheel + other
+    burst = b"\x1b[<64;1;1M\x1b\x1b[<64;2;2M\x1b\x1b[<64;3;3M"
+    assert ProxyRunner._strip_aborted_mouse_reports(burst) == b"\x1b[<64;1;1M\x1b[<64;2;2M\x1b[<64;3;3M"
+
+
+def test_the_back_half_of_a_report_we_gave_up_on_never_reaches_the_backend(monkeypatch):
+    """The half we DON'T hold. A read ends mid-report, the remainder does not arrive within
+    INPUT_TAIL_HOLD, so the front half is correctly dropped — and then the remainder turns up
+    as its own read containing no ESC at all, which nothing keyed on ESC can see. It reached
+    the user's input box as literal text ("<65;80;26M"), on the fixed code, in a real session.
+
+    Every split point, with the hold expiring between the two halves."""
+    report = b"\x1b[<65;80;26M"
+    burst = b"\x1b[<64;10;10M" * 3  # scrolling: what a real report is always surrounded by
+    for cut in range(1, len(report)):
+        reads = [burst + report[:cut], report[cut:]]
+        runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+        runner._reactor_stdin_phase([0])
+        # nothing readable for longer than the hold: the front half is given up on
+        runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+        runner._reactor_stdin_phase([])
+        runner._reactor_stdin_phase([0])  # ...and the remainder arrives on its own
+        assert bytes(forwarded) == b"", f"split at {cut} leaked {bytes(forwarded)!r} to the backend"
+
+
+def test_the_back_half_of_a_dropped_paste_marker_is_resynced_too(monkeypatch):
+    """Same failure, same fix, and here the missing half is exact: the markers are fixed
+    strings, so a dropped prefix has exactly one possible remainder. (The X10 form is
+    deliberately NOT resynced — its remainder is raw bytes indistinguishable from typing.)"""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    marker = PASTE_START
+    for cut in range(2, len(marker)):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [marker[:cut], marker[cut:] + b"hi"])
+        runner._reactor_stdin_phase([0])
+        runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+        runner._reactor_stdin_phase([])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == b"hi", f"split at {cut} forwarded {bytes(forwarded)!r}"
+
+    # A paste that arrives whole is untouched.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [PASTE_START + b"text" + PASTE_END])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == PASTE_START + b"text" + PASTE_END
+
+
+def test_a_dead_report_prefix_is_not_glued_onto_what_the_user_types(monkeypatch):
+    """The mirror image of the back-half case: the remainder never comes, but the user types
+    INSIDE the hold window, so the two are joined and forwarded together ("\\x1b[<65;80hello").
+    That is the "[<35;124;48 fragment in the input" shape exactly. The join has to be validated:
+    a report body is digits and ';' until its M/m, so any other byte there proves it died."""
+    for prefix in (b"\x1b[<", b"\x1b[<6", b"\x1b[<65;", b"\x1b[<65;80", b"\x1b[<65;80;2"):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [prefix, b"hello"])
+        runner._reactor_stdin_phase([0])  # the prefix is held...
+        runner._reactor_stdin_phase([0])  # ...and the user types before the hold expires
+        assert bytes(forwarded) == b"hello", f"{prefix!r} leaked into typing: {bytes(forwarded)!r}"
+
+    # The in-time continuation must still JOIN — validating the join must not become dropping it.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b";26M"])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b""  # recognised as a whole wheel report and consumed
+
+
+def test_many_orphaned_report_tails_in_one_read_are_all_removed(monkeypatch):
+    """The tty discards from the MIDDLE of the stream, not only at read boundaries, so a single
+    read carries a dozen headless report tails interleaved with intact reports. Holding a
+    partial and resyncing ONE orphan cannot cover that — the user got 15 of them at once:
+    "5;43;28M<65;43;28M5;43;28M43;28M;28M8M<64;43;29M..." in their input box."""
+    import random
+
+    up = b"\x1b[<64;43;29M"
+
+    # Two orphans around intact reports.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"5;43;28M" + up + b"5;43;28M" + up + b"43;28M"])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"leaked {bytes(forwarded)!r}"
+
+    # A whole burst with a random slice missing from each report's head — the user's shape.
+    random.seed(5)
+    reports = [b"\x1b[<6%d;43;2%dM" % (4 + i % 2, 8 + i % 2) for i in range(12)]
+    chunk = b"".join(r[random.choice([0, 2, 4, 6, 8, 10]) :] for r in reports)
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [chunk])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"leaked {bytes(forwarded)!r}"
+
+    # Typing survives a burst: no fragment matches at "h", and keeping it resets the run.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [up + b"hello" + up])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"hello"
+
+    # ...and a read with no mouse report in it is never touched, whatever it looks like.
+    for typed in (b"12345", b"hello", b";28M", b"8M"):
+        runner, forwarded = _stdin_phase_runner(monkeypatch, [typed])
+        runner._reactor_stdin_phase([0])
+        assert bytes(forwarded) == typed, f"typing {typed!r} was eaten"
+
+
+def test_a_joined_fragment_with_the_wrong_arity_is_not_taken_for_a_report(monkeypatch):
+    """A fragment can end in a perfectly good "M" and still be junk: joining a held prefix to a
+    headless tail gave "\\x1b[<65;43;25;43;28M" — FOUR parameters — which every "body followed by
+    a non-body byte" rule accepts. Arity is what tells them apart, so it has to be checked."""
+    from agitrack.proxy.runner import _SGR_MOUSE_RE, _SGR_REPORT_RE
+
+    assert _SGR_REPORT_RE.fullmatch(b"\x1b[<65;43;28M")  # three parameters: a real report
+    assert not _SGR_REPORT_RE.fullmatch(b"\x1b[<65;43;25;43;28M")  # four: wreckage
+
+    # On its own — no intact report alongside it, so the run-stripper's guard is off and only
+    # the arity check can reject it.
+    wreck = b"\x1b[<65;43;25;43;28M"
+    assert not _SGR_MOUSE_RE.search(wreck)  # nothing here is a report...
+    assert ProxyRunner._strip_aborted_mouse_reports(wreck) == b""  # ...so all of it must go
+
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;43;2", b"5;43;28M\x1b[<64;43;29M"])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"", f"forwarded a four-parameter fragment: {bytes(forwarded)!r}"
+
+
+def test_the_resync_expectation_never_outlives_the_read_it_was_armed_for(monkeypatch):
+    """Asserted rather than trusted to the docstring: an armed resync must not sit waiting to
+    swallow the first character of whatever the user types next."""
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b"more text"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])  # gives up mid-report and arms the resync
+    assert runner._mouse_resync is not None
+
+    runner._reactor_stdin_phase([0])  # the user types instead of the remainder arriving
+    assert runner._mouse_resync is None, "the expectation survived the read it was armed for"
+    assert bytes(forwarded) == b"more text"  # and took none of their characters with it
+
+
+def test_resyncing_after_a_dropped_report_does_not_eat_real_input(monkeypatch):
+    """The resync is armed by giving up mid-report, so it must only ever consume bytes that
+    genuinely complete THAT report. A user typing is not the missing half."""
+    # "m" completes "\x1b[<65;80;26" and nothing else: consumed there, kept everywhere else.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80", b"m hello"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"m hello"  # "65;80" + "m" is not a whole report — left alone
+
+    # And the expectation lasts exactly one read: it must not sit waiting to eat something later.
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b[<65;80;26", b"x", b"M"])
+    runner._reactor_stdin_phase([0])
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    runner._reactor_stdin_phase([0])
+    runner._reactor_stdin_phase([0])
+    assert bytes(forwarded) == b"xM", f"resync outlived its read: {bytes(forwarded)!r}"
+
+
+def test_a_held_debris_esc_is_dropped_when_it_rejoins_the_stream(monkeypatch):
+    """An orphan leading a chunk has no report in front of it to be recognised by, so the flag
+    set when it was held has to settle it — otherwise it survives the strip and is forwarded."""
+    chunk = b"\x1b[<64;44;30M" * 20 + b"\x1b"  # a burst the queue cut mid-report
+    reads = [chunk, b"\x1b[<65;30;20M" * 3]  # ...then the queue resumes with whole reports
+    runner, forwarded = _stdin_phase_runner(monkeypatch, reads)
+
+    runner._reactor_stdin_phase([0])
+    assert runner._input_tail == b"\x1b" and runner._input_tail_debris is True
+    runner._reactor_stdin_phase([0])  # more input arrives well before the hold expires
+    assert bytes(forwarded) == b"", f"backend got {bytes(forwarded)!r}"
+
+
+def _stdin_phase_runner(monkeypatch, reads):
+    """A _history_runner wired so _reactor_stdin_phase can be driven read-by-read, with
+    everything the backend would receive collected."""
+    runner = _history_runner()
+    forwarded = bytearray()
+    monkeypatch.setattr(runner, "_stdin_fileno", lambda: 0)
+    monkeypatch.setattr(runner, "_read_stdin", lambda n: reads.pop(0) if reads else b"")
+    monkeypatch.setattr(runner.active.process, "write", lambda data: forwarded.extend(data))
+    return runner, forwarded
+
+
+def test_the_esc_of_a_report_the_tty_dropped_is_not_forwarded_as_escape(monkeypatch):
+    """The overflow case the timeout alone cannot settle. The tty discards the rest of a
+    report AND the stream then pauses, so the held ESC ages out looking exactly like a
+    keypress. It is not: a person does not land Escape glued to the end of half a kilobyte
+    of wheel reports with nothing after it. Measured live before this: ~30 000 wheel events
+    delivered 22 spurious Escapes to the backend."""
+    chunk = b"\x1b[<64;44;30M" * 20 + b"\x1b"  # a burst the queue cut mid-report
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [chunk])
+
+    runner._reactor_stdin_phase([0])  # stdin readable: the burst arrives
+    assert runner._input_tail == b"\x1b"  # the orphan ESC is held, not forwarded
+    assert runner._input_tail_debris is True  # ...and recognised as a dropped report
+
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])  # nothing readable, the hold expires
+    assert runner._input_tail == b""
+    assert bytes(forwarded) == b"", f"backend got {bytes(forwarded)!r}"
+
+
+def test_a_real_escape_keypress_is_still_forwarded(monkeypatch):
+    """The other side of the same coin: Escape typed on its own must reach the backend, or
+    the fix above would break cancelling a turn."""
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b"])
+
+    runner._reactor_stdin_phase([0])
+    assert runner._input_tail == b"\x1b" and runner._input_tail_debris is False
+
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    runner._reactor_stdin_phase([])
+    assert bytes(forwarded) == b"\x1b"  # delivered, just INPUT_TAIL_HOLD late
+
+
+def test_a_held_escape_is_still_delivered_when_nothing_follows():
+    """Holding the lone ESC must not swallow the Escape KEY: once INPUT_TAIL_HOLD has passed
+    with no further input, the reactor flushes it. A partial sequence whose remainder never
+    arrived (the tty dropped it) is discarded instead — it can never be a keystroke, and
+    prepending it to the next keystroke is how "[<35;124;48" fragments reached commit traces."""
+    runner = _history_runner()
+
+    runner._input_tail, runner._input_tail_at = b"\x1b", time.monotonic()
+    assert runner._input_tail_expired() is False  # still inside the hold
+    assert runner._select_timeout() <= runner.INPUT_TAIL_HOLD  # ...and the loop wakes for it
+    runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
+    assert runner._input_tail_expired() is True
+    data, tail = runner._hold_incomplete_tail(runner._input_tail, flush=True)
+    assert data == b"\x1b" and tail == b""  # the Escape key lands
+
+    # A truncated report that never completed is dropped, not forwarded as text.
+    data, tail = runner._hold_incomplete_tail(b"\x1b[<64;5", flush=True)
+    assert data == b"" and tail == b""
 
 
 def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
@@ -10725,3 +11264,156 @@ def test_a_dying_thread_is_recorded_not_painted_over_the_session(tmp_path, monke
     assert any("died" in line and "worker exploded" in line for line in logged)
     reports = list((tmp_path / ".agitrack").glob("crash-*.log"))
     assert reports and "worker exploded" in reports[0].read_text(encoding="utf-8")
+
+
+def test_a_crash_report_lands_in_the_base_repo_not_the_session_worktree(tmp_path):
+    """The worktree is removed on exit, so a report written there is destroyed by the very
+    teardown that follows the crash — which is how a reported death left nothing to look at."""
+    from agitrack.git import GitRepo
+
+    base = GitRepo.init(tmp_path / "base")
+    worktree = GitRepo.init(tmp_path / "base" / ".agitrack" / "worktrees" / "session-1")
+    runner = make_runner(repo=worktree)
+    runner.base_repo = base
+
+    assert runner._crash_report_root() == base.repo
+
+    from agitrack.proxy.crash import write_crash_report
+
+    write_crash_report(runner._crash_report_root(), RuntimeError("reactor died"))
+    assert list((base.repo / ".agitrack").glob("crash-*.log"))
+    assert not list((worktree.repo / ".agitrack").glob("crash-*.log"))
+
+
+@_posix_only
+def test_the_stdin_reader_thread_keeps_the_tty_queue_from_overflowing(monkeypatch):
+    """The cause, not the symptom. A terminal's input queue is ~1 KB and the kernel DISCARDS
+    what will not fit, mid-escape-sequence — which is where every "stray text in the input box"
+    report came from. The reactor cannot out-read it (one read(4096) already empties the whole
+    queue), so a thread drains the tty continuously instead. Measured on the same burst:
+    77% of bytes lost before, 0.6% after."""
+    import pty
+    import re as _re
+    import termios
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved = os.dup(0)
+    try:
+        os.dup2(slave, 0)  # the host reads fd 0
+
+        class _Stdin:  # pytest replaces sys.stdin with a pseudofile that has no fileno()
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host.set_raw()  # the reader starts with raw mode, never before it
+        assert host._reader is not None and host._reader.is_alive()
+        assert host.stdin_fileno() != 0  # the reactor selects on the wake pipe now
+
+        # Far more than the ~1 KB queue holds, written while the main thread HOLDS THE GIL —
+        # which is the whole point. A repaint burns CPU in Python; it does not sleep. An
+        # earlier version of this test used time.sleep() to model "nobody is reading", and
+        # sleep RELEASES the GIL, so the reader ran freely and the test passed even when the
+        # thread was starved. Modelled honestly, the reader must still keep up.
+        def spin(seconds):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                for _ in range(200):
+                    pass
+
+        report = b"\x1b[<64;43;29M"
+        burst = report * 900  # ~10 KB
+        sent = [0]
+        done = threading.Event()
+
+        def writer():
+            while sent[0] < len(burst):
+                try:
+                    sent[0] += os.write(master, burst[sent[0] : sent[0] + 512])
+                except BlockingIOError:
+                    time.sleep(0.001)
+                except OSError:
+                    break
+            done.set()
+
+        threading.Thread(target=writer, daemon=True).start()
+        got = bytearray()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (done.is_set() and len(got) >= sent[0]):
+            spin(0.0043)  # one repaint's worth of GIL-holding work
+            chunk = host.read_stdin(65536)
+            if chunk:
+                got.extend(chunk)
+        assert len(got) >= sent[0] * 0.9, f"lost {sent[0] - len(got)} of {sent[0]} bytes to the tty queue"
+        # And nothing arrived chopped in half: every report is whole.
+        assert not _re.sub(rb"\x1b\[<\d+;\d+;\d+M", b"", bytes(got)), "a report was truncated"
+
+        host.set_cooked()  # a prompt takes the terminal: the reader must stand down
+        assert host._paused.is_set()
+        assert host.stdin_fileno() == 0
+    finally:
+        host.stop()
+        os.dup2(saved, 0)
+        os.close(saved)
+        try:
+            termios.tcsetattr(slave, termios.TCSANOW, termios.tcgetattr(slave))
+        except Exception:
+            pass
+        os.close(slave)
+        os.close(master)
+
+
+def test_backend_output_is_parsed_in_bounded_slices_without_changing_the_screen():
+    """`drain()` hands over up to 256 KB and pyte is ~2.5 ms per 4 KB, so an unbounded feed
+    held the GIL for ~107 ms — three times the repaint budget. Nothing else runs in that
+    window, including the stdin reader thread, so the tty's ~1 KB queue overflows and the
+    kernel discards INSIDE a single feed. Bounding it is what stops that; the screen it
+    produces must be byte-identical to parsing the same output in one go."""
+    import agitrack.proxy.runner as _R
+
+    def fresh():
+        runner = make_runner(cols=120, rows=40)
+        runner.screen = _R._BackgroundColorEraseScreen(120, 39, history=5000, ratio=0.5)
+        runner.stream = _R.pyte.ByteStream(runner.screen)
+        runner._render = lambda: None
+        runner._parse_carry, runner._parse_at = b"", 0
+        return runner
+
+    def text(runner):
+        rows = []
+        for y in range(runner.screen.lines):
+            line = runner.screen.buffer.get(y, {})
+            rows.append("".join((line.get(x).data if line.get(x) else " ") for x in range(120)))
+        return "\n".join(rows)
+
+    payload = b"".join(
+        b"\x1b[1;3%dm%07d\x1b[0m \x1b[38;2;120;200;90m%s\x1b[0m\r\n" % (i % 8, i, b"payload text here" * 3)
+        for i in range(2000)
+    )
+    assert len(payload) > ProxyRunner.PARSE_MAX_BYTES * 4  # enough to need several passes
+
+    reference = fresh()
+    _R.ScreenRenderer.feed(reference, payload, pyte_hostile_csi_re=_R._PYTE_HOSTILE_CSI_RE)
+
+    bounded = fresh()
+    bounded._feed_child_output(payload)
+    assert bounded._parse_at < len(bounded._parse_carry), "the whole payload was parsed in one pass"
+    passes = 1
+    while bounded._parse_at < len(bounded._parse_carry):
+        bounded._feed_child_output(b"")
+        passes += 1
+        assert passes < 10_000
+    assert passes > 4  # genuinely sliced, not one big feed
+    # Nothing dropped, nothing reordered, and a sequence split between feeds still parses.
+    assert text(bounded) == text(reference)
+    assert len(bounded.screen.history.top) == len(reference.screen.history.top)
