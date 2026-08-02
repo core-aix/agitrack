@@ -11181,3 +11181,78 @@ def test_a_crash_report_lands_in_the_base_repo_not_the_session_worktree(tmp_path
     write_crash_report(runner._crash_report_root(), RuntimeError("reactor died"))
     assert list((base.repo / ".agitrack").glob("crash-*.log"))
     assert not list((worktree.repo / ".agitrack").glob("crash-*.log"))
+
+
+@_posix_only
+def test_the_stdin_reader_thread_keeps_the_tty_queue_from_overflowing(monkeypatch):
+    """The cause, not the symptom. A terminal's input queue is ~1 KB and the kernel DISCARDS
+    what will not fit, mid-escape-sequence — which is where every "stray text in the input box"
+    report came from. The reactor cannot out-read it (one read(4096) already empties the whole
+    queue), so a thread drains the tty continuously instead. Measured on the same burst:
+    77% of bytes lost before, 0.6% after."""
+    import pty
+    import re as _re
+    import termios
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved = os.dup(0)
+    try:
+        os.dup2(slave, 0)  # the host reads fd 0
+
+        class _Stdin:  # pytest replaces sys.stdin with a pseudofile that has no fileno()
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host.set_raw()  # the reader starts with raw mode, never before it
+        assert host._reader is not None and host._reader.is_alive()
+        assert host.stdin_fileno() != 0  # the reactor selects on the wake pipe now
+
+        # Far more than the ~1 KB queue holds, and NOBODY reads while it is written — exactly
+        # the window (repaint + timers) in which input used to be silently discarded.
+        report = b"\x1b[<64;43;29M"
+        burst = report * 900  # ~10 KB
+        sent = 0
+        deadline = time.monotonic() + 5
+        while sent < len(burst) and time.monotonic() < deadline:
+            try:
+                sent += os.write(master, burst[sent : sent + 512])
+            except BlockingIOError:
+                time.sleep(0.001)
+
+        got = bytearray()
+        deadline = time.monotonic() + 5
+        while len(got) < sent and time.monotonic() < deadline:
+            chunk = host.read_stdin(65536)
+            if chunk:
+                got.extend(chunk)
+            else:
+                time.sleep(0.005)
+        assert len(got) >= sent * 0.9, f"lost {sent - len(got)} of {sent} bytes to the tty queue"
+        # And nothing arrived chopped in half: every report is whole.
+        assert bytes(got).count(b"\x1b") == bytes(got).count(b"M")
+        assert not _re.sub(rb"\x1b\[<\d+;\d+;\d+M", b"", bytes(got)), "a report was truncated"
+
+        host.set_cooked()  # a prompt takes the terminal: the reader must stand down
+        assert host._paused.is_set()
+        assert host.stdin_fileno() == 0
+    finally:
+        host.stop()
+        os.dup2(saved, 0)
+        os.close(saved)
+        try:
+            termios.tcsetattr(slave, termios.TCSANOW, termios.tcgetattr(slave))
+        except Exception:
+            pass
+        os.close(slave)
+        os.close(master)
