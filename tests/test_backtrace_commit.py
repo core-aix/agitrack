@@ -170,10 +170,27 @@ def test_backtrace_commit_requires_clean_tree(repo_with_history, capsys):
     assert "uncommitted changes" in capsys.readouterr().out
 
 
-def test_backtrace_commit_requires_branch_name(repo_with_history, capsys):
-    rc = backtrace_commit(repo_with_history, "", _input=lambda p: "y")
+def test_a_missing_branch_name_is_ASKED_for_not_a_dead_end(repo_with_history):
+    """Printing a flag and exiting was a trap: `parse_known_args` funnels an unknown option to
+    the BACKEND rather than erroring, so a user who mistyped the flag (or copied the `--branch`
+    spelling the message itself printed, which did not exist) got the identical message back
+    forever with nothing to say why. The command is interactive anyway, so it asks."""
+    answers = iter(["reconstructed", "y"])  # branch name, then the rewrite confirmation
+    rc = backtrace_commit(repo_with_history, "", _input=lambda _p: next(answers))
+
+    assert rc == 0
+    branches = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+    assert "reconstructed" in branches  # the name typed at the prompt was used
+
+
+def test_cancelling_the_branch_prompt_changes_nothing(repo_with_history, capsys):
+    before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+
+    rc = backtrace_commit(repo_with_history, "", _input=lambda _p: "")  # blank = cancel
+
     assert rc == 1
-    assert "NEW branch" in capsys.readouterr().out
+    assert "Cancelled" in capsys.readouterr().out
+    assert _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split() == before
 
 
 def test_backtrace_commit_rejects_existing_branch(repo_with_history, capsys):
@@ -347,3 +364,67 @@ def test_a_forked_conversation_contributes_each_turn_once(tmp_path, monkeypatch)
     assert body.count("## User") == 1  # one copy of the turn, not one per fork
     assert body.count("tokens_since_last_commit_output:") == 1
     assert "tokens_since_last_commit_output: 40" in body  # 40, not 80
+
+
+# --- the CLI wiring: where the branch name actually got lost -----------------------------------
+
+
+def _run_cli(argv, monkeypatch):
+    """Invoke `agitrack …` through main(), capturing what reached backtrace_commit."""
+    from agitrack import cli
+
+    seen: dict = {}
+
+    def fake(directory, branch, **kw):
+        seen["directory"], seen["branch"] = directory, branch
+        return 0
+
+    monkeypatch.setattr("agitrack.metrics.backtrace_commit.backtrace_commit", fake)
+    rc = cli.main(argv)
+    return rc, seen
+
+
+def test_the_branch_flag_actually_reaches_backtrace_commit(repo_with_history, monkeypatch):
+    """THE regression. `parse_known_args` funnels unknown options to the BACKEND instead of
+    erroring, so a branch flag that did not match silently vanished and `backtrace_commit` was
+    called with "" — printing "give me a branch name" no matter what the user typed. Nothing
+    covered the CLI wiring, so the whole feature was unusable from the command line."""
+    rc, seen = _run_cli(
+        ["--backtrace", "commit", "--backtrace-branch", "recon", "--repo", str(repo_with_history)], monkeypatch
+    )
+
+    assert rc == 0
+    assert seen["branch"] == "recon"  # ...not ""
+
+
+def test_the_legacy_branch_spelling_still_works(repo_with_history, monkeypatch):
+    """`--branch` is what earlier guidance printed. It stays as an undocumented alias precisely
+    because an unknown option here does NOT error — it would silently do nothing again."""
+    rc, seen = _run_cli(["--backtrace", "commit", "--branch", "recon", "--repo", str(repo_with_history)], monkeypatch)
+
+    assert rc == 0 and seen["branch"] == "recon"
+
+
+def test_an_unrecognized_option_is_reported_not_swallowed(repo_with_history, monkeypatch, capsys):
+    """The failure mode that made this unfixable from the outside: a mistyped option was collected
+    as backend passthrough, so the user saw no error — just the same message forever."""
+    _run_cli(
+        ["--backtrace", "commit", "--backtrace-branch", "recon", "--brunch", "x", "--repo", str(repo_with_history)],
+        monkeypatch,
+    )
+
+    assert "--brunch" in capsys.readouterr().out
+
+
+def test_reconstructed_history_carries_tokens_so_the_dashboard_has_something(repo_with_history):
+    """New-user payoff, end to end: after reconstructing, the repo is no longer "tracked but
+    tokenless" — which is the exact condition that sends someone to the backtrace view."""
+    from agitrack.git import GitRepo
+    from agitrack.metrics import suggest
+
+    repo = GitRepo.discover(repo_with_history)
+    assert suggest.has_tracked_tokens(repo) is False  # nothing recorded yet
+
+    assert backtrace_commit(repo_with_history, "recon", _input=lambda _p: "y") == 0
+
+    assert suggest.has_tracked_tokens(repo) is True  # the reconstruction put real numbers in

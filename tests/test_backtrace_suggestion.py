@@ -18,7 +18,7 @@ from agitrack.git import GitRepo
 from agitrack.metrics import suggest
 
 
-def _repo(path: Path, *, tracked: bool) -> GitRepo:
+def _repo(path: Path, *, tracked: bool, tokens: int = 0) -> GitRepo:
     subprocess.run(["git", "init", "-q", str(path)], check=True)
     for key, value in (("user.email", "t@t"), ("user.name", "t")):
         subprocess.run(["git", "-C", str(path), "config", key, value], check=True)
@@ -27,6 +27,8 @@ def _repo(path: Path, *, tracked: bool) -> GitRepo:
     message = "plain human commit"
     if tracked:
         message = f"<aGiTrack> did the thing\n\n{METADATA_HEADER}\ncommit_type: agent\n"
+        if tokens:
+            message += f"tokens_since_last_commit_output: {tokens}\n"
     subprocess.run(["git", "-C", str(path), "commit", "-q", "--cleanup=verbatim", "-m", message], check=True)
     return GitRepo(path)
 
@@ -34,12 +36,13 @@ def _repo(path: Path, *, tracked: bool) -> GitRepo:
 def test_a_repo_with_agitrack_history_is_never_diverted(tmp_path, monkeypatch):
     # The overwhelmingly common case, and the one that must stay fast: once anything is tracked
     # the decision is a single `git log` and the session probe never runs at all.
-    repo = _repo(tmp_path, tracked=True)
+    repo = _repo(tmp_path, tracked=True, tokens=120)
     monkeypatch.setattr(
-        suggest, "has_backtrace_history", lambda _d: pytest.fail("must not probe sessions when tracked")
+        suggest, "has_backtrace_history", lambda _d: pytest.fail("must not probe sessions when tokens exist")
     )
 
     assert suggest.has_tracked_history(repo) is True
+    assert suggest.has_tracked_tokens(repo) is True
     assert suggest.should_show_backtrace(repo) is False
 
 

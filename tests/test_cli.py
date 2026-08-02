@@ -265,13 +265,40 @@ def test_discover_or_init_initializes_when_user_agrees(tmp_path, monkeypatch):
 
 def test_discover_or_init_stops_when_user_declines(tmp_path, monkeypatch, capsys):
     _force_tty(monkeypatch, stdin=True)
-    monkeypatch.setattr("builtins.input", lambda *a: "")  # default = no
+    monkeypatch.setattr("builtins.input", lambda *a: "n")  # an EXPLICIT no
 
     repo = cli._discover_or_init(tmp_path)
 
     assert repo is None  # caller exits; aGiTrack can't run outside a git repo
     assert "cannot run outside a Git repository" in capsys.readouterr().out
     assert not (tmp_path / ".git").exists()  # nothing was created
+
+
+def test_discover_or_init_defaults_to_creating_the_repo(tmp_path, monkeypatch):
+    """Enter accepts. aGiTrack cannot track anything without a repo, so declining ends the run —
+    the default must be the answer that lets the user get started, not the one that quits."""
+    _force_tty(monkeypatch, stdin=True)
+    prompts: list = []
+    monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or "")  # bare Enter
+
+    repo = cli._discover_or_init(tmp_path)
+
+    assert repo is not None and (tmp_path / ".git").exists()
+    assert "[Y/n]" in prompts[0]  # ...and the prompt says so
+
+
+def test_discover_or_init_never_creates_a_repo_without_an_answer(tmp_path, monkeypatch):
+    """A default of YES must not become "create a repo" when there is nobody to ask — an
+    interrupted or closed stdin is not consent to write into the user's directory."""
+    _force_tty(monkeypatch, stdin=True)
+
+    def interrupted(*_a, **_k):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", interrupted)
+
+    assert cli._discover_or_init(tmp_path) is None
+    assert not (tmp_path / ".git").exists()
 
 
 def test_discover_or_init_non_interactive_does_not_prompt(tmp_path, monkeypatch):

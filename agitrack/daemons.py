@@ -266,6 +266,40 @@ def restart_all(*, exclude_pid: int | None = None, log=lambda message: None) -> 
     return restarted
 
 
+def stop_all(*, exclude_pid: int | None = None, log=lambda message: None) -> tuple[int, list[str]]:
+    """Stop every running aGiTrack daemon, across all repositories.
+
+    Returns ``(stopped, still_running)`` — the count that went away and a description of any that
+    would not, so the caller can report a partial result honestly rather than claiming success.
+    Each is SIGTERM'd (their handlers shut down cleanly and deregister) and waited for; a daemon
+    that ignores it is left alone and named rather than escalated to SIGKILL, since a stuck
+    dashboard is far less bad than one killed mid-write of its handshake or state.
+
+    The CURRENT process is skipped by default: `agitrack --daemons stop` run from inside a live
+    session must not terminate that session.
+    """
+    skip = exclude_pid if exclude_pid is not None else os.getpid()
+    stopped = 0
+    survivors: list[str] = []
+    for info in list_running():
+        if info.pid == skip:
+            continue
+        try:
+            terminate_pid(info.pid)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and pid_alive(info.pid):
+                time.sleep(0.05)
+            if pid_alive(info.pid):
+                survivors.append(f"{info.function} for {info.repo_name} (pid {info.pid})")
+                continue
+            deregister(info.pid)
+            stopped += 1
+            log(f"stopped {info.function} for {info.repo_name} (pid {info.pid})")
+        except Exception as error:  # a daemon we cannot signal (gone, or not ours) is not a failure
+            survivors.append(f"{info.function} for {info.repo_name} (pid {info.pid}): {error}")
+    return stopped, survivors
+
+
 def _safe_unlink(path: Path) -> None:
     try:
         path.unlink()
