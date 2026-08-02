@@ -11269,3 +11269,49 @@ def test_the_stdin_reader_thread_keeps_the_tty_queue_from_overflowing(monkeypatc
             pass
         os.close(slave)
         os.close(master)
+
+
+def test_backend_output_is_parsed_in_bounded_slices_without_changing_the_screen():
+    """`drain()` hands over up to 256 KB and pyte is ~2.5 ms per 4 KB, so an unbounded feed
+    held the GIL for ~107 ms — three times the repaint budget. Nothing else runs in that
+    window, including the stdin reader thread, so the tty's ~1 KB queue overflows and the
+    kernel discards INSIDE a single feed. Bounding it is what stops that; the screen it
+    produces must be byte-identical to parsing the same output in one go."""
+    import agitrack.proxy.runner as _R
+
+    def fresh():
+        runner = make_runner(cols=120, rows=40)
+        runner.screen = _R._BackgroundColorEraseScreen(120, 39, history=5000, ratio=0.5)
+        runner.stream = _R.pyte.ByteStream(runner.screen)
+        runner._render = lambda: None
+        runner._parse_carry, runner._parse_at = b"", 0
+        return runner
+
+    def text(runner):
+        rows = []
+        for y in range(runner.screen.lines):
+            line = runner.screen.buffer.get(y, {})
+            rows.append("".join((line.get(x).data if line.get(x) else " ") for x in range(120)))
+        return "\n".join(rows)
+
+    payload = b"".join(
+        b"\x1b[1;3%dm%07d\x1b[0m \x1b[38;2;120;200;90m%s\x1b[0m\r\n" % (i % 8, i, b"payload text here" * 3)
+        for i in range(2000)
+    )
+    assert len(payload) > ProxyRunner.PARSE_MAX_BYTES * 4  # enough to need several passes
+
+    reference = fresh()
+    _R.ScreenRenderer.feed(reference, payload, pyte_hostile_csi_re=_R._PYTE_HOSTILE_CSI_RE)
+
+    bounded = fresh()
+    bounded._feed_child_output(payload)
+    assert bounded._parse_at < len(bounded._parse_carry), "the whole payload was parsed in one pass"
+    passes = 1
+    while bounded._parse_at < len(bounded._parse_carry):
+        bounded._feed_child_output(b"")
+        passes += 1
+        assert passes < 10_000
+    assert passes > 4  # genuinely sliced, not one big feed
+    # Nothing dropped, nothing reordered, and a sequence split between feeds still parses.
+    assert text(bounded) == text(reference)
+    assert len(bounded.screen.history.top) == len(reference.screen.history.top)
