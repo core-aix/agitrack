@@ -676,6 +676,7 @@ class ProxyRunner:
     # `__init__`); both are rebound per instance, so nothing is shared.
     _last_git_pass = 0.0  # monotonic start of the last git-pipeline pass
     _pipeline_lock_wanted = 0  # main threads waiting on _pipeline_lock (the worker yields)
+    _parse_carry: bytearray = bytearray()  # output not yet parsed (see PARSE_MAX_BYTES)
     _mouse_resync: "bytes | None" = None  # half of a mouse report we gave up on (see _arm_mouse_resync)
     _stall_reported = 0.0  # longest stall already reported for the current loop iteration
     _stall_worst = 0.0  # worst reactor stall this run (reported in a crash report's context)
@@ -870,6 +871,7 @@ class ProxyRunner:
         self._input_tail = b""
         self._input_tail_at = 0.0  # monotonic time the held tail was first held (INPUT_TAIL_HOLD)
         self._input_tail_debris = False  # the held tail is a dropped mouse report, not a keypress
+        self._parse_carry = bytearray()  # backend output past this pass's parse budget
         self._last_git_pass = 0.0  # monotonic start of the last git-pipeline pass
         self._pipeline_lock_wanted = 0  # main threads waiting on _pipeline_lock (worker yields)
         self.last_child_output = 0.0
@@ -8057,6 +8059,8 @@ class ProxyRunner:
             # A partial escape sequence is being held. Wake when its hold expires so the
             # Escape key is delivered on time even if no other input ever arrives.
             return max(0.0, self._input_tail_at + self.INPUT_TAIL_HOLD - time.monotonic())
+        if self._parse_carry:
+            return 0.0  # backend output still unparsed: come straight back for it
         if self._render_pending or self._child_input_pending():
             # Input a backend's full PTY queue refused is owed to it: come back promptly to
             # push the rest rather than leaving the user's keystrokes parked for a whole tick.
@@ -8381,6 +8385,7 @@ class ProxyRunner:
         if not self.running:
             return  # an external graceful-shutdown request just fired
         self._run_pending_session_switch()  # a cross-backend switch deferred out of the sessions modal
+        self._drain_parse_carry()  # backend output past the last pass's parse budget
         self._flush_child_input()  # input a backend's full PTY queue would not take yet
         self._flush_pending_render()
         self._flush_pending_enter()
@@ -8597,8 +8602,38 @@ class ProxyRunner:
             except OSError:
                 pass
 
+    # How much backend output may be parsed in ONE reactor pass. `drain()` hands over up to
+    # 256 KB, and pyte is ~2.5 ms per 4 KB of coloured TUI output, so an unbounded feed held
+    # the GIL for ~107 ms — three times the repaint budget the renderer is so careful about.
+    # Nothing else can run in that window, including the stdin reader thread, so the tty's
+    # ~1 KB queue (about 85 wheel reports) overflows and the kernel discards INSIDE a single
+    # feed. That is the "stray text in the input box" leak, and it is why bounding the parse
+    # matters more than any filter downstream. 16 KB is ~6 ms — comfortably inside the duty
+    # cycle measured to lose nothing.
+    PARSE_MAX_BYTES = 16384
+
     def _feed_child_output(self, output: bytes) -> None:
-        ScreenRenderer.feed(self, output, pyte_hostile_csi_re=_PYTE_HOSTILE_CSI_RE)
+        """Parse backend output into the screen model, bounded per pass.
+
+        Anything over the bound is carried to the next pass IN ORDER — never dropped, never
+        reordered. Splitting between feeds is safe because pyte's stream parser keeps its state
+        across calls, so a sequence cut in half is resumed rather than mis-parsed."""
+        if output:
+            self._parse_carry.extend(output)
+        if not self._parse_carry:
+            return
+        chunk = bytes(self._parse_carry[: self.PARSE_MAX_BYTES])
+        del self._parse_carry[: self.PARSE_MAX_BYTES]
+        ScreenRenderer.feed(self, chunk, pyte_hostile_csi_re=_PYTE_HOSTILE_CSI_RE)
+
+    def _drain_parse_carry(self) -> bool:
+        """Parse the next bounded slice of carried-over output. True while more is owed, which
+        keeps the reactor on the fast poll so the screen never lags the backend."""
+        if not self._parse_carry:
+            return False
+        self._feed_child_output(b"")
+        self._render_output()
+        return bool(self._parse_carry)
 
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
