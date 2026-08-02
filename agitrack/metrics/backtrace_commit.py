@@ -81,21 +81,31 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
             "Initialize one and commit your current files, then re-run:\n"
             "    git init\n"
             "    git add -A && git commit -m 'initial snapshot'\n"
-            "    agitrack --backtrace commit --branch <new-branch>"
+            "    agitrack --backtrace commit --backtrace-branch <new-branch>"
         )
         return 1
     root = repo.repo
 
-    # 2) A new branch name is required (this never writes to the current branch).
+    # 2) A new branch name is required (this never writes to the current branch). The command is
+    #    interactive anyway, so ASK rather than exit with instructions: printing a flag and
+    #    quitting was a dead end for anyone who mistyped it, because `parse_known_args` funnels an
+    #    unknown flag to the backend instead of erroring — the same message came back forever.
     new_branch = (new_branch or "").strip()
     if not new_branch:
         print(
-            "Give the name of a NEW branch to create the reconstructed history on:\n"
-            "    agitrack --backtrace commit --branch <new-branch>\n"
-            "The reconstruction rewrites history, so it is placed on its own branch and your current "
-            "branch is left untouched."
+            "The reconstruction rewrites history, so it is placed on its own NEW branch and your "
+            "current branch is left untouched."
         )
-        return 1
+        try:
+            new_branch = (_input("Name for the new branch (blank to cancel): ") or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            new_branch = ""
+        if not new_branch:
+            print(
+                "Cancelled. You can also pass it up front:\n"
+                "    agitrack --backtrace commit --backtrace-branch <new-branch>"
+            )
+            return 1
     if _branch_exists(repo, new_branch):
         print(f"Branch '{new_branch}' already exists. Choose a new branch name that does not exist yet.")
         return 1

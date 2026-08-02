@@ -1676,6 +1676,11 @@ class ProxyRunner:
             self._teardown_manual_commit_mode()
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+            # Paint once before entering the loop. Every other frame is driven by backend output
+            # or a keystroke, so until the backend emits its first byte there was nothing on
+            # screen at all — and if that first byte was slow, the terminal sat showing whatever
+            # was there before until some unrelated event (a mouse click) forced a repaint.
+            self._render()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         except Exception as error:
             # The reactor died. The teardown below is about to switch the terminal back out
