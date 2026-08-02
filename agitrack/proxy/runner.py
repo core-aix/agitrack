@@ -229,6 +229,17 @@ _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\
 # a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
 _OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
 
+# The host terminal's ANSWERS to the capability queries `detect_host_terminal` sends: the
+# foreground/background/palette colour reports (OSC 10/11/4), the primary device attributes
+# reply, and the kitty keyboard flags reply. One arriving on STDIN is a late answer, not a
+# keypress — and since an OSC reply ends in BEL (0x07 = Ctrl-G, the menu key) it must never
+# reach the key handler. Deliberately narrow: exactly the shapes aGiTrack asks for, none of
+# which a keyboard can produce. See ProxyRunner._absorb_host_terminal_reply.
+_HOST_TERMINAL_REPLY_RE = re.compile(
+    rb"\x1b\](?:10|11|4);[^\x07\x1b]*(?:\x07|\x1b\\)"  # colour / palette reports
+    rb"|\x1b\[\?[0-9;]*[cu]"  # primary device attributes; kitty keyboard flags
+)
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
@@ -1676,6 +1687,11 @@ class ProxyRunner:
             self._teardown_manual_commit_mode()
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+            # Paint once before entering the loop. Every other frame is driven by backend output
+            # or a keystroke, so until the backend emits its first byte there was nothing on
+            # screen at all — and if that first byte was slow, the terminal sat showing whatever
+            # was there before until some unrelated event (a mouse click) forced a repaint.
+            self._render()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         except Exception as error:
             # The reactor died. The teardown below is about to switch the terminal back out
@@ -8288,6 +8304,8 @@ class ProxyRunner:
         # of plain bytes like \x01. We decode them so the menu key matching works.
         data = _decode_kitty_ctrl_keys(data)
         self._debug(f"after kitty decode: {data!r}")
+        # An ANSWER from the terminal is not a keystroke. Absorb any that reach the reactor.
+        data = self._absorb_host_terminal_reply(data)
         was_capturing = self.input.capturing
         # Snapshot the palette's visible state so we can tell a real change (typing, selection move)
         # from no-op input like mouse-motion reports — and avoid repainting the palette on the latter.
@@ -8739,6 +8757,34 @@ class ProxyRunner:
 
     def _parse_host_terminal_responses(self, data: bytes) -> None:
         TerminalHost.parse_host_terminal_responses(self, data, debug_fn=self._debug if self.debug_proxy else None)
+
+    def _absorb_host_terminal_reply(self, data: bytes) -> bytes:
+        """Take the host terminal's ANSWERS out of the input stream, and learn from them.
+
+        `detect_host_terminal` writes its queries and waits a bounded time for the replies; a
+        terminal slower than that (tmux relaying to an outer terminal, a forwarded/remote session)
+        answers afterwards, and the answer then arrives as ordinary input. That is not benign: an
+        OSC reply is terminated by BEL, and BEL is 0x07 — Ctrl-G, the default menu key. A late
+        background-colour report opened the command palette by itself, and the rest of the reply
+        was typed at the agent. So a reply is consumed here rather than fed to the key handler,
+        and the values in it still reach the capability cache, which repairs the theme aGiTrack
+        reports to the backend instead of leaving it at whatever detection managed to collect.
+
+        Only the three answers aGiTrack actually asks for are matched (OSC 10/11/4, primary
+        device attributes, kitty keyboard flags) — a shape no keyboard produces. Inside a
+        bracketed paste nothing is absorbed: there the bytes are content the user copied, and a
+        pasted transcript of a terminal session must arrive at the agent intact.
+        """
+        if not data or self._in_bracketed_paste:
+            return data
+        if b"\x1b]" not in data and b"\x1b[?" not in data:
+            return data  # cheap reject: every reply shape starts with one of these
+        replies = _HOST_TERMINAL_REPLY_RE.findall(data)
+        if not replies:
+            return data
+        self._parse_host_terminal_responses(b"".join(replies))
+        self._debug(f"absorbed {len(replies)} late host-terminal reply/replies: {replies!r}")
+        return _HOST_TERMINAL_REPLY_RE.sub(b"", data)
 
     def _answer_terminal_queries(self, output: bytes) -> None:
         if self.master_fd is None:
@@ -9884,6 +9930,11 @@ class ProxyRunner:
             )
             self._render()
             return
+        # Nothing tracked yet, but the backends' own transcripts hold history we can
+        # reconstruct? Serve THAT rather than an empty page (see metrics.suggest). The probe
+        # costs one `git log` once anything is tracked, which is the overwhelmingly common case.
+        if self._start_backtrace_instead_of_empty_dashboard():
+            return
         try:
             clear_handshake(self.base_repo)  # drop any record from a dead earlier daemon
             # No owner pid: the dashboard is a free-standing daemon (exactly like
@@ -9924,6 +9975,68 @@ class ProxyRunner:
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
         self._render()
+
+    # How long the Ctrl-G path waits for a freshly spawned backtrace daemon to publish its URL.
+    # Deliberately short: the reconstruction exports every local session (OpenCode shells out per
+    # session) and can take MINUTES, and the reactor must never be blocked for that — the daemon is
+    # detached and keeps building either way, so a slow one just means we hand over the command
+    # to check on it instead of the URL.
+    BACKTRACE_URL_WAIT = 3.0
+
+    def _start_backtrace_instead_of_empty_dashboard(self) -> bool:
+        """Serve the reconstruction when the live dashboard would be empty and it would not.
+
+        True when it took over, so the caller stops. Someone who has been coding with Claude or
+        OpenCode before adopting aGiTrack has no tracked commits yet, and showing them an empty
+        dashboard says "nothing to see" when their own transcripts say otherwise."""
+        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
+
+        try:
+            if not should_show_backtrace(self.base_repo):
+                return False
+            from agitrack.metrics import open_dashboard_in_browser
+            from agitrack.metrics.backtrace import (
+                _running_handshake,
+                _spawn_backtrace_child,
+                _read_handshake,
+            )
+
+            directory = self.base_repo.repo
+            record = _running_handshake(directory)  # one may already be up — reuse, never restart
+            if record is None:
+                _spawn_backtrace_child(directory)
+                deadline = time.monotonic() + self.BACKTRACE_URL_WAIT
+                while time.monotonic() < deadline and record is None:
+                    time.sleep(0.1)
+                    record = _read_handshake(directory)
+            detail = SUBSTITUTION_NOTICE.splitlines()
+            if record is None or not record.get("url"):
+                # Still reconstructing. It is detached, so it carries on without us.
+                self._select_popup(
+                    "Reconstructing your history from local sessions…",
+                    ["ok"],
+                    detail=detail
+                    + [
+                        "",
+                        "It is still building (this can take a few minutes for a big directory).",
+                        "Check on it with:  agitrack --backtrace status",
+                    ],
+                )
+                self._set_message("Backtrace view is building in the background.")
+            else:
+                url = str(record.get("url", ""))
+                opened = open_dashboard_in_browser(url)
+                self._select_popup(f"Backtrace view live at {url}", ["ok"], detail=detail)
+                self._set_message(
+                    f"Backtrace view live at {url} — opening in your browser."
+                    if opened
+                    else f"Backtrace view live at {url}."
+                )
+        except Exception as error:
+            self._debug(f"backtrace substitution failed: {error!r}")
+            return False  # never let this block the dashboard the user actually asked for
+        self._render()
+        return True
 
     def _dashboard_email_logins(self) -> dict[str, str]:
         """Map the current user's git email → their GitHub login, so the dashboard can

@@ -1666,6 +1666,7 @@ def test_an_unchanged_transcript_is_not_re_read(tmp_path, monkeypatch):
     assert len(parses) == 2
 
 
+@pytest.mark.timing
 def test_the_export_memo_lets_a_big_session_go_when_nobody_comes_back(tmp_path):
     """One entry, and only for a couple of minutes: this is here to serve the same file twice
     in a row, not to keep a 150 MB session resident for the rest of the day."""

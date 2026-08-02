@@ -417,3 +417,21 @@ def test_context_from_browser_restricts_to_the_given_stats():
 
     assert files == {"a.py": [(10, 3, 1)]}
     assert sha_paths == {"keep": {"a.py"}}
+
+
+def test_the_learn_call_to_action_hides_with_the_efficiency_section():
+    """The big green "open learn" button lives under the `agent efficiency` heading, and that
+    section hides itself when there is too little history to read a pattern out of. The button did
+    not — so on a fresh repo it was left as the most prominent thing on the page, promising lessons
+    the agent had nothing to write them from (`test_thin_history_yields_no_insights` above is
+    exactly that repo). One `show` flag now drives heading, cards and button together.
+
+    The small "learn" link in the header is deliberately NOT tied to this: that one is navigation.
+    """
+    from agitrack.metrics.web import _TEMPLATE
+
+    assert 'id="learncta"' in _TEMPLATE  # addressable at all
+    body = _TEMPLATE.split("function renderInsights", 1)[1].split("function renderAgg", 1)[0]
+    assert 'cta = $("learncta")' in body
+    assert 'if(cta) cta.style.display = show ? "" : "none";' in body
+    assert "learnlink" not in body  # the header link is untouched by the flag

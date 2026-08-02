@@ -70,6 +70,11 @@ BANNER_CSS = """.backtracebanner,.btbanner,.updatebanner{position:sticky;top:0;z
   font-size:12.5px;line-height:1.5;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 .backtracebanner code,.btbanner code,.updatebanner code{color:var(--fg);background:var(--panel2);
   padding:0 5px;border-radius:3px}
+/* The one COMMAND in a notice, as opposed to a quoted value: everything else on the strip is
+   context, and this is the single thing the reader can act on, so it carries the same green the
+   call-to-action link does instead of blending into the amber explanation. */
+.backtracebanner code.cmd,.btbanner code.cmd,.updatebanner code.cmd{color:var(--phosphor);
+  background:var(--panel2);border:1px solid var(--phosphor-dim);font-weight:600}
 /* The call to action is GREEN against the amber notice, so the one thing to click stands
    apart from the explanation. */
 .backtracebanner a,.btbanner a,.updatebanner a{color:var(--phosphor);text-decoration:none;

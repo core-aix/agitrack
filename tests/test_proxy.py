@@ -3182,7 +3182,6 @@ def test_a_held_escape_is_still_delivered_when_nothing_follows():
 
     runner._input_tail, runner._input_tail_at = b"\x1b", time.monotonic()
     assert runner._input_tail_expired() is False  # still inside the hold
-    assert runner._select_timeout() <= runner.INPUT_TAIL_HOLD  # ...and the loop wakes for it
     runner._input_tail_at = time.monotonic() - runner.INPUT_TAIL_HOLD - 0.01
     assert runner._input_tail_expired() is True
     data, tail = runner._hold_incomplete_tail(runner._input_tail, flush=True)
@@ -3191,6 +3190,19 @@ def test_a_held_escape_is_still_delivered_when_nothing_follows():
     # A truncated report that never completed is dropped, not forwarded as text.
     data, tail = runner._hold_incomplete_tail(b"\x1b[<64;5", flush=True)
     assert data == b"" and tail == b""
+
+
+@pytest.mark.timing
+def test_the_reactor_wakes_within_the_hold_to_flush_a_held_escape():
+    """Split out of the test above because it compares a COMPUTED timeout against the bound it
+    is derived from, so it turns on clock precision rather than behaviour: Windows' coarse
+    monotonic() makes `_input_tail_at + HOLD - now` land a float hair ABOVE the hold when no
+    time has passed (`assert 0.0500000000001819 <= 0.05` in CI). The property is still worth
+    checking on demand — without it the held Escape would wait for the next unrelated wakeup."""
+    runner = _history_runner()
+    runner._input_tail, runner._input_tail_at = b"\x1b", time.monotonic()
+
+    assert runner._select_timeout() <= runner.INPUT_TAIL_HOLD + 1e-6
 
 
 def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
@@ -11417,3 +11429,146 @@ def test_backend_output_is_parsed_in_bounded_slices_without_changing_the_screen(
     # Nothing dropped, nothing reordered, and a sequence split between feeds still parses.
     assert text(bounded) == text(reference)
     assert len(bounded.screen.history.top) == len(reference.screen.history.top)
+
+
+# --------------------------------------------------------------------------- startup terminal race
+#
+# aGiTrack asks the host terminal what its colours are (OSC 10/11 + 16x OSC 4, then DA as a
+# sentinel) and caches the answers, because the backend asks aGiTrack the same questions and
+# adapts its whole theme to them. Two bugs met here, and they share a cause.
+
+
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
+def test_the_stdin_reader_does_not_race_the_capability_round_trip(monkeypatch):
+    """The pump thread starts with RAW MODE, and `run()` sets raw BEFORE detecting — so both the
+    pump and the detection loop were reading fd 0 at once and the terminal's replies were split
+    between them at random. Measured on a pty, the pump won every time.
+
+    Two user-visible symptoms, one race: replies the pump took never reached the capability cache
+    (so the backend got no answer and fell back to a default theme — "the colors are different
+    from time to time"), and were handed to the reactor as ordinary input, where the BEL that
+    terminates every OSC reply is 0x07 = Ctrl-G, the menu key ("the Ctrl-G menu shows up at
+    start"). A full reply set carries 18 of them.
+    """
+    import pty
+    import select as _select
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved_in, saved_out = os.dup(0), os.dup(1)
+    try:
+        os.dup2(slave, 0)
+        os.dup2(slave, 1)
+
+        class _Stdin:
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        class _Stdout:  # pytest's capture replaces sys.stdout with an object off fd 1
+            @staticmethod
+            def fileno() -> int:
+                return 1
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        monkeypatch.setattr(sys, "stdout", _Stdout)
+        owner = make_runner()
+        owner.host_fg_value = owner.host_bg_value = owner.host_da = None
+        owner.host_palette = {}
+        host = PosixHostTerminal(owner)
+        host.set_raw()  # starts the pump, exactly as ProxyRunner.run() does
+        assert host._reader is not None and host._reader.is_alive()
+
+        def answer_like_a_terminal():
+            seen = b""
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and b"\x1b[c" not in seen:
+                if _select.select([master], [], [], 0.05)[0]:
+                    seen += os.read(master, 4096)
+            reply = b"\x1b]10;rgb:ffff/ffff/ffff\x07\x1b]11;rgb:0000/0000/0000\x07"
+            for index in range(16):
+                reply += b"\x1b]4;%d;rgb:1111/2222/3333\x07" % index
+            reply += b"\x1b[?62;c"
+            assert reply.count(b"\x07") == 18  # 18 chances to open the menu
+            os.write(master, reply)
+
+        responder = threading.Thread(target=answer_like_a_terminal, daemon=True)
+        responder.start()
+        host.detect_host_terminal()
+        responder.join(3)
+        time.sleep(0.2)  # give the pump every chance to have taken something
+
+        # The cache is COMPLETE: the backend gets a faithful theme every run, not a coin flip.
+        assert owner.host_fg_value and owner.host_bg_value and owner.host_da
+        assert len(owner.host_palette) == 16
+        # ...and not one reply byte was delivered as input.
+        assert host.read_stdin(65536) == b""
+        # The pump is reading again — pausing it is for the round trip only.
+        assert not host._paused.is_set()
+    finally:
+        # Join the pump BEFORE fd 0 goes back to the real stdin: a thread still selecting on it
+        # would start eating the test runner's own input.
+        host._stop_reader()
+        os.dup2(saved_in, 0)
+        os.dup2(saved_out, 1)
+        os.close(saved_in)
+        os.close(saved_out)
+        os.close(master)
+        os.close(slave)
+
+
+def test_a_late_terminal_reply_is_absorbed_instead_of_typed():
+    """Detection waits a bounded time; a terminal slower than that (tmux relaying outward, a
+    forwarded session) answers afterwards, and the answer lands in the reactor as input. The BEL
+    that ends an OSC reply is Ctrl-G, so a late background-colour report opened the command
+    palette by itself and typed the rest at the agent. It is an ANSWER, not a keystroke."""
+    runner = make_runner()
+    runner.host_fg_value = runner.host_bg_value = None
+    runner.host_palette = {}
+
+    late = b"\x1b]11;rgb:0a0a/0b0b/0c0c\x07"
+    assert runner._absorb_host_terminal_reply(late) == b""
+    assert runner.host_bg_value == b"rgb:0a0a/0b0b/0c0c"  # and the cache is repaired by it
+
+
+def test_absorbing_a_reply_keeps_the_keystrokes_around_it():
+    runner = make_runner()
+    runner.host_palette = {}
+    data = b"ab\x1b]4;3;rgb:1111/2222/3333\x07cd\x1b[?62;cef"
+    assert runner._absorb_host_terminal_reply(data) == b"abcdef"
+    assert runner.host_palette.get(b"3") == b"rgb:1111/2222/3333"
+
+
+def test_a_real_ctrl_g_is_never_absorbed():
+    """The whole point is telling an answer from a keypress: Ctrl-G must still open the menu."""
+    runner = make_runner()
+    for keys in (b"\x07", b"\x1b[A", b"\x1b[<64;43;29M", b"hello", b"\x1b[6n", b"\x1b[97;5u"):
+        assert runner._absorb_host_terminal_reply(keys) == keys, f"swallowed {keys!r}"
+
+
+def test_nothing_is_absorbed_inside_a_bracketed_paste():
+    """Inside a paste the bytes are content the user copied — a pasted terminal transcript must
+    reach the agent intact."""
+    runner = make_runner()
+    runner._in_bracketed_paste = True
+    pasted = b"\x1b]11;rgb:0000/0000/0000\x07"
+    assert runner._absorb_host_terminal_reply(pasted) == pasted
+
+
+def test_an_absorbed_reply_cannot_open_the_menu(monkeypatch):
+    """End to end through the reactor phase: the palette stays closed and the agent sees nothing."""
+    runner, forwarded = _stdin_phase_runner(monkeypatch, [b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"])
+    runner.host_bg_value = None
+
+    runner._reactor_stdin_phase([0])
+
+    assert runner.input.capturing is False, "the Ctrl-G palette opened by itself"
+    assert bytes(forwarded) == b"", f"the agent was typed at: {bytes(forwarded)!r}"
+    assert runner.host_bg_value == b"rgb:1e1e/1e1e/1e1e"

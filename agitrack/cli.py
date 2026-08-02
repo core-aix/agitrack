@@ -226,6 +226,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--backtrace-branch",
+        # `--backtrace-branch` is the canonical spelling (help text and every message use it).
+        # `--branch` is kept as an undocumented alias ONLY because earlier guidance printed it, and
+        # an unknown flag does not error here — `parse_known_args` funnels it to the backend — so
+        # without the alias that stale spelling silently produced "give me a branch name" forever.
+        "--branch",
+        dest="backtrace_branch",
         default=None,
         help="the NEW branch to create for `--backtrace commit` (the reconstructed, history-"
         "rewritten commits are placed here; your current branch is left untouched).",
@@ -239,10 +245,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--daemons",
-        action="store_true",
+        nargs="?",
+        const="list",
+        choices=("list", "stop"),
+        default=None,
         help="list every running aGiTrack daemon across ALL repositories — its function (repo "
-        "dashboard, backtrace dashboard, or background mode), repo name, and PID — so you can stop a "
-        "stray one by hand, then exit.",
+        "dashboard, backtrace dashboard, or background mode), repo name, and PID — then exit. "
+        "`--daemons stop` stops all of them (the session you run it from is never stopped).",
     )
     # --- options without a short form, in rough order of how often they matter ---
     parser.add_argument("--repo", default=".", help="target Git repository path")
@@ -485,6 +494,40 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    if args.daemons == "stop":
+        # Global: stop every aGiTrack daemon anywhere. No repo/git needed — the registry is
+        # user-wide, which is the point: this is the "I have strays I cannot find" escape hatch.
+        from agitrack.daemons import list_running, stop_all
+        from agitrack.metrics.collect import _abbreviate_home
+
+        # Show what is about to die BEFORE killing it. This reaches across every repository the
+        # user has, so a bare "stop all" typed while thinking about one repo can take down
+        # dashboards for four others; the listing is what makes that visible in time.
+        doomed = [info for info in list_running() if info.pid != os.getpid()]
+        if not doomed:
+            print("No aGiTrack daemons are currently running.")
+            return 0
+        print(f"About to stop {len(doomed)} aGiTrack daemon(s):\n")
+        for info in doomed:
+            print(f"  {info.pid:>7}  {info.function:<20}  {_abbreviate_home(info.repo)}")
+        if sys.stdin.isatty():
+            try:
+                answer = input("\nStop all of these? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"  # never kill on an unanswered prompt
+            if answer in {"n", "no"}:
+                print("Cancelled. Nothing was stopped.")
+                return 0
+        print()
+        stopped, survivors = stop_all(log=lambda message: print(f"  {message}"))
+        if not stopped and not survivors:
+            print("No aGiTrack daemons are currently running.")
+        elif stopped:
+            print(f"Stopped {stopped} aGiTrack daemon(s).")
+        for survivor in survivors:
+            # Named, not force-killed: a wedged dashboard is better than one killed mid-write.
+            print(f"Could not stop {survivor} — stop it by hand if it is stuck.")
+        return 1 if survivors else 0
     if args.daemons:
         # Global, read-only listing of every running aGiTrack daemon — no repo/git needed.
         from agitrack.daemons import list_running
@@ -550,6 +593,12 @@ def main(argv: list[str] | None = None) -> int:
 
             return backtrace_daemon_status(directory)
         if args.backtrace == "commit":
+            # `parse_known_args` funnels unknown flags to the backend, which the backtrace path
+            # never launches — so they would vanish without a word. Say so rather than leave the
+            # user re-running a command that cannot work.
+            stray = [a for a in backend_args if a.startswith("-")]
+            if stray:
+                print(f"Ignoring unrecognized option(s): {' '.join(stray)}")
             # Reconstruct a TRACKED git history: rewrite commits onto a new branch, annotating the
             # AI-made ones with aGiTrack metadata. Requires a git repo + clean tree + a branch name.
             # Always interactive (it rewrites history) — there is no skip-confirmation flag.
@@ -635,6 +684,16 @@ def main(argv: list[str] | None = None) -> int:
         # Bare `-d` / `-d html`: start the live dashboard as a detached background
         # daemon (#110). It is NOT bound to this terminal: it keeps serving until
         # `agitrack -d stop`, and restarts itself after aGiTrack updates.
+        # An empty live dashboard is the worst answer available when the backends' own
+        # transcripts hold history we could reconstruct, so show that instead (see
+        # metrics.suggest). The probe is skipped entirely once anything is tracked.
+        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
+
+        if should_show_backtrace(dashboard_repo):
+            from agitrack.metrics.backtrace import start_backtrace_daemon
+
+            print(SUBSTITUTION_NOTICE)
+            return start_backtrace_daemon(dashboard_repo.repo)
         from agitrack.metrics import start_dashboard_daemon
 
         return start_dashboard_daemon(dashboard_repo)
@@ -984,6 +1043,9 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
+            # Nothing tracked here yet, but their own Claude/OpenCode transcripts hold history
+            # aGiTrack can reconstruct — say so while there is still a shell to run it from.
+            _offer_backtrace_for_untracked_repo(repo, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -1262,6 +1324,42 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     if answer in {"q", "quit", "n", "no"}:
         print("aGiTrack not started.")
         return False
+    return True
+
+
+def _offer_backtrace_for_untracked_repo(repo: GitRepo, *, scripted: bool = False) -> bool:
+    """Before the TUI takes over: if this repo has no aGiTrack history but the backends' own
+    transcripts do, offer to open the reconstruction. Returns True if it was started.
+
+    Shown only in the one situation where it is useful — someone who has been coding with an
+    agent here BEFORE adopting aGiTrack — so it is not a recurring nag: the moment they commit
+    through aGiTrack the condition is false forever after. Never blocks automation (no TTY or
+    scripted ⇒ silent), and never blocks startup: declining just continues into the TUI.
+    """
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    from agitrack.metrics.suggest import STARTUP_HINT, should_show_backtrace
+
+    try:
+        if not should_show_backtrace(repo):
+            return False
+    except Exception:
+        return False  # a probe failure must never delay or block a normal start
+    print()
+    print(STARTUP_HINT)
+    try:
+        # Default YES: we only ask when the reconstruction is the ONLY view with history in it.
+        answer = input("Open the backtrace view now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer in {"n", "no"}:
+        return False
+    from agitrack.metrics.backtrace import start_backtrace_daemon
+
+    # Runs here, in cooked mode, where its progress bar and URL are readable — the reconstruction
+    # can take minutes, and inside the full-screen TUI there would be nowhere to show that.
+    start_backtrace_daemon(repo.repo)
     return True
 
 
@@ -1590,10 +1688,12 @@ def _discover_or_init(path: Path) -> GitRepo | None:
         print(f"Not a Git repository: {path}\naGiTrack requires a Git repository to run.")
         return None
     try:
-        answer = input(f"{path} is not a Git repository. Initialize one here with `git init`? [y/N] ").strip().lower()
+        # Default YES: aGiTrack cannot track anything without a repo, so declining ends the run.
+        # Enter should take the path that lets the user get started, not the one that quits.
+        answer = input(f"{path} is not a Git repository. Initialize one here with `git init`? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        answer = ""
-    if answer not in {"y", "yes"}:
+        answer = "n"  # no way to answer ⇒ do NOT create a repo the user never asked for
+    if answer in {"n", "no"}:
         print("aGiTrack cannot run outside a Git repository. Exiting.")
         return None
     try:
