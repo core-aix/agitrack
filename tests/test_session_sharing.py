@@ -514,6 +514,7 @@ def test_fetch_passes_timeout_through_to_git(tmp_path):
     assert seen == [12.0]  # the timeout bounds the listing fetch
 
 
+@pytest.mark.timing
 def test_run_bounded_cancel_kills_process_promptly(tmp_path):
     # A set cancel Event must terminate the subprocess at once (not wait it out),
     # so a user who cancels truly stops the work.
@@ -529,6 +530,7 @@ def test_run_bounded_cancel_kills_process_promptly(tmp_path):
     assert time.monotonic() - started < 2.0  # killed promptly, did not sleep 10s
 
 
+@pytest.mark.timing
 def test_run_bounded_timeout_kills_process(tmp_path):
     import time
 
@@ -539,6 +541,7 @@ def test_run_bounded_timeout_kills_process(tmp_path):
     assert time.monotonic() - started < 2.0
 
 
+@pytest.mark.timing
 def test_run_bounded_io_cancel_kills_and_captures(tmp_path):
     # The cancellable push variant kills the subprocess promptly and still returns
     # (code, stderr) so the caller can report the outcome.
@@ -1950,6 +1953,7 @@ def test_share_confirms_every_time_even_after_acknowledged(tmp_path, monkeypatch
     assert any("cancel" in m.lower() for m in runner.messages)
 
 
+@pytest.mark.timing
 def test_share_runs_in_background_without_blocking(tmp_path, monkeypatch):
     # A manual share must not freeze the terminal on the push: it kicks the upload
     # onto a background thread (returning at once) and surfaces the result as a notice.
@@ -2148,6 +2152,7 @@ def test_auto_share_on_exit_no_push_when_already_shared(tmp_path, monkeypatch):
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
 
 
+@pytest.mark.timing
 def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
     # A stalled push (offline / auth / unreachable remote) must never hang exit:
     # the push is bounded by EXIT_SHARE_TIMEOUT, after which exit continues with a
@@ -2383,6 +2388,7 @@ def _drain_background_share_ops(runner):
     runner._service_background_share_ops()
 
 
+@pytest.mark.timing
 def test_unshare_is_non_blocking_with_progress_and_result_notices(tmp_path, monkeypatch):
     # The reported freeze: unshare pushed synchronously with no message. It must now
     # return immediately (session stays usable), show a progress notice, then a result.

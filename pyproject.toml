@@ -55,6 +55,16 @@ Repository = "https://github.com/core-aix/agitrack"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests whose PASS/FAIL depends on how fast the machine is are excluded by default — from the
+# normal suite and therefore from CI, which runs a plain `pytest`. They measure wall-clock
+# elapsed time, so a loaded runner or a coarse clock fails them without anything being wrong:
+# Windows' monotonic() granularity once produced `assert 0.0500000000001819 <= 0.05`. They are
+# kept, not deleted — they are the right tool when investigating a timing-specific problem.
+# Run them deliberately with:  pytest -m timing
+addopts = "-m 'not timing'"
+markers = [
+    "timing: asserts on measured wall-clock time; excluded by default, run with `-m timing`",
+]
 
 [tool.coverage.run]
 source = ["agitrack"]

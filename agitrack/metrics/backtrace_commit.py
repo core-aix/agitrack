@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
-from agitrack.commits import METADATA_HEADER
+from agitrack.commits import METADATA_HEADER, carries_ai_history
 from agitrack.transcripts import capabilities
 from agitrack.commits.message import _trace_and_metadata_lines
 from agitrack.metrics import backtrace as bt
@@ -81,21 +81,31 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
             "Initialize one and commit your current files, then re-run:\n"
             "    git init\n"
             "    git add -A && git commit -m 'initial snapshot'\n"
-            "    agitrack --backtrace commit --branch <new-branch>"
+            "    agitrack --backtrace commit --backtrace-branch <new-branch>"
         )
         return 1
     root = repo.repo
 
-    # 2) A new branch name is required (this never writes to the current branch).
+    # 2) A new branch name is required (this never writes to the current branch). The command is
+    #    interactive anyway, so ASK rather than exit with instructions: printing a flag and
+    #    quitting was a dead end for anyone who mistyped it, because `parse_known_args` funnels an
+    #    unknown flag to the backend instead of erroring — the same message came back forever.
     new_branch = (new_branch or "").strip()
     if not new_branch:
         print(
-            "Give the name of a NEW branch to create the reconstructed history on:\n"
-            "    agitrack --backtrace commit --branch <new-branch>\n"
-            "The reconstruction rewrites history, so it is placed on its own branch and your current "
-            "branch is left untouched."
+            "The reconstruction rewrites history, so it is placed on its own NEW branch and your "
+            "current branch is left untouched."
         )
-        return 1
+        try:
+            new_branch = (_input("Name for the new branch (blank to cancel): ") or "").strip()
+        except (EOFError, KeyboardInterrupt):
+            new_branch = ""
+        if not new_branch:
+            print(
+                "Cancelled. You can also pass it up front:\n"
+                "    agitrack --backtrace commit --backtrace-branch <new-branch>"
+            )
+            return 1
     if _branch_exists(repo, new_branch):
         print(f"Branch '{new_branch}' already exists. Choose a new branch name that does not exist yet.")
         return 1
@@ -130,9 +140,14 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         return 0
     changed = filesmod._numstat_by_commit(repo, "HEAD", set(commits))
     ai_map = _match_turns_to_commits(repo, commits, changed, turns)
-    # AI commits already carrying aGiTrack metadata (a repo that used aGiTrack for part of its life)
-    # are left untouched — only agent-made commits WITHOUT metadata are annotated.
-    already_tracked = {sha for sha in ai_map if METADATA_HEADER in _commit_message(repo, sha)}
+    # AI commits that already record AI WORK (a repo that used aGiTrack for part of its life) are
+    # left untouched — only agent-made commits without that record are annotated. The test is
+    # `carries_ai_history`, NOT "has a metadata block": a plain USER commit made through aGiTrack
+    # carries an attribution-only block with no turn, no trace and no tokens, and reading that as
+    # "already tracked" made the whole command dead-end with "Nothing to add" on exactly the repos
+    # it exists for — someone who ran aGiTrack, committed once, and has all their real history
+    # sitting in the backend transcripts.
+    already_tracked = {sha for sha in ai_map if carries_ai_history(_commit_message(repo, sha))}
     to_annotate = len(ai_map) - len(already_tracked)
     if to_annotate == 0:
         kept = "already tracked" if already_tracked else "user commits with no agent-made edits to attribute"
@@ -327,6 +342,24 @@ def _match_turns_to_commits(
     return ai_map
 
 
+def _without_attribution_only_metadata(message: str) -> str:
+    """*message* with any attribution-only aGiTrack block removed, leaving the user's own text.
+
+    Only reached for a commit `carries_ai_history` said records no AI work, so anything dropped
+    here is a bare ``commit_type: user`` block — session id, system and version, no turn behind it.
+    The block is a run of contiguous ``key: value`` lines, so it ends at the first blank line.
+    """
+    out, rest = [], message
+    while METADATA_HEADER in rest:
+        head, _, tail = rest.partition(METADATA_HEADER)
+        out.append(head)
+        block, sep, remainder = tail.partition("\n\n")
+        rest = remainder if sep else ""  # a trailing block runs to the end: drop it entirely
+        del block
+    out.append(rest)
+    return "".join(out).rstrip()
+
+
 def _annotation(turns: list[_TurnRec]) -> str:
     """The ``# Interaction Trace`` + ``# aGiTrack Metadata`` block to append to a commit, built from
     the turns that produced it — rendered in the exact format a real aGiTrack commit uses."""
@@ -398,10 +431,13 @@ def _replay(repo, commits: list[str], ai_map: dict[str, list[_TurnRec]], new_bra
 
         message = repo._run(["git", "log", "-1", "--format=%B", sha], check=False).stdout.rstrip("\n")
         turns = ai_map.get(sha)
-        # Don't double-annotate a commit that already carries aGiTrack metadata (e.g. a repo that
-        # used aGiTrack for part of its life).
-        if turns and METADATA_HEADER not in message:
-            message = message.rstrip() + "\n\n" + _annotation(turns) + "\n"
+        # Don't double-annotate a commit that already RECORDS AI WORK (a repo that used aGiTrack
+        # for part of its life). Same predicate as the count promised above, so what gets written
+        # matches what the user agreed to. An attribution-only user block is not such a record, and
+        # is dropped rather than left beside the annotation: two metadata blocks would read as a
+        # squash aggregate whose user constituent carries nothing.
+        if turns and not carries_ai_history(message):
+            message = _without_attribution_only_metadata(message).rstrip() + "\n\n" + _annotation(turns) + "\n"
 
         args = ["git", "commit-tree", tree]
         for parent in new_parents:

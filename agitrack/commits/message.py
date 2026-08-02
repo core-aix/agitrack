@@ -173,6 +173,50 @@ def is_fully_tracked_message(body: str) -> bool:
     return any(IN_FLIGHT_MARKER not in block for block in blocks)
 
 
+# A token line that records real usage. `: [1-9]` excludes an explicit zero, so a block that
+# accounts for a turn which burned nothing does not read as AI work.
+_NONZERO_TOKENS_RE = re.compile(r"^tokens_since_last_commit_[a-z_]+: [1-9]", re.MULTILINE)
+
+
+def _metadata_blocks(body: str) -> list[str]:
+    """The metadata blocks in *body*, each cut at its first blank line.
+
+    A block is a run of contiguous ``key: value`` lines, so the blank line after it ends it. The
+    cut matters: without it a block would swallow the NEXT turn's interaction trace, and a trace
+    that happens to quote a metadata line (aGiTrack's own repo does this constantly) would then be
+    read as that block's own record.
+    """
+    return [chunk.split("\n\n", 1)[0] for chunk in body.split(METADATA_HEADER)[1:]]
+
+
+def carries_ai_history(body: str) -> bool:
+    """Whether *body* records actual AI WORK — not merely that aGiTrack was present.
+
+    ``METADATA_HEADER in body`` answers the weaker question, and conflating the two is a real
+    source of confusion: a repo whose only aGiTrack commit is a plain USER commit looks fully
+    tracked (100% coverage) while its dashboard is empty, and `--backtrace commit` refuses to
+    annotate anything — "every agent-made commit here is already tracked" — on the strength of an
+    attribution block holding no turn, no trace and no tokens.
+
+    A block qualifies when it is an agent/agent-merge record, or carries a non-zero token count.
+    A user commit that FOLDED turns in (manual mode) carries their `commit_type: agent` blocks and
+    still qualifies, so this never demotes a genuinely tracked commit. In-flight blocks do not
+    qualify — their trace and tokens are still to come.
+    """
+    for block in _metadata_blocks(body):
+        if IN_FLIGHT_MARKER in block:
+            continue
+        commit_type = ""
+        for line in block.splitlines():
+            if line.startswith("commit_type:"):
+                commit_type = line.split(":", 1)[1].strip()
+                break
+        # No commit_type at all is agent work, exactly as the dashboard's classifier reads it.
+        if commit_type in ("", "agent", "agent-merge") or _NONZERO_TOKENS_RE.search(block):
+            return True
+    return False
+
+
 def build_agent_commit_message(
     *,
     latest_prompt: str,

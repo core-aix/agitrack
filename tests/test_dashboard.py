@@ -287,6 +287,33 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     assert ".backtracebanner code,.btbanner code,.updatebanner code{color:var(--fg)" in html
 
 
+def test_a_banner_never_covers_the_server_unreachable_notice(tmp_path):
+    """The offline notice must stay visible on a backtrace dashboard.
+
+    It used to position itself independently (`fixed`, z-40) while the backtrace/update banners
+    were `sticky` z-60, so the banner painted straight over "can't reach the server" — hiding it
+    at the one moment it matters most. All top notices now share ONE sticky strip and stack.
+    """
+    from agitrack.metrics.web import format_html
+
+    html = format_html(
+        build_dashboard(_seeded(tmp_path)),
+        banner_html='<div class="backtracebanner">&#9194; BACKTRACE.</div>',
+        backtrace=True,
+    )
+    strip = html.split('<div class="topbanners">', 1)[1].split('<div class="wrap">', 1)[0]
+    # BOTH notices live in the one strip, offline first, so they stack instead of overlapping.
+    assert 'id="neterror"' in strip and "backtracebanner" in strip
+    assert strip.index('id="neterror"') < strip.index("backtracebanner")
+    # In-flow children: nothing inside the strip may position itself over a sibling.
+    assert ".topbanners{position:sticky;top:0;z-index:60}" in html
+    assert ".topbanners>*{position:static}" in html
+    assert "position:fixed" not in html.split(".neterror{", 1)[1].split("}", 1)[0]
+    # The filter bar offsets below the WHOLE strip, and re-measures when a notice toggles.
+    assert 'const strip = document.querySelector(".topbanners")' in html
+    assert "restackControls()" in html.split("function setOffline", 1)[1][:400]
+
+
 def test_subject_truncation_cuts_at_word_ends(tmp_path):
     # A long subject must not be chopped mid-word: the cut backs up to the last space inside
     # the cap (hard cut only when a single word fills more than half the line), then "…".

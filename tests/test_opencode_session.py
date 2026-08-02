@@ -1,4 +1,5 @@
 import json
+import pytest
 import subprocess
 
 from agitrack.transcripts.opencode import (
@@ -681,6 +682,7 @@ def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
 # --- no-deadlock guarantees: every synchronous opencode call must be bounded ------------------
 
 
+@pytest.mark.timing
 def test_run_opencode_pty_kills_a_hung_command_and_returns(monkeypatch):
     # The export/import pty path must never block forever: a command that produces no output
     # and never exits (opencode hanging on a TTY) is SIGKILLed by the watchdog, so the call

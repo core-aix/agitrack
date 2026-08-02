@@ -42,6 +42,10 @@ from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, Se
 # the dropped count is surfaced in the banner (never silently truncated).
 MAX_SESSIONS = 200
 
+# The one command the banner asks the reader to run. Named so the text and the HTML that
+# highlights it cannot drift apart — the highlight is a literal match against the text.
+BAKE_COMMAND = "agitrack --backtrace commit"
+
 # Cap on a single turn's reconstructed patch, so one enormous refactor can't bloat the
 # ``/diff`` payload. The line COUNTS are always exact (they are summed before this cap);
 # only the shown patch text is trimmed, with a marker.
@@ -79,7 +83,7 @@ class BacktraceView:
         if self.dropped_sessions:
             parts.append(f"Older sessions beyond the most recent {MAX_SESSIONS} were not included.")
         parts.append(
-            "Tip: run 'agitrack --backtrace commit' to bake this history into your git commit "
+            f"Tip: run '{BAKE_COMMAND}' to bake this history into your git commit "
             "messages, then launch your coding agent through 'agitrack' and everything is fully "
             "tracked going forward."
         )
@@ -943,7 +947,12 @@ def _banner_html(view: BacktraceView) -> str:
 
     # `backtracebanner` (not `updatebanner`) so it renders as a frozen top strip — the CSS pins
     # it like the filter bar, and the JS offsets the filters below it (see the template).
-    banner = f'<div class="backtracebanner">⏪ {_escape(view.banner_text())}</div>'
+    # The one COMMAND in the notice is set apart from the explanation around it: everything else
+    # here is context, and this is the single thing the reader can act on. Escape first, then
+    # promote the command, so the markup is inserted into already-safe text.
+    text = _escape(view.banner_text())
+    text = text.replace(f"'{BAKE_COMMAND}'", f'<code class="cmd">{BAKE_COMMAND}</code>')
+    banner = f'<div class="backtracebanner">⏪ {text}</div>'
     # An installation that could not update itself is the user's to fix, and this may be the
     # only aGiTrack page they have open — so the notice belongs here too. No repo is passed:
     # the "restart your session" half is repo-specific and meaningless for a reconstruction.
