@@ -229,6 +229,17 @@ _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\
 # a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
 _OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
 
+# The host terminal's ANSWERS to the capability queries `detect_host_terminal` sends: the
+# foreground/background/palette colour reports (OSC 10/11/4), the primary device attributes
+# reply, and the kitty keyboard flags reply. One arriving on STDIN is a late answer, not a
+# keypress — and since an OSC reply ends in BEL (0x07 = Ctrl-G, the menu key) it must never
+# reach the key handler. Deliberately narrow: exactly the shapes aGiTrack asks for, none of
+# which a keyboard can produce. See ProxyRunner._absorb_host_terminal_reply.
+_HOST_TERMINAL_REPLY_RE = re.compile(
+    rb"\x1b\](?:10|11|4);[^\x07\x1b]*(?:\x07|\x1b\\)"  # colour / palette reports
+    rb"|\x1b\[\?[0-9;]*[cu]"  # primary device attributes; kitty keyboard flags
+)
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
@@ -8293,6 +8304,8 @@ class ProxyRunner:
         # of plain bytes like \x01. We decode them so the menu key matching works.
         data = _decode_kitty_ctrl_keys(data)
         self._debug(f"after kitty decode: {data!r}")
+        # An ANSWER from the terminal is not a keystroke. Absorb any that reach the reactor.
+        data = self._absorb_host_terminal_reply(data)
         was_capturing = self.input.capturing
         # Snapshot the palette's visible state so we can tell a real change (typing, selection move)
         # from no-op input like mouse-motion reports — and avoid repainting the palette on the latter.
@@ -8744,6 +8757,34 @@ class ProxyRunner:
 
     def _parse_host_terminal_responses(self, data: bytes) -> None:
         TerminalHost.parse_host_terminal_responses(self, data, debug_fn=self._debug if self.debug_proxy else None)
+
+    def _absorb_host_terminal_reply(self, data: bytes) -> bytes:
+        """Take the host terminal's ANSWERS out of the input stream, and learn from them.
+
+        `detect_host_terminal` writes its queries and waits a bounded time for the replies; a
+        terminal slower than that (tmux relaying to an outer terminal, a forwarded/remote session)
+        answers afterwards, and the answer then arrives as ordinary input. That is not benign: an
+        OSC reply is terminated by BEL, and BEL is 0x07 — Ctrl-G, the default menu key. A late
+        background-colour report opened the command palette by itself, and the rest of the reply
+        was typed at the agent. So a reply is consumed here rather than fed to the key handler,
+        and the values in it still reach the capability cache, which repairs the theme aGiTrack
+        reports to the backend instead of leaving it at whatever detection managed to collect.
+
+        Only the three answers aGiTrack actually asks for are matched (OSC 10/11/4, primary
+        device attributes, kitty keyboard flags) — a shape no keyboard produces. Inside a
+        bracketed paste nothing is absorbed: there the bytes are content the user copied, and a
+        pasted transcript of a terminal session must arrive at the agent intact.
+        """
+        if not data or self._in_bracketed_paste:
+            return data
+        if b"\x1b]" not in data and b"\x1b[?" not in data:
+            return data  # cheap reject: every reply shape starts with one of these
+        replies = _HOST_TERMINAL_REPLY_RE.findall(data)
+        if not replies:
+            return data
+        self._parse_host_terminal_responses(b"".join(replies))
+        self._debug(f"absorbed {len(replies)} late host-terminal reply/replies: {replies!r}")
+        return _HOST_TERMINAL_REPLY_RE.sub(b"", data)
 
     def _answer_terminal_queries(self, output: bytes) -> None:
         if self.master_fd is None:
