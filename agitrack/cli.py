@@ -635,6 +635,16 @@ def main(argv: list[str] | None = None) -> int:
         # Bare `-d` / `-d html`: start the live dashboard as a detached background
         # daemon (#110). It is NOT bound to this terminal: it keeps serving until
         # `agitrack -d stop`, and restarts itself after aGiTrack updates.
+        # An empty live dashboard is the worst answer available when the backends' own
+        # transcripts hold history we could reconstruct, so show that instead (see
+        # metrics.suggest). The probe is skipped entirely once anything is tracked.
+        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
+
+        if should_show_backtrace(dashboard_repo):
+            from agitrack.metrics.backtrace import start_backtrace_daemon
+
+            print(SUBSTITUTION_NOTICE)
+            return start_backtrace_daemon(dashboard_repo.repo)
         from agitrack.metrics import start_dashboard_daemon
 
         return start_dashboard_daemon(dashboard_repo)
@@ -984,6 +994,9 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
+            # Nothing tracked here yet, but their own Claude/OpenCode transcripts hold history
+            # aGiTrack can reconstruct — say so while there is still a shell to run it from.
+            _offer_backtrace_for_untracked_repo(repo, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -1262,6 +1275,41 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     if answer in {"q", "quit", "n", "no"}:
         print("aGiTrack not started.")
         return False
+    return True
+
+
+def _offer_backtrace_for_untracked_repo(repo: GitRepo, *, scripted: bool = False) -> bool:
+    """Before the TUI takes over: if this repo has no aGiTrack history but the backends' own
+    transcripts do, offer to open the reconstruction. Returns True if it was started.
+
+    Shown only in the one situation where it is useful — someone who has been coding with an
+    agent here BEFORE adopting aGiTrack — so it is not a recurring nag: the moment they commit
+    through aGiTrack the condition is false forever after. Never blocks automation (no TTY or
+    scripted ⇒ silent), and never blocks startup: declining just continues into the TUI.
+    """
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    from agitrack.metrics.suggest import STARTUP_HINT, should_show_backtrace
+
+    try:
+        if not should_show_backtrace(repo):
+            return False
+    except Exception:
+        return False  # a probe failure must never delay or block a normal start
+    print()
+    print(STARTUP_HINT)
+    try:
+        answer = input("Open the backtrace view now? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if answer not in {"y", "yes"}:
+        return False
+    from agitrack.metrics.backtrace import start_backtrace_daemon
+
+    # Runs here, in cooked mode, where its progress bar and URL are readable — the reconstruction
+    # can take minutes, and inside the full-screen TUI there would be nowhere to show that.
+    start_backtrace_daemon(repo.repo)
     return True
 
 
