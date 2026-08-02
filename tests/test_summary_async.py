@@ -13,6 +13,7 @@ The reported problems, each pinned by a test here:
 - summarization cost is tracked → summary_model / summary_tokens_* metadata.
 """
 
+import pytest
 import threading
 import time
 
@@ -181,6 +182,7 @@ def _finish_summary(runner):
     runner._service_commit_summary()
 
 
+@pytest.mark.timing
 def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.gate = threading.Event()  # summary hangs until released
