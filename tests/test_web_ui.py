@@ -252,3 +252,30 @@ def test_a_page_with_its_own_hover_treatment_drops_the_shared_underline(pages):
 def test_the_pages_agree_on_their_width(pages):
     widths = {name: re.search(r"\.wrap\{max-width:(\d+)px", html).group(1) for name, html in pages.items()}
     assert len(set(widths.values())) == 1, f"the pages disagree on their width: {widths}"
+
+
+def test_the_banner_command_is_set_apart_from_the_explanation():
+    """The backtrace banner is mostly context; `agitrack --backtrace commit` is the single thing
+    the reader can act on, so it gets the call-to-action green rather than blending into the
+    amber prose. The highlight is a literal match against the banner text, so both come from one
+    constant — nothing to drift."""
+    import types
+
+    from agitrack.metrics import backtrace as bt
+    from agitrack.metrics import ui
+
+    view = types.SimpleNamespace(
+        dashboard=types.SimpleNamespace(total_commits=3),
+        session_count=1,
+        backends=["claude"],
+        directory="/tmp/x",
+        dropped_sessions=0,
+    )
+    view.banner_text = lambda: bt.BacktraceView.banner_text(view)
+
+    html = bt._banner_html(view)
+    assert f'<code class="cmd">{bt.BAKE_COMMAND}</code>' in html
+    assert f"'{bt.BAKE_COMMAND}'" not in html  # promoted, not left as a quoted string
+    # The plain-text form (terminal output, `--backtrace text`) keeps its quotes and no markup.
+    assert f"'{bt.BAKE_COMMAND}'" in view.banner_text() and "<code" not in view.banner_text()
+    assert ".backtracebanner code.cmd,.btbanner code.cmd,.updatebanner code.cmd{color:var(--phosphor)" in ui.BANNER_CSS

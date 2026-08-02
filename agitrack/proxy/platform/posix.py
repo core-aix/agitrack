@@ -33,6 +33,10 @@ class PosixHostTerminal:
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
         self._paused = threading.Event()
+        # Set by the pump once it has actually observed `_paused` and stopped touching the tty.
+        # Setting `_paused` alone is not enough to hand stdin over: the pump can be parked inside
+        # its 0.2s select and will still read whatever that call returns.
+        self._parked = threading.Event()
         self._wake_r = self._wake_w = -1
 
     # ------------------------------------------------------------------
@@ -86,10 +90,12 @@ class PosixHostTerminal:
         fd = sys.stdin.fileno()
         while not self._stop.is_set():
             if self._paused.is_set():
-                # Cooked mode: something else owns the terminal (a prompt, or the shell while
-                # we are suspended). Reading here would steal its keystrokes.
+                # Cooked mode: something else owns the terminal (a prompt, the shell while we are
+                # suspended, or the capability round trip). Reading here would steal its input.
+                self._parked.set()
                 self._stop.wait(0.02)
                 continue
+            self._parked.clear()
             try:
                 # Bounded wait rather than a blocking read, so a stop is honoured promptly —
                 # there is no portable way to interrupt a thread parked in read(2).
@@ -174,9 +180,40 @@ class PosixHostTerminal:
         TerminalHost.enter_host_screen(self._owner)
 
     def detect_host_terminal(self, debug_fn: Any = None) -> None:
+        """Run the capability round trip with the pump held off, so stdin has ONE reader.
+
+        The pump starts with raw mode and `run()` sets raw BEFORE detecting, so both were reading
+        fd 0 at once and the terminal's replies were split between them at random. Whatever the
+        pump took never reached the capability cache — the backend then got no answer for its own
+        OSC 10/11/4 queries and fell back to a default theme, which is why the colors differed
+        run to run — and was handed to the reactor as ordinary input, where the BEL that
+        TERMINATES every OSC reply is byte 0x07: Ctrl-G, the menu key. One stolen reply opened
+        the command palette at startup. Measured on a pty, the pump won every time, taking all
+        18 BELs of a full reply set.
+        """
         from agitrack.proxy.terminal import TerminalHost
 
-        TerminalHost.detect_host_terminal(self._owner, debug_fn=debug_fn)
+        handed_over = self._pause_pump_and_wait()
+        try:
+            TerminalHost.detect_host_terminal(self._owner, debug_fn=debug_fn)
+        finally:
+            if handed_over:
+                self._paused.clear()
+
+    def _pause_pump_and_wait(self, timeout: float = 0.5) -> bool:
+        """Ask the pump to let go of stdin and wait until it actually has. Returns whether it was
+        running (and therefore has to be resumed afterwards)."""
+        if not self._reader_owns_stdin():
+            return False
+        self._paused.set()
+        if not self._parked.wait(timeout):
+            # The pump is wedged (a blocked read on a dying tty). Detection would race it, so skip
+            # the round trip rather than corrupt the input stream: the cache stays empty, which
+            # only costs theme fidelity, and `_absorb_host_terminal_reply` still repairs it from
+            # any reply that arrives later.
+            self._paused.clear()
+            return False
+        return True
 
     def pause_child_ui(self) -> None:
         from agitrack.proxy.terminal import TerminalHost
