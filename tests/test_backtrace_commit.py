@@ -428,3 +428,112 @@ def test_reconstructed_history_carries_tokens_so_the_dashboard_has_something(rep
     assert backtrace_commit(repo_with_history, "recon", _input=lambda _p: "y") == 0
 
     assert suggest.has_tracked_tokens(repo) is True  # the reconstruction put real numbers in
+
+
+def _user_attribution_block() -> str:
+    """The metadata aGiTrack stamps on a plain USER commit: attribution only — no turn behind it,
+    no interaction trace, no token counts."""
+    return (
+        "\n\n# aGiTrack Metadata\n"
+        "commit_type: user\n"
+        "backend: agit\n"
+        "agitrack_session_id: agitrack-23c1ae28\n"
+        "system: macOS 15.7.3\n"
+        "agitrack_version: 0.6.5\n"
+    )
+
+
+@pytest.fixture
+def repo_ai_commit_at_head(tmp_path, monkeypatch):
+    """A repo whose HEAD is the AI-made commit, so a test can re-stamp THAT commit with `--amend`.
+
+    ``repo_with_history`` ends on a trailing user commit, and amending there silently rewrites the
+    wrong commit — a stamp the reconstruction never reads, so the test passes without exercising
+    anything. Keeping the AI commit at HEAD makes the stamp land where the assertion looks.
+    """
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    from agitrack.metrics import backtrace as bt
+
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("# Proj\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "initial: add README", date="2026-07-01T10:00:00+00:00")
+
+    rows = _write_edit_turn(
+        repo,
+        "Create calc.py",
+        "calc.py",
+        None,
+        "def add(a, b):\n    return a + b\n",
+        "2026-07-02T09:00:00",
+        uid=1,
+        mid="m1",
+    )
+    _plant_claude_session(home / ".claude", repo, "sess-aaa", rows)
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add calc module", date="2026-07-02T10:00:00+00:00")
+    return repo
+
+
+def _restamp_head(repo, message: str) -> None:
+    """Replace HEAD's message, leaving its tree and parents alone."""
+    _git(repo, "commit", "--amend", "-m", message, "--only")
+    assert message.splitlines()[0] in _git(repo, "log", "-1", "--format=%s").stdout
+
+
+def test_a_plain_user_commit_does_not_make_the_repo_look_already_tracked(repo_ai_commit_at_head, capsys):
+    """The reported dead end: someone runs aGiTrack, commits the agent's work THEMSELVES, and
+    `--backtrace commit` then refuses with "every agent-made commit here is already tracked" —
+    on the strength of an attribution block carrying no turn, no trace and no tokens. That is
+    precisely the new user this command exists for, so it must annotate, not decline.
+    """
+    repo = repo_ai_commit_at_head
+    _restamp_head(repo, "add calc module" + _user_attribution_block())
+
+    assert backtrace_commit(repo, "recon", _input=lambda _p: "y") == 0
+
+    out = capsys.readouterr().out
+    assert "Nothing to add" not in out
+    assert "1 agent commit(s) NOT yet tracked will gain aGiTrack metadata" in out
+    body = _git(repo, "log", "recon", "--format=%B", "-1").stdout
+    assert "# Interaction Trace" in body and "Create calc.py" in body
+    assert "tokens_since_last_commit_output:" in body
+
+
+def test_the_hollow_user_block_is_replaced_not_left_beside_the_real_record(repo_ai_commit_at_head):
+    """Two metadata blocks would read as a SQUASH aggregate whose user constituent carries
+    nothing, so the attribution-only block is dropped when the real record goes in."""
+    repo = repo_ai_commit_at_head
+    _restamp_head(repo, "add calc module" + _user_attribution_block())
+
+    assert backtrace_commit(repo, "recon", _input=lambda _p: "y") == 0
+
+    body = _git(repo, "log", "recon", "--format=%B", "-1").stdout
+    assert body.count("# aGiTrack Metadata") == 1
+    assert "commit_type: agent" in body and "commit_type: user" not in body
+    assert body.lstrip().startswith("add calc module")  # the user's own subject survives
+
+
+def test_a_genuinely_tracked_agent_commit_is_still_left_alone(repo_ai_commit_at_head, capsys):
+    """The relaxation must not go the other way. A commit that already RECORDS AI work (trace and
+    real token counts) stays untouched — re-annotating it would print the same conversation twice
+    and double-count its tokens. The anchor differs from the planted turn's, so the turn-level
+    dedup can't be what spares it: only `carries_ai_history` can.
+    """
+    repo = repo_ai_commit_at_head
+    _restamp_head(repo, _agitrack_commit_message("add calc module", session_id="other", anchor="other", output=416))
+
+    assert backtrace_commit(repo, "recon", _input=lambda _p: "y") == 0
+
+    # "Nothing to add" is still reachable — for the case it was always meant for. Nothing is
+    # rewritten, so the existing record cannot be doubled.
+    assert "Nothing to add: every agent-made commit here is already tracked" in capsys.readouterr().out
+    assert "recon" not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
+    assert _git(repo, "log", "-1", "--format=%B").stdout.count("tokens_since_last_commit_output:") == 1

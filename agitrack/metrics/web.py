@@ -771,7 +771,17 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
 #booting .bdots::after{content:"";animation:bdots 1.4s steps(4,end) infinite}
 @keyframes bdots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
 #booting .bsub{font-size:13px;color:var(--fg-dim)}
-.neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
+/* Every top-of-page notice lives in ONE sticky strip so they STACK instead of covering each
+   other. They used to position themselves independently — the offline banner `fixed` at z-40,
+   the backtrace/update banners `sticky` at z-60 — so on a backtrace dashboard the higher banner
+   painted straight over "can't reach the server", hiding it at the one moment it matters most.
+   (Two sticky banners at top:0 likewise converged onto each other once the page was scrolled.)
+   Inside the strip the children are back in normal flow, so they stack top to bottom in DOM
+   order, a hidden one takes no space, and each one's downward shadow is covered by the sibling
+   below it — only the last visible banner casts onto the page. */
+.topbanners{position:sticky;top:0;z-index:60}
+.topbanners>*{position:static}
+.neterror{background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
 /* Efficiency insights: one card per detected inefficiency category. The left border and
@@ -1205,8 +1215,10 @@ footer .flink:hover{text-decoration:underline}
 </head>
 <body>
 __PREBOOT_HTML__
+<div class="topbanners">
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
 __UPDATE_BANNER__
+</div>
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
@@ -1403,7 +1415,16 @@ const truncSubject = s => {
   if(sp > SUBJECT_MAX/2) cut = cut.slice(0, sp);
   return cut.trimEnd()+"…";
 };
-function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
+// Re-measure the top strip whenever a notice appears or disappears (set by stackStickyBanner).
+let restackControls = () => {};
+function setOffline(on){
+  const el=$("neterror"); if(!el) return;
+  if(el.hidden === !on) return;  // no change ⇒ no relayout
+  el.hidden = !on;
+  // The offline notice grows/shrinks the strip while the page is open, so the filter bar's
+  // sticky offset has to follow it — otherwise it hides behind the notice it just made room for.
+  restackControls();
+}
 // Show the "loading…" spinner while a user-initiated filter change re-fetches the data
 // (not during the background refresh poll, which would make it flicker constantly).
 function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
@@ -2286,13 +2307,16 @@ function hideFabricatedChrome(){
   if(sh){ sh.style.display = "none"; if(sh.previousElementSibling) sh.previousElementSibling.style.display = "none"; }
 }
 function stackStickyBanner(){
-  // Pin the filter bar just below the frozen backtrace strip (both are position:sticky top:0),
-  // so when the page scrolls the filters stop under the banner instead of behind it.
-  const bb = document.querySelector(".backtracebanner"), ctl = document.querySelector(".controls");
-  if(!bb || !ctl) return;
-  const setTop = () => { ctl.style.top = bb.offsetHeight + "px"; };
-  setTop();
-  window.addEventListener("resize", setTop);
+  // Pin the filter bar just below the frozen top strip (both are position:sticky top:0), so when
+  // the page scrolls the filters stop UNDER the notices instead of behind them. Measure the whole
+  // strip rather than the backtrace banner alone: it can also hold the update notice and the
+  // offline notice, and an unmeasured sibling puts the filters back behind a banner. An empty
+  // strip measures 0, which is exactly the CSS `top` the bar already has.
+  const strip = document.querySelector(".topbanners"), ctl = document.querySelector(".controls");
+  if(!strip || !ctl) return;
+  restackControls = () => { ctl.style.top = strip.offsetHeight + "px"; };
+  restackControls();
+  window.addEventListener("resize", restackControls);
 }
 async function init(){
   hideFabricatedChrome();
