@@ -160,6 +160,7 @@ class PosixHostTerminal:
     def restore_terminal(self) -> None:
         from agitrack.proxy.terminal import TerminalHost
 
+        self._paused.set()  # the tty is going back to the shell; stop reading behind it
         TerminalHost.restore_terminal(self._owner)
 
     def disable_host_terminal_modes(self) -> None:
