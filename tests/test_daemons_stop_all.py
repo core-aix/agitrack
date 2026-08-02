@@ -153,3 +153,31 @@ def test_bare_daemons_flag_still_lists(monkeypatch, capsys):
     )
     assert cli.main(["--daemons"]) == 0
     assert "No aGiTrack daemons" in capsys.readouterr().out
+
+
+def test_the_listing_says_how_to_stop_them_all(monkeypatch, capsys):
+    """Whoever is reading `--daemons` is usually there BECAUSE they have strays they cannot place,
+    and the listing only ever explained how to stop them one at a time — each needing its own
+    `--repo`. It now names the one command that ends all of them, with the count, and says that
+    it asks first so nobody has to try it to find out."""
+    from agitrack import cli
+
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda: [_Info(11), _Info(22), _Info(33)])
+    assert cli.main(["--daemons"]) == 0
+
+    out = capsys.readouterr().out
+    assert "agitrack --daemons stop" in out
+    assert "all 3 of them" in out  # the count, so the reach is concrete
+    assert "in every repository" in out  # ...and that it is not scoped to this project
+    assert "asks first" in out
+
+
+def test_the_stop_all_hint_is_not_shown_when_nothing_is_running(monkeypatch, capsys):
+    from agitrack import cli
+
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda: [])
+    assert cli.main(["--daemons"]) == 0
+
+    out = capsys.readouterr().out
+    assert "No aGiTrack daemons" in out
+    assert "--daemons stop" not in out  # nothing to stop, so no instructions for stopping it
