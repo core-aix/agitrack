@@ -553,6 +553,14 @@ def main(argv: list[str] | None = None) -> int:
             "        backtrace dashboard  agitrack --repo <path> --backtrace stop\n"
             "        background mode      agitrack --repo <path> -b stop"
         )
+        # Whoever is reading this listing is usually here BECAUSE they have strays they cannot
+        # place, and stopping five daemons one --repo at a time is the tedious way to find that
+        # out. The count and the reach are spelled out: this list is every repository, not the
+        # current one, so "stop them all" must not read as "stop the ones for this project".
+        print(
+            f"\nTo stop all {len(running)} of them, in every repository above:\n"
+            "  agitrack --daemons stop        (lists them and asks first)"
+        )
         return 0
 
     # Backtrace works purely from local transcripts — no git repo AND no git binary needed —
