@@ -1,6 +1,11 @@
 import pytest
 
-from agitrack.commits import build_agent_commit_message, build_user_commit_message, render_interaction_trace
+from agitrack.commits import (
+    build_agent_commit_message,
+    build_user_commit_message,
+    carries_ai_history,
+    render_interaction_trace,
+)
 from agitrack.commits.message import PATH_MASK, SECRET_MASK, apply_summary_to_message, mask_paths
 from agitrack.commits.message import _mask_secrets as _mask_secrets_for_test
 
@@ -801,3 +806,60 @@ def test_route_like_strings_are_masked_by_design():
     # so "/learn/state" is masked too. Masking a route only costs readability; the alternative
     # (a carve-out for extension-less lowercase paths) would let real paths through.
     assert mask_paths("the `/learn/state` endpoint") == f"the `{PATH_MASK}` endpoint"
+
+
+class TestCarriesAiHistory:
+    """`carries_ai_history` separates "aGiTrack was present" from "AI work is recorded here".
+
+    Conflating them is a real source of confusion: a repo whose only aGiTrack commit is a plain
+    USER commit reads as 100% tracked while its dashboard is empty, and `--backtrace commit`
+    declines to annotate anything.
+    """
+
+    USER_ONLY = (
+        "Ini\n\n# aGiTrack Metadata\ncommit_type: user\nbackend: agit\n"
+        "agitrack_session_id: agitrack-23c1\nsystem: macOS 15.7.3\nagitrack_version: 0.6.5\n"
+    )
+    AGENT = (
+        "Do a thing\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\ntokens_since_last_commit_output: 42\n"
+    )
+
+    def test_an_attribution_only_user_block_is_not_ai_history(self):
+        assert carries_ai_history(self.USER_ONLY) is False
+
+    def test_a_commit_with_no_metadata_at_all_is_not(self):
+        assert carries_ai_history("Initial commit") is False
+
+    def test_an_agent_block_is(self):
+        assert carries_ai_history(self.AGENT) is True
+
+    def test_a_block_with_no_commit_type_is_agent_work(self):
+        """Matches the dashboard's classifier, which reads metadata without a commit_type as agent."""
+        assert carries_ai_history("x\n\n# aGiTrack Metadata\nbackend: claude\n") is True
+
+    def test_an_in_flight_block_is_not_yet(self):
+        """Its trace and tokens are still to come; the completed turn still owes this commit."""
+        body = "x\n\n# aGiTrack Metadata\ncommit_type: agent\nin_flight: true\nbackend: claude\n"
+        assert carries_ai_history(body) is False
+
+    def test_a_user_commit_that_FOLDED_turns_still_counts(self):
+        """Manual mode: the user's own commit leads with a user block and carries each turn's
+        agent block. Demoting that would lose real history."""
+        assert carries_ai_history(self.USER_ONLY.rstrip() + "\n\n" + self.AGENT) is True
+
+    def test_explicit_zero_tokens_do_not_count_as_work(self):
+        body = "x\n\n# aGiTrack Metadata\ncommit_type: user\ntokens_since_last_commit_output: 0\n"
+        assert carries_ai_history(body) is False
+
+    def test_a_trace_that_QUOTES_a_metadata_line_is_not_mistaken_for_one(self):
+        """aGiTrack's own repo discusses these field names constantly, so a following turn's trace
+        must not be read as the preceding block's own record — blocks end at the first blank line."""
+        body = (
+            self.USER_ONLY.rstrip()
+            + "\n\n# Interaction Trace\n\n## User\n\nwhy is tokens_since_last_commit_output: 500 wrong?\n"
+        )
+        assert carries_ai_history(body) is False
+
+    def test_a_real_user_commit_from_the_wild_is_not_history(self):
+        """The exact block that made `--backtrace commit` dead-end on a fresh repo."""
+        assert carries_ai_history(build_user_commit_message(message="Ini", agitrack_session_id="s-1")) is False

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
-from agitrack.commits import METADATA_HEADER
+from agitrack.commits import METADATA_HEADER, carries_ai_history
 from agitrack.transcripts import capabilities
 from agitrack.commits.message import _trace_and_metadata_lines
 from agitrack.metrics import backtrace as bt
@@ -140,9 +140,14 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         return 0
     changed = filesmod._numstat_by_commit(repo, "HEAD", set(commits))
     ai_map = _match_turns_to_commits(repo, commits, changed, turns)
-    # AI commits already carrying aGiTrack metadata (a repo that used aGiTrack for part of its life)
-    # are left untouched — only agent-made commits WITHOUT metadata are annotated.
-    already_tracked = {sha for sha in ai_map if METADATA_HEADER in _commit_message(repo, sha)}
+    # AI commits that already record AI WORK (a repo that used aGiTrack for part of its life) are
+    # left untouched — only agent-made commits without that record are annotated. The test is
+    # `carries_ai_history`, NOT "has a metadata block": a plain USER commit made through aGiTrack
+    # carries an attribution-only block with no turn, no trace and no tokens, and reading that as
+    # "already tracked" made the whole command dead-end with "Nothing to add" on exactly the repos
+    # it exists for — someone who ran aGiTrack, committed once, and has all their real history
+    # sitting in the backend transcripts.
+    already_tracked = {sha for sha in ai_map if carries_ai_history(_commit_message(repo, sha))}
     to_annotate = len(ai_map) - len(already_tracked)
     if to_annotate == 0:
         kept = "already tracked" if already_tracked else "user commits with no agent-made edits to attribute"
@@ -337,6 +342,24 @@ def _match_turns_to_commits(
     return ai_map
 
 
+def _without_attribution_only_metadata(message: str) -> str:
+    """*message* with any attribution-only aGiTrack block removed, leaving the user's own text.
+
+    Only reached for a commit `carries_ai_history` said records no AI work, so anything dropped
+    here is a bare ``commit_type: user`` block — session id, system and version, no turn behind it.
+    The block is a run of contiguous ``key: value`` lines, so it ends at the first blank line.
+    """
+    out, rest = [], message
+    while METADATA_HEADER in rest:
+        head, _, tail = rest.partition(METADATA_HEADER)
+        out.append(head)
+        block, sep, remainder = tail.partition("\n\n")
+        rest = remainder if sep else ""  # a trailing block runs to the end: drop it entirely
+        del block
+    out.append(rest)
+    return "".join(out).rstrip()
+
+
 def _annotation(turns: list[_TurnRec]) -> str:
     """The ``# Interaction Trace`` + ``# aGiTrack Metadata`` block to append to a commit, built from
     the turns that produced it — rendered in the exact format a real aGiTrack commit uses."""
@@ -408,10 +431,13 @@ def _replay(repo, commits: list[str], ai_map: dict[str, list[_TurnRec]], new_bra
 
         message = repo._run(["git", "log", "-1", "--format=%B", sha], check=False).stdout.rstrip("\n")
         turns = ai_map.get(sha)
-        # Don't double-annotate a commit that already carries aGiTrack metadata (e.g. a repo that
-        # used aGiTrack for part of its life).
-        if turns and METADATA_HEADER not in message:
-            message = message.rstrip() + "\n\n" + _annotation(turns) + "\n"
+        # Don't double-annotate a commit that already RECORDS AI WORK (a repo that used aGiTrack
+        # for part of its life). Same predicate as the count promised above, so what gets written
+        # matches what the user agreed to. An attribution-only user block is not such a record, and
+        # is dropped rather than left beside the annotation: two metadata blocks would read as a
+        # squash aggregate whose user constituent carries nothing.
+        if turns and not carries_ai_history(message):
+            message = _without_attribution_only_metadata(message).rstrip() + "\n\n" + _annotation(turns) + "\n"
 
         args = ["git", "commit-tree", tree]
         for parent in new_parents:
