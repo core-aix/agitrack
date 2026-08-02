@@ -8612,7 +8612,7 @@ class ProxyRunner:
     # feed. That is the "stray text in the input box" leak, and it is why bounding the parse
     # matters more than any filter downstream. 16 KB is ~6 ms — comfortably inside the duty
     # cycle measured to lose nothing.
-    PARSE_MAX_BYTES = 8192
+    PARSE_MAX_BYTES = 16384
 
     def _feed_child_output(self, output: bytes) -> None:
         """Parse backend output into the screen model, bounded per pass.
