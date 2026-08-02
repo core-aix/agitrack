@@ -11218,29 +11218,42 @@ def test_the_stdin_reader_thread_keeps_the_tty_queue_from_overflowing(monkeypatc
         assert host._reader is not None and host._reader.is_alive()
         assert host.stdin_fileno() != 0  # the reactor selects on the wake pipe now
 
-        # Far more than the ~1 KB queue holds, and NOBODY reads while it is written — exactly
-        # the window (repaint + timers) in which input used to be silently discarded.
+        # Far more than the ~1 KB queue holds, written while the main thread HOLDS THE GIL —
+        # which is the whole point. A repaint burns CPU in Python; it does not sleep. An
+        # earlier version of this test used time.sleep() to model "nobody is reading", and
+        # sleep RELEASES the GIL, so the reader ran freely and the test passed even when the
+        # thread was starved. Modelled honestly, the reader must still keep up.
+        def spin(seconds):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                for _ in range(200):
+                    pass
+
         report = b"\x1b[<64;43;29M"
         burst = report * 900  # ~10 KB
-        sent = 0
-        deadline = time.monotonic() + 5
-        while sent < len(burst) and time.monotonic() < deadline:
-            try:
-                sent += os.write(master, burst[sent : sent + 512])
-            except BlockingIOError:
-                time.sleep(0.001)
+        sent = [0]
+        done = threading.Event()
 
+        def writer():
+            while sent[0] < len(burst):
+                try:
+                    sent[0] += os.write(master, burst[sent[0] : sent[0] + 512])
+                except BlockingIOError:
+                    time.sleep(0.001)
+                except OSError:
+                    break
+            done.set()
+
+        threading.Thread(target=writer, daemon=True).start()
         got = bytearray()
-        deadline = time.monotonic() + 5
-        while len(got) < sent and time.monotonic() < deadline:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (done.is_set() and len(got) >= sent[0]):
+            spin(0.0043)  # one repaint's worth of GIL-holding work
             chunk = host.read_stdin(65536)
             if chunk:
                 got.extend(chunk)
-            else:
-                time.sleep(0.005)
-        assert len(got) >= sent * 0.9, f"lost {sent - len(got)} of {sent} bytes to the tty queue"
+        assert len(got) >= sent[0] * 0.9, f"lost {sent[0] - len(got)} of {sent[0]} bytes to the tty queue"
         # And nothing arrived chopped in half: every report is whole.
-        assert bytes(got).count(b"\x1b") == bytes(got).count(b"M")
         assert not _re.sub(rb"\x1b\[<\d+;\d+;\d+M", b"", bytes(got)), "a report was truncated"
 
         host.set_cooked()  # a prompt takes the terminal: the reader must stand down
