@@ -437,7 +437,7 @@ Closed by the 2026-08-03 coverage audit (see `tests/TEST_PLAN.md` for the measur
 - ~~the composition layer — `run()` and `_loop` were reachable only through their callees~~ → §11b
 - ~~backend parity was unenforced; `test_proxy.py` ran entirely on Claude~~ → §11c
 - ~~nothing ever called a real backend CLI~~ → §11d (`-m live`)
-- ~~JSON mode / the UI bridge / `--recover` had no matrix section~~ → §12d
+- ~~JSON mode and the UI bridge had no matrix section~~ → §12d (`--recover` still has none — see below)
 
 Still open from that audit:
 - `shell/runner.py` is at 56% (was 43%): `_handle_agent_prompt` and `_handle_pre_compaction` are
