@@ -651,19 +651,13 @@ class CommitEngine:
             return None, awaited_followups
 
         if not exported_session:
-            # An EMPTY conversation still has to be ADOPTED. `/clear` (and OpenCode's `/new`)
-            # writes the new transcript the instant it runs but leaves it with no turns until the
-            # first prompt, so there is nothing to export — and returning here threw the discovery
-            # away and left the pin on the conversation the user had just discarded. Quitting
-            # before typing then resumed the OLD one on the next launch, and the name the user gave
-            # the new session was applied to it. Nothing is recorded from an empty session; only
-            # the pin moves, and the per-conversation watermark keeps that safe.
-            if session_id and session_id != self.state.backend_session_id:
-                debug_fn(f"adopting empty conversation {session_id} (switched inside the backend)")
-                note_session_change_fn(session_id)
-                self.state.backend_session_id = session_id
-            else:
-                debug_fn(f"agent parse consumed without session session_id={session_id}")
+            # Deliberately does NOT move the pin. An empty transcript is not evidence of a
+            # switch: Claude mints a fresh EMPTY session id on every resume/picker action, and
+            # adopting one drops the user into a blank session on the next start (the same trap
+            # `claude.latest_session_id` and `_sync_tracked_session` avoid by preferring a ref
+            # with a label). A real switch is picked up by `_service_native_session_switch` once
+            # the conversation has content, which is also when its name can be asked for.
+            debug_fn(f"agent parse consumed without session session_id={session_id}")
             return False, awaited_followups
 
         new_session_id = exported_session.session_id or session_id

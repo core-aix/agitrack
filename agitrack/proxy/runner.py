@@ -960,6 +960,8 @@ class ProxyRunner:
         # used to identify (and then pin to) the session aGiTrack actually spawned
         # rather than chasing whichever session is globally newest.
         self._pre_spawn_sessions: dict[str, float] | None = None
+        # Throttle for _service_native_session_switch (see SESSION_WATCH_SECONDS).
+        self._session_watch_at = 0.0
         # Raw responses captured from the host terminal so we can answer the
         # same queries OpenCode makes (foreground/background/palette colors and
         # device attributes). Without these, OpenCode cannot detect the real
@@ -4015,10 +4017,15 @@ class ProxyRunner:
         if not pinned:
             return
         try:
-            refs = {ref.id: ref.updated for ref in self.backend.list_sessions(self.repo.repo)}
+            listed = self.backend.list_sessions(self.repo.repo)
         except Exception as error:
             self._debug(f"pin resync skipped: {error!r}")
             return
+        # Only conversations that HAVE CONTENT can be resumed into. Claude mints a fresh EMPTY
+        # session id on every resume/picker action; it is newest by mtime and has nothing in it,
+        # and adopting one drops the user into a blank session on the next start. A ref's label
+        # is its first real user prompt, so `label` is None exactly when there is no real turn.
+        refs = {ref.id: ref.updated for ref in listed if ref.label or ref.id == pinned}
         if pinned not in refs:
             return  # not our directory's conversation (a worktree/rename case): leave staging to it
         newest = max(refs.items(), key=lambda item: item[1])
@@ -4026,6 +4033,89 @@ class ProxyRunner:
             return
         self._debug(f"pin resync: {pinned} -> {newest[0]} (newer conversation in this directory)")
         self.state.backend_session_id = newest[0]
+        self._restore_or_ask_session_name(newest[0], quiet=True)
+
+    # How often to ask the backend which conversation is live. One cheap directory listing;
+    # slow enough to be free, fast enough that the status bar catches up within a breath.
+    SESSION_WATCH_SECONDS = 2.0
+
+    def _service_native_session_switch(self) -> None:
+        """Follow a conversation switch the user made with the BACKEND's OWN commands, live.
+
+        `/clear`, `/resume`, OpenCode's `/new` and its session picker all change which
+        conversation is being written, and until now aGiTrack only noticed at the end of a turn
+        (or not at all). The status bar kept showing the previous name and id, so the one place
+        the user checks was actively wrong about what they were talking to.
+
+        Adopts only a conversation that HAS CONTENT: an empty transcript is not evidence of a
+        switch (Claude mints one on every resume/picker action), and it is also the moment a name
+        can be asked for meaningfully. That costs at most one turn of latency on a brand-new
+        conversation, and buys immunity to the blank-session trap.
+        """
+        now = time.monotonic()
+        # getattr: the runner's session-level fields go through the Session property layer,
+        # so an __init__ assignment is not guaranteed to land as a plain runner attribute.
+        if now - getattr(self, "_session_watch_at", 0.0) < self.SESSION_WATCH_SECONDS:
+            return
+        self._session_watch_at = now
+        if not self.running or self.agent_in_flight or self.input.capturing:
+            return  # never interrupt a running turn or an open palette
+        try:
+            refs = self.backend.list_sessions(self.repo.repo)
+        except Exception as error:
+            self._debug(f"session watch failed: {error!r}")
+            return
+        with_content = [ref for ref in refs if ref.label]
+        if not with_content:
+            return
+        newest = max(with_content, key=lambda ref: ref.updated)
+        current = self.state.backend_session_id
+        if newest.id == current:
+            return
+        ours = next((ref.updated for ref in refs if ref.id == current), None)
+        if ours is not None and newest.updated <= ours:
+            return  # ours is still the live one; a stale sibling must not pull tracking off it
+        self._debug(f"native session switch: {current} -> {newest.id}")
+        self.state.backend_session_id = newest.id
+        self.state.last_backend_message_id = None
+        self._initialize_session_baseline()
+        self._restore_or_ask_session_name(newest.id)
+
+    def _restore_or_ask_session_name(self, session_id: str, *, quiet: bool = False) -> None:
+        """Put the status bar back in step with the conversation now being tracked.
+
+        Two cases, and they must not be confused. A conversation aGiTrack has seen before carries
+        a name the user already chose: going BACK to it (`/resume`) has to restore that name and
+        id, not invent a new one. A conversation it has not seen is new work, and gets asked for
+        a name — the same question `session → New` asks.
+        """
+        try:
+            # `getattr`, not attribute access: a failed lookup here falls through to ASKING for a
+            # name, so an incidental AttributeError would silently re-ask for a conversation the
+            # user has already named — the exact thing this method exists to prevent.
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            known = root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            known = None
+        if known:
+            self.name = known
+            if not quiet:
+                self._set_message(f"Switched back to session '{known}' ({_short_session(session_id)}).")
+            self._render()
+            return
+        # Repaint FIRST so the new id is on the status bar behind the prompt: the question makes
+        # sense only once the user can see that the conversation really did change.
+        self._render()
+        if quiet:
+            return  # startup: the normal naming flow runs right after and would ask twice
+        name = self._prompt_session_name("New conversation detected", default=self.name)
+        if name:
+            self.name = name
+            self._persist_session_name(session_id)
+        self._render()
 
     def _repo_latest_session_id(self) -> str | None:
         # The conversation a bare `claude -c` / `opencode` would continue in the
@@ -8465,6 +8555,7 @@ class ProxyRunner:
                 self._service_precompact_summary()
                 self._service_background_sessions()
                 self._service_deferred_switch_offer()  # a switch's copy/commit offer, once reconciled
+                self._service_native_session_switch()  # /clear, /resume, OpenCode's picker
                 if self._base_advanced:
                     self._base_advanced = False
                     self._sync_idle_worktrees_to_base()
