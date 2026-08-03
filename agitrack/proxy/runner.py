@@ -1619,6 +1619,7 @@ class ProxyRunner:
         # FRESH one starts in the wrong/old dir. Staging only ever moves OUR recorded session id
         # (set for this repo), so it's safe; after it, _spawn's gate sees the dir match and resumes.
         if self.state.backend_session_id and not self._force_new_session:
+            self._resync_pin_to_the_live_conversation()
             self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
@@ -3994,6 +3995,37 @@ class ProxyRunner:
         return max((ref.updated for ref in refs if ref.id == session_id), default=0.0)
 
     _AUTO_NAME_RE = re.compile(r"^session-\d+$")
+
+    def _resync_pin_to_the_live_conversation(self) -> None:
+        """Before resuming, re-point the pin at the conversation most recently written here.
+
+        In-session discovery only runs when a turn completes, so a user who switches conversation
+        inside the backend and QUITS before typing (`/clear`, then Ctrl-C) leaves the pin on the
+        conversation they discarded. The next launch then resumes THAT one — the reported symptom:
+        aGiTrack asked for a name for the new session and reopened the old one under it.
+
+        This asks the same question worktree and background mode ask continuously (`what is the
+        newest human conversation in this directory?`), just once, at startup. The trade-off is
+        the same as theirs: a conversation the user drove here OUTSIDE aGiTrack, more recently
+        than the pinned one, is adopted. That is the honest reading of "most recent work in this
+        directory", and it is what those modes have always done — the pin only ever moves to a
+        conversation `list_sessions` already vouched for as human-driven.
+        """
+        pinned = self.state.backend_session_id
+        if not pinned:
+            return
+        try:
+            refs = {ref.id: ref.updated for ref in self.backend.list_sessions(self.repo.repo)}
+        except Exception as error:
+            self._debug(f"pin resync skipped: {error!r}")
+            return
+        if pinned not in refs:
+            return  # not our directory's conversation (a worktree/rename case): leave staging to it
+        newest = max(refs.items(), key=lambda item: item[1])
+        if newest[0] == pinned or newest[1] <= refs[pinned]:
+            return
+        self._debug(f"pin resync: {pinned} -> {newest[0]} (newer conversation in this directory)")
+        self.state.backend_session_id = newest[0]
 
     def _repo_latest_session_id(self) -> str | None:
         # The conversation a bare `claude -c` / `opencode` would continue in the
