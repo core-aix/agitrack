@@ -4,7 +4,10 @@ Everything else in the suite tests a method. These test the *sequence* — which
 bugs that survive a green suite live, because each individual method is correct and only the
 order or the wiring is wrong. See ``tests/harness.py`` for why this is a separate harness.
 
-All real-git. Nothing here sleeps: the reactor is bounded by iteration count.
+All real-git. Nothing here sleeps on a fixed delay: the reactor is bounded by iteration count,
+and the tests whose result is produced by the git WORKER thread stop on the outcome instead —
+how many reactor ticks a worker pass takes is a scheduling detail, and asserting on a tick count
+makes the test a coin toss (it passed on macOS and failed on Linux for exactly that reason).
 """
 
 from __future__ import annotations
@@ -328,6 +331,20 @@ def test_startup_installs_the_hook_slate_through_the_shared_method(tmp_path):
 # --- a turn, all the way to a commit ----------------------------------------
 
 
+def _git_log(repo_path) -> str:
+    return subprocess.run(
+        ["git", "log", "--all", "--format=%B"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+
+
+def _committed(runner) -> bool:
+    return "add a greeting" in _git_log(runner.repo.repo)
+
+
 def test_reactor_commits_a_finished_turn_into_real_git(tmp_path):
     """The pipeline's whole point, driven through the REAL reactor rather than by calling the
     commit path directly.
@@ -389,23 +406,23 @@ def test_reactor_commits_a_finished_turn_into_real_git(tmp_path):
         runner.turn_awaiting_commit = True
         runner.last_child_output = 0.0  # the backend has been quiet: the turn is over
         runner._active_transcript_mtime = lambda: 0.0
+        # Stop as soon as the commit lands, rather than after a fixed number of iterations.
+        # The commit is made by the git WORKER thread, so how many reactor ticks it takes is a
+        # scheduling detail; waiting for the outcome makes the test fast when the worker is
+        # prompt and patient when the machine is loaded.
+        if _committed(runner):
+            runner.running = False
 
     h = launch(
         tmp_path,
         monkeypatch,
         repo=repo,
-        reactor_iterations=12,
+        reactor_iterations=600,  # ceiling only; _hold_the_commit_gate_open stops at the commit
         script=_script,
         on_tick=_hold_the_commit_gate_open,
     )
 
-    log = subprocess.run(
-        ["git", "log", "--all", "--format=%B"],
-        cwd=h.runner.repo.repo,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout
+    log = _git_log(h.runner.repo.repo)
     assert "add a greeting" in log, f"the reactor never committed the finished turn; log was:\n{log}"
     assert "backend: claude" in log
 

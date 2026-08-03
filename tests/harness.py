@@ -365,6 +365,13 @@ def launch(
     # about what runs, only how long the reactor sits in select waiting for it.
     runner.ACTIVE_POLL_SECONDS = 0.01
     runner.IDLE_POLL_SECONDS = 0.01
+    # The commit pipeline does NOT run in the reactor's timers phase — it runs on the git
+    # worker thread, which the phase merely nudges, and which floors itself to one pass every
+    # GIT_PASS_MIN_INTERVAL (0.25s in production). An iteration-bounded reactor test therefore
+    # finishes long before the worker's first pass, so whether a commit lands is a coin toss
+    # decided by thread scheduling — which is exactly how a commit test passed on macOS and
+    # failed on Linux. Unflooring it lets the worker keep pace with the collapsed reactor.
+    runner.GIT_PASS_MIN_INTERVAL = 0.0
 
     # Stand in for the human at the keyboard whenever a modal asks something. Only the
     # keypress is faked; the modal itself runs for real. Without this the first popup the
