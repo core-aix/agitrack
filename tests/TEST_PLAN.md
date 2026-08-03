@@ -163,34 +163,59 @@ them up. Delete them.
 
 ---
 
-# Current status (2026-08-03)
+# Current status (2026-08-03) — plan complete
 
-**Two reported bugs: fixed, verified, covered.** Detail in the Outcome section below (items 2
-and 3) and in `FLOW_MATRIX.md` §12e.
+**`2801 passed, 10 skipped`. Ruff, ruff format and mypy clean. Coverage 81.45% against a 78%
+floor. ~1m40s under `-n auto`, down from 6m12s. Three consecutive full parallel runs green,
+plus 6 live tests against the real Claude and OpenCode CLIs.**
 
-**`2738 passed, 10 skipped`. Ruff, ruff format and mypy clean. Coverage 81% against a 78% floor.
-~1m35s under `-n auto`, down from 6m12s. Four consecutive full parallel runs green.**
+Every item in the plan below is now implemented. The five that were still outstanding at the
+first pass — and were found by re-auditing rather than by remembering — are done:
+
+| Was outstanding | Now |
+|---|---|
+| P0: "reactor commits a turn end-to-end" | `test_reactor_commits_a_finished_turn_into_real_git` drives prompt → finished parse → timers phase → a real commit, plus the mirror that a still-running turn is NOT committed |
+| P0: retire the `run()` reimplementation | the four-call startup hook sequence is now `ProxyRunner._reset_hook_slate`; `run()` and `test_mode_switching.py` call the SAME method, and `test_startup_installs_the_hook_slate_through_the_shared_method` pins that they stay that way |
+| P2: backtrace daemon lifecycle | `tests/test_backtrace_daemon.py`, 13 tests → `FLOW_MATRIX.md` §12g |
+| P2: `--recover` had no matrix section | `FLOW_MATRIX.md` §12f |
+| P3: the remaining edge cases | `tests/test_durability.py` (10), `tests/test_token_accounting.py` (15), and the terminal/OpenCode-parser additions to `tests/test_edge_cases.py` |
+
+## Three more real defects, found by the tests written for them
+
+4. **OpenCode under-reported context by the whole cache.** It computed `context = input`, while
+   Claude sums `input + cache_read + cache_write`. On a live OpenCode turn that is 727 against a
+   true 6365 — the dashboard's context gauge reading ~9x low, and not comparable across backends.
+   A pre-existing test had pinned the wrong formula, which is why it survived.
+5. **`Session.master_fd` / `child_pid` raised instead of returning None.** Both are documented as
+   `None` when there is no process ("not spawned yet, or torn down"), and the runner is full of
+   `if session.master_fd is None` guards written for exactly that state — every one of which
+   raised `AttributeError` on the one case it exists for.
+6. **The OpenCode event stream carries no model** (verified against the real CLI), so every
+   headless run recorded `model=None`. Now read from its session store.
+
+Settled while testing, rather than fixed: OpenCode's step events are **per-step, not cumulative**
+— each `total` is exactly that step's own input+output+reasoning+cache. So `_read_events` summing
+them is correct. That was flagged as an open risk in the original audit; it is now a recorded
+fact, pinned against real captured output in `tests/test_token_accounting.py`.
 
 ## Making the suite safe to parallelize
 
 Turning on `-n auto` surfaced three latent problems. None was a product bug; all three were tests
-that had been relying on having the machine to themselves, and each needed a different fix:
+relying on having the machine to themselves, and each needed a different fix:
 
 * **Shared OS resources — ptys.** Concurrent workers forking pseudo-terminals exhaust the pool,
-  which surfaced as `test_spawn_pty_returns_handle_with_master_fd` failing and a worker dying,
-  neither reproducible in isolation. Fixed by pinning every pty-forking module to one worker via
-  `xdist_group("pty")` + `--dist loadgroup`.
+  surfacing as an unrelated-looking failure that never reproduced in isolation. Every pty-forking
+  module is pinned to one worker via `xdist_group("pty")` + `--dist loadgroup`.
 * **Shared OS resources — TCP ports.** `test_dashboard_network.py` picks a free base port and
   asserts `base+1`/`base+2` are allocated consecutively; another worker can take one in between.
-  This cannot be fixed by waiting longer — the contention has to be removed — so every
-  port-binding module shares `xdist_group("net")`.
-* **Wall-clock bounds on thread scheduling.** Three waits in `test_story.py` (a 10s build
-  deadline, `started.wait(5)`, a 5s unwind loop) measured how soon a background thread got
-  scheduled against 14 competing workers. The agent is faked in all of them, so elapsed time was
-  never the claim; the bounds are now generous enough that only a genuine hang trips them.
+  Waiting longer cannot fix that — the contention has to be removed — so every port-binding
+  module shares `xdist_group("net")`.
+* **Wall-clock bounds on thread scheduling.** Three waits in `test_story.py` measured how soon a
+  background thread got scheduled against 14 competing workers. The agent is faked in all of
+  them, so elapsed time was never the claim.
 
-The `xdist_group` mechanism is worth knowing about before adding tests that touch a global
-resource — a new pty- or port-binding module should join the relevant group.
+Worth knowing before adding tests that touch a global resource: a new pty- or port-binding module
+should join the relevant group.
 
 ---
 

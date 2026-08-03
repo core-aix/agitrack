@@ -9,7 +9,10 @@ All real-git. Nothing here sleeps: the reactor is bounded by iteration count.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -298,3 +301,120 @@ def test_reactor_gives_up_on_a_backend_stuck_in_a_crash_loop(tmp_path):
     assert h.runner._backend_exit_notice, "a give-up must explain itself to the user"
     assert h.steps.count("spawn") <= 5, f"the crash-loop guard did not hold; got {h.steps.count('spawn')} spawns"
     assert "restore" in h.host.modes
+
+
+def test_startup_installs_the_hook_slate_through_the_shared_method(tmp_path):
+    """The startup hook sequence runs via `_reset_hook_slate` — the same method the mode-switch
+    tests call.
+
+    `test_mode_switching.py` used to re-implement those four calls inline, so it asserted
+    against a COPY of the startup behaviour: the copy stayed green while `run()` changed. Both
+    now go through one method, and this pins that `run()` really is the caller — otherwise the
+    two could drift apart again with nothing noticing.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    calls: list[str] = []
+    from agitrack.proxy.runner import ProxyRunner
+
+    real = ProxyRunner._reset_hook_slate
+    monkeypatch.setattr(ProxyRunner, "_reset_hook_slate", lambda self: calls.append("slate") or real(self))
+
+    h = launch(tmp_path, monkeypatch)
+
+    assert calls == ["slate"], "run() no longer installs the hook slate through the shared method"
+    assert h.ran_before("base-guard", "loop")
+
+
+# --- a turn, all the way to a commit ----------------------------------------
+
+
+def test_reactor_commits_a_finished_turn_into_real_git(tmp_path):
+    """The pipeline's whole point, driven through the REAL reactor rather than by calling the
+    commit path directly.
+
+    Every other commit test in the suite invokes `_maybe_agent_commit` (or lower) itself. This
+    one goes: agent edits a file → turn parses as finished → the timers phase notices → a
+    commit exists in git, carrying the turn's prompt and backend. If any link in that chain is
+    miswired the commit silently never happens, which is the single worst outcome for a tool
+    whose promise is "your agent's work ends up in git".
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    repo = init_repo(tmp_path)
+
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import ExportedSession, SessionTurn
+
+    turn = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="a1",
+        user_prompt="add a greeting",
+        final_response="added it",
+        tokens=TokenUsage(total=120, input=900, output=120),
+        model="claude-opus-5",
+    )
+
+    def _script(harness):
+        runner = harness.runner
+        # The agent's edit lands in its working directory...
+        (Path(runner.repo.repo) / "greeting.txt").write_text("hello\n", encoding="utf-8")
+        # ...and the backend reports the turn as finished. Stub at the PARSE boundary — the
+        # transcript format is covered exhaustively elsewhere; what is under test here is
+        # everything the reactor does with a finished parse.
+        runner.active.agent_parse_result = (
+            "ses-1",
+            ExportedSession(session_id="ses-1", model="claude-opus-5", turns=[turn], updated=1.0),
+            None,
+            runner.state,
+        )
+        runner.active.agent_parse_thread = None
+        runner.agent_in_flight = False
+        runner.turn_awaiting_commit = True
+        # The commit gate is a conjunction of three settle conditions. Satisfy each explicitly
+        # rather than sleeping them out: the worktree has stopped changing, a status read is
+        # due, and the backend has gone quiet on BOTH the pty and the transcript.
+        runner.FILE_STABLE_SECONDS = 0.0
+        runner.CHILD_IDLE_SECONDS = 0.0
+        runner._last_change_at = 0.0
+        runner.status_check_pending = True
+        runner.last_child_output = 0.0  # the backend has been quiet: the turn is over
+        runner._active_transcript_mtime = lambda: 0.0
+
+    h = launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=8, script=_script)
+
+    log = subprocess.run(
+        ["git", "log", "--all", "--format=%B"],
+        cwd=h.runner.repo.repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+    assert "add a greeting" in log, f"the reactor never committed the finished turn; log was:\n{log}"
+    assert "backend: claude" in log
+
+
+def test_reactor_does_not_commit_a_turn_that_is_still_running(tmp_path):
+    # The mirror, and the more dangerous direction: committing mid-turn captures half the
+    # agent's work and, under --no-worktree, offers to commit the user's own changes too.
+    monkeypatch = pytest.MonkeyPatch()
+    repo = init_repo(tmp_path)
+    head_before = repo.rev_parse("HEAD")
+
+    def _script(harness):
+        runner = harness.runner
+        (Path(runner.repo.repo) / "half.txt").write_text("partial\n", encoding="utf-8")
+        runner.agent_in_flight = True  # still working
+        runner.last_child_output = time.monotonic()  # and the terminal is live
+        runner._active_transcript_mtime = lambda: time.time()  # transcript advancing too
+        runner.file_change_event.set()
+
+    h = launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=6, script=_script)
+
+    log = subprocess.run(
+        ["git", "log", "--all", "--format=%B"],
+        cwd=h.runner.base_repo.repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout
+    assert "half.txt" not in log
+    assert h.runner.base_repo.rev_parse("HEAD") == head_before

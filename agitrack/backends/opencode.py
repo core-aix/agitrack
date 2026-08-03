@@ -315,14 +315,22 @@ class OpenCodeBackend:
         input_tokens = self._int_value(tokens.get("input"))
         output_tokens = self._int_value(tokens.get("output"))
         reasoning_tokens = self._int_value(tokens.get("reasoning"))
+        cache_read = self._int_value(cache.get("read"))
+        cache_write = self._int_value(cache.get("write"))
         return TokenUsage(
-            context=input_tokens or None,
+            # ``context`` is how FULL the model's window is, so it must count every token the
+            # model read — the cached prefix included. Counting only ``input`` under-reports it
+            # by the whole cache, which is most of a real conversation: measured on a live
+            # OpenCode turn, input=727 against cache.read=5632, so the gauge read 727 when the
+            # true context was 6365. Claude already sums the three (see backends/claude.py); this
+            # is the same formula, so the number means the same thing on both backends.
+            context=(input_tokens + cache_read + cache_write) or None,
             total=output_tokens + reasoning_tokens,
             input=input_tokens,
             output=output_tokens,
             reasoning=reasoning_tokens,
-            cache_read=self._int_value(cache.get("read")),
-            cache_write=self._int_value(cache.get("write")),
+            cache_read=cache_read,
+            cache_write=cache_write,
         )
 
     def _add_tokens(self, current: TokenUsage, addition: TokenUsage) -> None:

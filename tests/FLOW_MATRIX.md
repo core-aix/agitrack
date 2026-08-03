@@ -376,6 +376,45 @@ missing a turn or attributes it to the wrong model.
 | Bracketed paste split across reads is still recognised; pasted content reaches the backend byte-for-byte and a pasted newline/Ctrl-C is never interpreted | `test_bracketed_paste_markers_are_recognised_when_split_across_reads`, `test_pasted_content_reaches_the_backend_byte_for_byte`, `test_a_paste_split_mid_stream_still_forwards_everything` | mock |
 | Signal control bytes never reach the backend; ordinary bytes pass through untouched | `test_signal_control_bytes_are_never_forwarded_to_the_backend`, `test_ordinary_bytes_pass_through_untouched_when_not_capturing` | mock |
 
+## 12f. Headless recovery (`agitrack --recover`, `tests/test_recovery.py`, `tests/test_recovery_report.py`)
+Eager, standalone recovery of work left by a session that exited abruptly — the editor window
+closed mid-turn, or the process SIGKILLed. The agent's work survives on disk (uncommitted changes
+in the session worktree, plus the backend transcript) but is neither committed nor merged; the
+normal recovery is lazy (the next launch reconciles it), and this makes it immediate so the
+editor extension can run it the moment a session closes.
+
+The policy hinges on one distinction: a FINISHED turn is committed and merged, an ABORTED or
+still-in-flight turn is left strictly alone. Getting that backwards commits half a turn.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Latest turn finished → commit its changes, then merge (skipping the merge on conflict) | `test_finished_turn_is_committed_and_merged` | real-git |
+| Latest turn finished and summarization on → the commit is summarized | `test_finished_turn_is_summarized_when_enabled` | real-git |
+| **Latest turn aborted / still in flight → changes left untouched and the session flagged** — never commit a half-finished turn | `test_aborted_turn_is_left_untouched` | real-git |
+| Work already committed but unmerged → merged, as startup reconciliation does | `test_committed_but_unmerged_work_is_integrated` | real-git |
+| A live aGiTrack holds the repo lock → recovery no-ops (it must never commit under a running agent) | `test_recovery_skips_when_a_live_session_holds_the_lock`, `test_recover_returns_skipped_busy_when_lock_not_acquired`, `test_recovery_does_not_run_while_a_live_session_holds_the_lock` | real-git |
+| A SIGKILLed session's `flock` is released by the kernel, so recovery can take the repo (the premise the whole feature rests on) | `test_a_sigkilled_session_frees_the_repo_lock_for_recovery` | real-git |
+| No worktrees / nothing pending → clean no-op | `test_nothing_to_recover_with_no_worktrees`, `test_summary_nothing_to_recover` | real-git |
+| A worktree mid-merge, or one that raises, is FLAGGED for attention rather than silently skipped | `test_recover_one_flags_mid_merge_worktree`, `test_recover_one_exception_adds_to_flagged_once`, `test_recover_locked_handles_worktree_list_exception` | real-git |
+| The report says what happened (recovered / integrated / flagged / skipped-busy) | `test_recovery_report.py::test_summary_*`, `test_did_work_*` | mock |
+| Scope: `--no-worktree` sessions are deliberately NOT auto-committed (agent edits are intermixed with the user's own) | documented in `recovery.py`; enforced by the worktree-only scan in `test_nothing_to_recover_with_no_worktrees` | real-git |
+
+## 12g. Backtrace daemon lifecycle (`agitrack --backtrace`, `tests/test_backtrace_daemon.py`)
+The daemon's handshake file is its whole notion of "am I running": a JSON record naming a pid and
+a URL. Every row here is about that record staying honest — a stale one makes every later
+`--backtrace` believe a daemon is already running, permanently, since nothing else removes it.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| `status` with no daemon / with a live one (names its URL and pid) | `test_status_reports_nothing_when_no_daemon_has_run`, `test_status_names_the_url_and_pid_of_a_live_daemon` | real-proc |
+| `status` does not report a daemon whose process is gone | `test_status_does_not_report_a_daemon_whose_process_is_gone` | real-proc |
+| **A stale record is cleared, so a new daemon can start** (otherwise the feature is bricked for good) | `test_a_stale_handshake_is_cleared_so_a_new_daemon_can_start` | real-proc |
+| A corrupt / non-object / pid-less handshake reads as "no daemon" rather than raising | `test_a_corrupt_handshake_is_treated_as_no_daemon`, `test_a_handshake_that_is_not_an_object_is_rejected`, `test_a_handshake_without_a_pid_is_not_treated_as_live` | mock |
+| `stop` with nothing running says so; with a stale record it clears rather than claiming a stop | `test_stop_reports_plainly_when_nothing_is_running`, `test_stop_clears_a_stale_record_rather_than_claiming_to_stop_it` | real-proc |
+| `stop` really terminates a live process and clears its record | `test_stop_terminates_a_real_process_and_clears_its_record` | real-proc |
+| The preferred port being held by something else scans forward instead of failing | `test_the_daemon_binds_past_a_port_something_else_already_holds` | real-net |
+| Two directories track their daemons (and logs) independently | `test_the_daemon_log_path_is_scoped_to_the_directory`, `test_two_directories_track_their_daemons_independently` | mock |
+
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -437,7 +476,8 @@ Closed by the 2026-08-03 coverage audit (see `tests/TEST_PLAN.md` for the measur
 - ~~the composition layer — `run()` and `_loop` were reachable only through their callees~~ → §11b
 - ~~backend parity was unenforced; `test_proxy.py` ran entirely on Claude~~ → §11c
 - ~~nothing ever called a real backend CLI~~ → §11d (`-m live`)
-- ~~JSON mode and the UI bridge had no matrix section~~ → §12d (`--recover` still has none — see below)
+- ~~JSON mode / the UI bridge / `--recover` had no matrix section~~ → §12d, §12f
+- ~~the backtrace daemon lifecycle was untested~~ → §12g
 
 Still open from that audit:
 - `shell/runner.py` is at 56% (was 43%): `_handle_agent_prompt` and `_handle_pre_compaction` are
