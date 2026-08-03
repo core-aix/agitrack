@@ -163,36 +163,34 @@ them up. Delete them.
 
 ---
 
-# Current status (paused 2026-08-03) — read this first
+# Current status (2026-08-03)
 
-**Two reported bugs: fixed, verified, covered.** Details in the Outcome section below (items 2
+**Two reported bugs: fixed, verified, covered.** Detail in the Outcome section below (items 2
 and 3) and in `FLOW_MATRIX.md` §12e.
 
-| | |
-|---|---|
-| Agent-native session switch stranding the old conversation's summary | fixed — `runner._abandon_summary_for_switched_session`, 12 tests (both backends) |
-| `/goal` and `/loop` instructions missing from the trace | fixed — behavioural rule in `transcripts/claude.py`, 12 tests; verified against real on-disk transcripts |
+**`2738 passed, 10 skipped`. Ruff, ruff format and mypy clean. Coverage 81% against a 78% floor.
+~1m35s under `-n auto`, down from 6m12s. Four consecutive full parallel runs green.**
 
-**Suite:** `2736 passed, 10 skipped` — ruff, ruff format and mypy all clean.
+## Making the suite safe to parallelize
 
-**One known flake, not yet fixed** (this is where work paused):
+Turning on `-n auto` surfaced three latent problems. None was a product bug; all three were tests
+that had been relying on having the machine to themselves, and each needed a different fix:
 
-`tests/test_story.py` has two tests that wait on a background build thread against a wall-clock
-bound — `test_a_build_runs_in_the_background_and_reports_progress` (a 10s completion deadline)
-and `test_stopping_a_build_releases_the_reader_at_once` (`started.wait(5)` for a worker thread to
-be scheduled). Under `-n auto` on a 14-core machine one of them fails perhaps one run in three;
-both pass reliably in isolation (`pytest tests/test_story.py` → 68 passed) and at lower worker
-counts. Nothing about the product is wrong — the threads just do not get scheduled inside the
-bound while 14 workers compete.
+* **Shared OS resources — ptys.** Concurrent workers forking pseudo-terminals exhaust the pool,
+  which surfaced as `test_spawn_pty_returns_handle_with_master_fd` failing and a worker dying,
+  neither reproducible in isolation. Fixed by pinning every pty-forking module to one worker via
+  `xdist_group("pty")` + `--dist loadgroup`.
+* **Shared OS resources — TCP ports.** `test_dashboard_network.py` picks a free base port and
+  asserts `base+1`/`base+2` are allocated consecutively; another worker can take one in between.
+  This cannot be fixed by waiting longer — the contention has to be removed — so every
+  port-binding module shares `xdist_group("net")`.
+* **Wall-clock bounds on thread scheduling.** Three waits in `test_story.py` (a 10s build
+  deadline, `started.wait(5)`, a 5s unwind loop) measured how soon a background thread got
+  scheduled against 14 competing workers. The agent is faked in all of them, so elapsed time was
+  never the claim; the bounds are now generous enough that only a genuine hang trips them.
 
-They are precisely what this repo's existing `timing` marker describes ("asserts on measured
-wall-clock time"), but marking them would drop them from CI entirely and lose real coverage. The
-better fix is to make each wait generous (the intent is *"the build completes"* / *"the worker
-starts"*, not *"within 10 seconds"*), or to give `test_story.py` its own `xdist_group` so its
-background builds do not compete with the pty group. **Decide and apply this before turning
-`-n auto` on in CI** — the workflow change is already committed, so CI would inherit the flake.
-
-Everything else below is done and green.
+The `xdist_group` mechanism is worth knowing about before adding tests that touch a global
+resource — a new pty- or port-binding module should join the relevant group.
 
 ---
 
