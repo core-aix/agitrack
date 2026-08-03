@@ -11686,3 +11686,109 @@ def test_the_pinned_session_is_kept_until_something_newer_is_written(monkeypatch
     runner._pre_spawn_sessions = {"someone-elses": 9999.0}
     backend._refs = [SessionRef("someone-elses", 9999.0)]
     assert runner._discover_spawned_session() is None
+
+
+def test_an_empty_conversation_is_still_adopted(tmp_path):
+    """`/clear` writes its transcript immediately but leaves it with no turns until the first
+    prompt, so there is nothing to export. The pin must move anyway — otherwise quitting before
+    typing resumes the conversation the user just discarded, and the name they gave the new
+    session lands on the old one (the reported symptom)."""
+    from agitrack.proxy.commit_engine import CommitEngine
+
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "before-the-clear"
+    runner = make_runner(state=state)
+    session = runner.active
+    session.agent_parse_result = ("after-the-clear", None, None, state)  # export empty
+    noted = []
+
+    committed, _ = CommitEngine(runner.repo, state).finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda _m: None,
+        note_session_change_fn=noted.append,
+        mirror_fn=lambda _s: None,
+        commit_fn=lambda *a, **k: None,
+        on_cancelled_fn=None,
+        note_in_flight_fn=lambda *a, **k: None,
+    )
+
+    assert committed is False  # nothing to commit from an empty conversation...
+    assert state.backend_session_id == "after-the-clear"  # ...but the pin followed it
+    assert noted == ["after-the-clear"]  # and the name record follows too
+
+
+def test_an_empty_parse_for_the_SAME_session_changes_nothing(tmp_path):
+    """The ordinary "no result yet" case must not be mistaken for a switch."""
+    from agitrack.proxy.commit_engine import CommitEngine
+
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "same"
+    runner = make_runner(state=state)
+    runner.active.agent_parse_result = ("same", None, None, state)
+
+    CommitEngine(runner.repo, state).finish_parse_if_ready(
+        session=runner.active,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda _m: None,
+        note_session_change_fn=lambda _s: pytest.fail("no switch happened"),
+        mirror_fn=lambda _s: None,
+        commit_fn=lambda *a, **k: None,
+        on_cancelled_fn=None,
+        note_in_flight_fn=lambda *a, **k: None,
+    )
+    assert state.backend_session_id == "same"
+
+
+def test_restart_resumes_the_conversation_the_user_switched_to(tmp_path):
+    """The second half of the report: `/clear` then quit, and the next launch reopened the OLD
+    conversation. Startup now re-points the pin at the newest conversation in this directory."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "before-the-clear"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend([SessionRef("before-the-clear", 100.0), SessionRef("after-the-clear", 200.0)]),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "after-the-clear"
+
+
+def test_restart_keeps_the_pin_when_it_is_still_the_newest(tmp_path):
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "mine"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend([SessionRef("mine", 300.0), SessionRef("older", 100.0)]),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "mine"
+
+
+def test_restart_leaves_a_pin_from_another_directory_alone(tmp_path):
+    """A pin that this directory's listing does not know (a worktree or a renamed repo) is the
+    retargeting path's business, not this one's — hijacking it would break the resume it stages."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "lives-in-a-worktree"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend([SessionRef("someone-else", 900.0)]),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "lives-in-a-worktree"
