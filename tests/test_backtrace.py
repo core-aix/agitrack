@@ -8,6 +8,8 @@ non-git temp directory to prove the git-independence the feature promises.
 
 from __future__ import annotations
 
+import pytest
+
 import json
 import os
 import re
@@ -19,6 +21,13 @@ from agitrack.metrics.web import aggregates_payload, format_html, log_page
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import make_edit
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn
+
+# Binds real TCP ports. Pinned to a single xdist worker (see the `xdist_group` marker note in
+# pyproject.toml): ports are a GLOBAL resource, so concurrent workers race for them — the
+# consecutive-allocation tests assert that base+1 and base+2 are still free, which another
+# worker can falsify between choosing the base and binding it. Unlike a slow test this cannot
+# be fixed by waiting longer; the contention has to be removed.
+pytestmark = pytest.mark.xdist_group("net")
 
 
 # --------------------------------------------------------------------------- edits math

@@ -8,14 +8,21 @@ them for the rest of the session. Those were being dropped entirely: no ``isMeta
 row exists for them, so the invocation was remembered, never consumed, and silently
 discarded. A commit produced by a paragraph-long ``/goal`` recorded no prompt at all.
 
-The rule is deliberately BEHAVIOURAL rather than a list of command names — Claude Code keeps
+The rule is decided from the ARGUMENTS rather than a list of command names — Claude Code keeps
 adding commands and users define their own skills, so any fixed list is out of date the moment
 it ships:
 
-    a slash command that carries arguments AND is followed by the agent doing work
-    is a user instruction.
+    a slash command whose arguments are PROSE (more than one word) carries a user
+    instruction, and belongs in the trace exactly like a typed prompt.
 
-The tests below pin both halves, and the exclusions that fall out of them.
+Crucially it does NOT also require the agent to have replied. A `/goal` typed while the agent is
+mid-tool-call, or as the last row of a transcript, has no reply to wait for yet — and those are
+the ordinary ways these commands get used (steering work already in progress). Requiring a reply
+dropped exactly those.
+
+Something must still exclude configuration, because an unanswered turn is not free: it stays
+incomplete and defers commits (the same reason `/compact` is excluded). One bare token —
+`/model sonnet`, `/goal clear` — is a parameter or a control word, not a request. Prose is.
 """
 
 from __future__ import annotations
@@ -103,22 +110,50 @@ def test_a_command_with_no_arguments_is_not_a_prompt(tmp_path):
     assert [t.user_prompt for t in session.turns] == []
 
 
-def test_a_command_the_agent_never_answers_is_not_a_prompt(tmp_path):
-    # The other half: `/model sonnet` carries args but is handled locally and gets no assistant
-    # response. Recording it would put configuration noise in every later commit's trace.
+def test_single_token_arguments_are_configuration_not_an_instruction(tmp_path):
+    # `/model sonnet` carries args, but "sonnet" is a parameter — nobody asked the agent to do
+    # anything. Recording it would open a turn that never completes, and an incomplete turn
+    # defers commits (the same reason /compact is excluded).
     session = _session(tmp_path, [_command("/model", "sonnet"), _user("Now refactor the parser."), _assistant()])
 
     assert [t.user_prompt for t in session.turns] == ["Now refactor the parser."]
 
 
-def test_a_real_prompt_supersedes_an_unanswered_directive(tmp_path):
-    # A directive the agent never acted on must not attach itself to the NEXT prompt's work.
+def test_a_control_word_argument_is_not_an_instruction(tmp_path):
+    # `/goal clear` turns the goal OFF. Same command as the instruction case, and still not a
+    # request — which is why the test is on the arguments, not on the command name.
+    session = _session(tmp_path, [_command("/goal", "clear"), _user("Carry on."), _assistant()])
+
+    assert [t.user_prompt for t in session.turns] == ["Carry on."]
+
+
+def test_an_instruction_is_recorded_even_when_no_reply_has_arrived_yet(tmp_path):
+    # The case that requiring a reply used to drop: the user types /goal and the transcript ends
+    # there (the agent has not answered yet). The instruction is still the user's request, so it
+    # must be in the trace — as a turn in flight, which completes when the reply lands.
+    session = _session(tmp_path, [_command("/goal", "Make every test pass.")])
+
+    assert [t.user_prompt for t in session.turns] == ["/goal Make every test pass."]
+    assert session.turns[0].complete is False
+
+
+def test_an_instruction_typed_mid_turn_is_recorded(tmp_path):
+    # How these commands are most often used: steering the agent while it is already working, so
+    # the current turn is mid-tool-call. Requiring a reply lost this one silently.
     session = _session(
         tmp_path,
-        [_command("/status", "verbose"), _user("Fix the failing test."), _assistant()],
+        [
+            _user("Start the refactor.", uuid="u-1"),
+            _assistant("Working.", stop_reason="tool_use", uuid="a-1"),
+            _command("/goal", "Also make sure every test passes."),
+            _assistant("Understood.", uuid="a-2"),
+        ],
     )
 
-    assert [t.user_prompt for t in session.turns] == ["Fix the failing test."]
+    assert [t.user_prompt for t in session.turns] == [
+        "Start the refactor.",
+        "/goal Also make sure every test passes.",
+    ]
 
 
 def test_a_directive_can_open_the_very_first_turn_of_a_conversation(tmp_path):
