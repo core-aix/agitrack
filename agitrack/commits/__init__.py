@@ -16,6 +16,7 @@ from agitrack.commits.message import (
     build_user_commit_message,
     carries_ai_history,
     is_fully_tracked_message,
+    is_in_flight_only_message,
     render_interaction_trace,
     summary_metadata_lines,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "build_user_commit_message",
     "carries_ai_history",
     "is_fully_tracked_message",
+    "is_in_flight_only_message",
     "render_interaction_trace",
     "summary_metadata_lines",
 ]

@@ -38,6 +38,7 @@ from agitrack.commits import (
     build_manual_squash_trailer,
     build_pending_trailer,
     is_fully_tracked_message,
+    is_in_flight_only_message,
     build_user_commit_message,
     summary_metadata_lines,
     write_lf,
@@ -2303,7 +2304,13 @@ class ProxyRunner:
             self._debug(f"manual snapshot failed: {error!r}")
             self._manual_pending_tree = None
             return False
-        return self._manual_tree_differs_from_tip(self._manual_pending_tree)
+        if self._manual_tree_differs_from_tip(self._manual_pending_tree):
+            return True
+        # An unchanged tree normally means the turn left nothing to record. It does NOT when the
+        # agent committed its own work mid-turn: that commit carries an in-flight block only, so
+        # the turn's trace and tokens are still owed, and declining here loses them outright.
+        # Record with the tree as it stands — the latent commit is metadata, not a diff.
+        return bool(self._uncovered_backend_commits())
 
     def _manual_record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
@@ -2351,6 +2358,21 @@ class ProxyRunner:
             if not tip:
                 return False
             clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
+            if clean and is_in_flight_only_message(self.repo.commit_message(head)):
+                # A clean tree normally means the fold hook already combined the pending turns
+                # INTO HEAD, so they are redundant. It does NOT when HEAD carries only an
+                # IN-FLIGHT block: the agent committed while its turn was still running, so that
+                # commit records who made the change but not the turn's trace or tokens — which
+                # are still owed. Dropping the chain here is what loses them for good, and in
+                # manual mode (where aGiTrack must not commit) the chain is the ONLY thing
+                # holding them until the user's next commit folds them in.
+                # Same rule as `_uncovered_backend_commits`: in-flight ≠ accounted for.
+                #
+                # Narrow on purpose: a commit with NO aGiTrack metadata (made outside aGiTrack,
+                # where the hook never ran) still drops the chain as before — that trace is
+                # unavoidably lost, and keeping the chain would re-attach it to some later,
+                # unrelated commit.
+                return False
             if clean or self.repo.is_ancestor(tip, head):
                 self.repo.update_ref(self._manual_ref(), head)
                 return True
@@ -10739,6 +10761,23 @@ class ProxyRunner:
         # the final response lands. Normal turns always arrive complete, so this is a no-op there.
         turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         uncovered = self._uncovered_backend_commits() if turn_complete else []
+        # The agent committed its own work MID-TURN and left nothing further to commit, so the
+        # tree is clean. The latent gate only fires on a CHANGED tree, so it would record
+        # nothing at all — and the agent's commit carries only an in-flight block, which
+        # explicitly promises the trace and tokens land later. Both paths then decline and the
+        # turn's whole accounting is lost, silently.
+        #
+        # In AUTO mode take the COVER path instead (the metadata-only commit worktree mode
+        # already makes over such hashes). Manual mode must not commit for the user, so it keeps
+        # the latent path — `_manual_gate` widens to record on a clean tree when commits are
+        # owed, and the record waits for the user's next commit to fold it in.
+        use_latent = self._latent_tracking
+        if uncovered and self._noworktree_auto:
+            try:
+                if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+                    use_latent = False
+            except Exception as error:
+                self._debug(f"clean-tree cover check failed: {error!r}")
         committed = CommitEngine(
             self.repo,
             self.state,
@@ -10760,8 +10799,8 @@ class ProxyRunner:
             # user's or agent's own commit (no-worktree auto also folds it itself, see
             # _auto_fold_latent_pending). In manual-record mode commit_turns never makes a cover —
             # ``backend_commits`` only feeds the recorded body's ``covered_commits`` metadata.
-            manual_gate_fn=self._manual_gate if self._latent_tracking else None,
-            manual_record_fn=self._manual_record if self._latent_tracking else None,
+            manual_gate_fn=self._manual_gate if use_latent else None,
+            manual_record_fn=self._manual_record if use_latent else None,
             backend_commits=uncovered,
         )
         if committed and uncovered and self._latent_tracking:
@@ -13085,16 +13124,31 @@ class ProxyRunner:
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
-        if self._latent_tracking:
-            # No-worktree modes fold the agent's own commits via the prepare-commit-msg hook
-            # (and _reconcile_manual_external_commit is the cover backup when the hook can't run),
-            # so the #35 cover pass below is superseded — see _service_manual_commit_mode.
-            return
         if not self._use_worktrees:
             # No-worktree: the agent's own commits live on the current branch (there is no
-            # separate base to integrate into). Cover them with aGiTrack metadata — the same
-            # #35 machinery, minus the integration step.
+            # separate base to integrate into). The prepare-commit-msg fold hook normally folds
+            # the pending tracking INTO the agent's commit, and then there is nothing uncovered
+            # and nothing to do here.
+            #
+            # But the hook can only fold a turn that has FINISHED. When the agent commits
+            # MID-TURN it stamps an in-flight block instead — attribution without the trace or
+            # the tokens, and its own text promises they "land in a later commit". If the turn
+            # then finishes having left nothing further to commit (the agent already committed
+            # every file it touched), the tree is clean, the latent fold has nothing to fold,
+            # and that promised later commit never happens: the turn's whole token accounting
+            # is lost, silently. `_uncovered_backend_commits` is precisely the question "is
+            # anything still owed a record?" — it already treats an in-flight-only commit as
+            # uncovered — so let the #35 cover pass run whenever it says yes.
+            #
+            # (This branch used to be unreachable: `_latent_tracking` is defined as
+            # `not _use_worktrees`, so an earlier `if self._latent_tracking: return` fired first
+            # on exactly the sessions this is written for.)
             if not self._uncovered_backend_commits() or self._summary_blocks_integration(now):
+                return
+            if self._manual_commits:
+                # Manual mode: the user decides when to commit, so aGiTrack must not add one.
+                # The pending chain keeps the record and folds into the user's next commit —
+                # `_reset_stale_manual_ref` is what must not throw it away in the meantime.
                 return
             self._attach_trace_to_backend_commits(now)  # parse → commit_turns → cover commit
             return

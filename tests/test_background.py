@@ -1546,3 +1546,49 @@ def test_manual_tracker_reconcile_covers_external_commit(tmp_path):
     assert repo.rev_parse("HEAD^{tree}") == user_tree  # cover introduced no diff
     assert "# aGiTrack Metadata" in repo.commit_message(cover)
     assert repo.ref_sha(tracker.ref()) == cover  # ref reset
+
+
+def test_daemon_manual_mode_never_commits_for_the_user(tmp_path):
+    """`agitrack -b --manual-commits`: the user decides when to commit, full stop.
+
+    The daemon's cover path — which exists so an agent commit that leaves a clean tree still
+    gets its trace and tokens — was never gated on manual mode, so it added an unrequested
+    commit to the user's branch. That is the one thing manual mode promises will not happen.
+    The interactive proxy already refuses this; the daemon simply never checked.
+
+    Nothing is lost by refusing: the latent path records the turn instead, and the fold hook
+    combines it into the user's next commit.
+    """
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    # The agent commits its OWN work, leaving the tree clean — the case that triggers a cover.
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") == agent_head, "manual mode must not commit on the user's behalf"
+
+
+def test_daemon_auto_mode_still_covers_an_agent_commit(tmp_path):
+    # The other side, so the manual gate stays narrow: AUTO mode must keep covering, or the
+    # fix would trade an unwanted commit for lost token accounting.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") != agent_head
+    assert "do x" in _git(repo, "log", "-1", "--format=%B", "HEAD")
