@@ -19,6 +19,13 @@ import pytest
 
 from agitrack.proxy.pty_backend import spawn_pty
 
+# Every test in this module forks a real pseudo-terminal. Pinned to a single xdist worker
+# (see the `xdist_group` marker note in pyproject.toml): N workers forking ptys at once
+# exhausts the OS pty pool, which surfaces as an unrelated-looking failure that never
+# reproduces in isolation.
+pytestmark = pytest.mark.xdist_group("pty")
+
+
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY only")
 win_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows ConPTY only")
 

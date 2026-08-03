@@ -21,6 +21,12 @@ from agitrack.transcripts import ExportedSession, SessionRef
 from agitrack.config import AgitrackState
 from proxy_helpers import make_runner
 
+# Every test in this module forks a real pseudo-terminal. Pinned to a single xdist worker
+# (see the `xdist_group` marker note in pyproject.toml): N workers forking ptys at once
+# exhausts the OS pty pool, which surfaces as an unrelated-looking failure that never
+# reproduces in isolation.
+pytestmark = pytest.mark.xdist_group("pty")
+
 
 class _FakeBackend:
     name = "fake"

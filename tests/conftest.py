@@ -7,9 +7,23 @@ for convenience.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 
-from proxy_helpers import make_runner as _make_runner  # noqa: F401 – re-exported below
+# Put the REPO ROOT on sys.path so `from tests.test_dashboard import ...` resolves.
+# pytest only adds `tests/` itself (the first dir without an __init__.py), so several modules
+# that share fixtures via `tests.<module>` imports were relying on the repo root arriving by
+# accident — through whichever editable-install layout the environment happened to use. That
+# is not a property of this repo, so reinstalling the package (a plain `uv sync`) silently
+# broke collection of five test modules. Anchoring it here makes the suite independent of how
+# aGiTrack is installed.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from proxy_helpers import make_runner as _make_runner  # noqa: E402,F401 – re-exported below
 
 
 @pytest.fixture(autouse=True)

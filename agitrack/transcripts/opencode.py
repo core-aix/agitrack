@@ -975,3 +975,121 @@ def configured_mcp_servers(repo: Path) -> frozenset[str]:
         if isinstance(section, dict):
             servers.update(str(name).strip() for name in section if str(name).strip())
     return frozenset(servers)
+
+
+# --- turn-end liveness signal ------------------------------------------------
+#
+# `_backend_idle_for` (proxy/runner.py) decides "has this turn finished?" from TWO signals:
+# the backend PTY going quiet, and the session transcript going quiet. It needs both, and the
+# transcript is the authoritative one, because each alone is wrong in an opposite direction:
+#
+#   * PTY alone, when the TUI emits an idle heartbeat: never quiet ⇒ the turn end is NEVER
+#     detected and the session commits NOTHING until the user's next prompt. (Measured for
+#     Claude on Linux at a steady 8 bytes/second.)
+#   * PTY alone, when a sub-agent runs quietly: quiet ⇒ aGiTrack decides the turn ended and
+#     commits MID-TURN, and under --no-worktree also offers to commit the user's own changes.
+#
+# Claude gets both from its per-session .jsonl. OpenCode had NEITHER — it exposes no
+# transcript file, so `getattr(backend, "session_last_activity", None)` returned None and the
+# runner silently fell back to PTY-only, leaving both failure modes live on this backend with
+# no second opinion available. That is what these two functions fix.
+#
+# OpenCode keeps sessions in a SQLite database (`opencode.db`), so the signal is a bounded
+# read-only query for the newest message timestamp IN THIS SESSION. Session-scoped is
+# essential: the database file's own mtime advances whenever ANY session writes, so statting
+# it would make a busy neighbouring session read as "this turn is still running" forever —
+# reintroducing the never-commits failure through the back door.
+
+_OPENCODE_DB_NAME = "opencode.db"
+
+
+def _opencode_data_root() -> Path:
+    """OpenCode's data directory. Honours XDG_DATA_HOME; otherwise the documented default."""
+    xdg = getenv_compat("XDG_DATA_HOME")
+    root = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return root / "opencode"
+
+
+def session_last_activity(session_id: str) -> float | None:
+    """Epoch seconds of the newest message in ``session_id``, or None when unavailable.
+
+    Best-effort by design: an OpenCode version with a different store, a locked database, or a
+    session that has no messages yet all yield None, and the caller then falls back to exactly
+    the behaviour it had before this existed. Opened read-only (``mode=ro``) with a short
+    timeout so aGiTrack can never block, lock, or write the user's OpenCode database — this is
+    polled from the reactor, so it must be cheap and it must never be able to stall the UI.
+    """
+    if not session_id:
+        return None
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return None
+    try:
+        import sqlite3
+
+        # uri=True + mode=ro guarantees we cannot create or modify the user's database, even
+        # if the path is wrong. A 0.2s timeout keeps a busy writer from stalling the reactor.
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = connection.execute(
+                "SELECT MAX(time_updated) FROM message WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+    except Exception:
+        return None  # wrong schema, locked, corrupt, no sqlite3 — all mean "no signal"
+    if not row or row[0] is None:
+        return None
+    return _to_seconds(row[0])
+
+
+def session_activity_mtime(session_id: str) -> float | None:
+    """The same signal as :func:`session_last_activity`, named for the runner's transcript
+    slot. Kept as a separate entry point because the runner asks the two questions for
+    different reasons — "which conversation is newest?" (ranking) versus "is this turn still
+    running?" (the idle check) — and a future OpenCode version may answer them from different
+    places even though today one query serves both."""
+    return session_last_activity(session_id)
+
+
+def session_model(session_id: str) -> str | None:
+    """``"<provider>/<model>"`` for a session, from OpenCode's own store, or None.
+
+    OpenCode's ``run --format json`` event stream does NOT name the model anywhere — verified
+    against the real CLI: neither ``step_start``, ``text`` nor ``step_finish`` carries it. So a
+    headless run (the summarizer, the learning page) came back with ``model=None`` and the
+    commit metadata recorded no model at all for this backend, while Claude recorded a real one.
+
+    The store does know, so ask it. Same read-only, best-effort, never-raise contract as
+    :func:`session_last_activity` — a None here just restores the previous behaviour.
+    """
+    if not session_id:
+        return None
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return None
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            row = connection.execute("SELECT model FROM session WHERE id = ?", (session_id,)).fetchone()
+        finally:
+            connection.close()
+    except Exception:
+        return None
+    if not row or not row[0]:
+        return None
+    # Stored as JSON: {"id": "gpt-5.5", "providerID": "openai", "variant": "minimal"}. Fall back
+    # to the raw string if a future version stores a plain name instead.
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return str(row[0]).strip() or None
+    if not isinstance(data, dict):
+        return str(row[0]).strip() or None
+    model_id = data.get("id") or data.get("modelID")
+    provider = data.get("providerID") or data.get("provider")
+    if not model_id:
+        return None
+    return f"{provider}/{model_id}" if provider else str(model_id)

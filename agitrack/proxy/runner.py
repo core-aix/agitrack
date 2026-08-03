@@ -1527,9 +1527,17 @@ class ProxyRunner:
         # ``state.backend`` on an unconfigured state now raises. Seed a concrete backend so
         # the test factory keeps producing a launch-ready session unless a test set one.
         # Guarded so tests that pass a non-AgitrackState stub (no ``data`` dict) are untouched.
+        #
+        # The default is overridable via ``backend_name=`` so a test can ask for a session on
+        # the OTHER backend without hand-building a state. It matters that this is reachable:
+        # while it was an unconditional "claude", every one of the ~260 tests built through this
+        # factory ran on Claude and no runner-level behaviour was ever exercised on OpenCode —
+        # which is how OpenCode came to ship with no turn-end signal at all (see
+        # tests/test_turn_end_detection.py).
+        default_backend = runner_overrides.pop("backend_name", "claude")
         state_data = getattr(session.state, "data", None)
         if isinstance(state_data, dict) and not state_data.get("backend"):
-            state_data["backend"] = "claude"
+            state_data["backend"] = default_backend
 
         # Apply runner-level overrides. Names shadowed by a class property are
         # routed through it; a read-only property makes the misuse loud instead
@@ -4076,10 +4084,48 @@ class ProxyRunner:
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
         self._debug(f"native session switch: {current} -> {newest.id}")
+        self._abandon_summary_for_switched_session(current, newest.id)
         self.state.backend_session_id = newest.id
         self.state.last_backend_message_id = None
         self._initialize_session_baseline()
         self._restore_or_ask_session_name(newest.id)
+
+    def _abandon_summary_for_switched_session(self, leaving_id: str | None, joining_id: str) -> None:
+        """Drop summary work belonging to the conversation we are switching AWAY from.
+
+        Summary state (``_summary_pending`` / ``_summary_result`` / the rolling
+        ``state.session_summary``) is keyed by SESSION-THE-OBJECT, not by backend conversation
+        id — one slot per aGiTrack session, because normally one aGiTrack session tracks one
+        conversation for its whole life. A native switch (`/clear`, `/resume`, OpenCode's
+        picker) breaks that assumption: the same aGiTrack session is now pointed at a different
+        conversation, while the old one's summary state is still sitting in those slots. Two
+        things then go wrong, both silently:
+
+        * a summary worker started for the OLD conversation's commit lands after the switch and
+          is applied/reported against the NEW conversation — and its ``sha`` is no longer the
+          head it was computed for, so the amend fails and the user is told summarization
+          failed in a session that never asked for one;
+        * ``state.session_summary`` — the ROLLING summary — still describes the old
+          conversation, so the new one's very first commit is summarized "in the context of"
+          work it has nothing to do with, and that wrong context then compounds into every
+          later summary of the new conversation.
+
+        So: forget the pending/finished result for the outgoing conversation, and clear the
+        rolling summary so the new one starts from a blank slate. The worker thread itself is
+        left to finish and die on its own (it is a daemon and holds no lock); only its RESULT
+        is disowned, because joining it here would block the reactor on a live LLM call.
+        """
+        if not leaving_id or leaving_id == joining_id:
+            return
+        pending, result = self._summary_pending, self._summary_result
+        if pending is not None or result is not None:
+            self._debug(f"discarding summary work for {leaving_id} (switched to {joining_id})")
+        self._summary_pending = None
+        self._summary_result = None
+        # A stale rolling summary is not merely useless on a new conversation — it is wrong
+        # input that the next summary is generated FROM.
+        self.state.session_summary = None
+        self.state.session_summary_commit = None
 
     def _restore_or_ask_session_name(self, session_id: str, *, quiet: bool = False) -> None:
         """Put the status bar back in step with the conversation now being tracked.
@@ -12174,6 +12220,20 @@ class ProxyRunner:
         session_id = getattr(self.state, "backend_session_id", None) if self.state else None
         if not session_id:
             return None
+        # A backend with no stat-able transcript file can still expose the signal directly
+        # (OpenCode keeps its sessions in a SQLite database, so it answers from a bounded
+        # read-only query instead of a path). Ask for that first: without it this method
+        # returns None on such a backend and `_backend_idle_for` degrades to the PTY alone —
+        # which is exactly the failure this whole mechanism exists to prevent, in both
+        # directions (never commits behind an idle heartbeat; commits mid-turn behind a quiet
+        # sub-agent). Cheap enough to call per tick, and any failure just yields None.
+        direct = getattr(self.backend, "session_activity_mtime", None)
+        if direct is not None:
+            try:
+                return direct(session_id)
+            except Exception as error:
+                self._debug(f"transcript activity lookup failed: {error!r}")
+                return None
         cached_id, cached_path = self._transcript_path_cache
         # A MISS must not be cached forever. The transcript often does not exist yet when a
         # session starts (the backend creates it on the first turn), and the miss used to be

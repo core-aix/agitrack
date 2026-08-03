@@ -163,6 +163,99 @@ them up. Delete them.
 
 ---
 
+# Current status (paused 2026-08-03) — read this first
+
+**Two reported bugs: fixed, verified, covered.** Details in the Outcome section below (items 2
+and 3) and in `FLOW_MATRIX.md` §12e.
+
+| | |
+|---|---|
+| Agent-native session switch stranding the old conversation's summary | fixed — `runner._abandon_summary_for_switched_session`, 12 tests (both backends) |
+| `/goal` and `/loop` instructions missing from the trace | fixed — behavioural rule in `transcripts/claude.py`, 12 tests; verified against real on-disk transcripts |
+
+**Suite:** `2736 passed, 10 skipped` — ruff, ruff format and mypy all clean.
+
+**One known flake, not yet fixed** (this is where work paused):
+
+`tests/test_story.py` has two tests that wait on a background build thread against a wall-clock
+bound — `test_a_build_runs_in_the_background_and_reports_progress` (a 10s completion deadline)
+and `test_stopping_a_build_releases_the_reader_at_once` (`started.wait(5)` for a worker thread to
+be scheduled). Under `-n auto` on a 14-core machine one of them fails perhaps one run in three;
+both pass reliably in isolation (`pytest tests/test_story.py` → 68 passed) and at lower worker
+counts. Nothing about the product is wrong — the threads just do not get scheduled inside the
+bound while 14 workers compete.
+
+They are precisely what this repo's existing `timing` marker describes ("asserts on measured
+wall-clock time"), but marking them would drop them from CI entirely and lose real coverage. The
+better fix is to make each wait generous (the intent is *"the build completes"* / *"the worker
+starts"*, not *"within 10 seconds"*), or to give `test_story.py` its own `xdist_group` so its
+background builds do not compete with the pty group. **Decide and apply this before turning
+`-n auto` on in CI** — the workflow change is already committed, so CI would inherit the flake.
+
+Everything else below is done and green.
+
+---
+
+# Outcome (implemented 2026-08-03)
+
+The plan below was carried out in full. Result:
+
+```
+BEFORE   2607 passed, 10 skipped   79% coverage   6m12s (serial)
+AFTER    2718 passed, 10 skipped   81% coverage   1m15s (pytest -n auto)
+         + 6 live tests behind `-m live`, run against the real Claude and OpenCode CLIs
+```
+
+**Four real defects were found and fixed, not just covered:**
+
+1. **OpenCode had no turn-end signal at all.** `_backend_idle_for` needs a signal that advances
+   only on real backend work; OpenCode answered neither `session_transcript_path` nor anything
+   else, so the runner silently fell back to the PTY alone — which fails in both directions
+   (never commits behind an idle heartbeat; commits mid-turn behind a quiet sub-agent). Fixed by
+   `transcripts/opencode.session_activity_mtime`, a session-scoped read-only query against
+   OpenCode's SQLite store. Session-scoping is load-bearing: the database file's own mtime
+   advances for ANY session, so statting it would reintroduce the never-commits failure.
+
+2. **A native session switch stranded the previous conversation's summary work.** `/clear`,
+   `/resume` and OpenCode's picker repoint one aGiTrack session at a different conversation while
+   the old one's summary state stays in the slots — so its result was applied and reported
+   against the new conversation (the amend failing, since the sha was no longer head), and the
+   stale rolling summary became INPUT to every later summary. Fixed in
+   `_abandon_summary_for_switched_session`.
+
+3. **Slash commands carrying user instructions were dropped from the trace entirely.** `/goal …`
+   and `/loop …` get no `isMeta` expansion row, so the invocation was remembered, never consumed,
+   and discarded — a commit driven by a paragraph-long `/goal` recorded no prompt at all. Fixed
+   behaviourally rather than by a list of names (Claude Code keeps adding commands, and skills are
+   invoked the same way): *a slash command with arguments that the agent then responds to is a
+   user instruction.*
+
+4. **OpenCode reported no model.** Found by the live tests on their first run: OpenCode's
+   `--format json` event stream names no model anywhere, so every headless run recorded
+   `model=None` in the commit metadata while Claude recorded a real one. Fixed by reading it from
+   the session store. This is precisely the drift class mocks cannot see.
+
+Two robustness fixes fell out of the edge-case work: the Claude transcript reader now uses
+`errors="replace"` (one undecodable byte — a torn multi-byte character mid-append — made the
+WHOLE session unparseable, i.e. no commits at all, silently), and `tests/conftest.py` now anchors
+the repo root on `sys.path` (five test modules were relying on the editable-install layout, so a
+plain `uv sync` broke their collection).
+
+**Infrastructure:** `pytest -n auto` (xdist) cuts the suite from 6m12s to 1m15s; coverage moved to
+`pytest --cov` because a wrapping `coverage run` never enters the xdist workers and reported 10%
+with every test passing; a `fail_under = 78` floor now makes a coverage regression fail the build;
+the Windows job grew from 4 test files to 15, adding the platform-agnostic core (commit engine,
+state, settings, paths, git/worktree) that had never executed on Windows despite the MSI being
+built and installed on every PR; and the two 723 KB `runner.py.bak*` files were removed.
+
+**Coverage moved where it was supposed to:** `runner.py` 75% → 79% (1,825 → 1,494 missed lines,
+almost all of the recovery in `run()` and the reactor phases), `shell/runner.py` 43% → 56%,
+`transcripts/claude.py` 83% → 84%, `transcripts/opencode.py` 79% → 80%.
+
+Remaining gaps are recorded in `FLOW_MATRIX.md` under "Known gaps / TODO".
+
+---
+
 # The plan
 
 Ordered by *(user-visible risk) ÷ (effort)*. P0 is the one that changes the suite's shape; everything

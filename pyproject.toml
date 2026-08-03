@@ -36,6 +36,17 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    # Parallel test execution (`pytest -n auto`). The suite is dominated by wall-clock waits
+    # on subprocesses, pty drains and poll intervals rather than CPU, so distributing it
+    # across cores turns a ~6-minute serial run into well under two. Every test is already
+    # isolated (its own tmp_path, its own AGITRACK_CONFIG_DIR via the autouse fixture), which
+    # is what makes this safe to switch on.
+    "pytest-xdist>=3.6",
+    # Coverage measured through pytest rather than by wrapping it in `coverage run`. With
+    # xdist the tests execute in WORKER SUBPROCESSES, which a plain `coverage run` never
+    # enters — it reported 10% and failed the floor while every test passed. pytest-cov starts
+    # and merges coverage inside each worker, so the number is the real one.
+    "pytest-cov>=6.0",
     "coverage>=7.14.1",
     "ruff>=0.9",
     "mypy>=1.13",
@@ -61,14 +72,39 @@ testpaths = ["tests"]
 # Windows' monotonic() granularity once produced `assert 0.0500000000001819 <= 0.05`. They are
 # kept, not deleted — they are the right tool when investigating a timing-specific problem.
 # Run them deliberately with:  pytest -m timing
-addopts = "-m 'not timing'"
+addopts = "-m 'not timing and not live' --dist loadgroup"
 markers = [
+    # Tests that fork a real pseudo-terminal. `--dist loadgroup` keeps every test carrying the
+    # same `xdist_group` on ONE worker, which serializes them relative to each other while the
+    # rest of the suite still spreads across cores. Without it, N workers each forking ptys
+    # concurrently exhaust the OS pty pool — observed on a 14-core machine as
+    # `test_spawn_pty_returns_handle_with_master_fd` failing and a worker dying, neither
+    # reproducible in isolation. forkpty from a multi-threaded process is hazardous enough
+    # (CPython warns about it) that bounding the concurrency is right regardless of the pool.
+    "xdist_group: pin to one xdist worker (see --dist loadgroup); used for pty/fork tests",
     "timing: asserts on measured wall-clock time; excluded by default, run with `-m timing`",
+    # Live tests call the REAL backend CLIs. They are the only thing that catches a backend
+    # changing its output format under us — which no mock can, since the mocks assert the
+    # shape we believed was true when we wrote them. Excluded by default because they need
+    # the backend installed and authenticated, cost real tokens, and take seconds each.
+    # Run with `pytest -m live` (each skips itself when its binary is absent).
+    "live: calls a real backend CLI; excluded by default, run with `-m live`",
 ]
 
 [tool.coverage.run]
 source = ["agitrack"]
 omit = ["tests/*"]
+# The suite starts real threads (git worker, summary workers, the reactor's helpers), so
+# coverage has to follow them or their lines read as dead. Worker-subprocess handling is
+# pytest-cov's job — see the dev-dependency note.
+concurrency = ["thread"]
+
+[tool.coverage.report]
+# A floor, not a target. CI measured 79% when this was introduced, so this fails only on a
+# real REGRESSION while leaving room for a legitimate refactor to move coverage around.
+# Raise it as coverage climbs; never lower it to make a red build green.
+fail_under = 78
+
 
 [tool.ruff]
 line-length = 120

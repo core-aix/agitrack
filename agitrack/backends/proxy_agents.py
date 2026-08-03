@@ -210,13 +210,47 @@ class ProxyAgent(Protocol):
         timestamp) restricts the answer to turns recorded at or after the current
         launch, so a stale pre-launch cwd isn't mistaken for drift."""
 
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
+        """Move the session's RECORDED working directory to ``cwd`` so a resume opens where it
+        was launched rather than in whatever directory it last ran in (a since-removed worktree,
+        or the base repo after ``--no-worktree``). ``git_branch`` additionally moves a recorded
+        worktree branch off the relocated rows, so a worktree session resumed under
+        ``--no-worktree`` stops reading as still in a worktree. Returns True if anything moved.
+
+        Declared here because the runner calls it on every backend (``_stage_backend_resume``)
+        and both agents implement it — it was part of the real contract while being absent from
+        this Protocol, which is exactly the drift ``test_backend_parity.py`` now prevents."""
+
     def latest_session_id(self, repo: Path) -> str | None: ...
+
+    # --- turn-end liveness ---------------------------------------------------
+    #
+    # ``_backend_idle_for`` needs a signal that advances ONLY on real backend work, to tell an
+    # in-progress turn from a merely-quiet terminal. A backend supplies it either as a file to
+    # stat (``session_transcript_path``) or directly (``session_activity_mtime``); the runner
+    # prefers the direct form and falls back to the path. A backend offering NEITHER leaves the
+    # runner on the PTY alone, which fails in both directions — see the extended note in
+    # ``transcripts/opencode.py``. Both are optional in the structural sense (the runner uses
+    # ``getattr``), but a backend should implement one of them.
 
     def session_transcript_path(self, session_id: str) -> Path | None:
         """The session's live transcript file to ``stat`` as a liveness signal, or None when the
         backend has no single stat-able transcript. Advances (mtime) while the agent is working
         even if it prints nothing to the terminal (e.g. waiting on a sub-agent), so the proxy can
         tell an in-progress turn from a merely-quiet one. The caller caches and stats it."""
+        return None
+
+    def session_activity_mtime(self, session_id: str) -> float | None:
+        """Epoch seconds of this session's most recent backend activity, for backends with no
+        stat-able transcript file (OpenCode answers from its SQLite store). None when unknown.
+        MUST be session-scoped: a shared, always-advancing signal would read as "this turn is
+        still running" forever and the session would never commit."""
+        return None
+
+    def session_last_activity(self, session_id: str) -> float | None:
+        """Epoch seconds of the session's newest message, for ranking conversations by genuine
+        user activity. Distinct from a file mtime, which aGiTrack's own staging/retargeting
+        bumps without adding a message. None when the backend can't tell."""
         return None
 
     def list_sessions(self, repo: Path) -> list[SessionRef]:
@@ -302,6 +336,16 @@ class OpenCodeProxyAgent:
 
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return None  # not tracked for OpenCode
+
+    def session_last_activity(self, session_id: str) -> float | None:
+        return opencode_session.session_last_activity(session_id)
+
+    def session_activity_mtime(self, session_id: str) -> float | None:
+        # OpenCode exposes no per-session transcript FILE to stat, so it answers the runner's
+        # liveness question directly instead of via `session_transcript_path`. Without this the
+        # runner has no transcript signal on this backend and `_backend_idle_for` falls back to
+        # the PTY alone — see the note in transcripts/opencode.py for why that is not survivable.
+        return opencode_session.session_activity_mtime(session_id)
 
     def retarget_working_dir(self, repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
         # OpenCode resumes by id and restores the session's RECORDED directory, ignoring the
