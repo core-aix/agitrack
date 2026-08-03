@@ -20,7 +20,12 @@ import pytest
 
 from agitrack.backends.base import TokenUsage
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_agent_commit_message, build_manual_squash_trailer, build_pending_trailer
+from agitrack.commits.message import (
+    build_agent_commit_message,
+    build_manual_squash_trailer,
+    build_pending_trailer,
+    is_fully_tracked_message,
+)
 from agitrack.config import AgitrackState
 from agitrack.config.settings import GlobalConfig
 from agitrack.git import GitRepo
@@ -1443,3 +1448,155 @@ def test_runner_service_refreshes_after_post_commit_signal(tmp_path):
 
     assert (repo.repo / ".agitrack" / "manual-pending-trailer").exists()
     assert runner._manual_last_head == repo.rev_parse("HEAD")
+
+
+# --- the agent committing MID-TURN in no-worktree auto mode ------------------
+#
+# The reported loss. When the agent runs `git commit` ITSELF while its turn is still running,
+# the prepare-commit-msg hook stamps that commit with an IN-FLIGHT block: attribution only, no
+# trace, no tokens — and the block says in so many words that "the turn's full interaction
+# trace and token usage land in a later commit".
+#
+# That later commit has to actually happen. The agent has already committed every file it
+# touched, so when the turn finishes the tree is CLEAN — and both the fold and the staleness
+# check used to read "clean" as "already accounted for" and stop. The turn's tokens then lived
+# only on the hidden latent ref and never reached the branch: silently lost, exactly as the
+# in-flight commit promised they would not be.
+#
+# `is_fully_tracked_message` already encodes the right rule for this (an in-flight-only block
+# does NOT account for a turn) and `_uncovered_backend_commits` already applies it. These pin
+# that the no-worktree fold applies it too.
+
+
+def _agent_committed_mid_turn(tmp_path):
+    """A no-worktree AUTO session where the agent committed its own work mid-turn, and the turn
+    has since finished. Returns (runner, repo, the agent's commit)."""
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    runner._start_commit_summary = lambda *a, **k: None
+    runner.untracked_before_turn = set()
+
+    # Mid-turn: the agent edits and commits its own work. The hook stamps it in-flight.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    body = _git(repo, "log", "-1", "--format=%B", agent_commit)
+    assert "in_flight: true" in body  # attribution only...
+    assert not is_fully_tracked_message(body)  # ...and explicitly NOT a complete record
+
+    # The turn finishes, having left nothing further to commit: the tree is clean. Recording it
+    # is what the tests below exercise, so the helper stops here.
+    runner._note_in_flight(None)
+    assert repo.snapshot_worktree_tree() == repo.rev_parse("HEAD^{tree}"), "the tree should be clean"
+    return runner, repo, agent_commit
+
+
+def _idle_and_ready_to_cover(runner, repo, *, turn):
+    """Put the runner in the state the reactor reaches when a turn has just finished and the
+    tree is clean, with the finished turn waiting at the parse boundary."""
+    from agitrack.backends.proxy_agents import make_proxy_agent
+    from agitrack.transcripts.types import ExportedSession
+
+    runner.backend = make_proxy_agent("claude")
+    runner.active.agent_parse_result = (
+        "s1",
+        ExportedSession(session_id="s1", model="m", turns=[turn], updated=1.0),
+        None,
+        runner.state,
+    )
+    runner.active.agent_parse_thread = None
+    runner.agent_in_flight = False
+    runner.last_child_output = 0.0  # the backend has gone quiet
+    runner.CHILD_IDLE_SECONDS = 0.0
+    runner.BASE_POLL_SECONDS = 0.0
+    runner._idle_integrate_at = 0.0
+    runner._summary_blocks_integration = lambda _now: False
+
+
+def test_a_turn_the_agent_committed_itself_still_lands_its_tokens(tmp_path):
+    """The reported loss, end to end.
+
+    aGiTrack's whole promise is that the agent's work — and its accounting — reaches git. The
+    agent having committed the CODE itself must not cost the user the TOKENS. This drives the
+    production path (`_integrate_agent_made_commits_if_idle`, which the reactor calls from
+    `_maybe_agent_commit`'s clean-tree branch), not a helper.
+    """
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    assert runner._uncovered_backend_commits() == [agent_commit], "the in-flight commit is still owed a record"
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=4321, output=4321), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    head = repo.rev_parse("HEAD")
+    assert head != agent_commit, "no commit was made to carry the finished turn's trace/tokens"
+    body = _git(repo, "log", "-1", "--format=%B", head)
+    assert "4321" in body, f"the turn's tokens never reached the branch; body was:\n{body}"
+    assert is_fully_tracked_message(body)
+    assert not runner._uncovered_backend_commits(), "the agent's commit is still unaccounted for"
+
+
+def test_the_cover_for_an_agent_commit_introduces_no_diff(tmp_path):
+    # The agent already committed the code, so the accounting must ride a metadata-only commit:
+    # it must never re-apply or revert a single file.
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=7, output=7), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(f"{agent_commit}^{{tree}}")
+    assert (tmp_path / "a.txt").read_text() == "one\nagent work\n"
+
+
+def test_manual_mode_keeps_the_record_pending_instead_of_committing(tmp_path):
+    # In manual-commit mode the user decides when to commit, so aGiTrack must NOT add a cover
+    # commit of its own — the record waits on the latent chain for the user's next commit. The
+    # fix must not trade one broken promise for another.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    runner._note_in_flight(None)
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=9, output=9), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    assert repo.rev_parse("HEAD") == agent_commit, "manual mode must not commit on the user's behalf"
+
+
+def test_a_clean_tree_under_a_fully_tracked_head_still_drops_the_chain(tmp_path):
+    # The other side, so the fix stays narrow: once HEAD really does account for the turn, a
+    # clean tree means the pending chain IS redundant and must still be dropped — otherwise it
+    # would re-attach its trace to some later, unrelated commit.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._start_commit_summary = lambda *a, **k: None
+    runner.untracked_before_turn = set()
+    runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=10, output=10), "m")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+    runner._auto_fold_latent_pending()  # aGiTrack folds it itself: HEAD now fully accounts
+    assert is_fully_tracked_message(_git(repo, "log", "-1", "--format=%B", "HEAD"))
+
+    runner._reset_stale_manual_ref()
+
+    assert not runner._manual_pending_bodies()

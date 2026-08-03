@@ -1031,6 +1031,14 @@ class BackgroundRunner:
         turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
         covered = self._agent_committed_own_work(turns) if turn_complete else []
+        # …but NEVER in manual-commit mode: there the user decides when to commit, and aGiTrack
+        # adding a cover commit of its own breaks that contract outright — the user gets an
+        # unrequested commit on their branch. The latent path below records the turn instead and
+        # the fold hook combines it into the user's next commit, losing nothing. The interactive
+        # proxy already refuses this (`_integrate_agent_made_commits_if_idle`); the daemon's own
+        # cover branch was simply never gated on it.
+        if covered and self._manual_commits:
+            covered = []
         if covered:
             # The cover commit is created immediately and the daemon never amends HEAD, so — unlike
             # the async note flow for other commits — its message must LEAD with the summary already.

@@ -695,6 +695,18 @@ def _build_turn(
 
     final_info = (final_assistant or last_assistant or {}).get("info", {})
     assistant_id = str(final_info.get("id") or "")
+    # Whether the agent has FINISHED this turn. OpenCode records a terminal reason on the
+    # assistant message once it stops (verified against a real export: ``finish: "stop"``); a
+    # message still streaming has none, and a user prompt the agent has not answered yet has no
+    # assistant message at all. Both mean mid-turn.
+    #
+    # This was never set, so every OpenCode turn defaulted to ``complete=True`` — which made the
+    # whole mid-turn machinery inert on this backend. `CommitEngine.finish_parse_if_ready` finds
+    # the running turn via ``not turns[-1].complete``, so on OpenCode it never found one: an
+    # agent commit made mid-turn got no in-flight attribution at all, and the background tracker
+    # would commit a "turn" that was still being written. Claude computes the same thing as
+    # ``complete=not in_flight`` (transcripts/claude.py).
+    complete = bool(_as_dict(final_info).get("finish"))
     # OpenCode has no skills concept, so `skills` stays empty; MCP tools and `task` sub-agents
     # are the extensions it can carry.
     used = capabilities.collect(tool_names=tool_names, subagents=subagents, mcp_servers=mcp_servers)
@@ -705,6 +717,7 @@ def _build_turn(
         final_response=final_response,
         tokens=tokens,
         model=model,
+        complete=complete,
         # A named effort/variant when the export records one, otherwise "on" when
         # the turn spent reasoning tokens — the only reasoning signal OpenCode
         # reliably exposes (the configured level is not in the export).

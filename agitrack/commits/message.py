@@ -162,6 +162,21 @@ METADATA_HEADER = "# aGiTrack Metadata"
 IN_FLIGHT_MARKER = "in_flight: true"
 
 
+def is_in_flight_only_message(body: str) -> bool:
+    """Whether *body* carries an aGiTrack record that is ONLY an in-flight block — the agent
+    committed while its turn was still running, so the commit names who made the change but
+    still owes the turn's trace and tokens.
+
+    Deliberately narrower than ``not is_fully_tracked_message(...)``, which is also true of a
+    commit with no aGiTrack metadata at all. The two need opposite handling: a commit made
+    outside aGiTrack can never be completed (there is no pending record to attach), so the
+    latent chain is redundant and must be dropped; an in-flight one is mid-record, so the chain
+    is the only thing holding the accounting until it lands."""
+    if METADATA_HEADER not in body:
+        return False
+    return not is_fully_tracked_message(body)
+
+
 def is_fully_tracked_message(body: str) -> bool:
     """Whether *body* carries a COMPLETE aGiTrack record — metadata that accounts for a
     finished turn. False for a message with no metadata at all, and false for one whose only
