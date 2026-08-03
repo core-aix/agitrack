@@ -4111,7 +4111,12 @@ class ProxyRunner:
         self._render()
         if quiet:
             return  # startup: the normal naming flow runs right after and would ask twice
-        name = self._prompt_session_name("New conversation detected", default=self.name)
+        # A FRESH suggestion, not `self.name`: this conversation is new work, and offering the
+        # previous session's name invites keeping it — leaving two conversations sharing one name
+        # and the status bar unable to say which is which. `_next_session_name` is the same
+        # generator `session -> New` uses, so a switch made inside the backend and one made from
+        # the menu suggest names from the same pool and never collide with a name already taken.
+        name = self._prompt_session_name("New conversation detected", default=self._next_session_name())
         if name:
             self.name = name
             self._persist_session_name(session_id)
