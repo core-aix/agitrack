@@ -87,7 +87,7 @@ class Session:
         "_last_change_at",
         "last_child_output",
         "last_child_output_sample",
-        "_pre_spawn_session_ids",
+        "_pre_spawn_sessions",
         # background commit summarization (#8) — per session so two sessions can
         # summarize concurrently, each with its own worker/result/pending slot
         "_summary_thread",
@@ -204,7 +204,7 @@ class Session:
             "_last_change_at": 0.0,
             "last_child_output": 0.0,
             "last_child_output_sample": b"",
-            "_pre_spawn_session_ids": None,
+            "_pre_spawn_sessions": None,
             "_summary_thread": None,
             "_summary_result": None,
             "_summary_pending": None,
