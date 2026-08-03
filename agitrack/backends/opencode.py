@@ -156,10 +156,21 @@ class OpenCodeBackend:
             for child_id in child_ids:
                 tokens.add(_subagent_tokens_for_session(self.repo, child_id, visited))
 
+        # OpenCode's event stream names no model — verified against the real CLI, none of
+        # step_start / text / step_finish carries one — so `parsed_model` is None for every run
+        # where the caller didn't pin one, and the commit metadata recorded no model at all for
+        # this backend. Its session store does know, so ask that before giving up. Best-effort:
+        # None simply leaves the previous behaviour.
+        resolved_model = parsed_model or model
+        if not resolved_model and (parsed_session_id or session_id):
+            from agitrack.transcripts.opencode import session_model
+
+            resolved_model = session_model(parsed_session_id or session_id or "")
+
         return AgentResult(
             backend=self.name,
             session_id=parsed_session_id or session_id,
-            model=parsed_model or model,
+            model=resolved_model,
             final_response=final_response.strip(),
             exit_code=exit_code,
             tokens=tokens,

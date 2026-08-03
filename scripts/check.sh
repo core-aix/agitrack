@@ -33,7 +33,9 @@ uv run mypy | uv run mypy-baseline filter || { status=$?; set -o pipefail; exit 
 set -o pipefail
 
 step "tests + coverage"
-uv run coverage run -m pytest -q
-uv run coverage report
+# -n auto distributes across cores (the suite waits on subprocesses and poll intervals far more
+# than it computes, so this is most of the wall clock back). --cov measures inside the xdist
+# workers, which a wrapping `coverage run` cannot reach. Fails below the floor in pyproject.toml.
+uv run pytest -q -n auto --cov --cov-report=term:skip-covered
 
 printf '\nAll checks passed.\n'

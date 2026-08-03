@@ -80,6 +80,29 @@ _BACKGROUND_LIVE_HORIZON_SECONDS = 3600
 # the command lets that expansion open a real turn so its work is committed.
 _COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/[^<]*?)\s*</command-name>")
 
+# The arguments the user typed after the command, e.g.
+#   <command-args>Improve the paper and record an experimentation plan.</command-args>
+_COMMAND_ARGS_RE = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL)
+
+# Slash commands are a moving target — Claude Code keeps adding them (`/goal` and `/loop` were
+# the ones that exposed this, but the set is not knowable in advance and grows without warning),
+# and user-defined skills are invoked the same way. So a command whose ARGUMENTS are a user
+# instruction is identified by BEHAVIOUR, never by an allow-list of names:
+#
+#     a slash command that carries arguments AND is followed by the agent doing work
+#     is a user instruction, and belongs in the trace exactly like a typed prompt.
+#
+# Both halves are load-bearing. "Carries arguments" excludes bare mode switches (`/clear`,
+# `/compact`). "Followed by agent work" excludes the ones whose args are configuration rather
+# than instruction — `/model sonnet`, `/cost`, `/status` — because those are handled locally
+# and produce no assistant response to attribute. Nothing needs updating when a new command
+# ships: if its args drive the agent, it is captured; if they don't, it isn't.
+#
+# Without this the instruction was lost entirely. Such a command has no `isMeta` expansion row
+# (unlike `/init`), so `pending_command` was set, never consumed, and silently dropped — a
+# commit produced by "/goal <a paragraph of requirements>" recorded no prompt at all, and the
+# work looked unmotivated in both the history and the dashboard.
+
 # Values Claude stamps on a conversation's opening user row when the prompt came from a
 # program rather than a person — see `_is_programmatic_row`.
 _SDK_PROMPT_SOURCES = {"sdk"}
@@ -836,7 +859,13 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
             return cached
     rows: list[dict] = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        # errors="replace", NEVER strict: a transcript is appended to by the backend while we
+        # read it, and one undecodable byte — a torn multi-byte character mid-write, or a lone
+        # surrogate that reached the transcript from pasted/mis-decoded input — would otherwise
+        # raise here and make the WHOLE session unparseable. That is not a degraded parse, it
+        # is no commits at all for that session, silently. Per-line JSON errors are already
+        # tolerated a few lines below for the same reason; this is the byte-level equivalent.
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -1087,6 +1116,9 @@ def parse_rows(
     # new user prompt in between — that work opens its own turn rather than being merged into
     # the previous (already-committed) turn. See `_task_notification_kind`.
     pending_background: str | None = None
+    # A slash command with arguments, awaiting proof that it was an INSTRUCTION rather than
+    # local configuration: the proof is the agent responding to it. See `_slash_command_directive`.
+    pending_directive: str | None = None
     # Liveness of background tasks, judged from the NOTIFICATION stream (launch-based
     # counting overcounts badly: a task finishing while the agent is mid-turn delivers
     # its result without a terminal notification). A task that has streamed an
@@ -1151,11 +1183,19 @@ def parse_rows(
                 continue
             command = _slash_command_name(row)
             if command is not None:
-                # A typed slash command invocation. Remember it: a command that does
-                # real work (e.g. /init) injects its expanded instructions as the next
-                # isMeta user row, which then opens the turn. Commands with no expansion
-                # (/model, /clear) leave this set but harmlessly unused.
+                # Remember the invocation: a command that does real work (e.g. /init) injects
+                # its expanded instructions as the next isMeta user row, which then opens the
+                # turn. Commands with no expansion (/model, /clear) leave this set but
+                # harmlessly unused.
                 pending_command = command
+                # A command that carries ARGUMENTS may be a user instruction (`/goal …`,
+                # `/loop …`, a skill invocation). It gets no isMeta expansion row, so nothing
+                # would ever open a turn for it and the instruction would be dropped. Hold it,
+                # and let the assistant branch open the turn IF the agent goes on to do work —
+                # that response is the evidence that these args were an instruction rather than
+                # local configuration. Superseded by a real prompt, exactly like a pending
+                # background notification.
+                pending_directive = _slash_command_directive(row)
                 continue
             prompt = _user_prompt(row)
             if prompt is None:
@@ -1165,7 +1205,11 @@ def parse_rows(
                 # otherwise meta rows stay excluded as before.
                 if pending_command is None or _command_expansion_text(row) is None:
                     continue
-                prompt = pending_command
+                # Prefer the directive text when the command carried arguments: it is the same
+                # turn either way, but "/goal <the actual requirements>" says what was asked
+                # while a bare "/goal" says only that something was. Commands whose expansion
+                # is the whole story (/init) have no args and fall back to the name.
+                prompt = pending_directive or pending_command
             if prompt == "/compact" or prompt.startswith("/compact "):
                 # Newer Claude Code records a typed /compact as a PLAIN user row (no
                 # <command-name> artifact). It is a local command driving the compaction
@@ -1174,6 +1218,7 @@ def parse_rows(
                 # unanswered "/compact" turn would ride every later commit's trace.
                 continue
             pending_command = None
+            pending_directive = None  # …and supersedes a slash directive that drove no work
             pending_background = None  # a real prompt supersedes a pending background-task turn
             flush()
             current = {
@@ -1233,17 +1278,31 @@ def parse_rows(
             # turn's sub-agent buckets instead of dropping them.
             message = _as_dict(row.get("message"))
             current["tokens"].add(_usage_once(message, counted_ids, sidechain=True))
-        elif row_type == "assistant" and current is not None:
-            if pending_background and current.get("stop_reason") not in (None, "tool_use"):
+        elif row_type == "assistant" and (current is not None or pending_directive is not None):
+            # `pending_directive is not None` widens this branch's old `current is not None`
+            # guard: a slash directive can be the FIRST thing in a conversation, with no turn
+            # open for it to attach to, and that work must still be captured.
+            opens_new_turn = current is None or current.get("stop_reason") not in (None, "tool_use")
+            new_prompt: str | None = None
+            if pending_directive is not None and opens_new_turn:
+                # The agent is responding to a slash command that carried arguments. That
+                # response is the evidence the args were an INSTRUCTION rather than local
+                # configuration (`/model sonnet` gets no reply), so record the directive as
+                # this turn's prompt — otherwise the instruction never appears anywhere and the
+                # work it drove looks unmotivated.
+                new_prompt = pending_directive
+            elif pending_background and current is not None and opens_new_turn:
                 # The agent is acting on a completed background task, and the current turn has
                 # already finished (a real stop reason, not mid-tool) with no new user prompt
                 # since. Open a fresh turn so this background-driven work is committed and
                 # attributed on its own — not merged into the prior, already-committed turn
                 # (which would also overwrite its assistant id and break the commit watermark).
+                new_prompt = MONITOR_UPDATE_LABEL if pending_background == "update" else _BACKGROUND_TURN_LABEL
+            if new_prompt is not None:
                 flush()
                 current = {
                     "user_id": str(row.get("uuid") or ""),
-                    "prompt": MONITOR_UPDATE_LABEL if pending_background == "update" else _BACKGROUND_TURN_LABEL,
+                    "prompt": new_prompt,
                     "final": "",
                     "assistant_id": "",
                     "model": model,
@@ -1260,7 +1319,10 @@ def parse_rows(
                     "messages": [],
                 }
                 pending_compactions = 0
+            if current is None:
+                continue  # a directive whose turn is still mid-flight elsewhere; nothing to add
             pending_background = None
+            pending_directive = None
             message = _as_dict(row.get("message"))
             if stamp is not None:
                 current["ended_at"] = stamp
@@ -1697,6 +1759,35 @@ def _slash_command_name(row: dict) -> str | None:
         return None
     match = _COMMAND_NAME_RE.search(text)
     return match.group(1) if match else None
+
+
+def _slash_command_directive(row: dict) -> str | None:
+    """``"/cmd <args>"`` when a slash-command row carries arguments, else None.
+
+    The arguments are the interesting part: ``/goal <what to achieve>``,
+    ``/loop <what to repeat>``, ``/some-skill <what to do>``. The command names the mode and
+    the args say what was asked, so both are kept. Returns None for a bare invocation with no
+    arguments — there is no instruction there to record.
+
+    This says only "an instruction was typed"; whether it actually drove any work is decided by
+    the caller, from whether the agent then responded. See the note by :data:`_COMMAND_ARGS_RE`.
+    """
+    name = _slash_command_name(row)
+    if name is None:
+        return None
+    message = _as_dict(row.get("message"))
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        return None
+    match = _COMMAND_ARGS_RE.search(text)
+    args = match.group(1).strip() if match else ""
+    return f"{name} {args}" if args else None
 
 
 def _command_expansion_text(row: dict) -> str | None:

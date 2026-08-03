@@ -210,6 +210,61 @@ Conventions:
 | `exit`/`quit` command routes through the unified flow | `test_exit_command_routes_through_unified_exit_flow`, `_cancelled_does_not_request_exit` | mock |
 | Signal teardown (terminal closed) keeps a worktree with leftover files | `test_handle_exit_signal_*` *(posix-only: SIGHUP/SIGTERM delivery)* | mock |
 
+## 11b. Startup & reactor composition (`tests/test_startup_composition.py`)
+The whole of `ProxyRunner.run()` and `_loop` driven end to end against a real git repo, with only
+the three platform boundaries faked (`tests/harness.py`). Every other row in this matrix tests a
+METHOD; these test the SEQUENCE, which is where a bug survives a green suite — each method is
+correct and only the order or the wiring is wrong. The recorded precedent is a fix applied to
+`_new_session`'s resume path but not to the `run()` → `_spawn()` startup path.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Launch reaches the reactor having spawned exactly one backend child in the repo | `test_startup_runs_to_the_reactor_and_spawns_the_backend` | real-git |
+| **Startup stages the backend resume BEFORE spawning** (else `_should_continue_session` reads the stale recorded dir, calls our own session a stranger, and silently starts a fresh one) | `test_startup_stages_the_backend_resume_before_spawning` | real-git |
+| `--new-session` skips resume staging | `test_startup_skips_resume_staging_for_a_forced_new_session` | real-git |
+| Startup ORDER is pinned: screen → spawn → watcher → git worker → reconcile → hooks → first paint → reactor | `test_startup_sequence_order_is_stable` | real-git |
+| Terminal enters raw mode and is restored (incl. after a reactor crash, which still writes a crash report) | `test_startup_puts_the_terminal_in_raw_mode_and_restores_it`, `test_startup_restores_the_terminal_even_when_the_reactor_crashes` | real-git |
+| Management lock released, so a second launch succeeds | `test_startup_releases_the_lock_so_a_second_launch_succeeds` | real-git |
+| Proxy status written while live, cleared on exit | `test_startup_records_the_proxy_status_and_clears_it_on_exit` | real-git |
+| Worktree vs `--no-worktree`: the child's cwd is the worktree / the base checkout | `test_worktree_startup_runs_the_agent_inside_the_worktree`, `test_no_worktree_startup_runs_the_agent_in_the_base_repo` | real-git |
+| Commit guidance reaches the real spawn argv and names this session's worktree; `--no-commit-guidance` omits it | `test_commit_guidance_reaches_the_real_spawn_command`, `test_no_commit_guidance_omits_the_note` | real-git |
+| Reactor drains real backend output through all five phases onto the screen | `test_reactor_drains_real_backend_output_through_all_five_phases` | real-git |
+| Reactor forwards keystrokes to the backend | `test_reactor_forwards_keystrokes_to_the_backend` | real-git |
+| Backend exits on its own → relaunch + resume; keeps dying → crash-loop guard stops with a notice | `test_reactor_relaunches_a_backend_that_exits_on_its_own`, `test_reactor_gives_up_on_a_backend_stuck_in_a_crash_loop` | real-git |
+| The harness's fakes still satisfy the platform Protocols | `test_fakes_satisfy_the_platform_protocols` | mock |
+
+## 11c. Backend parity (`tests/test_backend_parity.py`, `tests/test_turn_end_detection.py`)
+Structural checks that every registered backend implements the same contract, so "works on Claude"
+can no longer silently mean "does nothing on OpenCode". The runner reaches most backend methods via
+`getattr(..., None)`, which turns a missing one into a SILENT degradation. Parameterized over
+`available_backends()`, so a third backend is covered the moment it is registered.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Every backend implements the whole `ProxyAgent` contract, with matching signatures | `test_every_backend_implements_the_whole_proxy_agent_contract`, `test_every_backend_matches_the_contract_signatures` | mock |
+| `retarget_working_dir` is part of the DECLARED contract (it was called on every backend while declared nowhere) | `test_retarget_working_dir_is_part_of_the_declared_contract` | mock |
+| Every backend offers a turn-end liveness signal (transcript path OR direct activity mtime) | `test_every_backend_offers_a_turn_end_liveness_signal` | mock |
+| Liveness lookups answer None (never raise) for an empty/unknown session — they are polled from the reactor | `test_liveness_signals_are_safe_on_an_unknown_session` | mock |
+| Unknown backend name raises rather than substituting one | `test_unknown_backend_raises_rather_than_substituting_one` | mock |
+| Spawn command starts with the backend binary and honours a launch wrapper | `test_spawn_command_starts_with_the_backend_binary`, `test_spawn_command_honours_a_launch_wrapper` | mock |
+| **Turn end: a quiet sub-agent must not read as the turn ending** (else a half-finished turn is committed) — both backends | `test_a_quiet_subagent_does_not_read_as_the_turn_ending` | mock |
+| **Turn end: a chattering idle heartbeat must not prevent it** (else NOTHING is ever committed) — both backends | `test_a_chattering_idle_heartbeat_does_not_prevent_the_turn_from_ending` | mock |
+| OpenCode's signal is session-scoped, read-only, and degrades to None on any store problem | `test_opencode_reports_activity_from_its_session_store`, `test_opencode_activity_is_none_when_the_store_is_unusable`, `test_opencode_never_writes_to_the_users_database` | mock |
+| OpenCode's model comes from its session store (its event stream names none) | `test_opencode_resolves_the_model_from_its_session_store`, `test_opencode_model_lookup_tolerates_an_unexpected_store_shape` | mock |
+
+## 11d. Live backend smoke (`tests/test_live_backends.py`, `-m live`)
+The only tests that call the REAL backend CLIs, and therefore the only ones that can catch a CLI
+changing its output format under us — mocks assert the shape we believed was true when we wrote
+them. Excluded from the default run and from CI (they need the backend installed and
+authenticated and cost real tokens); each skips itself when its binary is absent. Run `pytest -m
+live`. They found OpenCode reporting no model on the very first run.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| A bare run returns usable text and exits cleanly | `test_a_bare_run_returns_usable_text` | live |
+| A bare run reports its model and non-zero token counts (the fields every commit records) | `test_a_bare_run_reports_its_model_and_token_usage` | live |
+| The backend's self-update command names the real binary | `test_the_update_command_names_the_real_binary` | live |
+
 ## 12. Session sharing
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -285,6 +340,40 @@ back to it the public demo 404s.
 | Learn profile fallback: the store's single non-empty profile ships when the exporting identity has none (how CI exports the checked-in fixture) | `test_export_learn_state_falls_back_to_the_single_store_profile` | real-git |
 | CLI: `-d export --export-dir` writes the site and reports the path | `test_cli_export_writes_the_site` | real-git |
 
+## 12d. Non-interactive modes: JSON loop and the UI bridge (`tests/test_bridge_protocol.py`)
+`--json`, `--prompt` and `--ui-bridge` all drive `shell/runner.py`, and the bridge is the transport
+the **VSCode extension** uses for every session it opens. A regression breaks every extension user
+at once and does it silently — the editor just never receives the event it is waiting for. In
+bridge mode stdout IS the protocol channel, so nothing may be printed as free text.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| `:exit` / `:quit` end the session | `test_exit_commands_end_the_session` | real-git |
+| `:status` / `:unstaged` answer as notices, never as stray stdout | `test_status_reports_a_clean_tree_as_a_notice`, `test_unstaged_reports_when_there_is_nothing_intentionally_unstaged`, `test_unstaged_lists_the_declined_files` | real-git |
+| `:new-session` mints an id and announces it in a `ready` frame (the editor keys its view on it) | `test_new_session_mints_an_id_and_announces_it` | real-git |
+| Unknown command warns instead of failing; a command with args dispatches on the verb alone | `test_an_unknown_command_warns_instead_of_failing`, `test_a_command_with_arguments_dispatches_on_the_verb_alone` | real-git |
+| Backend switch: unknown / not-installed warn and change nothing; a real switch stashes the outgoing conversation and announces the new backend | `test_switching_to_an_unknown_backend_warns_and_changes_nothing`, `test_switching_to_an_uninstalled_backend_warns_with_an_install_hint`, `test_switching_backend_remembers_the_outgoing_conversation`, `test_switching_backend_announces_the_new_backend_to_the_editor` | real-git |
+| `:summarizer on/off` is case-insensitive and persists globally; an unknown argument changes nothing | `test_summarizer_toggle_is_case_insensitive_and_persists_globally`, `test_an_unknown_summarizer_argument_does_not_change_the_setting` | real-git |
+| Transport survives a partial/malformed frame and ignores unknown frame types; closed stdin becomes an exit so the loop always unblocks | `test_the_reader_survives_a_partial_or_malformed_frame`, `test_a_frame_of_an_unknown_type_is_ignored_not_queued`, `test_closed_stdin_becomes_an_exit_so_the_loop_always_unblocks` | mock |
+
+## 12e. Trace fidelity and silent-failure edge cases (`tests/test_slash_directives.py`, `tests/test_session_switch_summary.py`, `tests/test_edge_cases.py`)
+Cases that fail without printing anything — the user only finds out later, from a history that is
+missing a turn or attributes it to the wrong model.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| A slash command carrying ARGS that the agent then acts on (`/goal …`, `/loop …`, a skill) is recorded with its full instruction — behavioural rule, not a list of command names | `test_a_command_with_args_followed_by_work_is_recorded_with_its_instruction`, `test_the_rule_is_not_a_list_of_known_command_names`, `test_multiline_arguments_are_preserved` | mock |
+| …and the exclusions: no args, or no agent response, is not a prompt; a real prompt supersedes an unanswered one; `/compact` is still never a turn | `test_a_command_with_no_arguments_is_not_a_prompt`, `test_a_command_the_agent_never_answers_is_not_a_prompt`, `test_a_real_prompt_supersedes_an_unanswered_directive`, `test_compact_is_still_never_a_turn` | mock |
+| A directive can open the first turn of a conversation, or its own turn mid-conversation; `/init`-style expansion is unchanged | `test_a_directive_can_open_the_very_first_turn_of_a_conversation`, `test_a_directive_mid_conversation_opens_its_own_turn`, `test_an_expanding_command_keeps_its_expansion_behaviour`, `test_an_expanding_command_with_args_prefers_the_instruction` | mock |
+| **Agent-native session switch (`/clear`, `/resume`, OpenCode's picker) discards the OLD conversation's pending summary and rolling summary** — else its result is applied and reported against the new conversation, and the stale rolling summary poisons every later summary | `test_a_native_switch_discards_the_old_conversations_pending_summary`, `test_a_native_switch_clears_the_rolling_session_summary` | real-git |
+| …and the guard is narrow: staying on the same conversation, or a stale sibling, keeps the state | `test_staying_on_the_same_conversation_keeps_the_summary_state`, `test_a_stale_sibling_conversation_does_not_trigger_a_switch` | real-git |
+| A transcript read mid-append (torn trailing line, corrupt middle line, undecodable byte) keeps every completed turn | `test_a_half_written_trailing_line_does_not_lose_the_completed_turns`, `test_a_corrupt_line_in_the_middle_does_not_discard_what_follows`, `test_a_prompt_containing_a_lone_surrogate_does_not_crash_the_parser` | mock |
+| Empty / blank-only / missing transcripts are not errors | `test_an_empty_transcript_is_not_an_error`, `test_a_transcript_of_only_blank_lines_yields_no_turns`, `test_a_missing_transcript_returns_nothing_rather_than_raising` | mock |
+| Token accounting: every field sums, `context` is a level (not summed), a message's usage is counted once, `<synthetic>` never becomes the turn's model | `test_token_usage_sums_every_field_when_added`, `test_adding_usage_takes_the_latest_context_rather_than_summing_it`, `test_a_turns_tokens_are_counted_once_per_message`, `test_a_synthetic_model_marker_never_becomes_the_turns_model` | mock |
+| Commit messages survive emoji / multi-script / control characters / very long subjects | `test_a_commit_message_survives_awkward_text` | real-git |
+| Bracketed paste split across reads is still recognised; pasted content reaches the backend byte-for-byte and a pasted newline/Ctrl-C is never interpreted | `test_bracketed_paste_markers_are_recognised_when_split_across_reads`, `test_pasted_content_reaches_the_backend_byte_for_byte`, `test_a_paste_split_mid_stream_still_forwards_everything` | mock |
+| Signal control bytes never reach the backend; ordinary bytes pass through untouched | `test_signal_control_bytes_are_never_forwarded_to_the_backend`, `test_ordinary_bytes_pass_through_untouched_when_not_capturing` | mock |
+
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -341,6 +430,20 @@ Flows that run on an interactive launch when a required tool, config, or login i
 ## Known gaps / TODO
 Track anything not yet covered here so it's explicit rather than silently missing. Add a row, then
 remove it once a test lands.
+
+Closed by the 2026-08-03 coverage audit (see `tests/TEST_PLAN.md` for the measurements):
+- ~~the composition layer — `run()` and `_loop` were reachable only through their callees~~ → §11b
+- ~~backend parity was unenforced; `test_proxy.py` ran entirely on Claude~~ → §11c
+- ~~nothing ever called a real backend CLI~~ → §11d (`-m live`)
+- ~~JSON mode / the UI bridge / `--recover` had no matrix section~~ → §12d
+
+Still open from that audit:
+- `shell/runner.py` is at 56% (was 43%): `_handle_agent_prompt` and `_handle_pre_compaction` are
+  covered only indirectly. The command surface is now pinned (§12d); the TURN path is not.
+- `metrics/backtrace.py` daemon lifecycle (66%): start → serve → shutdown, port already bound,
+  stale pidfile.
+- The Windows job now runs the platform-agnostic core, but not the proxy/reactor suites — those
+  are POSIX-terminal-specific and would need ConPTY equivalents of `tests/harness.py`.
 
 Remaining from the 2026-06-27 self-audit — lower-risk message/guard branches, to be filled:
 - `runner.py:_change_session_merge_branch_menu` — the "'X' is running a turn — change its merge branch when idle" refusal for an in-flight session (happy-path retarget IS tested).
