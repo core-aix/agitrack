@@ -11812,8 +11812,14 @@ def test_a_native_switch_to_a_NEW_conversation_asks_for_a_name(tmp_path, monkeyp
         [SessionRef("old", 100.0, label="old work"), SessionRef("fresh", 200.0, label="new work")],
         tracked="old",
     )
-    asked = []
-    monkeypatch.setattr(runner, "_prompt_session_name", lambda title, default: asked.append(title) or "otter")
+    runner.name = "previous-session"
+    monkeypatch.setattr(runner, "_next_session_name", lambda: "otter")
+    asked = {}
+    monkeypatch.setattr(
+        runner,
+        "_prompt_session_name",
+        lambda title, default: asked.update(title=title, default=default) or "otter",
+    )
     monkeypatch.setattr(runner, "_persist_session_name", lambda _sid: None)
 
     runner._service_native_session_switch()
@@ -11821,6 +11827,10 @@ def test_a_native_switch_to_a_NEW_conversation_asks_for_a_name(tmp_path, monkeyp
     assert runner.state.backend_session_id == "fresh"  # tracking followed
     assert runner.name == "otter"  # ...and the status bar's name with it
     assert asked, "the user was never asked to name the new conversation"
+    # A FRESH suggestion. Offering the previous session's name invites keeping it, leaving two
+    # conversations sharing one name and the status bar unable to say which is which.
+    assert asked["default"] == "otter"
+    assert asked["default"] != "previous-session"
 
 
 def test_a_native_switch_BACK_restores_the_old_name_and_id(tmp_path, monkeypatch):
