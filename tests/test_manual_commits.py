@@ -1474,7 +1474,7 @@ def _agent_committed_mid_turn(tmp_path):
     runner, repo = _noworktree_proxy(tmp_path, manual=False)
     assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
     runner._manual_hooks_installed = True
-    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))  # persisted, as production does
     runner._start_commit_summary = lambda *a, **k: None
     runner.untracked_before_turn = set()
 
@@ -1600,3 +1600,86 @@ def test_a_clean_tree_under_a_fully_tracked_head_still_drops_the_chain(tmp_path)
     runner._reset_stale_manual_ref()
 
     assert not runner._manual_pending_bodies()
+
+
+# --- the coverage anchor must survive a restart -----------------------------
+
+
+def test_the_noworktree_anchor_survives_a_restart(tmp_path):
+    """`_noworktree_base_head` is what separates "work aGiTrack must account for" from the
+    user's pre-existing history. It used to live only in memory and re-anchor to the current
+    HEAD on every start — so if the agent committed mid-turn (an in-flight block that still
+    owes its trace and tokens) and aGiTrack restarted before the turn finished, the anchor
+    moved ONTO that commit and it could never be seen as uncovered again. The accounting was
+    gone for good. The background daemon had already solved this by persisting its watermark.
+    """
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    assert runner._uncovered_backend_commits() == [agent_commit]
+
+    # A fresh instance over the SAME repo — the restart. Built directly rather than via the
+    # helper, which would re-init the repo and add history that isn't part of this scenario.
+    from proxy_helpers import make_runner
+
+    restarted = make_runner(
+        repo=repo,
+        base_repo=repo,
+        state=AgitrackState(tmp_path, default_backend="claude"),
+        _use_worktrees=False,
+        _manual_commits=False,
+        worktree=None,
+    )
+    restarted._load_noworktree_anchor()  # what startup does
+
+    assert restarted._uncovered_backend_commits() == [agent_commit], (
+        "the restart re-anchored past the agent's in-flight commit, losing its accounting"
+    )
+
+
+def test_a_first_ever_run_anchors_at_head_and_claims_no_history(tmp_path):
+    # The other half: on a repo aGiTrack has never tracked, everything already in the history
+    # belongs to the user and must never be retroactively attributed to the agent.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    (tmp_path / "prior.txt").write_text("the user's own work\n", encoding="utf-8")
+    _git(repo, "add", "prior.txt")
+    _git(repo, "commit", "-m", "a commit from before aGiTrack existed here")
+
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD")
+    assert runner._uncovered_backend_commits() == []
+
+
+def test_an_anchor_naming_a_vanished_commit_re_anchors_instead_of_failing(tmp_path):
+    # A hard reset or a re-clone can leave a watermark git can no longer resolve. Scanning from
+    # it would raise on every poll; re-anchoring is the safe recovery.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    runner._noworktree_anchor_path().parent.mkdir(parents=True, exist_ok=True)
+    runner._noworktree_anchor_path().write_text("0" * 40 + "\n", encoding="utf-8")
+
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD")
+
+
+# --- `git commit --no-verify` -----------------------------------------------
+#
+# `--no-verify` skips `pre-commit` and `commit-msg`. It does NOT skip `prepare-commit-msg` or
+# `post-commit` — verified against real git. That distinction decides how much it can cost:
+# in every no-worktree mode the FOLD happens in `prepare-commit-msg`, so the tracking still
+# lands. Worth pinning, because the natural assumption is that --no-verify defeats everything.
+
+
+def test_no_verify_still_folds_the_pending_trace_in_no_worktree_mode(tmp_path):
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "committed with --no-verify", "--no-verify")
+
+    body = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in body, "--no-verify must not cost the commit its tracking"
+    assert "do x" in body

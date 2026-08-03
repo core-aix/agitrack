@@ -3890,14 +3890,10 @@ class ProxyRunner:
             except Exception as error:
                 self._debug(f"no-worktree leftover scan failed: {error!r}")
                 self._pending_noworktree_cleanup = []
-            # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
-            # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
-            # never touched. Set once (the earliest start); the metadata-reset handles the rest.
+            # Anchor the no-worktree cover scan so commits the agent makes itself from here get
+            # aGiTrack metadata (#35), while pre-existing history is never touched.
             if self._noworktree_base_head is None:
-                try:
-                    self._noworktree_base_head = self.repo.rev_parse("HEAD")
-                except Exception as error:
-                    self._debug(f"no-worktree cover anchor failed: {error!r}")
+                self._load_noworktree_anchor()
             return
         root_state = self.state  # the durable repo-root "last session" record
         backend_name = root_state.backend
@@ -10810,10 +10806,74 @@ class ProxyRunner:
             # ``tracked_head`` watermark. HEAD is unchanged by the latent record (it sits at the
             # agent's own commit), so this pins the anchor there.
             try:
-                self._noworktree_base_head = self.repo.rev_parse("HEAD")
+                self._set_noworktree_base_head(self.repo.rev_parse("HEAD"))
             except Exception as error:
                 self._debug(f"no-worktree cover anchor advance failed: {error!r}")
         return committed
+
+    # --- the no-worktree coverage anchor (persistent) -------------------------
+    #
+    # Everything after this sha on the branch is work aGiTrack is responsible for accounting
+    # for; everything before it is the user's pre-existing history and must never be claimed.
+    #
+    # PERSISTED, and deliberately in the same file the background daemon uses. It used to live
+    # only in memory and be re-initialised to the current HEAD on every start, which lost
+    # coverage exactly when it mattered most: if the agent committed mid-turn (leaving an
+    # in-flight block that still owes its trace and tokens) and aGiTrack restarted before the
+    # turn finished, the anchor moved forward ONTO that commit, so it could never be seen as
+    # uncovered again and its accounting was gone for good. The daemon had already solved this
+    # with `tracked-head`; sharing the file also means switching between `-b` and the
+    # interactive TUI carries the watermark across instead of resetting it.
+
+    def _noworktree_anchor_path(self) -> Path | None:
+        # In no-worktree mode `repo` IS the base checkout, so it is the right root either way;
+        # `base_repo` is preferred only because it is the durable one, and it is not always set
+        # yet (early startup, and tests that build a runner directly). None when neither is —
+        # the anchor is then in-memory only, exactly as it was before it became persistent.
+        root = self.base_repo if self.base_repo is not None else self.repo
+        return (root.repo / ".agitrack" / "tracked-head") if root is not None else None
+
+    def _load_noworktree_anchor(self) -> None:
+        """Restore the persisted anchor, or start it at the current HEAD on a repo never tracked
+        before (so pre-existing history is never retroactively attributed to the agent)."""
+        path = self._noworktree_anchor_path()
+        try:
+            saved = path.read_text(encoding="utf-8").strip() if path is not None else ""
+        except OSError:
+            saved = ""
+        if saved:
+            try:
+                # `rev-parse` echoes a well-formed sha back without checking it EXISTS, so the
+                # object store is what decides — a watermark naming a commit this repo no longer
+                # has (a hard reset, a re-clone) must re-anchor rather than leave every later
+                # scan running from a sha git cannot resolve.
+                if self.repo.has_object_local(saved):
+                    self._noworktree_base_head = self.repo.rev_parse(saved)
+                    return
+                self._debug(f"no-worktree anchor {saved!r} is not in this repo; re-anchoring")
+            except Exception as error:
+                self._debug(f"stale no-worktree anchor {saved!r}: {error!r}")
+        try:
+            self._set_noworktree_base_head(self.repo.rev_parse("HEAD"))
+        except Exception as error:
+            self._debug(f"no-worktree cover anchor failed: {error!r}")
+
+    def _set_noworktree_base_head(self, sha: str | None) -> None:
+        self._noworktree_base_head = sha
+        if not sha:
+            return
+        path = self._noworktree_anchor_path()
+        if path is None:
+            return  # no repo to persist against; the in-memory anchor still works for this run
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)  # .agitrack/ may not exist yet
+            try:
+                self.state.ensure_local_ignore()  # keep .agitrack/ out of the user's commits
+            except Exception as error:  # a stub state in tests, or an unwritable exclude file
+                self._debug(f"local ignore for the anchor failed: {error!r}")
+            path.write_text(sha + "\n", encoding="utf-8")
+        except OSError as error:
+            self._debug(f"no-worktree anchor write failed: {error!r}")
 
     def _uncovered_backend_commits(self) -> list[str]:
         """Commits the backend created itself that no aGiTrack commit accounts for
