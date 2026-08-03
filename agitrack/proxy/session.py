@@ -145,9 +145,16 @@ class Session:
     # master_fd remain addressable as plain session fields over it.
     # ------------------------------------------------------------------
 
+    # Both read as ``None`` when there is no process yet — the documented meaning of None for
+    # each ("has not been spawned yet, or has been torn down"). Reading straight through to
+    # ``self.process`` raised AttributeError instead, so every ``if session.master_fd is None``
+    # guard in the runner — the exact idiom written to handle this state — crashed on the one
+    # case it exists for. The setters keep raising: assigning an fd to a session that owns no
+    # process is a genuine mistake, and silently swallowing it would lose the fd.
+
     @property
     def child_pid(self) -> int | None:
-        return self.process.child_pid
+        return self.process.child_pid if self.process is not None else None
 
     @child_pid.setter
     def child_pid(self, value: int | None) -> None:
@@ -155,7 +162,7 @@ class Session:
 
     @property
     def master_fd(self) -> int | None:
-        return self.process.master_fd
+        return self.process.master_fd if self.process is not None else None
 
     @master_fd.setter
     def master_fd(self, value: int | None) -> None:

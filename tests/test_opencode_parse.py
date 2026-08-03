@@ -99,7 +99,13 @@ def test_opencode_parse_token_usage():
     assert parsed is not None
     _display, _final, session_id, _model, tokens = parsed
     assert session_id == "ses-1"
-    assert tokens.context == 8869
+    # `context` is how FULL the window is, so it counts every token the model read — the cached
+    # prefix included. This used to assert `input` alone (8869), which under-reported it by the
+    # whole cache: measured on a live OpenCode turn, input=727 against cache.read=5632, so the
+    # gauge read 727 when the true context was 6365. Claude has always summed the three, so this
+    # is also what makes the number mean the same thing on both backends.
+    # See tests/test_token_accounting.py for the full semantics, pinned against real output.
+    assert tokens.context == 8869 + 2 + 3
     assert tokens.total == 14
     assert tokens.input == 8869
     assert tokens.output == 14

@@ -368,3 +368,251 @@ def test_ordinary_bytes_pass_through_untouched_when_not_capturing():
     payload = b"select * from t where x > 1;\r"
     forwarded, _, _, _ = proxy.feed(payload)
     assert b"".join(forwarded) == payload
+
+
+# --- the OpenCode parser under the same damage ------------------------------
+#
+# OpenCode has no per-line transcript: its session arrives as one JSON blob from
+# `opencode export`. The equivalent failure is therefore a TRUNCATED or malformed export —
+# the CLI killed mid-write, a version whose shape moved, a session with nothing in it. Every
+# one must degrade to "no turns", never to an exception: this runs on the commit path, where
+# a raised error means the turn is never committed and the user is told nothing.
+
+
+def _opencode_session(**overrides):
+    from agitrack.transcripts.opencode import parse_exported_session
+
+    data = {
+        "info": {"id": "ses_x", "model": {"providerID": "openai", "id": "gpt-5.5"}, "time": {"updated": 123}},
+        "messages": [
+            {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "fix it"}]},
+            {
+                "info": {"role": "assistant", "id": "a1", "time": {"completed": 5}},
+                "parts": [{"type": "text", "text": "fixed"}],
+            },
+        ],
+    }
+    data.update(overrides)
+    return parse_exported_session(data)
+
+
+def test_opencode_parses_a_well_formed_export():
+    # The baseline the damage cases are measured against.
+    session = _opencode_session()
+    assert [t.user_prompt for t in session.turns] == ["fix it"]
+
+
+@pytest.mark.parametrize(
+    "messages,label",
+    [
+        ([], "a session with no messages yet"),
+        ("not a list", "messages of the wrong type"),
+        ([{}], "a message with no info or parts"),
+        ([{"info": {"role": "user", "id": "u1"}}], "a message whose parts are missing"),
+        ([{"info": None, "parts": None}], "explicit nulls where objects belong"),
+        ([{"info": {"role": "user", "id": "u1"}, "parts": "truncated"}], "parts truncated to a string"),
+    ],
+)
+def test_opencode_export_damage_yields_no_turns_rather_than_raising(messages, label):
+    session = _opencode_session(messages=messages)
+    assert session.turns == [], f"{label} should yield no turns"
+
+
+def test_opencode_export_missing_its_info_block_still_parses():
+    # A truncated export can lose the trailing/leading block entirely.
+    session = _opencode_session(info={})
+    assert session.turns == [] or all(t.user_prompt for t in session.turns)
+
+
+def test_opencode_export_with_a_half_written_last_message_keeps_the_earlier_turns():
+    # The direct analogue of Claude's torn trailing line: the last message is incomplete
+    # because the export was cut off mid-write. Everything before it is real work and must
+    # survive — dropping it means the commit silently omits the user's turns.
+    session = _opencode_session(
+        messages=[
+            {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "first"}]},
+            {
+                "info": {"role": "assistant", "id": "a1", "time": {"completed": 5}},
+                "parts": [{"type": "text", "text": "done"}],
+            },
+            {"info": {"role": "user", "id": "u2"}},  # cut off: no parts at all
+        ]
+    )
+
+    assert [t.user_prompt for t in session.turns][:1] == ["first"]
+
+
+def test_opencode_extract_json_object_rejects_a_truncated_export():
+    # `opencode export` output is scanned for the outermost {...}; a stream cut mid-object has
+    # no closing brace, and must be reported as "no data" rather than parsed as partial JSON.
+    from agitrack.transcripts.opencode import _extract_json_object
+
+    assert _extract_json_object('{"info": {"id": "ses_x"') is None
+    assert _extract_json_object("") is None
+    assert _extract_json_object("no braces here") is None
+    assert _extract_json_object('noise {"a": 1} trailing') == '{"a": 1}'
+
+
+# --- terminal state under stress --------------------------------------------
+#
+# The stdin state machine sees bytes in whatever chunks the kernel delivers, and the terminal
+# can change size or be suspended at any moment — including while a modal is open. Each of
+# these leaves the user staring at a broken or frozen screen rather than an error.
+
+
+def test_ctrl_z_requests_a_suspend_instead_of_reaching_the_backend():
+    # Raw mode means the kernel does NOT turn Ctrl-Z into SIGTSTP, so an un-intercepted \x1a
+    # is forwarded as a plain byte — and Claude answers it by tearing its UI down and waiting
+    # for a resume that can never arrive on a pty it doesn't control, leaving a dead screen.
+    proxy = _proxy_input()
+    forwarded, _, _, _ = proxy.feed(b"\x1a")
+
+    assert proxy.suspend_requested is True
+    assert b"\x1a" not in b"".join(forwarded)
+
+
+def test_ctrl_z_with_the_palette_open_is_not_typed_into_it():
+    # A control byte is not text. Typing it into the one-line field would put an unprintable
+    # character in the command name and leave the palette in a state nothing matches.
+    proxy = _proxy_input()
+    proxy.capturing = True
+    before = bytes(proxy.buffer)
+
+    proxy.feed(b"\x1a")
+
+    assert bytes(proxy.buffer) == before
+
+
+def test_ctrl_z_inside_a_paste_is_content_not_a_suspend():
+    # Pasted text can contain anything. Suspending aGiTrack because of something the user
+    # copied would be baffling.
+    from agitrack.proxy.runner import PASTE_END, PASTE_START
+
+    proxy = _proxy_input()
+    proxy.feed(PASTE_START)
+    proxy.feed(b"\x1a")
+    proxy.feed(PASTE_END)
+
+    assert proxy.suspend_requested is False
+
+
+def test_a_resize_mid_turn_reshapes_the_screen_and_tells_the_backend(tmp_path):
+    # SIGWINCH arrives whenever the user drags the window — routinely mid-turn. The screen
+    # model and the child's pty must both follow, or the backend renders to the old geometry
+    # and the display is corrupt until something forces a full repaint.
+    from proxy_helpers import make_runner
+
+    runner = make_runner(cols=80, rows=24)
+    runner._init_screen()
+    resizes: list[tuple[int, int]] = []
+
+    class _Process:
+        master_fd = 7
+
+        def resize(self, rows, cols):
+            resizes.append((rows, cols))
+
+    runner.active.process = _Process()
+    runner._terminal_size = lambda: (40, 120)
+    runner._render = lambda *a, **k: None
+
+    runner._resize_child()
+
+    assert (runner.rows, runner.cols) == (40, 120)
+    assert runner.screen.columns == 120
+    assert resizes == [(39, 120)]  # one row reserved for aGiTrack's status bar
+
+
+def test_a_resize_returns_the_view_to_live_rather_than_stale_scrollback(tmp_path):
+    # Scrollback offsets are computed against the old geometry; keeping one after a resize
+    # shows the user a slice of history that no longer lines up with anything.
+    from proxy_helpers import make_runner
+
+    runner = make_runner(cols=80, rows=24)
+    runner._init_screen()
+    runner.scroll_back = 12
+
+    class _Process:
+        master_fd = 7
+
+        def resize(self, rows, cols):
+            pass
+
+    runner.active.process = _Process()
+    runner._terminal_size = lambda: (30, 100)
+    runner._render = lambda *a, **k: None
+
+    runner._resize_child()
+
+    assert runner.scroll_back == 0
+
+
+def test_a_resize_that_fails_does_not_take_the_session_down(tmp_path):
+    # This runs INSIDE the SIGWINCH handler, so an exception propagates into whatever the main
+    # thread happened to be executing. A resize is never worth ending a session for.
+    from proxy_helpers import make_runner
+
+    runner = make_runner(cols=80, rows=24)
+    runner._init_screen()
+
+    class _Process:
+        master_fd = 7
+
+        def resize(self, rows, cols):
+            raise OSError("ioctl failed")
+
+    runner.active.process = _Process()
+    runner._terminal_size = lambda: (30, 100)
+    runner._render = lambda *a, **k: None
+
+    runner._resize_child()  # must not raise
+
+
+def test_a_resize_before_the_backend_exists_is_a_noop(tmp_path):
+    # SIGWINCH can arrive during startup, before the child is spawned.
+    from proxy_helpers import make_runner
+
+    runner = make_runner(cols=80, rows=24)
+    runner.active.process = None
+    runner._resize_child()  # must not raise
+
+
+# --- awkward input volumes and bytes ----------------------------------------
+
+
+def test_a_nul_byte_in_the_input_stream_does_not_break_forwarding():
+    # NUL reaches stdin from mis-decoded input and from some terminal emulators. It must be
+    # forwarded like any other byte, not truncate the stream at it (C-string semantics).
+    proxy = _proxy_input()
+    forwarded, _, _, _ = proxy.feed(b"before\x00after")
+
+    assert b"".join(forwarded) == b"before\x00after"
+
+
+def test_a_one_megabyte_paste_is_forwarded_whole():
+    # Pasting a large file into the agent is ordinary. Any per-chunk cap or accidental
+    # truncation here silently corrupts what the agent is asked to work on.
+    from agitrack.proxy.runner import PASTE_END, PASTE_START
+
+    payload = b"x" * (1024 * 1024)
+    proxy = _proxy_input()
+    forwarded, _, command, should_exit = proxy.feed(PASTE_START + payload + PASTE_END)
+
+    assert b"".join(forwarded) == PASTE_START + payload + PASTE_END
+    assert command is None and should_exit is False
+
+
+def test_a_large_paste_arriving_in_many_chunks_is_reassembled_in_order():
+    # The kernel delivers a big paste in whatever pieces it likes; order and completeness are
+    # the only things that matter to the backend.
+    from agitrack.proxy.runner import PASTE_END, PASTE_START
+
+    payload = bytes(range(256)) * 512  # every byte value, including \x00, \x03, \x1a, \x1b
+    stream = PASTE_START + payload + PASTE_END
+    proxy = _proxy_input()
+    seen = b""
+    for start in range(0, len(stream), 977):  # a deliberately awkward chunk size
+        forwarded, _, _, _ = proxy.feed(stream[start : start + 977])
+        seen += b"".join(forwarded)
+
+    assert seen == stream

@@ -1694,10 +1694,7 @@ class ProxyRunner:
             # commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
             # user hook) and are no-ops when absent, so clearing then re-installing exactly what
             # THIS mode wants makes every mode-switch safe regardless of how the last run ended.
-            self._remove_base_commit_guard()
-            self._teardown_manual_commit_mode()
-            self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
-            self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+            self._reset_hook_slate()
             # Paint once before entering the loop. Every other frame is driven by backend output
             # or a keystroke, so until the backend emits its first byte there was nothing on
             # screen at all — and if that first byte was slow, the terminal sat showing whatever
@@ -1993,6 +1990,27 @@ class ProxyRunner:
             and sandbox.is_enabled()
             and not sandbox.is_available()
         )
+
+    def _reset_hook_slate(self) -> None:
+        """Start this run from a clean hook slate: clear whatever a previous run left in the base
+        repo's ``.git/hooks``, then install exactly what THIS mode wants.
+
+        A prior run that crashed (no teardown) leaves the OTHER mode's managed hooks behind, and
+        modes switch between runs (worktree ↔ no-worktree/manual). A stale manual fold-hook would
+        rewrite a worktree run's commits; a stale base-commit guard would block a no-worktree
+        run's commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
+        user hook) and are no-ops when absent, so clear-then-install makes every mode switch safe
+        regardless of how the last run ended.
+
+        A method rather than four inline calls in :meth:`run` because the mode-switch tests need
+        to perform exactly this sequence: as a copy in the test file it silently drifted from the
+        original — the copy stayed green while the real startup changed, which is the failure
+        mode the whole composition harness exists to prevent.
+        """
+        self._remove_base_commit_guard()
+        self._teardown_manual_commit_mode()
+        self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
+        self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
 
     def _install_base_commit_guard(self) -> None:
         # Install the pre-commit guard in the base repo when active. Skipped (with a note) when a
