@@ -100,6 +100,30 @@ Conventions:
 | **Commit failure (hook/config) → surfaced, no crash, changes kept** | `test_user_commit_popup_surfaces_failure_without_crashing` (mock) + `test_commit_raises_catchable_giterror_on_failing_pre_commit_hook` (**real-git**, real pre-commit hook) | mock + real-git |
 | **No AI turns → zero aGiTrack footprint** (empty trailer; hook appends nothing; commit stays plain/untracked) | `test_manual_trailer_with_no_pending_turns_is_empty_no_footprint`, `test_hook_leaves_commit_untouched_when_no_pending_turns`, `test_runner_git_commit_with_no_pending_turns_is_plain_user_commit` | real-git |
 
+## 6b. Base-commit guard: keeping the agent out of the base repo (`tests/test_base_commit_guard.py`)
+Worktree mode only. The agent works in a linked worktree and aGiTrack commits and merges for it;
+an agent that commits into the BASE repo instead puts an untracked commit on the user's branch —
+there is no fold hook there, and `_uncovered_backend_commits` only scans the session's managed
+turn branch, so that commit is invisible to aGiTrack forever.
+
+TWO hooks, because one of them is bypassable. `git commit --no-verify` skips `pre-commit` (git's
+documented behaviour; no hook can change it), so that guard alone is advisory.
+`reference-transaction` is NOT skipped and aborts the ref update itself, so the commit cannot
+land. `pre-commit` is kept as the friendly first line: it fails earlier, with a better message,
+and exists on git < 2.28. All real-git — a guard that only works in theory is worse than none,
+because it is trusted.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| The agent cannot commit into the base repo | `test_the_agent_cannot_commit_into_the_base_repo` | real-git |
+| **…and `--no-verify` cannot get one past it either** (the reason the second hook exists) | `test_no_verify_cannot_get_a_commit_past_the_guard` | real-git |
+| The USER is never blocked (the marker is on the agent's process only) | `test_the_user_is_never_blocked` | real-git |
+| The agent commits freely inside its own worktree, with or without the bypass flag | `test_the_agent_commits_freely_inside_its_worktree`, `test_the_agent_commits_freely_in_its_worktree_even_with_no_verify` | real-git |
+| **aGiTrack's own integration is never blocked** — it merges into the base branch from its own process, the exact transaction the guard aborts | `test_agitracks_own_integration_is_never_blocked`, `test_the_marker_is_only_ever_set_on_the_agent_child` | real-git |
+| The ref hook fires on EVERY update, so: checkout, branch creation, tag, fetch and reads all still work under the guard | `test_checkout_still_works_under_the_guard`, `test_creating_a_branch_still_works_under_the_guard`, `test_tagging_still_works_under_the_guard`, `test_fetching_still_works_under_the_guard`, `test_reading_history_is_never_affected` | real-git |
+| Both hooks install and remove together; a project's own hook is chained, receives its stdin, can still veto, and survives removal | `test_both_hooks_are_installed_and_removed_together`, `test_an_existing_project_reference_transaction_hook_is_chained_not_destroyed`, `test_a_chained_project_hook_still_runs_and_receives_its_stdin`, `test_a_chained_hook_can_still_veto`, `test_installing_twice_does_not_clobber_the_backup`, `test_removal_leaves_a_foreign_hook_untouched` | real-git |
+| Neither hook names git's bypass flag (the refusal is only ever shown to the agent) | `test_the_guard_never_names_gits_bypass_flag` | mock |
+
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
 |---|---|---|
