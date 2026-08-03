@@ -294,6 +294,7 @@ def launch(
     reactor_iterations: int = 0,
     script=None,
     on_spawn=None,
+    on_tick=None,
     answers: list[bytes] | None = None,
     **runner_kwargs,
 ):
@@ -310,6 +311,13 @@ def launch(
 
     ``on_spawn(child)`` is invoked for EVERY spawned child, including the ones a relaunch
     creates — that is how a test scripts a backend that keeps dying (the crash-loop guard).
+
+    ``on_tick(harness)`` runs before every timers phase. Use it to hold a precondition true for
+    the whole run rather than seeding it once: the reactor's own bookkeeping legitimately
+    consumes flags as it services them (``status_check_pending`` is cleared by the status read,
+    ``file_change_event`` by the watcher check), and which tick that lands on depends on the
+    platform's file watcher — so a one-shot seed passes on macOS and fails on Linux for reasons
+    that have nothing to do with the behaviour under test.
 
     ``answers`` is the scripted human: each modal popup consumes one entry, and anything
     unanswered gets Esc (every modal's documented default). This is required, not optional —
@@ -399,6 +407,15 @@ def launch(
     else:
         remaining = {"n": reactor_iterations}
         real_child_exit_phase = runner._reactor_child_exit_phase
+
+        if on_tick is not None:
+            real_timers_phase = runner._reactor_timers_phase
+
+            def _timers_phase_with_hook():
+                on_tick(harness)
+                return real_timers_phase()
+
+            monkeypatch.setattr(runner, "_reactor_timers_phase", _timers_phase_with_hook)
 
         def _bounded_child_exit_phase():
             steps.append("loop-iteration")

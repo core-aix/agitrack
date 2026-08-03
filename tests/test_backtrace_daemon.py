@@ -153,44 +153,11 @@ def test_stop_terminates_a_real_process_and_clears_its_record(tmp_path, capsys):
             child.wait(timeout=10)
 
 
-# --- port selection ---------------------------------------------------------
-
-
-def test_the_daemon_binds_past_a_port_something_else_already_holds(tmp_path):
-    """A second daemon (or any unrelated program) already on the preferred port must not stop
-    this one starting — it scans forward instead. Otherwise a stray process on 8765 makes the
-    feature simply not work, with a bind error the user cannot act on."""
-    from agitrack.metrics.server import bind_scanning
-
-    class _Listener:
-        def __init__(self, address):
-            import socket
-
-            self._sock = socket.socket()
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._sock.bind(address)
-            self._sock.listen(1)
-            self.server_address = self._sock.getsockname()
-
-        def close(self):
-            self._sock.close()
-
-    import socket
-
-    probe = socket.socket()
-    probe.bind(("127.0.0.1", 0))
-    base = probe.getsockname()[1]
-    probe.close()
-
-    blocker = _Listener(("127.0.0.1", base))
-    try:
-        server = bind_scanning(_Listener, "127.0.0.1", base)
-        try:
-            assert server.server_address[1] > base
-        finally:
-            server.close()
-    finally:
-        blocker.close()
+# Port scanning is NOT tested here. `bind_scanning` is shared with the dashboard and is already
+# covered by tests/test_dashboard_network.py, which knows something this file got wrong: a
+# stand-in listener must bind the way the real server does (`bind_exclusively`), because plain
+# SO_REUSEADDR on Windows means "bind even if someone else already has this port" — so a naive
+# blocker blocks nothing and the assertion passes vacuously on POSIX and fails on Windows.
 
 
 # --- the log the daemon leaves behind ---------------------------------------

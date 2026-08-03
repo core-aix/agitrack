@@ -367,19 +367,37 @@ def test_reactor_commits_a_finished_turn_into_real_git(tmp_path):
             runner.state,
         )
         runner.active.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.turn_awaiting_commit = True
-        # The commit gate is a conjunction of three settle conditions. Satisfy each explicitly
-        # rather than sleeping them out: the worktree has stopped changing, a status read is
-        # due, and the backend has gone quiet on BOTH the pty and the transcript.
+
+    def _hold_the_commit_gate_open(harness):
+        # The commit gate is a conjunction of settle conditions, and the reactor legitimately
+        # CONSUMES the flags as it services them. Re-arm them every tick rather than seeding
+        # once: a one-shot seed passed on macOS and failed on Linux in CI for reasons unrelated
+        # to the behaviour under test.
+        #
+        # `_maybe_agent_commit` forks on whether a file watcher exists — with one it waits for
+        # a change event, without one it polls on POLL_SECONDS and RETURNS EARLY until that
+        # elapses. Both branches are real (watchdog can be missing, or inotify can fail in a
+        # container), so hold the preconditions for each rather than betting on which is live.
+        runner = harness.runner
         runner.FILE_STABLE_SECONDS = 0.0
         runner.CHILD_IDLE_SECONDS = 0.0
+        runner.POLL_SECONDS = 0.0
+        runner.last_poll = 0.0  # the no-watcher branch's early return
         runner._last_change_at = 0.0
         runner.status_check_pending = True
+        runner.agent_in_flight = False
+        runner.turn_awaiting_commit = True
         runner.last_child_output = 0.0  # the backend has been quiet: the turn is over
         runner._active_transcript_mtime = lambda: 0.0
 
-    h = launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=8, script=_script)
+    h = launch(
+        tmp_path,
+        monkeypatch,
+        repo=repo,
+        reactor_iterations=12,
+        script=_script,
+        on_tick=_hold_the_commit_gate_open,
+    )
 
     log = subprocess.run(
         ["git", "log", "--all", "--format=%B"],
@@ -400,14 +418,26 @@ def test_reactor_does_not_commit_a_turn_that_is_still_running(tmp_path):
     head_before = repo.rev_parse("HEAD")
 
     def _script(harness):
+        (Path(harness.runner.repo.repo) / "half.txt").write_text("partial\n", encoding="utf-8")
+
+    def _keep_the_turn_running(harness):
+        # Held every tick, for the same reason the positive test re-arms its gate: the reactor
+        # clears `agent_in_flight` as soon as it judges the backend idle, so seeding it once
+        # would let a later tick decide the turn had ended and commit after all.
         runner = harness.runner
-        (Path(runner.repo.repo) / "half.txt").write_text("partial\n", encoding="utf-8")
         runner.agent_in_flight = True  # still working
         runner.last_child_output = time.monotonic()  # and the terminal is live
         runner._active_transcript_mtime = lambda: time.time()  # transcript advancing too
         runner.file_change_event.set()
 
-    h = launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=6, script=_script)
+    h = launch(
+        tmp_path,
+        monkeypatch,
+        repo=repo,
+        reactor_iterations=12,
+        script=_script,
+        on_tick=_keep_the_turn_running,
+    )
 
     log = subprocess.run(
         ["git", "log", "--all", "--format=%B"],
