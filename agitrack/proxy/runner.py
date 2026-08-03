@@ -959,7 +959,7 @@ class ProxyRunner:
         # Session ids that existed before aGiTrack launched a fresh backend session,
         # used to identify (and then pin to) the session aGiTrack actually spawned
         # rather than chasing whichever session is globally newest.
-        self._pre_spawn_session_ids: set[str] | None = None
+        self._pre_spawn_sessions: dict[str, float] | None = None
         # Raw responses captured from the host terminal so we can answer the
         # same queries OpenCode makes (foreground/background/palette colors and
         # device attributes). Without these, OpenCode cannot detect the real
@@ -1826,25 +1826,30 @@ class ProxyRunner:
         fork = self._fork_next_spawn and resume
         self._fork_next_spawn = False
         if resume:
+            # --fork-session resumes this conversation but mints a NEW id (the original is left
+            # to its running background agent); a plain resume keeps the id it is given.
             session_id = self.state.backend_session_id
-            if fork:
-                # --fork-session resumes this conversation but mints a NEW id (the
-                # original is left to its running background agent). Snapshot existing
-                # sessions so the forked one is discovered and adopted on first parse,
-                # exactly like a backend that assigns its own id.
-                self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
-            else:
-                self._pre_spawn_session_ids = None
         else:
             session_id = self.backend.new_session_id()
             if session_id:
-                # The backend lets aGiTrack choose the id, so it is pinned already.
+                # The backend lets aGiTrack choose the id (Claude), so it is pinned already.
                 self.state.backend_session_id = session_id
-                self._pre_spawn_session_ids = None
-            else:
-                # The backend assigns its own id; snapshot existing sessions so
-                # the one it creates can be identified on the first parse.
-                self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
+        # Snapshot the directory's sessions AND how recently each was written, in EVERY case.
+        # `_discover_spawned_session` uses it to tell "the user switched conversations inside the
+        # backend" from "an unrelated conversation happens to live in this directory", and the
+        # mtime is what makes BOTH kinds of switch visible:
+        #   • to a NEW conversation — Claude `/clear`, OpenCode `/new`: an id that is not in the
+        #     snapshot at all (verified against the real Claude CLI: `/clear` writes a brand-new
+        #     transcript under a new id the moment it runs, before the next prompt).
+        #   • BACK to an EXISTING one — Claude `/resume`, OpenCode's session switcher: the id IS
+        #     in the snapshot, so an id-only snapshot could never see it. A mtime that has moved
+        #     since launch can, and a conversation nobody has touched still cannot.
+        # Taking it unconditionally is also strictly SAFER than skipping it, which is what used to
+        # happen in the two most ordinary cases — Claude pins its id up front, and every relaunch
+        # is a resume. With no snapshot, discovery returns None and the parse falls back to the
+        # pinned id forever, so everything after a `/clear` was recorded against the conversation
+        # the user had just thrown away: no prompts, no tokens, no trace.
+        self._pre_spawn_sessions = {ref.id: ref.updated for ref in self.backend.list_sessions(self.repo.repo)}
         command = self.backend.spawn_command(
             self.repo.repo,
             session_id=session_id,
@@ -12120,21 +12125,24 @@ class ProxyRunner:
         )
 
     def _discover_spawned_session(self) -> str | None:
-        # Identify the session aGiTrack spawned (or the user switched to inside the
-        # backend): the newest one that did NOT exist before launch. Returns None when no
-        # pre-spawn snapshot was taken — without one we cannot tell aGiTrack's own session
-        # apart from a pre-existing unrelated session in the same directory, so the caller
-        # must keep its pinned id rather than risk grabbing the wrong session. (Because the
-        # snapshot only ever excludes post-launch sessions, the result is always safe to
-        # prefer over the pinned id, which is what lets no-worktree mode follow an
-        # in-backend session switch.) `list_sessions` supplies both halves of the filter:
-        # it already excludes programmatic (SDK) transcripts, so an agent that farms work
-        # out to `claude -p` workers cannot have one of them adopted as the tracked session.
-        snapshot = self._pre_spawn_session_ids
+        # Identify the conversation actually being driven here: the most recently written session
+        # that has been WRITTEN TO SINCE LAUNCH — either it did not exist before (aGiTrack's own
+        # session; a `/clear` or `/new`) or its transcript has moved on since the snapshot (a
+        # `/resume` or session switch back onto an older conversation).
+        #
+        # "Since launch" is the whole safety property. A directory can hold conversations that
+        # have nothing to do with this run, and those are exactly the ones nobody has touched —
+        # so they can never be adopted, however recent they look. Returns None when no snapshot
+        # exists (a restored session object) or when nothing has moved, and the caller then keeps
+        # its pinned id. `list_sessions` supplies the other half of the filter: it already drops
+        # programmatic (SDK) transcripts, so an agent farming work out to `claude -p` workers
+        # cannot have one of them adopted as the tracked conversation.
+        snapshot = self._pre_spawn_sessions
         if snapshot is None:
             return None
         refs = self.backend.list_sessions(self.repo.repo)
-        candidates = [ref for ref in refs if ref.id not in snapshot]
+        # `>` not `>=`: an untouched session must compare equal to its snapshot and drop out.
+        candidates = [ref for ref in refs if ref.updated > snapshot.get(ref.id, float("-inf"))]
         if not candidates:
             return None
         return max(candidates, key=lambda ref: ref.updated).id

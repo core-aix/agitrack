@@ -106,25 +106,47 @@ def test_opencode_spawn_command_embeds_the_worktree_path():
 def test_discover_spawned_session_picks_the_new_session():
     refs = [SessionRef("old", 100.0), SessionRef("new", 200.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = {"old"}
+    runner._pre_spawn_sessions = {"old": 100.0}
     assert runner._discover_spawned_session() == "new"
 
 
 def test_discover_spawned_session_returns_none_when_nothing_new():
     refs = [SessionRef("old", 100.0), SessionRef("older", 50.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = {"old", "older"}
+    runner._pre_spawn_sessions = {"old": 100.0, "older": 50.0}
     assert runner._discover_spawned_session() is None
 
 
 def test_discover_spawned_session_without_snapshot_returns_none():
-    # Without a pre-spawn snapshot we cannot tell aGiTrack's own session apart from a
+    # Without a pre-spawn snapshot we cannot tell this run's conversation apart from a
     # pre-existing unrelated one in the same directory, so discovery returns None and the
     # caller keeps its pinned id. (This is what makes the result always safe to prefer over
     # the pinned id, which is how no-worktree mode follows an in-backend session switch.)
     refs = [SessionRef("a", 100.0), SessionRef("b", 300.0), SessionRef("c", 200.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = None
+    runner._pre_spawn_sessions = None
+    assert runner._discover_spawned_session() is None
+
+
+def test_switching_BACK_to_an_existing_conversation_is_followed():
+    """Claude `/resume` and OpenCode's session switcher move onto a conversation that already
+    existed, so an id-only snapshot could never see it — the id is in the snapshot either way.
+    What changes is that its transcript starts being written again."""
+    runner = _runner_with_sessions([SessionRef("this-run", 200.0), SessionRef("resumed", 100.0)])
+    runner._pre_spawn_sessions = {"resumed": 100.0}  # existed, untouched, at launch
+
+    assert runner._discover_spawned_session() == "this-run"  # nothing switched yet
+
+    # ...the user runs /resume and types: the old transcript moves on, past this run's.
+    runner.backend._refs = [SessionRef("this-run", 200.0), SessionRef("resumed", 300.0)]
+    assert runner._discover_spawned_session() == "resumed"
+
+
+def test_an_untouched_conversation_is_never_adopted_however_recent():
+    """The safety property. A directory can hold conversations that have nothing to do with this
+    run; they are exactly the ones nobody has written to since launch."""
+    runner = _runner_with_sessions([SessionRef("stranger", 9999.0)])
+    runner._pre_spawn_sessions = {"stranger": 9999.0}
     assert runner._discover_spawned_session() is None
 
 
@@ -11572,3 +11594,95 @@ def test_an_absorbed_reply_cannot_open_the_menu(monkeypatch):
     assert runner.input.capturing is False, "the Ctrl-G palette opened by itself"
     assert bytes(forwarded) == b"", f"the agent was typed at: {bytes(forwarded)!r}"
     assert runner.host_bg_value == b"rgb:1e1e/1e1e/1e1e"
+
+
+# --------------------------------------------------------------------------- in-backend /clear
+#
+# Claude's `/clear` starts a new conversation: verified against the real CLI, it writes a brand-new
+# transcript under a NEW session id the moment it runs. aGiTrack has to follow it or everything
+# after the clear is recorded against the conversation the user just threw away.
+
+
+class _SpawnSnapshotBackend:
+    """Records what `_spawn` snapshots, and whether it pinned an id of its own."""
+
+    name = "fake"
+
+    def __init__(self, refs, *, picks_own_id):
+        self._refs = refs
+        self._picks_own_id = picks_own_id
+        self.spawn_repo = None
+
+    def new_session_id(self):
+        return "pinned-by-agitrack" if self._picks_own_id else None
+
+    def list_sessions(self, repo):
+        return list(self._refs)
+
+    def spawn_command(self, repo, **kwargs):
+        self.spawn_repo = repo
+        return ["fakebin"]
+
+
+def _spawn_with(monkeypatch, backend, *, resume, tmp_path):
+    import agitrack.proxy.runner as runner_mod
+
+    runner = make_runner(repo=types.SimpleNamespace(repo="/repo"), backend=backend, state=AgitrackState(tmp_path))
+    runner.worktree = None
+    runner._should_continue_session = lambda: resume
+    runner._launch_command = lambda: []
+    runner._backend_child_env = lambda: {}
+    runner._fork_next_spawn = False
+    runner._commit_guidance = True
+    runner._use_worktrees = False
+    runner.state.backend_session_id = "before-the-clear" if resume else None
+    monkeypatch.setattr(
+        runner_mod,
+        "make_child_process",
+        lambda command, cwd, extra_env=None: types.SimpleNamespace(child_pid=1, master_fd=3),
+    )
+    runner._spawn()
+    return runner
+
+
+@pytest.mark.parametrize("resume", [False, True], ids=["fresh", "resume"])
+@pytest.mark.parametrize("picks_own_id", [False, True], ids=["backend-assigns-id", "agitrack-pins-id"])
+def test_every_spawn_snapshots_the_sessions_that_existed_first(monkeypatch, tmp_path, resume, picks_own_id):
+    """The snapshot is what lets aGiTrack notice a conversation started INSIDE the backend, and
+    it used to be skipped in exactly the two ordinary cases: Claude pins its id up front, and
+    every relaunch is a resume. With no snapshot `_discover_spawned_session` returns None and the
+    parse falls back to the pinned id forever."""
+    refs = [SessionRef("before-the-clear", 100.0)]
+    backend = _SpawnSnapshotBackend(refs, picks_own_id=picks_own_id)
+    runner = _spawn_with(monkeypatch, backend, resume=resume, tmp_path=tmp_path)
+
+    assert runner._pre_spawn_sessions == {"before-the-clear": 100.0}
+
+
+def test_a_conversation_started_by_clear_is_adopted(monkeypatch, tmp_path):
+    """End state of a `/clear`: the transcript aGiTrack was reading stops, a newer one appears.
+    Discovery must hand the parse the NEW id."""
+    before = [SessionRef("before-the-clear", 100.0)]
+    backend = _SpawnSnapshotBackend(before, picks_own_id=True)
+    runner = _spawn_with(monkeypatch, backend, resume=True, tmp_path=tmp_path)
+
+    # ...the user types /clear, and Claude writes a new transcript beside the old one.
+    backend._refs = [SessionRef("before-the-clear", 100.0), SessionRef("after-the-clear", 200.0)]
+
+    assert runner._discover_spawned_session() == "after-the-clear"
+
+
+def test_the_pinned_session_is_kept_until_something_newer_is_written(monkeypatch, tmp_path):
+    """The snapshot now includes the pinned session's own directory, so discovery must not drift
+    off it while it is still the conversation being written."""
+    backend = _SpawnSnapshotBackend([], picks_own_id=True)
+    runner = _spawn_with(monkeypatch, backend, resume=False, tmp_path=tmp_path)
+    assert runner.state.backend_session_id == "pinned-by-agitrack"
+
+    backend._refs = [SessionRef("pinned-by-agitrack", 100.0)]
+    assert runner._discover_spawned_session() == "pinned-by-agitrack"  # itself, not a stranger
+
+    # A session that predates the launch is never adopted, however recently it was touched.
+    runner._pre_spawn_sessions = {"someone-elses": 9999.0}
+    backend._refs = [SessionRef("someone-elses", 9999.0)]
+    assert runner._discover_spawned_session() is None
