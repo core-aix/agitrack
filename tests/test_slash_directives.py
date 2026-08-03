@@ -235,3 +235,45 @@ def test_directive_turns_carry_their_tokens_and_model(tmp_path):
     assert turn.tokens.input == 10
     assert session.model == "claude-opus-5"
     assert turn.final_response == "Done."
+
+
+def test_an_instruction_at_the_start_of_a_turn_is_recorded(tmp_path):
+    """The other ordinary way these are typed: the agent is IDLE and the user opens the next
+    turn with `/goal …` rather than a plain prompt.
+
+    Uses the real row shape — Claude Code follows the invocation with a `<local-command-stdout>`
+    row and an `isMeta` row describing the hook it installed, and only then does the agent work.
+    Neither of those may swallow the instruction or add a second turn for the same request.
+    """
+    session = _session(
+        tmp_path,
+        [
+            _user("Add a helper.", uuid="u-1"),
+            _assistant("Added.", uuid="a-1"),
+            _command("/goal", "Now keep the whole suite green."),
+            _user("<local-command-stdout>Goal set: Now keep the whole suite green.</local-command-stdout>"),
+            _row(type="user", isMeta=True, message={"role": "user", "content": "A Stop hook is now active."}),
+            _assistant("Running the suite.", uuid="a-2"),
+        ],
+    )
+
+    assert [t.user_prompt for t in session.turns] == [
+        "Add a helper.",
+        "/goal Now keep the whole suite green.",
+    ]
+    assert session.turns[-1].final_response == "Running the suite."
+
+
+def test_an_instruction_opening_a_conversation_uses_the_real_row_shape(tmp_path):
+    # Same, but as the very first thing in the conversation — no previous turn to attach to.
+    session = _session(
+        tmp_path,
+        [
+            _command("/loop", "Re-run the failing test until it passes."),
+            _user("<local-command-stdout>Loop armed.</local-command-stdout>"),
+            _row(type="user", isMeta=True, message={"role": "user", "content": "A loop is now active."}),
+            _assistant("Starting."),
+        ],
+    )
+
+    assert [t.user_prompt for t in session.turns] == ["/loop Re-run the failing test until it passes."]
