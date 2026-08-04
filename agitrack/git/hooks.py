@@ -135,6 +135,11 @@ _PENDING_TRAILER_REL = ".agitrack/manual-pending-trailer"
 _MANUAL_REF_REL = ".agitrack/manual-ref"
 _MANUAL_SIGNAL_REL = ".agitrack/manual-commit-signal"
 
+# The metadata header both manual hooks grep for. `prepare-commit-msg` uses it to stay idempotent
+# (never fold twice); `post-commit` uses it to confirm the fold actually happened before it clears
+# the pending chain. They MUST agree — see the note in _POST_COMMIT_SCRIPT.
+_METADATA_HEADER_LINE = "# aGiTrack Metadata"
+
 _PREPARE_COMMIT_MSG_SCRIPT = f"""#!/bin/sh
 {_MANUAL_MSG_MARKER}
 # Installed by aGiTrack manual-commit mode. Appends the pending agent interaction
@@ -153,7 +158,7 @@ esac
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _trailer="$_root/{_PENDING_TRAILER_REL}"
 # Idempotent: never append twice (the trailer carries its own metadata header).
-if [ -s "$_trailer" ] && ! grep -q '^# aGiTrack Metadata$' "$1"; then
+if [ -s "$_trailer" ] && ! grep -q '^{_METADATA_HEADER_LINE}$' "$1"; then
   printf '\n' >> "$1"
   cat "$_trailer" >> "$1"
 fi
@@ -171,6 +176,15 @@ _POST_COMMIT_SCRIPT = f"""#!/bin/sh
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _reffile="$_root/{_MANUAL_REF_REL}"
 _agitrack_cr="$(printf '\\r')"
+# Only advance the refs if the fold ACTUALLY happened. `prepare-commit-msg` deliberately skips
+# folding for an amend/squash/merge-template commit (source `commit`/`squash`/`merge`, see its
+# case statement), and this hook used to reset regardless — so `git commit --amend --no-edit`
+# with a turn still pending cleared the chain without the trailer ever landing anywhere. The
+# turn's trace and tokens were gone, silently and permanently. The two hooks have to reach the
+# SAME decision, and the commit's own message is the only honest evidence of what was folded.
+if ! git log -1 --format=%B 2>/dev/null | grep -q '^{_METADATA_HEADER_LINE}$'; then
+  exit 0
+fi
 if [ -f "$_reffile" ]; then
   while IFS= read -r _ref || [ -n "$_ref" ]; do
     # Strip a trailing CR: a file written by an older aGiTrack on Windows has CRLF endings, and

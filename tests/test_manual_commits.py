@@ -12,6 +12,7 @@ when off (no hooks, no latent commits, existing paths unchanged).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -1783,3 +1784,152 @@ def test_hooks_are_installed_when_no_custom_hookspath_is_set(tmp_path):
 
     assert runner._manual_hooks_installed is True
     assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+
+# --- commit shapes that SKIP the fold --------------------------------------
+#
+# `prepare-commit-msg` deliberately declines to fold for an amend/squash/merge-template commit
+# (git passes source `commit`/`squash`/`merge`) — folding there would duplicate a trailer, or
+# attach one to a merge that contains no agent work. `post-commit` used to reset the latent
+# chain regardless, so the pending turns were cleared with the trailer never landing anywhere:
+# a silent, permanent loss of that turn's trace and tokens. The two hooks must agree, and the
+# commit's own message is the only honest evidence of what was folded.
+
+
+def _tracker(tmp_path, *, hooks=True):
+    repo = _init_repo(tmp_path)
+    if hooks:
+        assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    tracker.setup()
+    return tracker, repo
+
+
+def test_amend_does_not_silently_drop_a_still_pending_turn(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "pending", 999)
+    tracker.render_trailer()
+    assert tracker.pending_count() == 1
+
+    # The user amends an earlier commit, reusing its message: git source is "commit", so the
+    # fold is skipped by design.
+    _git(repo, "commit", "--amend", "--no-edit")
+
+    assert "# aGiTrack Metadata" not in _git(repo, "log", "-1", "--format=%B", "HEAD")  # not folded…
+    # …so it must still be pending, ready for the user's next real commit. Asserted on the
+    # CONTENT rather than the count: an amend rewrites HEAD, so the orphaned old commit also
+    # falls in `HEAD..ref` and inflates the count — the turn surviving is what matters.
+    assert "pending prompt" in "".join(tracker.pending_bodies()), "the turn was cleared without being folded"
+
+
+def test_a_squash_merge_commit_does_not_silently_drop_a_pending_turn(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    base = repo.current_branch()
+    _git(repo, "checkout", "-qb", "feature")
+    (tmp_path / "f.txt").write_text("feature work\n", encoding="utf-8")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-qm", "feature work")
+    _git(repo, "checkout", "-q", base)
+    _record(tracker, "pending", 555)
+    tracker.render_trailer()
+
+    _git(repo, "merge", "-q", "--squash", "feature")
+    subprocess.run(
+        ["git", "-C", str(repo.repo), "commit", "-q"],
+        check=True,
+        env={**os.environ, "GIT_EDITOR": "true"},  # no -m ⇒ git source "squash" ⇒ fold skipped
+    )
+
+    assert "pending prompt" in "".join(tracker.pending_bodies()), (
+        "the turn was cleared by a commit that never folded it"
+    )
+
+
+def test_an_ordinary_commit_still_folds_and_clears_the_chain(tmp_path):
+    # The gate must stay narrow: a normal commit DOES fold, and must still reset the chain, or
+    # every later commit would fold the same turns again.
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "folded", 321)
+    tracker.render_trailer()
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's own commit")
+
+    body = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in body and "321" in body
+    assert tracker.pending_count() == 0, "a folded chain must be cleared or it folds twice"
+
+
+def test_a_second_commit_does_not_refold_an_already_folded_turn(tmp_path):
+    # The consequence of getting the reset wrong in the other direction.
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "once", 42)
+    tracker.render_trailer()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "first")
+
+    (tmp_path / "b.txt").write_text("the user's own later work\n", encoding="utf-8")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "second, unrelated")
+
+    assert "once prompt" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+# --- the latent ref surviving damage ---------------------------------------
+
+
+def test_a_pruned_latent_object_does_not_kill_all_future_tracking(tmp_path):
+    """`git gc --prune` can collect a latent commit — it is unreachable from any branch by
+    design. Every lookup against the now-dangling ref then raised, and because `record()` runs on
+    EVERY turn, the session stopped tracking entirely until someone deleted the ref by hand. The
+    turns already on the pruned chain are gone; the ones after it must not be.
+    """
+    tracker, repo = _tracker(tmp_path, hooks=False)
+    (tmp_path / "a.txt").write_text("turn one\n", encoding="utf-8")
+    _record(tracker, "one", 50)
+    tip = repo.ref_sha(tracker.ref())
+    (repo.repo / ".git" / "objects" / tip[:2] / tip[2:]).unlink()  # what a prune leaves behind
+
+    (tmp_path / "a.txt").write_text("turn one\nturn two\n", encoding="utf-8")
+    assert tracker.gate() is True
+    sha = tracker.record(
+        "<aGiTrack> two\n\n# Interaction Trace\n\n## User\n\ntwo prompt\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 50\n"
+    )
+
+    assert sha is not None, "record() must re-anchor past a pruned tip, not raise"
+    assert "two prompt" in "".join(tracker.pending_bodies())
+
+
+# --- the trailer files the sh hooks read ------------------------------------
+
+
+def test_the_trailer_is_written_atomically(tmp_path):
+    """The `sh` hooks read these files from another process during a `git commit` that can land
+    at any moment. An in-place rewrite can be read half-finished — an empty read is harmlessly
+    skipped, but a partial-but-non-empty one folds a truncated metadata block into the user's
+    permanent commit message. Temp file + rename makes a reader see only the old or the new.
+    """
+    from agitrack.commits.manual import write_lf
+
+    target = tmp_path / "nested" / "trailer"
+    write_lf(target, "first\n")
+    write_lf(target, "second, much longer than the first\n")
+
+    assert target.read_text() == "second, much longer than the first\n"
+    assert list(target.parent.glob("*.tmp")) == [], "a temp file was left behind"
+
+
+def test_the_trailer_keeps_lf_endings_on_every_platform(tmp_path):
+    # The hooks read `manual-ref` a line at a time; a CRLF ending leaves a trailing CR on the ref
+    # name, `git update-ref` rejects it, and the turns fold a SECOND time into the next commit.
+    from agitrack.commits.manual import write_lf
+
+    target = tmp_path / "manual-ref"
+    write_lf(target, "refs/agitrack/manual/s1\n")
+
+    assert target.read_bytes() == b"refs/agitrack/manual/s1\n"
