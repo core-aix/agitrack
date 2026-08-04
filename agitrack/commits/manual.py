@@ -121,6 +121,13 @@ class ManualCommitTracker:
         except Exception as error:
             self._debug(f"manual-commit hook install failed: {error!r}")
         self.reset_stale_ref()
+        # …and drop turns left behind by sessions that are gone, so they never ride into an
+        # unrelated commit. Startup is the natural moment: any ref other than ours belongs to a
+        # session that is no longer running. See `prune_abandoned_refs` for the rule.
+        try:
+            prune_abandoned_refs(self.repo, self.ref(), self.pending_refs(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"abandoned-ref prune failed: {error!r}")
         try:
             self.last_head = self.repo.rev_parse("HEAD")
         except Exception:
@@ -404,3 +411,75 @@ class ManualCommitTracker:
         except Exception as error:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self.render_trailer()
+
+
+def prune_abandoned_refs(
+    repo: GitRepo,
+    own_ref: str,
+    refs: list[str],
+    *,
+    debug: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Drop latent turns from ABANDONED sessions that no longer explain any uncommitted work.
+
+    Manual mode is always no-worktree, so every session edits the SAME working tree, and a user
+    commit folds the pending turns of all of them. That is right while those turns still explain
+    the code being committed — and wrong once they don't. A session abandoned mid-work (a crash,
+    Ctrl-C, a mode switch), or one whose edits the user discarded with ``git checkout --``, leaves
+    a ref behind that nothing ever revisits: `reset_stale_ref` only ever looks at the caller's OWN
+    ref. Its turns then ride into some later, unrelated commit, permanently attributing AI
+    authorship and token counts to code that never contained them.
+
+    The rule, per the maintainer:
+
+        keep a session's turns when it made code changes that are still uncommitted — those get
+        committed along with their trace; discard a trailing run of turns that led to no code
+        change at all.
+
+    Both halves are decided from git, not from a clock:
+
+    * **Nothing uncommitted anywhere** (the working tree matches HEAD) — no session's changes
+      survive, so every abandoned chain is discarded outright. This is the discarded-edit case.
+    * **Something uncommitted** — the chain is kept, minus any TRAILING commits whose recorded
+      tree matches HEAD's. Those are the conversation-only tail: turns that discussed rather than
+      changed anything, so they contribute nothing to the commit about to be made.
+
+    The caller's own ref is never touched — a live session owns its chain, and `reset_stale_ref`
+    already governs it. Returns the refs that were changed (pruned or reset), for logging.
+    """
+    log = debug or (lambda _message: None)
+    changed: list[str] = []
+    try:
+        head = repo.rev_parse("HEAD")
+        head_tree = repo.rev_parse("HEAD^{tree}")
+        working_tree_is_clean = repo.snapshot_worktree_tree() == head_tree
+    except Exception as error:
+        log(f"abandoned-ref prune skipped: {error!r}")
+        return changed
+
+    for ref in refs:
+        if ref == own_ref:
+            continue
+        try:
+            tip = repo.ref_sha(ref)
+            if not tip or repo.is_ancestor(tip, head):
+                continue  # already folded/committed: reset_stale_ref's ordinary case
+            if working_tree_is_clean:
+                # No uncommitted code anywhere, so nothing this session recorded still explains
+                # work about to be committed.
+                repo.update_ref(ref, head)
+                changed.append(ref)
+                log(f"discarded abandoned latent chain {ref}: no uncommitted work remains")
+                continue
+            # Trim the conversation-only tail: trailing turns that recorded no code beyond HEAD.
+            pruned = tip
+            while pruned and pruned != head and repo.rev_parse(f"{pruned}^{{tree}}") == head_tree:
+                parents = repo.parents(pruned)
+                pruned = parents[0] if parents else head
+            if pruned != tip:
+                repo.update_ref(ref, pruned or head)
+                changed.append(ref)
+                log(f"trimmed conversation-only tail from abandoned chain {ref}")
+        except Exception as error:
+            log(f"abandoned-ref prune failed for {ref}: {error!r}")
+    return changed

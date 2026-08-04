@@ -22,6 +22,7 @@ import pytest
 
 from agitrack.backends.base import TokenUsage
 from agitrack.commits import ManualCommitTracker
+from agitrack.commits.manual import prune_abandoned_refs
 from agitrack.commits.message import (
     build_agent_commit_message,
     build_manual_squash_trailer,
@@ -1938,3 +1939,179 @@ def test_the_trailer_keeps_lf_endings_on_every_platform(tmp_path):
     write_lf(target, "refs/agitrack/manual/s1\n")
 
     assert target.read_bytes() == b"refs/agitrack/manual/s1\n"
+
+
+# --- abandoned sessions ------------------------------------------------------
+#
+# Manual mode is always no-worktree, so every session edits the SAME tree and a user commit
+# folds the pending turns of all of them. Right while those turns still explain the code being
+# committed; wrong once they don't. `reset_stale_ref` only ever looked at the CALLER's ref, so
+# a session abandoned mid-work — a crash, a Ctrl-C, a mode switch, or edits the user discarded —
+# left a chain nothing revisited, and its turns rode into an unrelated later commit, attributing
+# AI authorship and tokens to code that never contained them.
+#
+# The rule, decided from git rather than a clock: keep a session's turns while its code changes
+# are still uncommitted; discard a trailing run of turns that changed nothing.
+
+
+def _abandoned_chain(repo, name: str, tokens: int, session_id: str):
+    """Record one turn under a DIFFERENT session id, as an abandoned session would leave it."""
+    state = AgitrackState(repo.repo, default_backend="claude")
+    state.data["agitrack_session_id"] = session_id
+    tracker = ManualCommitTracker(repo, repo, state)
+    _record(tracker, name, tokens)
+    return tracker.ref()
+
+
+def test_a_discarded_sessions_turns_never_ride_into_an_unrelated_commit(tmp_path):
+    # The reported shape: the agent edits, the user throws the edit away rather than committing
+    # it, and commits something unrelated later. That commit contains none of the agent's work,
+    # so it must carry none of its attribution.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "abandoned", 50, "gone-session")
+    _git(repo, "checkout", "--", "a.txt")  # the user discards the agent's work
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    assert repo.ref_sha(ref) == repo.rev_parse("HEAD"), "the abandoned chain was left to fold later"
+
+
+def test_an_abandoned_sessions_uncommitted_work_is_kept(tmp_path):
+    # The other half of your rule: work that is still uncommitted DOES get committed with its
+    # trace. Discarding here would lose real AI authorship.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit that survives\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "real work", 50, "gone-session")
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    assert repo.ref_sha(ref) != repo.rev_parse("HEAD"), "uncommitted agent work lost its trace"
+
+
+def test_a_conversation_only_tail_is_trimmed_but_the_code_turns_are_kept(tmp_path):
+    # A session that did real work and then only talked. The talking contributed nothing to the
+    # commit about to be made, so it goes; the work stays.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    state.data["agitrack_session_id"] = "gone-session"
+    tracker = ManualCommitTracker(repo, repo, state)
+    (tmp_path / "a.txt").write_text("real agent work\n", encoding="utf-8")
+    _record(tracker, "did the work", 100)
+    _record(tracker, "just discussed it", 5)  # same tree: a conversation-only turn
+    before = len(tracker.pending_bodies())
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [tracker.ref()])
+
+    bodies = "".join(tracker.pending_bodies())
+    assert "did the work prompt" in bodies, "the turn that wrote code was discarded"
+    assert len(tracker.pending_bodies()) <= before
+
+
+def test_the_live_sessions_own_chain_is_never_pruned(tmp_path):
+    # A live session owns its chain — `reset_stale_ref` governs it. Pruning it here would fight
+    # that and could drop a turn the session is about to fold itself.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "mine", 50, "my-session")
+    _git(repo, "checkout", "--", "a.txt")  # clean tree: an abandoned chain WOULD be dropped
+
+    prune_abandoned_refs(repo, ref, [ref])  # …but this one is our own
+
+    assert repo.ref_sha(ref) != repo.rev_parse("HEAD")
+
+
+def test_an_already_folded_chain_is_left_alone(tmp_path):
+    # Reachable from HEAD means it was folded/committed already; touching it would be pointless
+    # churn on the ref.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "folded", 50, "gone-session")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's commit")
+    repo.update_ref(ref, repo.rev_parse("HEAD"))
+    before = repo.ref_sha(ref)
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/live", [ref])
+
+    assert repo.ref_sha(ref) == before
+
+
+# --- what the user can see ---------------------------------------------------
+
+
+def test_the_exit_dialog_does_not_claim_tracking_is_lost_when_it_is_not(tmp_path):
+    """The persistent auto-track hook folds the tracking into a `git commit` made after aGiTrack
+    exits — verified. Telling the user otherwise pushed them into committing before they were
+    ready, in the one mode built around them choosing when."""
+    runner, repo, _ = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("t", 1))
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._autotrack_hook_will_survive_exit = lambda: True
+    captured: dict = {}
+    runner._exit_confirmation_popup = lambda title, opts: captured.setdefault("title", title) or opts[1]
+
+    runner._confirm_exit()
+
+    assert "still folds in the interaction tracking" in captured["title"]
+    assert "won't" not in captured["title"]
+
+
+def test_the_exit_dialog_does_warn_when_the_hook_will_not_survive(tmp_path):
+    # The warning is right when it IS right: a custom core.hooksPath or the autotrack opt-out.
+    runner, repo, _ = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("t", 1))
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._autotrack_hook_will_survive_exit = lambda: False
+    captured: dict = {}
+    runner._exit_confirmation_popup = lambda title, opts: captured.setdefault("title", title) or opts[1]
+
+    runner._confirm_exit()
+
+    assert "won't" in captured["title"]
+
+
+def test_the_status_bar_shows_uncommitted_turns_in_manual_mode():
+    # The count existed only in the exit dialog, so while working the user could not tell whether
+    # the agent had done nothing or twenty turns' worth since they last committed.
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    line = ScreenRenderer.status_line(
+        None,  # status_line reads only its keyword args, never `self`
+        cols=200,
+        name="s",
+        session_id=None,
+        backend_name="claude",
+        base_branch=None,
+        worktree=None,
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "",
+        manual_pending=3,
+    )
+
+    assert "3 uncommitted turns" in line
+
+
+def test_the_status_bar_says_nothing_when_no_turns_are_pending():
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    line = ScreenRenderer.status_line(
+        None,  # status_line reads only its keyword args, never `self`
+        cols=200,
+        name="s",
+        session_id=None,
+        backend_name="claude",
+        base_branch=None,
+        worktree=None,
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "",
+        manual_pending=0,
+    )
+
+    assert "uncommitted" not in line
