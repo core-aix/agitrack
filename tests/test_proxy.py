@@ -4183,7 +4183,9 @@ def test_backend_session_change_warns_once(tmp_path):
     state = AgitrackState(tmp_path)
     state.backend_session_id = "old"
     runner = make_runner(
-        worktree=object(),
+        # The notice names the worktree the new conversation landed in, so this needs a
+        # worktree with a real path rather than a bare sentinel.
+        worktree=types.SimpleNamespace(name="wt", path=tmp_path / "wt", branch=""),
         _warned_backend_session=False,
         state=state,
     )
@@ -4191,7 +4193,8 @@ def test_backend_session_change_warns_once(tmp_path):
     runner._set_message = lambda message, **kw: messages.append(message)
 
     runner._note_backend_session_change("new")
-    assert messages and "separate branch" in messages[0].lower()
+    assert messages and "own worktree" in messages[0].lower()
+    assert ".agitrack/worktrees/wt" in messages[0]
     assert runner._warned_backend_session is True
 
     # It only warns once, not on every subsequent change.

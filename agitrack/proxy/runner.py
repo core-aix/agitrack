@@ -4177,6 +4177,11 @@ class ProxyRunner:
             return
         newest = max(with_content, key=lambda ref: ref.updated)
         current = self.state.backend_session_id
+        if not current:
+            # Nothing is bound yet, so this cannot be a switch — there is nothing to switch
+            # away FROM. See _bind_first_conversation.
+            self._bind_first_conversation(with_content)
+            return
         if newest.id == current:
             return
         ours = next((ref.updated for ref in refs if ref.id == current), None)
@@ -4188,6 +4193,81 @@ class ProxyRunner:
         self.state.last_backend_message_id = None
         self._initialize_session_baseline()
         self._restore_or_ask_session_name(newest.id)
+        self._warn_native_switch_shares_worktree()
+
+    def _bind_first_conversation(self, with_content: list) -> None:
+        """Adopt the conversation this session just started — WITHOUT asking for a name again.
+
+        A session started with ``--new-session`` (and any fresh session) has no
+        ``backend_session_id`` until the backend writes its first transcript, which happens on
+        the user's FIRST PROMPT. Until that moment the switch watcher is tracking nothing, so
+        the conversation appearing looked exactly like a native switch: aGiTrack asked "New
+        conversation detected — name this session?" for a session the user had named seconds
+        earlier at the startup prompt. Two questions for one session, and answering the second
+        with a different name splits the name record between the two.
+
+        There is no switch here. Bind the id, KEEP the name already chosen, and make the link
+        durable so a crash before the first commit doesn't lose it.
+
+        Which conversation is "ours" needs two filters at once, and neither alone is enough.
+        WRITTEN SINCE LAUNCH (the ``_pre_spawn_sessions`` snapshot, as the commit path uses):
+        under ``--no-worktree`` the directory can hold conversations from long before this run,
+        and an unbound session must never adopt one of those however recent it looks. HAS REAL
+        CONTENT: Claude mints empty transcripts on picker actions, and they sort newest —
+        binding to one strands the session on a blank conversation. So the candidate is the
+        newest conversation satisfying BOTH, not merely the newest of either.
+        """
+        snapshot = self._pre_spawn_sessions
+        if snapshot is None:
+            return  # a restored session object has no snapshot; adopting blind is not safe
+        # `>` not `>=`: a conversation nobody has touched compares equal to its snapshot entry
+        # and drops out. Absent from the snapshot means it did not exist at launch — ours.
+        fresh = [ref for ref in with_content if ref.updated > snapshot.get(ref.id, float("-inf"))]
+        if not fresh:
+            return  # nothing of ours written yet — stay unbound and look again next tick
+        spawned = max(fresh, key=lambda ref: ref.updated).id
+        self._debug(f"binding session '{self.name}' to its first conversation {spawned}")
+        self.state.backend_session_id = spawned
+        self.state.last_backend_message_id = None
+        self._initialize_session_baseline()
+        # Durable now, keyed by the id that finally exists. This also clears the pending-name
+        # record written at startup, when there was no conversation to key the name to.
+        self._persist_session_name(spawned)
+        self._render()
+
+    def _warn_native_switch_shares_worktree(self) -> None:
+        """Say out loud that a backend-side switch did NOT get its own worktree.
+
+        `/clear`, `/resume` and OpenCode's picker change the conversation INSIDE the already
+        running backend process. aGiTrack follows the switch — tracking, status bar, trace —
+        but it cannot move the process: the backend's cwd IS this session's worktree, and
+        relocating it would mean respawning the backend, killing the conversation the user
+        just started. So the new conversation shares this worktree, this session's turn
+        branch, and its merge target.
+
+        Nothing on screen says so. After the switch the status bar shows the new
+        conversation's name and id, which reads exactly like a session aGiTrack started
+        itself — the kind that DOES get its own worktree. The user only finds out when two
+        conversations' changes turn up on one branch. So say it at the moment of the switch,
+        and name the gesture that actually gives isolation.
+
+        Shares the runner-level ``_warned_backend_session`` flag with the end-of-turn notice in
+        :meth:`_note_backend_session_change` (which catches switches made mid-turn, when this
+        watcher stands down): the point is learned once per run, and a user who switches
+        conversation often should not be nagged on every `/clear`.
+        """
+        if self.worktree is None or self._warned_backend_session:
+            return  # nothing to share (--no-worktree / manual), or already said once
+        self._warned_backend_session = True
+        self._set_message(
+            f"This conversation was started inside {self.backend.name}, so it shares session "
+            f"'{self.name}'’s worktree (.agitrack/worktrees/{self.worktree.path.name}) and branch — "
+            "aGiTrack can’t move a running backend into a new one. For a conversation with its own "
+            f"worktree, start it from {self._menu_label()} → session → “+ New session (own worktree)” "
+            "rather than with /clear or /resume.",
+            seconds=14.0,
+        )
+        self._render()
 
     def _abandon_summary_for_switched_session(self, leaving_id: str | None, joining_id: str) -> None:
         """Drop summary work belonging to the conversation we are switching AWAY from.
@@ -4797,8 +4877,10 @@ class ProxyRunner:
         ):
             self._warned_backend_session = True
             self._set_message(
-                "Detected a new conversation started inside the backend. Its changes are tracked on "
-                f"this session's branch. To get a separate branch, start sessions with {self._menu_label()} → session → New.",
+                "Detected a new conversation started inside the backend. It stays in this session's "
+                f"worktree (.agitrack/worktrees/{self.worktree.path.name}), so its changes are tracked on "
+                "this session's branch. For a conversation with its own worktree, start it from "
+                f"{self._menu_label()} → session → “+ New session (own worktree)”.",
                 seconds=12.0,
             )
 
