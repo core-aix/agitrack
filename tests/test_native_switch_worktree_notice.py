@@ -564,3 +564,59 @@ def test_a_stale_sibling_conversation_does_not_trigger_the_offer(tmp_path, backe
 
     assert runner.popups == []
     assert runner.state.backend_session_id == "old-session"
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_backing_out_of_the_name_prompt_says_what_happened_and_renames_nothing(tmp_path, backend_name):
+    # Esc (or quitting) at the name prompt used to be silent: nothing moved, and the user was
+    # left to work out why. The conversation stays — and keeps running in this session, so it is
+    # still linked to it — but the SESSION is not renamed, and going back to its earlier
+    # conversation no longer demands a new name (see test_worktree_conversation_ownership).
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=YES)
+    runner._name_for_switched_conversation = lambda sid: None  # backed out
+    messages: list[str] = []
+    runner._set_message = lambda text, **k: messages.append(text)
+
+    runner._service_native_session_switch()
+
+    assert runner.relocations == []
+    assert runner.name == "alpha"  # the session keeps its own name
+    assert runner.state.backend_session_id == "new-session"  # still tracking what the backend runs
+    assert any("Not moved" in text and "alpha" in text for text in messages)
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_deciding_to_keep_it_here_does_link_the_new_conversation_to_this_session(tmp_path, backend_name):
+    # The counterpart: "No — keep it here" IS a decision, so the conversation joins this session.
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=NO)
+    named: list[str | None] = []
+    runner._persist_session_name = lambda sid: named.append(sid)
+
+    runner._service_native_session_switch()
+
+    assert named == ["new-session"]
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_the_naming_dialog_does_not_ask_for_a_name_twice(tmp_path, backend_name):
+    # The popup shows a title AND a field label; both saying "Name for the new session…" read as
+    # the same sentence twice, in slightly different words.
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=YES)
+    seen: list[tuple[str, str]] = []
+
+    def fake_prompt(title, prompt, *, default="", detail=None):
+        seen.append((title, prompt))
+        return "gamma"
+
+    runner._prompt_popup = fake_prompt
+    runner._session_name_taken = lambda name: False
+    runner._live_session_name_taken = lambda name: False
+    del runner._name_for_switched_conversation  # exercise the real naming flow
+
+    runner._service_native_session_switch()
+
+    assert len(seen) == 1
+    title, prompt = seen[0]
+    assert "name" in (title + prompt).lower()  # it does ask
+    assert not (title.lower().startswith("name for") and prompt.lower().startswith("name for"))
+    assert prompt.lower().count("name") == 1
