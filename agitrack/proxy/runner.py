@@ -230,6 +230,10 @@ _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\
 # a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
 _OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
 
+# "No argument given", for parameters where None is itself a meaningful value (a transcript
+# that genuinely has no mtime) and so cannot double as the default.
+_UNSET: object = object()
+
 # The host terminal's ANSWERS to the capability queries `detect_host_terminal` sends: the
 # foreground/background/palette colour reports (OSC 10/11/4), the primary device attributes
 # reply, and the kitty keyboard flags reply. One arriving on STDIN is a late answer, not a
@@ -4221,7 +4225,21 @@ class ProxyRunner:
         ours = next((ref.updated for ref in refs if ref.id == current), None)
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
+        if not self._conversation_idle(newest.id, self.CHILD_IDLE_SECONDS):
+            # The new conversation's first turn is still RUNNING. A conversation becomes visible
+            # here the moment the user's prompt is written — long before the agent has answered
+            # it — and every signal that normally says "the agent is busy" is keyed to the
+            # conversation just left, which `/clear` froze. So without this the switch was
+            # handled mid-turn: the commit below captured a turn with no response yet, and the
+            # offer opened a modal over a working agent (which then relocated the session away
+            # from files the turn had not written yet). Come back when it has finished.
+            self._debug(f"native switch to {newest.id} deferred: its turn is still running")
+            return
         self._debug(f"native session switch: {current} -> {newest.id}")
+        # Captured BEFORE the tracked id moves: if the conversation is relocated to a worktree of
+        # its own, this is what the outgoing session must be put back to (see
+        # _restore_outgoing_session_identity).
+        prior_message_id = self.state.last_backend_message_id
         self._abandon_summary_for_switched_session(current, newest.id)
         self.state.backend_session_id = newest.id
         self.state.last_backend_message_id = None
@@ -4235,7 +4253,7 @@ class ProxyRunner:
         # from under those changes entirely. Observed live as a `/clear`, a turn that wrote a
         # file, and no commit for it anywhere.
         self._commit_latest_turn_sync()
-        if self._relocate_switched_conversation(newest.id):
+        if self._relocate_switched_conversation(newest.id, previous_id=current, previous_message_id=prior_message_id):
             return
         if self.worktree is not None:
             # STAYING PUT in worktree mode: the session keeps its name. A worktree session and
@@ -4276,7 +4294,9 @@ class ProxyRunner:
         self._debug(f"conversation {session_id} is new since launch; committing its turns from the start")
         self.state.last_backend_message_id = None
 
-    def _relocate_switched_conversation(self, session_id: str) -> bool:
+    def _relocate_switched_conversation(
+        self, session_id: str, *, previous_id: str | None = None, previous_message_id: str | None = None
+    ) -> bool:
         """Offer the just-switched-to conversation a worktree of its own, and make it.
 
         A conversation started with the backend's own `/clear` or `/resume` runs in the process
@@ -4348,6 +4368,14 @@ class ProxyRunner:
         if name is None:
             return False  # cancelled at the name prompt — keep the conversation where it is
         outgoing = self.active
+        # Land the turn that has just been committed on the base branch BEFORE cutting the new
+        # worktree from it. The turn belongs to the conversation being moved, but it ran — and
+        # was committed — in the worktree being left; a worktree cut from a base branch that
+        # does not have it yet opens WITHOUT the files the conversation just created, and the
+        # resumed agent reads its own last turn as never having happened ("b.txt isn't there…
+        # it landed outside this working directory", live). Same call the pre-prompt path makes,
+        # so --delay-merge and conflicts are handled exactly as they are everywhere else.
+        self._integrate_committed_turn_before_new_turn()
         self._stop_file_watcher()
         self._teardown_child()  # the process that switched; the new session spawns its own
         self._new_session(name, resume_session_id=session_id)
@@ -4361,6 +4389,7 @@ class ProxyRunner:
             return False
         if outgoing in self.sessions:
             self.sessions.remove(outgoing)
+        self._restore_outgoing_session_identity(outgoing, previous_id, previous_message_id, moved=session_id)
         self._set_message(
             f"Moved this conversation into its own worktree '{name}'. "
             f"Session '{getattr(outgoing, 'name', '?')}' is idle — resume it from the sessions menu.",
@@ -4368,6 +4397,51 @@ class ProxyRunner:
         )
         self._render()
         return True
+
+    def _restore_outgoing_session_identity(
+        self, outgoing, previous_id: str | None, previous_message_id: str | None, *, moved: str
+    ) -> None:
+        """Give the session the conversation just LEFT its own identity back.
+
+        Detecting the switch re-points the (still active) session at the new conversation —
+        necessarily, because the turn that has just run belongs to it and has to be committed
+        here. Relocation then carries that conversation off to a worktree of its own, and unless
+        this runs, the worktree it left behind is still recorded as running it: two worktrees,
+        one conversation. That record outlives the run, and the next start resolves the moved
+        conversation's NAME from whichever worktree claims it (``_resolve_session_name`` scans
+        worktree state, then the backend's per-worktree conversation listing) — which is the
+        reported "after a restart the two worktrees are mixed up", and why deleting the worktrees
+        was the only cure.
+
+        Two records have to be put back, in both places a worktree can claim a conversation:
+
+        * the outgoing worktree's ``.agitrack/state.json`` — restored to the conversation it was
+          on before the switch, so a later resume of that session continues ITS work, and so
+          ``_adopt_latest_backend_session`` on exit doesn't re-adopt the moved one;
+        * the outgoing worktree's per-directory transcript (Claude keeps one per project dir):
+          the moved conversation ran in that directory, so a copy of it sits there and makes the
+          old worktree the answer to "which session is this conversation?" forever. It is dropped
+          once the new worktree's copy is in place — the conversation itself is untouched.
+        """
+        state = getattr(outgoing, "state", None)
+        if state is not None:
+            try:
+                state.backend_session_id = previous_id  # setter re-points backend_session_repo too
+                state.last_backend_message_id = previous_message_id
+                self._debug(f"outgoing session restored to conversation {previous_id}")
+            except Exception as error:
+                self._debug(f"restoring the outgoing session's conversation failed: {error!r}")
+        worktree = getattr(outgoing, "worktree", None)
+        # The OUTGOING session's backend: it is the one that recorded the conversation there, and
+        # by now `self.backend` belongs to the session that has just taken over.
+        forget = getattr(getattr(outgoing, "backend", None) or self.backend, "forget_session_in", None)
+        if forget is None or worktree is None or getattr(worktree, "path", None) is None:
+            return
+        try:
+            if forget(worktree.path, moved):
+                self._debug(f"dropped {moved}'s transcript from the worktree it moved out of")
+        except Exception as error:
+            self._debug(f"forget_session_in failed: {error!r}")
 
     def _name_for_switched_conversation(self, session_id: str) -> str | None:
         """The name for a conversation being moved into its own worktree: the one it already
@@ -12727,7 +12801,45 @@ class ProxyRunner:
             self._transcript_path_cache = (None, None)  # vanished — re-resolve next time
             return None
 
-    def _backend_idle_for(self, seconds: float) -> bool:
+    def _conversation_activity_mtime(self, session_id: str | None) -> float | None:
+        """Last-activity mtime of ANY conversation, not just the tracked one. Same two sources as
+        :meth:`_active_transcript_mtime` (a direct query, else the transcript file), without its
+        path cache — this is asked about a conversation aGiTrack is not tracking yet, so caching
+        by id would fight the active session's entry."""
+        if not session_id:
+            return None
+        direct = getattr(self.backend, "session_activity_mtime", None)
+        if direct is not None:
+            try:
+                return direct(session_id)
+            except Exception as error:
+                self._debug(f"conversation activity lookup failed: {error!r}")
+                return None
+        resolver = getattr(self.backend, "session_transcript_path", None)
+        if resolver is None:
+            return None
+        try:
+            path = resolver(session_id)
+            return path.stat().st_mtime if path is not None else None
+        except Exception as error:  # a missing/unreadable transcript is simply "unknown"
+            self._debug(f"conversation transcript lookup failed for {session_id}: {error!r}")
+            return None
+
+    def _conversation_idle(self, session_id: str, seconds: float) -> bool:
+        """Whether the backend has finished working IN ``session_id`` (as opposed to in the
+        conversation aGiTrack currently tracks).
+
+        The distinction only matters after a native switch, and there it is the whole ballgame.
+        `/clear` freezes the tracked conversation's transcript, so every idleness signal keyed to
+        it reads "the agent is done" the instant the user switches away — while the agent is in
+        fact working on the FIRST TURN of the new conversation. Acting on that read committed a
+        turn that had not happened yet ("committing finished turn with no final text response",
+        seen live) and opened a modal over a running agent; answering it relocated the session
+        out from under a turn still writing files, stranding them uncommitted in the worktree the
+        user had just left. So the switch waits for the conversation it is switching TO."""
+        return self._backend_idle_for(seconds, transcript_mtime=self._conversation_activity_mtime(session_id))
+
+    def _backend_idle_for(self, seconds: float, *, transcript_mtime: "float | None | object" = _UNSET) -> bool:
         """Whether the backend has produced NOTHING for ``seconds`` — judged by the PTY output
         and the session transcript together.
 
@@ -12751,9 +12863,14 @@ class ProxyRunner:
         it has been quiet for ``TRANSCRIPT_IDLE_FACTOR`` x the window, the backend is idle no
         matter how loud the terminal is. The factor keeps the PTY authoritative for the common
         case (both quiet ⇒ idle at ``seconds``) and only overrules a chattering one, so a real
-        sub-agent still gets the full transcript-freshness guard above."""
-        mtime = self._active_transcript_mtime()
-        transcript_quiet_for = None if mtime is None else time.time() - mtime
+        sub-agent still gets the full transcript-freshness guard above.
+
+        ``transcript_mtime`` overrides which transcript is consulted. The default (the ACTIVE
+        session's) is wrong in exactly one place: right after a native switch, where the tracked
+        conversation is the one the user just left — frozen, therefore "quiet", while the agent
+        is busy in the conversation they switched TO. See ``_conversation_idle``."""
+        mtime = self._active_transcript_mtime() if transcript_mtime is _UNSET else transcript_mtime
+        transcript_quiet_for = time.time() - mtime if isinstance(mtime, (int, float)) else None
         if transcript_quiet_for is not None and transcript_quiet_for < seconds:
             return False  # real backend work — possibly a sub-agent printing nothing to the PTY
         if time.monotonic() - self.last_child_output >= seconds:
