@@ -2155,7 +2155,20 @@ class ProxyRunner:
         try:
             from agitrack.commits.manual import prune_abandoned_refs
 
-            prune_abandoned_refs(self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug)
+            dropped = prune_abandoned_refs(
+                self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug
+            )
+            if dropped:
+                # Say so. Discarding a chain is the right call (its work is no longer uncommitted),
+                # but it is still AI attribution going away, and the user should hear about it
+                # rather than find out from a history that is quietly missing a turn.
+                count = len(dropped)
+                chains = "chain" if count == 1 else "chains"
+                self._set_message(
+                    f"aGiTrack: discarded {count} abandoned tracking {chains} from an earlier session — "
+                    "their changes are no longer uncommitted, so they had nothing left to attribute.",
+                    seconds=10.0,
+                )
         except Exception as error:
             self._debug(f"abandoned-ref prune failed: {error!r}")
         # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
@@ -10883,12 +10896,31 @@ class ProxyRunner:
             try:
                 # `rev-parse` echoes a well-formed sha back without checking it EXISTS, so the
                 # object store is what decides — a watermark naming a commit this repo no longer
-                # has (a hard reset, a re-clone) must re-anchor rather than leave every later
-                # scan running from a sha git cannot resolve.
-                if self.repo.has_object_local(saved):
+                # has (a re-clone) must re-anchor rather than leave every later scan running from
+                # a sha git cannot resolve. And presence alone is not enough either:
+                # ANCESTOR of HEAD, not merely present. A watermark can survive as an object while
+                # ceasing to describe this branch — any history rewrite does it: a rebase, a squash, an
+                # amend of an earlier commit, `reset --hard` onto a different line, or a force-push
+                # someone else made. `git log <orphan>..HEAD` still succeeds against such a sha, so the
+                # scan silently runs over the WRONG range: it walks commits that were already accounted
+                # for, and can re-attribute them. (Observed for real after rewriting this repo's history:
+                # the anchor pointed at a commit that no longer existed on the branch.) Re-anchoring at
+                # HEAD is the safe recovery — it can only ever under-claim, never attribute the user's
+                # own history to the agent.
+                if self.repo.has_object_local(saved) and self.repo.is_ancestor(saved, "HEAD"):
                     self._noworktree_base_head = self.repo.rev_parse(saved)
                     return
-                self._debug(f"no-worktree anchor {saved!r} is not in this repo; re-anchoring")
+                # VISIBLE, not just a debug line. Every failure path in this area used to log to
+                # a sink nobody reads without --verbose, so a silent loss of AI attribution could
+                # never be noticed — the single worst property this feature can have. Re-anchoring
+                # means commits between the old anchor and HEAD will not be attributed, and the
+                # user is the only one who can judge whether that matters.
+                self._debug(f"no-worktree anchor {saved!r} no longer describes this branch; re-anchoring")
+                self._set_message(
+                    "aGiTrack: the git history was rewritten since this repo was last tracked, so the "
+                    "coverage marker was reset. Agent commits made before the rewrite won't be attributed.",
+                    seconds=12.0,
+                )
             except Exception as error:
                 self._debug(f"stale no-worktree anchor {saved!r}: {error!r}")
         try:

@@ -2115,3 +2115,145 @@ def test_the_status_bar_says_nothing_when_no_turns_are_pending():
     )
 
     assert "uncommitted" not in line
+
+
+# --- the coverage anchor vs a rewritten history ------------------------------
+#
+# The persisted anchor separates "work aGiTrack must account for" from the user's own history.
+# It was validated only by "does this object exist", which a rewritten history passes: a rebase,
+# squash, amend, `reset --hard` or someone else's force-push leaves the old commit as a reachable
+# OBJECT while it stops describing the branch. `git log <orphan>..HEAD` still succeeds against it,
+# so the scan silently ran over the wrong range — walking commits already accounted for and able
+# to re-attribute them. Observed for real after rewriting this repo's own history.
+
+
+def _anchor_runner(tmp_path):
+    from proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    runner = make_runner(
+        repo=repo,
+        base_repo=repo,
+        state=AgitrackState(tmp_path, default_backend="claude"),
+        _use_worktrees=False,
+        worktree=None,
+    )
+    return runner, repo
+
+
+def test_an_anchor_orphaned_by_a_rewrite_is_re_anchored(tmp_path):
+    runner, repo = _anchor_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "a commit that a rewrite will replace")
+    orphaned = repo.rev_parse("HEAD")
+    runner._set_noworktree_base_head(orphaned)
+
+    # Rewrite history: the old commit survives as an object but no longer describes the branch.
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+    assert repo.has_object_local(orphaned), "precondition: the old object is still present"
+    assert not repo.is_ancestor(orphaned, "HEAD"), "precondition: it is no longer on the branch"
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD"), "a stale anchor must re-anchor at HEAD"
+
+
+def test_a_valid_anchor_still_survives_a_restart(tmp_path):
+    # The check must stay narrow: an anchor that IS on the branch is the whole point of persisting
+    # it, and re-anchoring it would lose coverage of the agent's commits since.
+    runner, repo = _anchor_runner(tmp_path)
+    anchor = repo.rev_parse("HEAD")
+    runner._set_noworktree_base_head(anchor)
+    (tmp_path / "a.txt").write_text("agent work after the anchor\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the agent's own commit")
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == anchor, "a still-valid anchor must be kept"
+    assert runner._uncovered_backend_commits(), "the commit after the anchor must still read as uncovered"
+
+
+def test_the_daemon_re_anchors_a_watermark_orphaned_by_a_rewrite(tmp_path):
+    # The daemon persists the same watermark and had the same flaw: it checked only that the sha
+    # parsed, which an orphaned commit does.
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    runner = BackgroundRunner(
+        repo, manual_commits=False, _global_config=GlobalConfig(path=tmp_path / "gc.json"), _state=state
+    )
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "to be rewritten")
+    runner._set_tracked_head(repo.rev_parse("HEAD"))
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+
+    runner._tracked_head = None
+    runner._load_tracked_head()
+
+    assert runner._tracked_head == repo.rev_parse("HEAD")
+
+
+# --- the user is told when attribution goes away -----------------------------
+#
+# Every failure path in this area used to log only to `self._debug`, invisible without
+# --verbose. That is the worst possible property for a feature whose whole job is not losing AI
+# attribution: a silent loss can never be noticed, so it can never be reported or investigated.
+
+
+def test_a_rewritten_history_tells_the_user_the_marker_was_reset(tmp_path):
+    runner, repo = _anchor_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "to be rewritten")
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner.message is not None, "the reset was silent"
+    assert "rewritten" in runner.message and "won't be attributed" in runner.message
+
+
+def test_a_valid_anchor_says_nothing(tmp_path):
+    # The notice must be an exception, not noise on every start.
+    runner, repo = _anchor_runner(tmp_path)
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner.message is None
+
+
+def test_discarding_an_abandoned_chain_tells_the_user(tmp_path):
+    # Discarding is the right call — the work is no longer uncommitted — but it is still AI
+    # attribution going away, and the user should hear it rather than find a history quietly
+    # missing a turn.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _abandoned_chain(repo, "abandoned", 50, "gone-session")
+    _git(repo, "checkout", "--", "a.txt")  # the user discarded it
+
+    tracker.setup()
+
+    assert tracker.dropped_chains, "the tracker did not record what it discarded"
+
+
+def test_nothing_is_reported_when_no_chain_is_dropped(tmp_path):
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+
+    tracker.setup()
+
+    assert tracker.dropped_chains == []
