@@ -3785,11 +3785,12 @@ class ProxyRunner:
         # are 1:1, so names must be unique). Returns the chosen name, or None on
         # cancel / empty input. The hint must match the MODE — under --no-worktree there is no
         # worktree to promise, and the sessions menu already says "shares this directory".
-        prompt = (
-            "Name for the new session (its own git worktree):"
-            if self._use_worktrees
-            else "Name for the new session (shares this directory):"
-        )
+        #
+        # The field label says what the name BUYS, not "name for the new session" again: the
+        # popup already carries a title, and every caller's title says which session is being
+        # named — so repeating it here read as the same sentence twice, in slightly different
+        # words. Callers keep their titles free of "Name for…" for the same reason.
+        prompt = "It gets its own git worktree. Name:" if self._use_worktrees else "It shares this directory. Name:"
         while True:
             name = self._prompt_popup(title, prompt, default=default)
             if name is None or not name.strip():
@@ -4270,7 +4271,10 @@ class ProxyRunner:
         # from under those changes entirely. Observed live as a `/clear`, a turn that wrote a
         # file, and no commit for it anywhere.
         self._commit_latest_turn_sync()
-        if self._relocate_switched_conversation(newest.id, previous_id=current, previous_message_id=prior_message_id):
+        outcome = self._relocate_switched_conversation(
+            newest.id, previous_id=current, previous_message_id=prior_message_id
+        )
+        if outcome == self._RELOCATION_MOVED:
             return
         if self.worktree is not None:
             # STAYING PUT in worktree mode: the session keeps its name. A worktree session and
@@ -4283,6 +4287,16 @@ class ProxyRunner:
             # lost and two conversations end up sharing one. Link the new conversation to THIS
             # session's name instead; the offer above is where a differently-named session is
             # made, and it makes a directory to match.
+            #
+            # This holds however the offer ended, including backing out of the naming step: the
+            # conversation IS running in this session — its turns commit on this session's branch
+            # and the status bar says so — and the record has to say what is actually happening.
+            # (The commit flow files the same link independently, via
+            # `_note_backend_session_change`, so withholding it here would only produce a
+            # half-state.) What used to hurt was the consequence, not the record: going back to
+            # the session's EARLIER conversation demanded a new name. It no longer does — see
+            # `_reopen_conversation_in_session` — and the resume list now shows each conversation's
+            # own prompt, so two conversations of one session are told apart.
             self._persist_session_name(newest.id)
             self._render()
             return
@@ -4311,9 +4325,16 @@ class ProxyRunner:
         self._debug(f"conversation {session_id} is new since launch; committing its turns from the start")
         self.state.last_backend_message_id = None
 
+    # What came of the own-worktree offer. "Declined" is a decision (the user chose to keep the
+    # conversation in this session); "cancelled" is the absence of one (Esc / quit at the name
+    # prompt, or a relocation that could not proceed) — and the caller treats them differently.
+    _RELOCATION_MOVED = "moved"
+    _RELOCATION_DECLINED = "declined"
+    _RELOCATION_CANCELLED = "cancelled"
+
     def _relocate_switched_conversation(
         self, session_id: str, *, previous_id: str | None = None, previous_message_id: str | None = None
-    ) -> bool:
+    ) -> str:
         """Offer the just-switched-to conversation a worktree of its own, and make it.
 
         A conversation started with the backend's own `/clear` or `/resume` runs in the process
@@ -4334,7 +4355,7 @@ class ProxyRunner:
         sessions menu as an idle worktree to resume.
         """
         if self.worktree is None or not self._use_worktrees:
-            return False  # --no-worktree / manual: no worktrees to hand out
+            return self._RELOCATION_DECLINED  # --no-worktree / manual: no worktrees to hand out
         choice = self._select_popup(
             "New conversation — give it its own worktree?",
             [
@@ -4357,7 +4378,9 @@ class ProxyRunner:
             ],
         )
         if choice is None or choice.startswith("No"):
-            return False  # Esc reads as "leave it alone", the conservative answer
+            # Esc reads as "leave it alone" — a decision to keep the conversation in this session,
+            # so it takes this session's name (unlike backing out of the naming step below).
+            return self._RELOCATION_DECLINED
         # NOTHING UNCOMMITTED MAY BE LEFT BEHIND. The caller commits the just-finished turn
         # before opening this offer, but that commit can decline to capture the turn (observed
         # live: a `/clear` turn that CREATED a file left it untracked and the turn branch empty).
@@ -4380,10 +4403,17 @@ class ProxyRunner:
                     "committed as usual in a moment.",
                 ],
             )
-            return False
+            return self._RELOCATION_CANCELLED  # asked to move and could not: not a choice to stay
         name = self._name_for_switched_conversation(session_id)
         if name is None:
-            return False  # cancelled at the name prompt — keep the conversation where it is
+            # Backed out of naming (Esc, or quitting): the conversation stays where it is, but the
+            # user never said it belongs to this session, so it is not given this session's name.
+            self._set_message(
+                f"Not moved — no name given. This conversation is still running in '{self.name}'; "
+                "the offer comes back on the next conversation switch.",
+                seconds=10.0,
+            )
+            return self._RELOCATION_CANCELLED
         outgoing = self.active
         # Land the turn that has just been committed on the base branch BEFORE cutting the new
         # worktree from it. The turn belongs to the conversation being moved, but it ran — and
@@ -4403,7 +4433,7 @@ class ProxyRunner:
             self._debug("relocation failed to start the new session; restoring the outgoing one")
             self.active = outgoing
             self._render()
-            return False
+            return self._RELOCATION_CANCELLED
         if outgoing in self.sessions:
             self.sessions.remove(outgoing)
         self._restore_outgoing_session_identity(outgoing, previous_id, previous_message_id, moved=session_id)
@@ -4413,7 +4443,7 @@ class ProxyRunner:
             seconds=10.0,
         )
         self._render()
-        return True
+        return self._RELOCATION_MOVED
 
     def _restore_outgoing_session_identity(
         self, outgoing, previous_id: str | None, previous_message_id: str | None, *, moved: str
@@ -4575,14 +4605,14 @@ class ProxyRunner:
         # Re-ask until the name is free. A session and its worktree are 1:1, so accepting a name
         # another LIVE session already holds would point two backends at one directory — the
         # same reason `_resume_conversation` asks again rather than silently renaming.
-        title = "Name for the new conversation's session"
+        title = "This conversation is moving to a session of its own"
         while True:
             chosen = self._prompt_session_name(title, default=self._next_session_name())
             if chosen is None:
                 return None
             if not self._live_session_name_taken(chosen):
                 return chosen
-            title = f"'{chosen}' is already open — two live sessions can't share a worktree. New name:"
+            title = f"'{chosen}' is already open — two live sessions can't share a worktree"
 
     def _bind_first_conversation(self, with_content: list) -> None:
         """Adopt the conversation this session just started — WITHOUT asking for a name again.
@@ -5987,7 +6017,15 @@ class ProxyRunner:
         options: list[str] = []
         for ref in sessions:
             mark = "● " if ref.id in live_ids else "  "
-            label = (names.get(ref.id) or ref.label or "(no prompt recorded)").strip()[:48]
+            # NAME and PROMPT, not one or the other. A session can hold several conversations —
+            # every `/clear` that stayed in it adds one, and they are ALL named after that session
+            # — so a name-only row rendered them as two identical "alpha" lines with no way to
+            # tell which held your work. The first prompt is what distinguishes them.
+            name, prompt = names.get(ref.id), (ref.label or "").strip()
+            if name and prompt and prompt != name:
+                label = f"{name} · {prompt}"[:64]
+            else:
+                label = (name or prompt or "(no prompt recorded)").strip()[:64]
             options.append(f"{mark}{_short_session(ref.id)}  {self._format_age(ref.updated)}  {label}")
         choice = self._select_popup("Resume a conversation (newest first)", options)
         if choice is None:  # Esc → back up one level to the sessions menu
@@ -6005,14 +6043,24 @@ class ProxyRunner:
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
                 self._switch_to_session_index(index)
                 return
-        if self._live_session_name_taken(name):
-            # The name is occupied by a different LIVE session. Two live sessions can't share a
-            # name — a session and its git worktree are 1:1, so they'd share a worktree and run
-            # two backends in one directory. Don't silently rename: ASK the user, explaining
-            # why, and offer a random word they can keep or change (Esc cancels the resume).
+        held_by = self._live_session_index_for_name(name)
+        if held_by is not None and self._conversation_belongs_to_session(session_id, held_by, backend=backend):
+            # It is not a name CLASH — it is the same session. This conversation ran in that
+            # live session's worktree (a `/clear` left it behind there, or the user answered
+            # "keep it here"), so going back to it is a conversation switch inside that session,
+            # not a second session that needs a name of its own. Being asked to invent a name to
+            # return to your own earlier conversation — and having it renamed for good — is the
+            # reported bug; there is no second worktree to name here.
+            self._reopen_conversation_in_session(held_by, session_id, name)
+            return
+        if held_by is not None:
+            # A genuine clash: a DIFFERENT session holds this name. Two live sessions can't share
+            # one — a session and its git worktree are 1:1, so they would run two backends in one
+            # directory. Don't silently rename: ASK, explaining why, and offer a random word they
+            # can keep or change (Esc cancels the resume).
             chosen = self._prompt_session_name(
-                f"A session named '{name}' is already open, so this resumed conversation needs a "
-                f"different name (two live sessions can't share a worktree). New name:",
+                f"A session named '{name}' is already open, and it is a different session — "
+                f"two live sessions can't share a worktree",
                 default=self._next_session_name(),
             )
             if chosen is None:
@@ -6026,8 +6074,53 @@ class ProxyRunner:
         self._new_session(name, resume_session_id=session_id, backend=backend)
 
     def _live_session_name_taken(self, name: str) -> bool:
+        return self._live_session_index_for_name(name) is not None
+
+    def _live_session_index_for_name(self, name: str) -> int | None:
+        """Index of the LIVE session holding ``name``, or None. Names are compared sanitized,
+        exactly as the worktree directory they map to."""
         sanitized = _sanitize_name(name)
-        return any(_sanitize_name(self._session_name(index)) == sanitized for index in range(len(self.sessions)))
+        for index in range(len(self.sessions)):
+            if _sanitize_name(self._session_name(index)) == sanitized:
+                return index
+        return None
+
+    def _conversation_belongs_to_session(self, session_id: str, index: int, *, backend: str | None = None) -> bool:
+        """Whether ``session_id`` is an earlier conversation OF the live session at ``index`` —
+        one that ran in its worktree — rather than an unrelated conversation whose name happens
+        to collide.
+
+        Decided from the durable name record (which session a conversation was last named
+        under), backed by the worktree's own directory: a `/clear` conversation that stayed
+        behind is filed under that session's name AND has its transcript there. A shared session
+        being imported (``backend`` pins a backend for it) is never "the same session" — it is
+        another machine's conversation that merely arrives with a colliding name.
+        """
+        if backend is not None or not (0 <= index < len(self.sessions)):
+            return False
+        session = self.sessions[index]
+        worktree = getattr(session, "worktree", None)
+        if worktree is None:
+            return False  # --no-worktree: sessions share a directory, so "belongs to" means nothing
+        name = self._session_name(index)
+        if self._recorded_session_name(session_id) != name:
+            return False
+        try:
+            repo = getattr(session, "repo", None)
+            recorded_here = {ref.id for ref in self.backend.list_sessions(repo.repo)} if repo is not None else set()
+        except Exception as error:
+            self._debug(f"conversation-ownership listing failed: {error!r}")
+            return False
+        return session_id in recorded_here
+
+    def _reopen_conversation_in_session(self, index: int, session_id: str, name: str) -> None:
+        """Put a live session back on one of its own earlier conversations, in place: same
+        worktree, same name, only the backend process restarts (with ``--resume``)."""
+        self._switch_to_session_index(index)
+        self._commit_latest_turn_sync()  # don't let the outgoing conversation's turn go unrecorded
+        self._set_message(f"Reopening '{name}' on conversation {_short_session(session_id)}…")
+        self._render()
+        self._switch_to_session(session_id)
 
     def _live_session_for_lineage(self, owner: str, name: str) -> int | None:
         """Index of a live session that is the SAME shared session as ``owner/name`` —

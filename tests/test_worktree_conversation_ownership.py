@@ -257,3 +257,107 @@ def test_exit_still_adopts_a_genuinely_newer_conversation(tmp_path):
 
     assert runner.state.backend_session_id == "switched-to"
     assert AgitrackState(runner.base_repo.repo).session_name_for("switched-to") == "alpha"
+
+
+def _live_runner(tmp_path, *, live_conversation: str, also_here: list[str]):
+    """A runner whose single live session 'alpha' owns a worktree holding several
+    conversations — the shape a `/clear` that stayed behind leaves."""
+    base = _init_repo(tmp_path)
+    alpha = WorktreeManager(base).create("alpha", base="main")
+    state = AgitrackState(alpha.path, default_backend="claude")
+    state.backend_session_id = live_conversation
+
+    root = AgitrackState(base.repo, default_backend="claude")
+    for sid in [live_conversation, *also_here]:
+        root.name_session(sid, "alpha")
+
+    runner = make_runner(repo=GitRepo(alpha.path), state=state)
+    runner.base_repo = base
+    runner.global_config = GlobalConfig(path=tmp_path / "global.json")
+    runner.worktree = alpha
+    runner.name = "alpha"
+    runner._use_worktrees = True
+    runner._debug = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._set_message = lambda *a, **k: None
+
+    class _Backend:
+        name = "claude"
+
+        def list_sessions(self, _repo):
+            return [SessionRef(id=sid, updated=100.0, label=sid) for sid in [live_conversation, *also_here]]
+
+    runner.backend = _Backend()
+    runner.sessions.append(runner.active)  # the live session the user would be switching from
+    runner._prompt_session_name = lambda *a, **k: pytest.fail("asked for a name to return to its own conversation")
+    switched: list[str] = []
+    runner._switch_to_session = lambda sid: switched.append(sid)
+    runner._switch_to_session_index = lambda index: None
+    runner._commit_latest_turn_sync = lambda: None
+    runner._new_session = lambda *a, **k: pytest.fail("started a second session for its own conversation")
+    runner.switched = switched
+    return runner
+
+
+def test_going_back_to_an_earlier_conversation_reopens_it_in_its_own_session(tmp_path):
+    # `/clear` (kept here, or a move the user backed out of) leaves the previous conversation
+    # filed under this session. Going back to it is a conversation switch INSIDE the session —
+    # not a second session that needs a name. Being made to rename it, permanently, to return to
+    # your own earlier conversation is the reported bug.
+    runner = _live_runner(tmp_path, live_conversation="after-the-clear", also_here=["before-the-clear"])
+
+    runner._resume_conversation("alpha", "before-the-clear")
+
+    assert runner.switched == ["before-the-clear"]  # same session, same worktree, same name
+
+
+def test_an_unrelated_conversation_with_a_colliding_name_still_asks(tmp_path):
+    # A DIFFERENT session's conversation that happens to carry the same name is a real clash:
+    # two live sessions can't share one worktree, so it has to be named apart.
+    runner = _live_runner(tmp_path, live_conversation="ours", also_here=[])
+    AgitrackState(runner.base_repo.repo).name_session("stranger", "alpha")  # named alpha, but not ours
+    asked: list[str] = []
+    runner._prompt_session_name = lambda title, **k: (asked.append(title), None)[1]
+
+    runner._resume_conversation("alpha", "stranger")
+
+    assert runner.switched == []
+    assert len(asked) == 1
+    assert "different session" in asked[0]
+
+
+def test_a_shared_session_is_never_treated_as_our_own_conversation(tmp_path):
+    # An imported conversation arrives with someone else's name; a collision there is a clash,
+    # not a return to our own work.
+    runner = _live_runner(tmp_path, live_conversation="ours", also_here=["imported"])
+    asked: list[str] = []
+    runner._prompt_session_name = lambda title, **k: (asked.append(title), None)[1]
+
+    runner._resume_conversation("alpha", "imported", backend="opencode")
+
+    assert runner.switched == []
+    assert len(asked) == 1
+
+
+def test_the_resume_list_tells_two_conversations_of_one_session_apart(tmp_path):
+    # Every `/clear` that stays in a session is named after that session, so a name-only row
+    # rendered them as identical "alpha" lines — with no way to see which one held your work.
+    runner = _live_runner(tmp_path, live_conversation="after-the-clear", also_here=["before-the-clear"])
+    runner._resumable_sessions = lambda: [
+        SessionRef(id="after-the-clear", updated=200.0, label="hi"),
+        SessionRef(id="before-the-clear", updated=100.0, label="add the parser"),
+    ]
+    shown: list[str] = []
+
+    def fake_popup(title, options, **kw):
+        shown.extend(options)
+        return None  # Esc: this test is about what the list SHOWS
+
+    runner._select_popup = fake_popup
+
+    runner._resume_session_menu()
+
+    assert len(shown) == 2
+    assert any("alpha · hi" in row for row in shown)
+    assert any("alpha · add the parser" in row for row in shown)
+    assert shown[0].startswith("● ")  # the live one is still marked

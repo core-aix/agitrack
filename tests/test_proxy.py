@@ -10444,10 +10444,13 @@ def _collision_resume_runner(tmp_path):
 
 
 def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
-    # Resuming a conversation whose name collides with a LIVE session must PROMPT the user
-    # (explaining why, suggesting a random word) — never silently rename.
+    # Resuming a conversation whose name collides with a DIFFERENT live session must PROMPT the
+    # user (explaining why, suggesting a random word) — never silently rename. (A conversation
+    # belonging to that same session takes the reopen-in-place path instead; see
+    # test_worktree_conversation_ownership.)
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: True
+    runner._live_session_index_for_name = lambda name: 0
+    runner._conversation_belongs_to_session = lambda sid, index, **k: False
     asked = []
     runner._prompt_session_name = lambda title, *, default: asked.append((title, default)) or "bar"
 
@@ -10462,7 +10465,8 @@ def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
 
 def test_resume_name_collision_cancel_aborts_resume(tmp_path):
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: True
+    runner._live_session_index_for_name = lambda name: 0
+    runner._conversation_belongs_to_session = lambda sid, index, **k: False
     runner._prompt_session_name = lambda *a, **k: None  # Esc / cancel
 
     runner._resume_conversation("foo", "ses_1")
@@ -10472,7 +10476,7 @@ def test_resume_name_collision_cancel_aborts_resume(tmp_path):
 
 def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: False
+    runner._live_session_index_for_name = lambda name: None
     runner._prompt_session_name = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt"))
 
     runner._resume_conversation("foo", "ses_1")
