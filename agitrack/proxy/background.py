@@ -625,6 +625,13 @@ class BackgroundRunner:
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
         self._manual.setup()
+        if getattr(self._manual, "dropped_chains", None):
+            count = len(self._manual.dropped_chains)
+            chains = "chain" if count == 1 else "chains"
+            self._print(
+                f"discarded {count} abandoned tracking {chains} from an earlier session — their "
+                "changes are no longer uncommitted, so they had nothing left to attribute."
+            )
         self._install_autotrack_hook()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
@@ -1114,9 +1121,21 @@ class BackgroundRunner:
         except OSError:
             saved = ""
         try:
-            if saved and self.repo.rev_parse(saved):
+            # The watermark must still describe THIS branch, not merely parse. `rev_parse` echoes
+            # a well-formed sha back without checking it exists, and an object can outlive the
+            # branch that contained it — any history rewrite (rebase, squash, amend, reset, a
+            # force-push) orphans it. `git log <orphan>..HEAD` still succeeds, so the scan would
+            # silently run over the wrong range and could re-attribute already-accounted commits.
+            # Re-anchoring at HEAD can only under-claim, never claim the user's own history.
+            if saved and self.repo.has_object_local(saved) and self.repo.is_ancestor(saved, "HEAD"):
                 self._tracked_head = self.repo.rev_parse(saved)
                 return
+            if saved:
+                self._debug(f"tracked-head {saved!r} no longer describes this branch; re-anchoring")
+                self._print(
+                    "the git history was rewritten since this repo was last tracked, so the coverage "
+                    "marker was reset. Agent commits made before the rewrite won't be attributed."
+                )
         except Exception:
             pass
         try:
