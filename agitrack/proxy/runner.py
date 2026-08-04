@@ -4035,6 +4035,10 @@ class ProxyRunner:
             self.state.last_backend_message_id = prior_message_id
             self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
+        # Heal a worktree an earlier aGiTrack left holding a conversation that has since moved to
+        # a sibling (see _release_sibling_owned_conversations). `resume_id` is what the durable
+        # record asks this run to continue, so it is kept whatever else is cleaned up.
+        self._release_sibling_owned_conversations(keep=resume_id)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
 
     def _resolve_session_name(self, session_id: str | None) -> str | None:
@@ -4442,6 +4446,103 @@ class ProxyRunner:
                 self._debug(f"dropped {moved}'s transcript from the worktree it moved out of")
         except Exception as error:
             self._debug(f"forget_session_in failed: {error!r}")
+
+    def _sibling_worktree_conversations(self) -> dict[str, str]:
+        """``conversation id -> the OTHER worktree that records it as its own``.
+
+        Read from each sibling worktree's own ``.agitrack/state.json``, which is where a session
+        says which conversation it is running. Two worktrees naming the same conversation is
+        corruption by construction — aGiTrack never runs one conversation in two places."""
+        owners: dict[str, str] = {}
+        if self.worktree is None:
+            return owners
+        try:
+            for info in self._worktrees().list():
+                if info.name == self.worktree.name:
+                    continue
+                sid = AgitrackState(
+                    info.path, default_backend=getattr(self.global_config, "default_backend", None)
+                ).backend_session_id
+                if sid:
+                    owners[sid] = info.name
+        except Exception as error:
+            self._debug(f"sibling worktree scan failed: {error!r}")
+        return owners
+
+    def _release_sibling_owned_conversations(self, *, keep: str | None = None) -> None:
+        """Let go of a conversation that belongs to a SIBLING session — the self-heal.
+
+        Relocation now leaves both worktrees consistent, but a worktree that was mixed up by an
+        EARLIER aGiTrack (or by a relocation interrupted part-way) stays mixed up on disk: its
+        state file still names the conversation that moved out, and Claude's copy of that
+        conversation still sits in its project directory. Both outlive the run, which is why the
+        only cure used to be deleting the worktrees. So a worktree session checks, as it opens,
+        whether what it is holding is really its own:
+
+        * its RECORDED conversation, when a sibling worktree claims the same one and the durable
+          name record does not name US as its session — released, and this worktree falls back to
+          the newest conversation it genuinely owns (its own work, not the one that moved away);
+        * any sibling-owned TRANSCRIPT left in this worktree's project directory — dropped, so
+          ``latest_session_id`` here stops answering with someone else's conversation and
+          ``_adopt_latest_backend_session`` cannot re-adopt it on the way out. Only ever a
+          duplicate: ``forget_session_in`` refuses to remove a conversation's last copy.
+
+        ``keep`` is the conversation the user explicitly asked to resume in this action; it is
+        never released or dropped, so resuming a past conversation under a new name still works
+        while its old worktree is still on disk.
+        """
+        if self.worktree is None or not self._use_worktrees:
+            return
+        owners = self._sibling_worktree_conversations()
+        if not owners:
+            return
+        mine = self.state.backend_session_id
+        if mine and mine != keep and mine in owners and self._recorded_session_name(mine) != self.worktree.name:
+            # Prefer what this run was asked to continue here; otherwise this worktree's own
+            # newest work. (At startup the two differ exactly when the state file is the corrupt
+            # one and the durable record still knows which conversation belongs here.)
+            replacement = keep if keep and keep not in owners else self._own_conversation_here(exclude=set(owners))
+            self._debug(
+                f"'{self.worktree.name}' was holding {mine}, which belongs to '{owners[mine]}'; "
+                f"releasing it for {replacement}"
+            )
+            self.state.backend_session_id = replacement
+            self.state.last_backend_message_id = None
+            mine = replacement
+        forget = getattr(self.backend, "forget_session_in", None)
+        if forget is None:
+            return
+        for sid in owners:
+            if sid in (mine, keep):
+                continue
+            try:
+                if forget(self.repo.repo, sid):
+                    self._debug(f"dropped sibling conversation {sid} from '{self.worktree.name}'")
+            except Exception as error:
+                self._debug(f"forget_session_in failed for {sid}: {error!r}")
+
+    def _recorded_session_name(self, session_id: str | None) -> str | None:
+        """The name the durable repo-root record gives a conversation (None if unknown)."""
+        try:
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            return root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            return None
+
+    def _own_conversation_here(self, *, exclude: set[str]) -> str | None:
+        """The newest conversation WITH CONTENT recorded in this session's directory, ignoring
+        ``exclude`` (conversations that belong to other sessions). None when there is none — a
+        fresh conversation is then started, which is the right answer for a worktree whose only
+        conversation turned out to be somebody else's."""
+        try:
+            refs = [ref for ref in self.backend.list_sessions(self.repo.repo) if ref.label and ref.id not in exclude]
+        except Exception as error:
+            self._debug(f"own-conversation lookup failed: {error!r}")
+            return None
+        return max(refs, key=lambda ref: ref.updated).id if refs else None
 
     def _name_for_switched_conversation(self, session_id: str) -> str | None:
         """The name for a conversation being moved into its own worktree: the one it already
@@ -8128,6 +8229,12 @@ class ProxyRunner:
             self.state.backend_session_id = resume_session_id
             self._persist_session_name(resume_session_id)
         self.backend = make_proxy_agent(self.state.backend)
+        # Reopening a dormant worktree passes no conversation: it runs whatever its state file
+        # says, so that file has to be trustworthy. Heal it here if an earlier aGiTrack left it
+        # pointing at (or holding a copy of) a conversation that has since moved to a sibling
+        # worktree — the "switched to the old session and got the new one" report. Before
+        # staging, so a conversation this call is explicitly resuming is never touched.
+        self._release_sibling_owned_conversations(keep=resume_session_id)
         if resume_session_id:
             # Stage the transcript into THIS session's directory before spawning, so a
             # `--resume` finds it. Crucial when the conversation last ran somewhere else:
@@ -11968,11 +12075,22 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"adopt latest backend session failed: {error!r}")
             return
-        if latest and latest != self.state.backend_session_id:
-            self._debug(f"adopting backend session {latest} (was {self.state.backend_session_id})")
-            self.state.backend_session_id = latest
-            self.state.last_backend_message_id = None  # recomputed from the transcript on resume
-            self._persist_session_name(latest)
+        if not latest or latest == self.state.backend_session_id:
+            return
+        if latest in self._sibling_worktree_conversations():
+            # Not ours to adopt. A conversation that ran here and then moved to its own worktree
+            # leaves a copy of its transcript behind, and on an old aGiTrack that copy can still
+            # be the newest thing in this directory — so this would adopt a SIBLING's conversation
+            # and, worse, re-file its name under this session (``_persist_session_name``). That
+            # rewrite is what made a later start open this worktree running the other session's
+            # conversation. The stale copy is cleaned up when the worktree next opens; until then,
+            # simply decline it.
+            self._debug(f"not adopting {latest}: it belongs to another session's worktree")
+            return
+        self._debug(f"adopting backend session {latest} (was {self.state.backend_session_id})")
+        self.state.backend_session_id = latest
+        self.state.last_backend_message_id = None  # recomputed from the transcript on resume
+        self._persist_session_name(latest)
 
     def _persist_last_session_record(self) -> None:
         # Save just the resume pointer for the current (primary) session into the
