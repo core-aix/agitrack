@@ -32,6 +32,7 @@ __all__ = [
     "import_shared_session",
     "prepare_resume",
     "link_session",
+    "forget_session_in",
     "session_cwd",
     "retarget_session_cwd",
     "parse_rows",
@@ -406,6 +407,37 @@ def link_session(session_id: str, src_repo: Path, dst_repo: Path) -> bool:
         os.link(src, dst)
     except FileExistsError:
         return True
+    except OSError:
+        return False
+    return True
+
+
+def forget_session_in(repo: Path, session_id: str) -> bool:
+    """Drop ``repo``'s copy of a conversation's transcript — the conversation itself lives on.
+
+    Claude files a transcript per working directory, so a conversation that RAN in one directory
+    and then moved to another (aGiTrack relocating a `/clear`-started conversation into its own
+    worktree) leaves a copy behind in the directory it left. That copy is not harmless: it is
+    what ``list_worktree_sessions`` and ``latest_session_id`` read, so the old worktree goes on
+    claiming a conversation that is now somebody else's — which is how, after a restart, two
+    worktrees end up mixed up.
+
+    Refuses unless the conversation is recorded somewhere ELSE, so this can only ever remove a
+    duplicate, never the last copy. Returns True when a copy was removed."""
+    if not session_id:
+        return False
+    target = _session_path(Path(repo), session_id)
+    if not target.is_file():
+        return False
+    elsewhere = [
+        path
+        for path in _projects_root().glob(f"*/{session_id}.jsonl")
+        if path.is_file() and path.resolve() != target.resolve()
+    ]
+    if not elsewhere:
+        return False  # the only copy — dropping it would lose the conversation
+    try:
+        target.unlink()
     except OSError:
         return False
     return True

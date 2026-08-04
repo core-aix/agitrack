@@ -1681,3 +1681,35 @@ def test_the_export_memo_lets_a_big_session_go_when_nobody_comes_back(tmp_path):
     claude._LAST_EXPORT = (stored_key, stored, time.monotonic() - claude._EXPORT_MEMO_SECONDS - 1)
     claude.export_session_at(path)  # expired: re-read, and the stale entry replaced
     assert claude._LAST_EXPORT[2] > time.monotonic() - 5
+
+
+def test_forget_session_in_drops_a_worktrees_copy_of_a_moved_conversation(monkeypatch, tmp_path):
+    # A conversation relocated into its own worktree leaves a copy in the directory it ran in,
+    # and that copy is what `list_worktree_sessions` / `latest_session_id` read — so the old
+    # worktree goes on claiming a conversation that is now someone else's.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    left = tmp_path / "alpha"
+    moved_to = tmp_path / "gamma"
+    for directory in (left, moved_to):
+        proj = config / "projects" / claude_session._encode_repo(directory)
+        proj.mkdir(parents=True)
+        (proj / "s.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+    assert claude_session.forget_session_in(left, "s") is True
+    assert not (config / "projects" / claude_session._encode_repo(left) / "s.jsonl").exists()
+    assert (config / "projects" / claude_session._encode_repo(moved_to) / "s.jsonl").exists()
+    assert claude_session.forget_session_in(left, "s") is False  # already gone: nothing to do
+
+
+def test_forget_session_in_never_removes_the_last_copy(monkeypatch, tmp_path):
+    # It drops a duplicate record of WHERE a conversation ran, never the conversation itself.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    only = tmp_path / "alpha"
+    proj = config / "projects" / claude_session._encode_repo(only)
+    proj.mkdir(parents=True)
+    (proj / "s.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+    assert claude_session.forget_session_in(only, "s") is False
+    assert (proj / "s.jsonl").exists()

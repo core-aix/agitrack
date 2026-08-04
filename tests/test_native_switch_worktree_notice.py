@@ -22,12 +22,14 @@ Real git worktrees, both backends.
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.git import GitRepo
 from agitrack.git.worktree import WorktreeManager
+from agitrack.proxy.session import Session
 from agitrack.transcripts.types import SessionRef
 from proxy_helpers import make_runner
 
@@ -52,12 +54,14 @@ def _init_repo(path):
     return GitRepo.discover(path)
 
 
-def _runner(tmp_path, backend_name, *, refs, worktree: bool, answer=NO):
+def _runner(tmp_path, backend_name, *, refs, worktree: bool, answer=NO, activity=None):
     """A runner tracking ``old-session``, either inside a real worktree or on the base tree
     (the --no-worktree/manual shape, where there are no worktrees to hand out).
 
     ``answer`` is what the user picks at the own-worktree offer: the YES/NO prefix of an option,
-    or None for Esc.
+    or None for Esc. ``activity`` maps a conversation id to the epoch of its last backend
+    activity, so a test can hold a conversation's turn OPEN (a recent mtime) — the switch is
+    only handled once the conversation switched TO has gone quiet.
     """
     base = _init_repo(tmp_path)
     if worktree:
@@ -76,13 +80,24 @@ def _runner(tmp_path, backend_name, *, refs, worktree: bool, answer=NO):
     runner._use_worktrees = worktree
     runner.state.data["backend"] = backend_name
 
+    forgotten: list[tuple[str, str]] = []
+
     class _Backend:
         name = backend_name
 
         def list_sessions(self, _repo):
             return refs
 
+        def session_activity_mtime(self, session_id):
+            # None = "unknown", which is how a backend with no such signal answers.
+            return (activity or {}).get(session_id)
+
+        def forget_session_in(self, repo, session_id):
+            forgotten.append((str(repo), session_id))
+            return True
+
     runner.backend = _Backend()
+    runner.forgotten = forgotten
     runner._session_watch_at = 0.0
     runner.agent_in_flight = False
     runner.running = True
@@ -287,6 +302,97 @@ def test_a_failed_relocation_restores_the_outgoing_session(tmp_path, backend_nam
     assert runner.name == "alpha"
 
 
+def _relocating_runner(tmp_path, backend_name):
+    """A runner whose ``_new_session`` really does what relocation depends on: swaps the active
+    session for a NEW one, in its own worktree, with its own state file."""
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=YES)
+    runner.state.last_backend_message_id = "msg-old"
+
+    def new_session(name, *, resume_session_id=None, **kw):
+        info = WorktreeManager(runner.base_repo).create(name, base="main")
+        session = Session.bare()
+        session.name = name
+        session.worktree = info
+        session.repo = GitRepo(info.path)
+        session.state = AgitrackState(info.path, default_backend=backend_name)
+        session.state.backend_session_id = resume_session_id
+        runner.relocations.append((name, resume_session_id))
+        runner.active = session
+        runner.sessions.append(session)
+
+    runner._new_session = new_session
+    return runner
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_relocation_gives_the_outgoing_worktree_its_own_conversation_back(tmp_path, backend_name):
+    # THE restart mix-up. Detecting the switch necessarily re-points the still-active session at
+    # the new conversation (the turn that just ran belongs to it and is committed there). If
+    # relocation then carries that conversation off without putting the old session back, the
+    # worktree it left is still recorded as running it — two worktrees, one conversation — and
+    # the next start resolves the moved conversation's name from whichever worktree claims it.
+    runner = _relocating_runner(tmp_path, backend_name)
+    outgoing = runner.active
+
+    runner._service_native_session_switch()
+
+    assert runner.relocations == [("gamma", "new-session")]
+    assert outgoing.state.backend_session_id == "old-session"
+    assert outgoing.state.last_backend_message_id == "msg-old"
+    assert runner.active.state.backend_session_id == "new-session"
+    # …and durably, not just in memory: the next run reads these files.
+    outgoing_state = AgitrackState(outgoing.worktree.path, default_backend=backend_name)
+    assert outgoing_state.backend_session_id == "old-session"
+    assert AgitrackState(runner.active.worktree.path).backend_session_id == "new-session"
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_relocation_lands_the_moved_turn_on_the_base_before_cutting_the_worktree(tmp_path, backend_name):
+    # The turn belongs to the conversation being moved but was committed in the worktree being
+    # left. Cut the new worktree from a base branch that doesn't have it yet and the resumed
+    # agent opens without the files it just wrote — live, it reported its own b.txt missing.
+    runner = _relocating_runner(tmp_path, backend_name)
+    order: list[str] = []
+    runner._integrate_committed_turn_before_new_turn = lambda: order.append("integrate")
+    inner = runner._new_session
+    runner._new_session = lambda name, **kw: (order.append("new session"), inner(name, **kw))[1]
+
+    runner._service_native_session_switch()
+
+    assert order == ["integrate", "new session"]
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_relocation_stops_the_old_worktree_claiming_the_moved_conversation(tmp_path, backend_name):
+    # The other half of the same claim: Claude files a transcript per directory, so the moved
+    # conversation leaves a copy in the worktree it ran in, and that copy is what the resume
+    # list and `latest_session_id` read. The backend is asked to forget it there.
+    runner = _relocating_runner(tmp_path, backend_name)
+    outgoing = runner.active
+
+    runner._service_native_session_switch()
+
+    assert runner.forgotten == [(str(outgoing.worktree.path), "new-session")]
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_declining_leaves_the_outgoing_session_tracking_the_new_conversation(tmp_path, backend_name):
+    # The restore belongs to relocation ALONE. Answering No means this session keeps the new
+    # conversation — putting the old id back there would point the session at a conversation
+    # the user has left.
+    runner = _relocating_runner(tmp_path, backend_name)
+    runner.popups.clear()
+    runner._select_popup = lambda title, options, **kw: next(
+        (option for option in options if option.startswith(NO)), options[0]
+    )
+
+    runner._service_native_session_switch()
+
+    assert runner.relocations == []
+    assert runner.state.backend_session_id == "new-session"
+    assert runner.forgotten == []
+
+
 @pytest.mark.parametrize("backend_name", BACKENDS)
 def test_a_name_already_held_by_a_live_session_is_re_asked(tmp_path, backend_name):
     # A session and its worktree are 1:1, so accepting a name another live session holds would
@@ -360,6 +466,54 @@ def test_staying_on_the_same_conversation_offers_nothing(tmp_path, backend_name)
     assert runner.popups == []
     assert runner.relocations == []
     assert runner.state.backend_session_id == "old-session"
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_the_switch_waits_for_the_new_conversations_turn_to_finish(tmp_path, backend_name):
+    # A conversation becomes visible the moment the user's PROMPT is written, not when the agent
+    # has answered it. Every "is the agent busy" signal is keyed to the conversation just left,
+    # which `/clear` froze — so acting immediately committed a turn that had not happened
+    # ("committing finished turn with no final text response", live) and opened a modal over a
+    # working agent, which on Yes walked the session away from files the turn had yet to write.
+    runner = _runner(
+        tmp_path,
+        backend_name,
+        refs=SWITCHED,
+        worktree=True,
+        answer=YES,
+        activity={"new-session": time.time()},  # its turn is running right now
+    )
+
+    runner._service_native_session_switch()
+
+    assert runner.popups == []
+    assert runner.commits == []
+    assert runner.relocations == []
+    assert runner.state.backend_session_id == "old-session"  # tracking has not moved yet
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_the_switch_is_handled_once_the_new_conversation_goes_quiet(tmp_path, backend_name):
+    # The deferral is a wait, not a refusal: the very next pass, with the turn finished, does
+    # the whole thing — commit first, then offer.
+    runner = _runner(
+        tmp_path,
+        backend_name,
+        refs=SWITCHED,
+        worktree=True,
+        answer=YES,
+        activity={"new-session": time.time()},
+    )
+
+    runner._service_native_session_switch()
+    assert runner.relocations == []
+
+    runner.backend.session_activity_mtime = lambda sid: time.time() - 3600  # turn finished
+    runner._session_watch_at = 0.0
+    runner._service_native_session_switch()
+
+    assert runner.commits == ["new-session"]
+    assert runner.relocations == [("gamma", "new-session")]
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
