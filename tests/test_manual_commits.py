@@ -13,6 +13,7 @@ when off (no hooks, no latent commits, existing paths unchanged).
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -1892,7 +1893,11 @@ def test_a_pruned_latent_object_does_not_kill_all_future_tracking(tmp_path):
     (tmp_path / "a.txt").write_text("turn one\n", encoding="utf-8")
     _record(tracker, "one", 50)
     tip = repo.ref_sha(tracker.ref())
-    (repo.repo / ".git" / "objects" / tip[:2] / tip[2:]).unlink()  # what a prune leaves behind
+    loose = repo.repo / ".git" / "objects" / tip[:2] / tip[2:]
+    # git stores loose objects READ-ONLY, which on Windows makes unlink() an access error. Make
+    # it writable first so this simulates a prune on every platform rather than only POSIX.
+    loose.chmod(stat.S_IWRITE | stat.S_IREAD)
+    loose.unlink()  # what a prune leaves behind: a ref naming an object that is gone
 
     (tmp_path / "a.txt").write_text("turn one\nturn two\n", encoding="utf-8")
     assert tracker.gate() is True
