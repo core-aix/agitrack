@@ -100,6 +100,18 @@ Conventions:
 | **Commit failure (hook/config) → surfaced, no crash, changes kept** | `test_user_commit_popup_surfaces_failure_without_crashing` (mock) + `test_commit_raises_catchable_giterror_on_failing_pre_commit_hook` (**real-git**, real pre-commit hook) | mock + real-git |
 | **No AI turns → zero aGiTrack footprint** (empty trailer; hook appends nothing; commit stays plain/untracked) | `test_manual_trailer_with_no_pending_turns_is_empty_no_footprint`, `test_hook_leaves_commit_untouched_when_no_pending_turns`, `test_runner_git_commit_with_no_pending_turns_is_plain_user_commit` | real-git |
 
+## 6a. Commit accounting when the AGENT commits itself
+The agent running `git commit` mid-turn is ordinary, not exotic. Its commit is stamped with an
+IN-FLIGHT block — attribution only, no trace, no tokens — whose text promises they land in a
+later commit. These rows are that promise being kept, across every mode.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| **Manual mode: a turn whose only action was the agent's own mid-turn commit is still RECORDED** — gate and record must agree, or the gate's widening is vetoed one step later and the tokens vanish | `test_manual_mode_records_a_turn_whose_only_action_was_its_own_midturn_commit`, `test_manual_daemon_records_a_turn_whose_only_action_was_its_own_midturn_commit` | real-git |
+| …and the record guard still refuses a turn that genuinely changed nothing (else every poll chains an empty latent commit) | `test_the_record_guard_still_refuses_a_turn_that_genuinely_changed_nothing`, `test_the_daemons_record_guard_still_refuses_a_turn_that_changed_nothing` | real-git |
+| A custom `core.hooksPath` is DETECTED from real git config (not a hand-set flag), the fold hooks are skipped, and poll+cover takes over | `test_setup_falls_back_to_poll_cover_under_a_real_core_hookspath`, `test_hooks_are_installed_when_no_custom_hookspath_is_set`, `test_core_hooks_path_is_detected_from_real_git_config`, `test_a_custom_hookspath_really_does_stop_our_hook_from_running` | real-git |
+| `-b` autostart after a pre-commit sync resumes the mode the user last chose — auto as well as manual | `test_precommit_sync_autostart_resumes_auto_mode`, `test_precommit_sync_autostart_spawns_daemon` | real-git |
+
 ## 6b. Base-commit guard: keeping the agent out of the base repo (`tests/test_base_commit_guard.py`)
 Worktree mode only. The agent works in a linked worktree and aGiTrack commits and merges for it;
 an agent that commits into the BASE repo instead puts an untracked commit on the user's branch —
