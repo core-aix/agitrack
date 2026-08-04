@@ -835,12 +835,20 @@ class ProxyRunner:
             # which may be unset (there is no hardcoded fallback).
             else AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         )
-        if backend and backend != self.state.backend:
-            self.state.remember_backend_session()
+        if backend:
+            if backend != self.state.backend:
+                self.state.remember_backend_session()
+                self.state.backend_session_id = self.state.stored_backend_session(backend)
+                self.state.last_backend_message_id = None
+            # Record the explicit `--backend` choice even when it only CONFIRMS what the state
+            # already resolves to. On a fresh repo the state was seeded with this very flag as an
+            # in-memory default, so `backend != self.state.backend` was false and nothing was ever
+            # written: `--backend claude` (documented as "also saved as the global default") left
+            # both the state file and the global config empty, and every later reader of them saw
+            # no backend at all.
             self.state.backend = backend
-            self.global_config.default_backend = backend
-            self.state.backend_session_id = self.state.stored_backend_session(backend)
-            self.state.last_backend_message_id = None
+            if self.global_config.default_backend != backend:
+                self.global_config.default_backend = backend
         self.backend = make_proxy_agent(self.state.backend)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose)
         self.verbose = verbose
@@ -8269,6 +8277,20 @@ class ProxyRunner:
             ["Got it"],
         )
 
+    def _active_backend_name(self) -> str | None:
+        """The backend the CURRENT session is running, or None when it cannot be told.
+
+        Read from the live proxy agent first (always right for this run) and only then from
+        the session state, whose getter RAISES when no backend is configured anywhere — this
+        is called precisely to avoid that raise reaching a session-creating path."""
+        name = getattr(self.backend, "name", None)
+        if name:
+            return str(name)
+        try:
+            return self.state.backend
+        except Exception:
+            return None
+
     def _new_session(
         self,
         name: str,
@@ -8285,6 +8307,15 @@ class ProxyRunner:
         # shared-tree caveat, which used to be raised from inside the branch below.)
         if not self._use_worktrees:
             self._warn_parallel_no_worktree_sessions()
+        # The backend THIS RUN is using, read before the swap below empties `self.active`.
+        # A new session inherits it. Seeding the new state from the global default alone was
+        # not enough: `agitrack --backend claude` on a repo with no configured default never
+        # recorded one, so the new state resolved to no backend at all and
+        # `make_proxy_agent(self.state.backend)` raised "No coding agent backend is configured
+        # for this session" — a crash mid-relocation, after the new worktree existed and
+        # before the outgoing session's identity was restored, which left BOTH worktrees
+        # claiming one conversation: exactly the corruption the relocation fix prevents.
+        inherited_backend = backend or self._active_backend_name()
         # Fresh per-session runtime state; the outgoing active session keeps
         # its state on its own Session object in self.sessions.
         self.active = Session.bare()
@@ -8303,7 +8334,9 @@ class ProxyRunner:
             self.repo = repo
             self._base_branch = base  # this session integrates into `base` (per-session)
             self.turn = self._turn_from_branch(repo.current_branch())
-            self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+            self.state = AgitrackState(
+                info.path, default_backend=inherited_backend or self.global_config.default_backend
+            )
             if base_branch is None:
                 # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
                 # any merge branch a prior run assigned it, confirming the change with the user.
@@ -8322,7 +8355,9 @@ class ProxyRunner:
             self.repo = self.base_repo
             self._base_branch = self.base_repo.current_branch()
             self.turn = 0
-            self.state = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            self.state = AgitrackState(
+                self.base_repo.repo, default_backend=inherited_backend or self.global_config.default_backend
+            )
             if not resume_session_id:
                 # A blank session is a FRESH conversation, not a continuation of whatever
                 # the shared base-dir state last recorded (worktree sessions each got a

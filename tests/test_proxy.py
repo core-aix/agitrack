@@ -6150,6 +6150,55 @@ def test_new_session_no_worktree_runs_in_base_dir_not_a_worktree(tmp_path):
     assert "warn" in events  # the shared-tree caveat was surfaced
 
 
+def test_a_new_session_inherits_the_runs_backend_when_none_is_configured(tmp_path):
+    # Found live: `agitrack --backend claude` on a repo with no configured default never
+    # recorded one anywhere, so a NEW session's state (seeded only from the global default)
+    # resolved to no backend and `make_proxy_agent(self.state.backend)` raised "No coding
+    # agent backend is configured for this session". That crash landed mid-relocation — after
+    # the new worktree existed, before the outgoing session's identity was restored — leaving
+    # BOTH worktrees recording the same conversation, the very corruption the relocation
+    # fix exists to prevent. The run's own backend is the answer, and it is always known.
+    import types
+
+    runner, _base, _events = _no_worktree_new_session_runner(tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend=None)
+    runner.backend = types.SimpleNamespace(name="claude")  # what this run is actually using
+
+    runner._new_session("second")
+
+    assert runner.state.backend == "claude"
+
+
+def test_a_new_worktree_session_inherits_the_runs_backend_too(tmp_path):
+    # Same defect, on the path that actually crashed: the /clear "move it to its own
+    # worktree" relocation, which goes through the worktree branch of _new_session.
+    import types
+
+    from agitrack.git import GitRepo
+
+    runner, base, _events = _no_worktree_new_session_runner(tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend=None)
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner._use_worktrees = True
+    worktree_dir = tmp_path / "wt"
+    worktree_dir.mkdir()
+    wt_repo = GitRepo.init(worktree_dir)
+    (worktree_dir / "f.txt").write_text("x\n", encoding="utf-8")
+    wt_repo.stage_paths(["f.txt"])
+    wt_repo.commit("seed")
+    runner._open_session_worktree = lambda name, **kw: (
+        types.SimpleNamespace(name=name, path=worktree_dir),
+        wt_repo,
+    )
+    runner._merge_target_default = lambda: "main"
+    runner._reconcile_merge_branch = lambda _base: None
+    runner._release_sibling_owned_conversations = lambda **kw: None
+
+    runner._new_session("beta")
+
+    assert runner.state.backend == "claude"
+
+
 def test_new_session_no_worktree_blank_starts_fresh_conversation(tmp_path):
     # A blank no-worktree session must not inherit the shared base-dir state's recorded
     # conversation id — it mints a fresh one.
