@@ -4216,12 +4216,118 @@ class ProxyRunner:
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
         self._debug(f"native session switch: {current} -> {newest.id}")
+        # Offer the new conversation a worktree of its own FIRST, before a single field is
+        # mutated. Relocation hands the runner to _new_session, which needs the outgoing session
+        # intact — its state still pointing at the OLD conversation — so its pending turn is
+        # committed against the conversation that produced it.
+        if self._relocate_switched_conversation(newest.id):
+            return
         self._abandon_summary_for_switched_session(current, newest.id)
         self.state.backend_session_id = newest.id
         self.state.last_backend_message_id = None
         self._initialize_session_baseline()
+        if self.worktree is not None:
+            # STAYING PUT in worktree mode: the session keeps its name. A worktree session and
+            # its name are 1:1 — the name IS the directory — so renaming here (which is what
+            # _restore_or_ask_session_name does for an unknown conversation) splits the two:
+            # the status bar and the turn branches take the new name while the directory keeps
+            # the old, exit cleanup then removes the worktree by its directory name and leaks
+            # the branches filed under the other one, and _remember_session_for_backend finally
+            # overwrites the chosen name with the directory's — so the name the user typed is
+            # lost and two conversations end up sharing one. Link the new conversation to THIS
+            # session's name instead; the offer above is where a differently-named session is
+            # made, and it makes a directory to match.
+            self._persist_session_name(newest.id)
+            self._render()
+            return
         self._restore_or_ask_session_name(newest.id)
-        self._warn_native_switch_shares_worktree()
+
+    def _relocate_switched_conversation(self, session_id: str) -> bool:
+        """Offer the just-switched-to conversation a worktree of its own, and make it.
+
+        A conversation started with the backend's own `/clear` or `/resume` runs in the process
+        aGiTrack already spawned, whose cwd is this session's worktree — so by default it shares
+        that worktree, that turn branch and that merge target with the conversation before it.
+        aGiTrack CAN give it its own, the same way ``sessions → New session`` and ``Resume a past
+        conversation`` do: create a worktree and respawn the backend there with ``--resume``, so
+        the conversation itself is preserved and only the process moves.
+
+        That costs a backend restart, so it is asked rather than assumed. Returns True when the
+        relocation happened and the caller must not touch the outgoing session any further.
+
+        The retirement of the OLD process is the delicate part and the reason this is not simply
+        ``_new_session``: that process has ALREADY left the old conversation and is writing the
+        new one. Leaving it alive would put two backends on a single transcript. So the outgoing
+        session commits its pending turn (still attributed to the old conversation, since nothing
+        has been repointed yet), its child is torn down, and only then does the new session
+        spawn. The outgoing worktree, its commits and its conversation all survive — it simply
+        becomes dormant, and reappears in the sessions menu as an idle worktree to resume.
+        """
+        if self.worktree is None or not self._use_worktrees:
+            return False  # --no-worktree / manual: no worktrees to hand out
+        choice = self._select_popup(
+            "New conversation — give it its own worktree?",
+            [
+                "Yes — move it to a new worktree (the backend restarts)",
+                f"No — keep it here, in '{self.name}'",
+            ],
+            detail=[
+                f"You started a new conversation inside {self.backend.name}. It is running in the",
+                f"process aGiTrack spawned for session '{self.name}', so unless it is moved it",
+                f"shares that session's worktree (.agitrack/worktrees/{self.worktree.path.name}),",
+                f"its branch, and its merge into {self._base_branch or 'the base branch'}.",
+                "",
+                "Moving it creates a worktree of its own and restarts the backend there,",
+                f"resuming this same conversation. Session '{self.name}' keeps its worktree and",
+                "its commits, and stays available under sessions → resume.",
+            ],
+        )
+        if choice is None or choice.startswith("No"):
+            return False  # Esc reads as "leave it alone", the conservative answer
+        name = self._name_for_switched_conversation(session_id)
+        if name is None:
+            return False  # cancelled at the name prompt — keep the conversation where it is
+        outgoing = self.active
+        # Commit the outgoing session's work BEFORE anything is repointed, so it is recorded
+        # against the conversation that produced it rather than the one just switched to.
+        self._commit_latest_turn_sync()
+        self._stop_file_watcher()
+        self._teardown_child()  # the process that switched; the new session spawns its own
+        self._new_session(name, resume_session_id=session_id)
+        if not (self.sessions and self.sessions[-1] is self.active):
+            # _new_session bailed (e.g. the worktree could not be created) and left a bare
+            # session behind. Put the outgoing one back rather than stranding the runner with
+            # no screen and no PTY; its child is gone, and the session-exit handling respawns.
+            self._debug("relocation failed to start the new session; restoring the outgoing one")
+            self.active = outgoing
+            self._render()
+            return False
+        if outgoing in self.sessions:
+            self.sessions.remove(outgoing)
+        self._set_message(
+            f"Moved this conversation into its own worktree '{name}'. "
+            f"Session '{getattr(outgoing, 'name', '?')}' is idle — resume it from the sessions menu.",
+            seconds=10.0,
+        )
+        self._render()
+        return True
+
+    def _name_for_switched_conversation(self, session_id: str) -> str | None:
+        """The name for a conversation being moved into its own worktree: the one it already
+        carries if aGiTrack has seen it, otherwise asked for with a fresh suggestion. None when
+        the user cancels. A fresh suggestion (not the current session's name) because the new
+        worktree is a sibling of the current one and two live sessions cannot share a name."""
+        try:
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            known = root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            known = None
+        if known and not self._live_session_name_taken(known):
+            return known
+        return self._prompt_session_name("Name for the new conversation's session", default=self._next_session_name())
 
     def _bind_first_conversation(self, with_content: list) -> None:
         """Adopt the conversation this session just started — WITHOUT asking for a name again.
