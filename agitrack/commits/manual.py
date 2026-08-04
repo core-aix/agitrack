@@ -280,7 +280,10 @@ class ManualCommitTracker:
         empty) — i.e. whether there is uncommitted agent work to account for."""
         tip = self.repo.ref_sha(self.ref())
         try:
-            base_tree = self.repo.rev_parse(f"{tip or 'HEAD'}^{{tree}}")
+            # `comparable_tree`, never a raw `^{tree}`: *tree* is a snapshot, which drops the
+            # agent scaffolding dirs, so a repo that TRACKS `.claude/` would otherwise read as
+            # permanently dirty and nothing here could ever be equal. See GitRepo.comparable_tree.
+            base_tree = self.repo.comparable_tree(tip or "HEAD")
         except Exception:
             base_tree = None
         return tree != base_tree
@@ -317,6 +320,7 @@ class ManualCommitTracker:
                 self._debug(f"manual snapshot failed: {error!r}")
                 return None
         tip = self.repo.ref_sha(self.ref())
+        re_anchored = False
         if tip is not None and not self.repo.has_object_local(tip):
             # The ref names a commit this repo no longer has — `git gc --prune` can collect a
             # latent commit, which is unreachable from any branch by design. Every lookup against
@@ -324,13 +328,18 @@ class ManualCommitTracker:
             # would silently stop tracking until someone deleted the ref by hand. Re-anchor at
             # HEAD instead: the chain restarts, and only the already-lost turns are lost.
             self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
-            tip = None
+            tip, re_anchored = None, True
         parent = tip or self.repo.rev_parse("HEAD")
         allow_unchanged, self._allow_unchanged = self._allow_unchanged, False
-        if not allow_unchanged and tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
-            # Defensive: nothing new since the latent tip. Skipped when gate() explicitly allowed
-            # an unchanged tree (the agent committed the turn's work itself), or this guard would
-            # veto the record gate just approved and the turn's tokens would vanish.
+        # Defensive: nothing new since the baseline — the latent tip, or HEAD when the chain is
+        # EMPTY, which is the same baseline gate() uses and was previously exempt from this guard
+        # entirely, so a record() reaching here ungated recorded a phantom first turn against an
+        # untouched tree. Skipped in two cases, both of which would otherwise vanish a turn's
+        # tokens: gate() explicitly allowed an unchanged tree (the agent committed the turn's work
+        # itself), and the re-anchor above, where the tip we would have compared against is the
+        # object git collected — HEAD is a fallback parent there, not evidence of no work.
+        baseline = None if re_anchored else (tip or "HEAD")
+        if not allow_unchanged and baseline is not None and tree == self.repo.comparable_tree(baseline):
             return None
         sha = self.repo.commit_tree(tree, parents=[parent], message=message)
         self.repo.update_ref(self.ref(), sha)
@@ -350,7 +359,7 @@ class ManualCommitTracker:
             tip = self.repo.ref_sha(self.ref())
             if not tip:
                 return False
-            clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
+            clean = self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD")
             if clean or self.repo.is_ancestor(tip, head):
                 self.repo.update_ref(self.ref(), head)
                 return True
@@ -455,7 +464,9 @@ def prune_abandoned_refs(
     changed: list[str] = []
     try:
         head = repo.rev_parse("HEAD")
-        head_tree = repo.rev_parse("HEAD^{tree}")
+        # Scaffolding-stripped on BOTH sides of every comparison below (the snapshot, and the
+        # latent trees the tail-trim walks), or a repo tracking `.claude/` never prunes anything.
+        head_tree = repo.comparable_tree("HEAD")
         working_tree_is_clean = repo.snapshot_worktree_tree() == head_tree
     except Exception as error:
         log(f"abandoned-ref prune skipped: {error!r}")
@@ -477,7 +488,7 @@ def prune_abandoned_refs(
                 continue
             # Trim the conversation-only tail: trailing turns that recorded no code beyond HEAD.
             pruned = tip
-            while pruned and pruned != head and repo.rev_parse(f"{pruned}^{{tree}}") == head_tree:
+            while pruned and pruned != head and repo.comparable_tree(pruned) == head_tree:
                 parents = repo.parents(pruned)
                 pruned = parents[0] if parents else head
             if pruned != tip:

@@ -283,6 +283,42 @@ class GitRepo:
             )
             return self._run(["git", "write-tree"], env=env).stdout.strip()
 
+    def comparable_tree(self, rev: str = "HEAD") -> str:
+        """The tree of *rev* with the agent scaffolding dirs stripped, so it is directly
+        COMPARABLE with :meth:`snapshot_worktree_tree`.
+
+        Every "has the working tree changed?" test in manual/no-worktree/background mode is a
+        comparison between a snapshot and some commit's tree. The snapshot deliberately drops
+        ``.agitrack/`` / ``.claude/`` / ``.opencode/``; a raw ``rev^{tree}`` does not. So in a repo
+        that TRACKS any of those — committing ``.claude/settings.json`` or a ``.claude/commands/``
+        dir is ordinary practice — the two could never be equal and every one of those tests
+        answered "dirty" forever: the daemon stopped covering the agent's own commits, stale and
+        abandoned latent chains were never reset or pruned, a purely human commit made during an
+        agent turn was stamped as agent work, and a turn that changed nothing was still recorded.
+        Stripping the same paths from both sides is what makes the comparison mean what it says.
+
+        Idempotent, so it is safe on a tree that is already a snapshot (the latent tips it is
+        compared against are). Falls back to the raw tree when *rev* has no scaffolding at top
+        level — the overwhelmingly common case, and one cheap ``ls-tree`` instead of three
+        index writes."""
+        scaffolding = [prefix.rstrip("/") for prefix in _NEVER_STAGE_PREFIXES]
+        try:
+            top = set(self._run(["git", "ls-tree", "--name-only", rev]).stdout.split("\n"))
+        except Exception:
+            top = set(scaffolding)  # unreadable ⇒ take the thorough path rather than guess
+        if not top.intersection(scaffolding):
+            return self.rev_parse(f"{rev}^{{tree}}")
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index")
+            env = {"GIT_INDEX_FILE": index}
+            self._run(["git", "read-tree", rev], env=env)
+            self._run(
+                ["git", "rm", "-r", "--cached", "--quiet", "--ignore-unmatch", *scaffolding],
+                env=env,
+                check=False,
+            )
+            return self._run(["git", "write-tree"], env=env).stdout.strip()
+
     def commit_tree(self, tree: str, *, parents: list[str], message: str) -> str:
         """Create a commit object for ``tree`` with the given ``parents`` and return its
         FULL SHA. Unlike ``commit``/``cover_commit`` this moves no ref and touches neither
