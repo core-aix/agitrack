@@ -140,6 +140,40 @@ def _session_path(repo: Path, session_id: str) -> Path:
     return _project_dir(repo) / f"{session_id}.jsonl"
 
 
+# How much of a transcript's tail to read when asking when it last had a message. Generous
+# enough to span several rows of a long turn, small enough to be free on a 150 MB session.
+_TAIL_BYTES = 65536
+
+
+def _content_updated(path: Path, fallback: float) -> float:
+    """When this conversation last had a MESSAGE, read from the tail of its transcript.
+
+    The file's mtime cannot answer this. aGiTrack itself touches transcripts — hardlinking one
+    into a worktree for a resume, mirroring it to the base repo, rewriting a recorded cwd — none
+    of which adds a message, all of which bump the mtime. Observed live: a conversation
+    abandoned by `/clear` hours earlier was linked into a worktree, became the newest file
+    there, and was adopted as that session's conversation, taking the session's NAME with it —
+    so the next start opened the session on the dead conversation and the real one came back
+    under a fresh name.
+
+    A transcript is append-only JSONL, so the newest message timestamp is at the end: only the
+    tail is read, whatever the file's size. ``fallback`` (the mtime) is used when the tail
+    carries no timestamp at all."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return fallback
+    for raw in reversed(_TIMESTAMP_RE.findall(tail)):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return fallback
+
+
 def latest_session_id(repo: Path) -> str | None:
     refs = list_sessions(repo)
     # Prefer the newest conversation that actually has a user prompt. Claude mints
@@ -155,7 +189,11 @@ def latest_session_id(repo: Path) -> str | None:
     pool = resumable or refs
     if not pool:
         return None
-    return max(pool, key=lambda ref: ref.updated).id
+    # Ranked by CONTENT recency, not the file's mtime — see _content_updated for what mtime
+    # ranking cost here (a dead conversation aGiTrack had merely touched being adopted as the
+    # session's own).
+    project = _project_dir(repo)
+    return max(pool, key=lambda ref: _content_updated(project / f"{ref.id}.jsonl", ref.updated)).id
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
@@ -846,6 +884,13 @@ def session_last_activity(session_id: str) -> float | None:
     path = _find_session_file(session_id)
     if path is None:
         return None
+    # The tail first: this is asked on a timer (the conversation-switch watcher), and a session's
+    # transcript runs to hundreds of megabytes, so reading the whole file to find its LAST
+    # timestamp would put a multi-megabyte read on every tick. Append-only JSONL puts the newest
+    # timestamp at the end. Only a transcript whose tail somehow carries none is read in full.
+    tail = _content_updated(path, float("nan"))
+    if tail == tail:  # not NaN: the tail answered
+        return tail
     try:
         data = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
