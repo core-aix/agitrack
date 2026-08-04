@@ -199,7 +199,10 @@ def test_every_page_script_runs(pages, tmp_path):
         source = re.findall(r"<script>(.*?)</script>", html, re.S)[-1]
         script = tmp_path / f"{name}.js"
         script.write_text("const SOURCE = " + _json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
-        result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=60)
+        # Generous on purpose: the bound is here to catch a script that HANGS, not to assert how
+        # fast node starts. A 60s bound timed out on a loaded Windows CI runner under `-n auto`,
+        # which measured the runner rather than the page.
+        result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300)
         assert result.returncode == 0, f"{name}: {result.stdout.strip() or result.stderr.strip()}"
 
 

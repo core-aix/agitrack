@@ -1429,7 +1429,10 @@ def test_the_page_script_runs(tmp_path):
     source = re.findall(r"<script>(.*?)</script>", story.story_html(tmp_path), re.S)[-1]
     script = tmp_path / "page.js"
     script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
-    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=60)
+    # Generous on purpose: the bound is here to catch a script that HANGS, not to assert how
+    # fast node starts. A 60s bound timed out on a loaded Windows CI runner under `-n auto`,
+    # which measured the runner rather than the page.
+    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, f"the story page script threw: {result.stdout.strip() or result.stderr.strip()}"
 
 
