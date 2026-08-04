@@ -878,6 +878,9 @@ def main(argv: list[str] | None = None) -> int:
     if repo is None:
         return 1
 
+    if _refuse_during_merge_conflict(repo):
+        return 1
+
     # Migrate a pre-rename ``.agit/`` state dir (and its worktrees) to ``.agitrack/``
     # before anything reads state, so existing sessions survive the upgrade.
     from agitrack.config.migrate import migrate_repo_state
@@ -1676,6 +1679,41 @@ def _read_menu_key_press_windows(expected: bytes, *, shift: bool, timeout: float
         if expected in buffer:
             return True
     return False
+
+
+def _refuse_during_merge_conflict(repo: GitRepo) -> bool:
+    """True (and explain) when the repo is mid-conflict, so the caller can stop.
+
+    aGiTrack must not start on top of an unresolved conflict. Everything it does assumes it can
+    read the tree as the user's work and commit it: the pre-agent commit would fold half-merged
+    files (conflict markers included) into a commit, the worktree a session is checked out from
+    would inherit that state, and the agent would be handed a tree the user is still repairing.
+    Refusing is also the only honest answer — there is no reading of "commit this" that is right
+    while a merge is unresolved.
+
+    Detected from the unmerged index entries rather than from ``MERGE_HEAD``, so a rebase,
+    cherry-pick or revert that stopped on a conflict is caught too — none of those write
+    ``MERGE_HEAD``, and all of them leave the same half-resolved tree.
+    """
+    try:
+        conflicted = repo.unmerged_paths()
+    except Exception:
+        return False  # never block a start on a failed check
+    if not conflicted:
+        return False
+    shown = conflicted[:20]
+    print(f"\naGiTrack can't start: {repo.repo} has an unresolved merge conflict.")
+    print("\nThese files still have conflicts:")
+    for path in shown:
+        print(f"  {path}")
+    if len(conflicted) > len(shown):
+        print(f"  … and {len(conflicted) - len(shown)} more")
+    print(
+        "\nResolve them first (edit the files, `git add` each one, then finish with\n"
+        "`git commit` / `git rebase --continue`), or abandon the merge with\n"
+        "`git merge --abort`. Then start aGiTrack again."
+    )
+    return True
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:
