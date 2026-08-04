@@ -11896,3 +11896,28 @@ def test_the_switch_watch_is_throttled(tmp_path):
     runner._service_native_session_switch()
 
     assert not calls, "a directory listing on every reactor tick"
+
+
+def test_restart_ignores_a_conversation_that_is_only_a_newer_FILE(tmp_path):
+    """aGiTrack touches transcripts itself — staging a resume, mirroring to the base repo,
+    retargeting a recorded cwd — none of which adds a message. Live, that made a conversation
+    abandoned with `/clear` the newest FILE in a worktree, and the pin moved onto it: the session
+    came back running the thrown-away conversation, under that session's name."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "the-real-one"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend(
+            [
+                SessionRef("the-real-one", 100.0, label="real work"),
+                SessionRef("abandoned", 200.0, label="hi"),  # newer file, older messages
+            ]
+        ),
+        state=state,
+    )
+    messages = {"the-real-one": 2_000.0, "abandoned": 1_000.0}
+    runner.backend.session_last_activity = lambda sid: messages.get(sid)
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "the-real-one"

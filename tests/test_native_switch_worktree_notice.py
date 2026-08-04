@@ -517,6 +517,35 @@ def test_the_switch_is_handled_once_the_new_conversation_goes_quiet(tmp_path, ba
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
+def test_a_merely_touched_transcript_does_not_read_as_a_switch(tmp_path, backend_name):
+    # The listing ranks by FILE mtime, and aGiTrack's own writes move it: staging a resume,
+    # mirroring a conversation into the base repo, retargeting a recorded cwd. Live, that made a
+    # conversation abandoned with `/clear` hours earlier the newest file in the directory — it
+    # was adopted as the session's own and took the session's name with it.
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=YES)
+    messages = {"old-session": 2_000.0, "new-session": 1_000.0}  # ours has the newer MESSAGES
+    runner.backend.session_last_activity = lambda sid: messages.get(sid)
+
+    runner._service_native_session_switch()
+
+    assert runner.popups == []
+    assert runner.commits == []
+    assert runner.state.backend_session_id == "old-session"
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_a_real_switch_is_still_adopted_when_its_messages_are_newer(tmp_path, backend_name):
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=NO)
+    messages = {"old-session": 1_000.0, "new-session": 2_000.0}
+    runner.backend.session_last_activity = lambda sid: messages.get(sid)
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "new-session"
+    assert runner.commits == ["new-session"]
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
 def test_a_stale_sibling_conversation_does_not_trigger_the_offer(tmp_path, backend_name):
     # An older conversation in the same directory must never pull tracking off the live one,
     # and certainly must not prompt to restart the backend for it.

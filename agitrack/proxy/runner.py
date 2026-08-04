@@ -4174,7 +4174,12 @@ class ProxyRunner:
         # session id on every resume/picker action; it is newest by mtime and has nothing in it,
         # and adopting one drops the user into a blank session on the next start. A ref's label
         # is its first real user prompt, so `label` is None exactly when there is no real turn.
-        refs = {ref.id: ref.updated for ref in listed if ref.label or ref.id == pinned}
+        # Ranked by CONTENT recency, not the file's mtime. aGiTrack touches transcripts itself —
+        # staging a resume, mirroring to the base repo, retargeting a recorded cwd — so an
+        # abandoned conversation can be the newest FILE here while carrying nothing newer than
+        # the pinned one. Moving the pin onto it is what made a session come back running a
+        # conversation the user had thrown away with `/clear`, under that session's name.
+        refs = {ref.id: self._session_recency(ref.id, ref.updated) for ref in listed if ref.label or ref.id == pinned}
         if pinned not in refs:
             return  # not our directory's conversation (a worktree/rename case): leave staging to it
         newest = max(refs.items(), key=lambda item: item[1])
@@ -4229,6 +4234,14 @@ class ProxyRunner:
         ours = next((ref.updated for ref in refs if ref.id == current), None)
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
+        if self._session_recency(newest.id, newest.updated) <= self._session_recency(current, ours or 0.0):
+            # The listing ranks by FILE mtime, which aGiTrack's own writes move: staging a resume,
+            # mirroring a conversation to the base repo and retargeting a recorded cwd all touch a
+            # transcript without adding a message to it. So confirm against the message timestamps
+            # before believing a conversation has taken over — otherwise a conversation the user
+            # abandoned reads as a fresh switch, and gets adopted (and named) as this session's.
+            self._debug(f"ignoring {newest.id}: newer file, but no newer messages than {current}")
+            return
         if not self._conversation_idle(newest.id, self.CHILD_IDLE_SECONDS):
             # The new conversation's first turn is still RUNNING. A conversation becomes visible
             # here the moment the user's prompt is written — long before the agent has answered
@@ -12076,6 +12089,16 @@ class ProxyRunner:
             self._debug(f"adopt latest backend session failed: {error!r}")
             return
         if not latest or latest == self.state.backend_session_id:
+            return
+        tracked = self.state.backend_session_id
+        if tracked and self._session_recency(latest, 0.0) < self._session_recency(tracked, 0.0):
+            # Never adopt BACKWARDS. "Latest" is whatever the backend reports as this directory's
+            # most recent conversation, and a conversation aGiTrack merely touched (staged,
+            # mirrored, retargeted) can hold that title while carrying nothing newer than what we
+            # are already on. Adopting it re-files this session's NAME onto a dead conversation
+            # (`_persist_session_name` below), which is how a session came back, after a restart,
+            # running a conversation the user had abandoned with `/clear` hours earlier.
+            self._debug(f"not adopting {latest}: it is older than the tracked conversation")
             return
         if latest in self._sibling_worktree_conversations():
             # Not ours to adopt. A conversation that ran here and then moved to its own worktree

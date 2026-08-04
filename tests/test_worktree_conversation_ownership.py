@@ -214,3 +214,46 @@ def test_a_release_prefers_the_conversation_this_run_was_asked_to_continue(tmp_p
 
     assert runner.state.backend_session_id == OURS
     assert runner.forgotten == [(str(runner.alpha.path), MOVED)]
+
+
+def test_exit_never_adopts_a_conversation_older_than_the_tracked_one(tmp_path):
+    # "Latest" is whatever the directory reports, and aGiTrack's own file touches can hand that
+    # title to a conversation carrying nothing newer. Adopting it re-files the session's NAME
+    # onto a dead conversation — the "same session came back under a different name" report.
+    runner = _runner(
+        tmp_path,
+        here_records=OURS,
+        here_holds=[
+            SessionRef(id="abandoned", updated=300.0, label="hi"),
+            SessionRef(id=OURS, updated=100.0, label="ours"),
+        ],
+        named={OURS: "alpha"},
+    )
+    activity = {OURS: 2_000.0, "abandoned": 1_000.0}  # ours has the newer MESSAGES
+    runner.backend.session_last_activity = lambda sid: activity.get(sid)
+
+    runner._adopt_latest_backend_session()
+
+    assert runner.state.backend_session_id == OURS
+    assert AgitrackState(runner.base_repo.repo).session_name_for("abandoned") is None
+
+
+def test_exit_still_adopts_a_genuinely_newer_conversation(tmp_path):
+    # The adoption itself is wanted: a conversation the user really did switch to inside the
+    # backend must become this session's, so the next start restores what they were using.
+    runner = _runner(
+        tmp_path,
+        here_records=OURS,
+        here_holds=[
+            SessionRef(id="switched-to", updated=300.0, label="new"),
+            SessionRef(id=OURS, updated=100.0, label="ours"),
+        ],
+        named={OURS: "alpha"},
+    )
+    activity = {OURS: 1_000.0, "switched-to": 2_000.0}
+    runner.backend.session_last_activity = lambda sid: activity.get(sid)
+
+    runner._adopt_latest_backend_session()
+
+    assert runner.state.backend_session_id == "switched-to"
+    assert AgitrackState(runner.base_repo.repo).session_name_for("switched-to") == "alpha"

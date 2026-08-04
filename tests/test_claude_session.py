@@ -1713,3 +1713,94 @@ def test_forget_session_in_never_removes_the_last_copy(monkeypatch, tmp_path):
 
     assert claude_session.forget_session_in(only, "s") is False
     assert (proj / "s.jsonl").exists()
+
+
+def test_latest_session_id_ranks_by_message_time_not_file_mtime(monkeypatch, tmp_path):
+    # aGiTrack itself touches transcripts (staging a resume, mirroring to the base repo,
+    # retargeting a cwd) without adding a message. Ranking by mtime therefore let a conversation
+    # abandoned with `/clear` become "this directory's latest" the moment aGiTrack linked it in —
+    # it was then adopted as the session's conversation and took the session's name with it.
+    import os
+
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "wt"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    live = proj / "live.jsonl"
+    live.write_text(
+        '{"type":"user","timestamp":"2026-08-04T20:04:00Z","message":{"role":"user","content":"real work"}}\n',
+        encoding="utf-8",
+    )
+    abandoned = proj / "abandoned.jsonl"
+    abandoned.write_text(
+        '{"type":"user","timestamp":"2026-08-04T19:04:00Z","message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    # The dead conversation's FILE is the newest — exactly what a hardlink-in for a resume does.
+    os.utime(live, (1_000_000, 1_000_000))
+    os.utime(abandoned, (2_000_000, 2_000_000))
+
+    assert claude_session.latest_session_id(repo) == "live"
+
+
+def test_latest_session_id_falls_back_to_mtime_without_timestamps(monkeypatch, tmp_path):
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "wt"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    for name, mtime in (("older", 1_000_000), ("newer", 2_000_000)):
+        path = proj / f"{name}.jsonl"
+        path.write_text('{"type":"user","message":{"role":"user","content":"x"}}\n', encoding="utf-8")
+        import os
+
+        os.utime(path, (mtime, mtime))
+
+    assert claude_session.latest_session_id(repo) == "newer"
+
+
+def test_session_last_activity_reads_only_the_tail_of_a_big_transcript(monkeypatch, tmp_path):
+    # Asked on a timer by the conversation-switch watcher, against transcripts that reach
+    # hundreds of megabytes — so it must not read the whole file to find the last timestamp.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    proj = config / "projects" / claude_session._encode_repo(tmp_path / "wt")
+    proj.mkdir(parents=True)
+    padding = '{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"content":"%s"}}\n' % ("x" * 4000)
+    (proj / "big.jsonl").write_text(
+        padding * 40
+        + '{"type":"user","timestamp":"2026-08-04T20:04:00Z","message":{"role":"user","content":"last"}}\n',
+        encoding="utf-8",
+    )
+    reads: list[int] = []
+    real_read = Path.read_text
+
+    def counting_read(self, *args, **kwargs):
+        reads.append(1)
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read)
+
+    stamp = claude_session.session_last_activity("big")
+
+    assert stamp is not None
+    assert time.strftime("%Y-%m-%dT%H:%M", time.gmtime(stamp)) == "2026-08-04T20:04"
+    assert reads == []  # answered from the tail, never read whole
+
+
+def test_session_last_activity_falls_back_to_a_full_read(monkeypatch, tmp_path):
+    # A transcript whose tail carries no timestamp at all still gets an answer.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    proj = config / "projects" / claude_session._encode_repo(tmp_path / "wt")
+    proj.mkdir(parents=True)
+    (proj / "odd.jsonl").write_text(
+        '{"type":"user","timestamp":"2026-08-04T20:04:00Z"}\n' + '{"type":"assistant"}\n' * 5000,
+        encoding="utf-8",
+    )
+
+    stamp = claude_session.session_last_activity("odd")
+
+    assert stamp is not None
+    assert time.strftime("%Y-%m-%dT%H:%M", time.gmtime(stamp)) == "2026-08-04T20:04"
