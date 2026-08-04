@@ -2329,7 +2329,9 @@ class ProxyRunner:
         empty) — i.e. whether there is uncommitted agent work to account for."""
         tip = self.repo.ref_sha(self._manual_ref())
         try:
-            base_tree = self.repo.rev_parse(f"{tip or 'HEAD'}^{{tree}}")
+            # `comparable_tree`, never a raw `^{tree}` — the snapshot on the other side of this
+            # comparison drops the agent scaffolding dirs. See GitRepo.comparable_tree.
+            base_tree = self.repo.comparable_tree(tip or "HEAD")
         except Exception:
             base_tree = None
         return tree != base_tree
@@ -2368,13 +2370,26 @@ class ProxyRunner:
                 self._debug(f"manual snapshot failed: {error!r}")
                 return None
         tip = self.repo.ref_sha(self._manual_ref())
+        re_anchored = False
+        if tip is not None and not self.repo.has_object_local(tip):
+            # Kept in lockstep with `ManualCommitTracker.record`: `git gc --prune` can collect a
+            # latent commit (unreachable from any branch by design), after which every lookup
+            # against the tip raises — and record() runs on EVERY turn, so interactive `-m` would
+            # silently stop tracking for the rest of the session. Re-anchor at HEAD: the chain
+            # restarts and only the already-lost turns are lost.
+            self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
+            tip, re_anchored = None, True
         parent = tip or self.repo.rev_parse("HEAD")
         allow_unchanged = getattr(self, "_manual_allow_unchanged", False)
         self._manual_allow_unchanged = False
-        if not allow_unchanged and tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
-            # Defensive: nothing new since the latent tip. Skipped when the gate explicitly
-            # allowed an unchanged tree (the agent committed the turn's work itself), or this
-            # guard would veto the record the gate just approved and the tokens would vanish.
+        # Defensive: nothing new since the baseline — the latent tip, or HEAD when the chain is
+        # EMPTY (the same baseline the gate uses, and previously exempt from this guard, so an
+        # ungated record() wrote a phantom first turn against an untouched tree). Skipped when the
+        # gate allowed an unchanged tree (the agent committed the turn's work itself) and after a
+        # re-anchor, where HEAD is a fallback parent rather than evidence that nothing happened —
+        # either way the turn's tokens would vanish.
+        baseline = None if re_anchored else (tip or "HEAD")
+        if not allow_unchanged and baseline is not None and tree == self.repo.comparable_tree(baseline):
             return None
         sha = self.repo.commit_tree(tree, parents=[parent], message=message)
         self.repo.update_ref(self._manual_ref(), sha)
@@ -2405,7 +2420,7 @@ class ProxyRunner:
             tip = self.repo.ref_sha(self._manual_ref())
             if not tip:
                 return False
-            clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
+            clean = self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD")
             if clean and is_in_flight_only_message(self.repo.commit_message(head)):
                 # A clean tree normally means the fold hook already combined the pending turns
                 # INTO HEAD, so they are redundant. It does NOT when HEAD carries only an
@@ -2525,7 +2540,7 @@ class ProxyRunner:
         if not tip:
             return
         try:
-            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                 return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
         except Exception:
             return
@@ -10821,7 +10836,7 @@ class ProxyRunner:
         use_latent = self._latent_tracking
         if uncovered and self._noworktree_auto:
             try:
-                if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+                if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                     use_latent = False
             except Exception as error:
                 self._debug(f"clean-tree cover check failed: {error!r}")

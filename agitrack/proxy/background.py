@@ -1220,7 +1220,10 @@ class BackgroundRunner:
             head = self.repo.rev_parse("HEAD")
             if head == self._tracked_head:
                 return []  # no new commit since we last accounted (e.g. a pure-Q&A turn)
-            if self.repo.snapshot_worktree_tree() != self.repo.rev_parse("HEAD^{tree}"):
+            # `comparable_tree`, not a raw `^{tree}`: the snapshot drops the agent scaffolding
+            # dirs, so in a repo that TRACKS `.claude/` this test read "dirty" forever and the
+            # daemon covered NO agent self-commit at all. See GitRepo.comparable_tree.
+            if self.repo.snapshot_worktree_tree() != self.repo.comparable_tree("HEAD"):
                 return []  # dirty tree ⇒ the agent's edits are uncommitted; record latently instead
             commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
         except Exception as error:
@@ -1291,7 +1294,7 @@ class BackgroundRunner:
         try:
             # Clean working tree vs HEAD ⇒ the agent (or user) already committed its work, and the
             # prepare-commit-msg fold hook folded the tracking into THAT commit — nothing to do.
-            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                 return
         except Exception:
             return

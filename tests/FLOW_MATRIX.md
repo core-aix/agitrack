@@ -136,6 +136,36 @@ because it is trusted.
 | Both hooks install and remove together; a project's own hook is chained, receives its stdin, can still veto, and survives removal | `test_both_hooks_are_installed_and_removed_together`, `test_an_existing_project_reference_transaction_hook_is_chained_not_destroyed`, `test_a_chained_project_hook_still_runs_and_receives_its_stdin`, `test_a_chained_hook_can_still_veto`, `test_installing_twice_does_not_clobber_the_backup`, `test_removal_leaves_a_foreign_hook_untouched` | real-git |
 | Neither hook names git's bypass flag (the refusal is only ever shown to the agent) | `test_the_guard_never_names_gits_bypass_flag` | mock |
 
+## 6c. Repos that TRACK the agent scaffolding dirs (`.claude/`, `.opencode/`, `.agitrack/`)
+Committing `.claude/settings.json` or a `.claude/commands/` dir is ordinary practice — a team
+shares its agent setup like an editorconfig. But every "has the working tree changed?" question
+in manual / no-worktree / background mode is a comparison between `snapshot_worktree_tree()` and
+some commit's tree, and the snapshot deliberately STRIPS those dirs while a raw `^{tree}` keeps
+them. The two could therefore never be equal, so all of those questions answered "dirty" forever
+and each mode broke in a different direction. `GitRepo.comparable_tree` strips the same paths
+from the commit side; a raw `^{tree}` reads as obviously correct, so these rows exist to stop it
+being reintroduced. **Verified live** as well as in tests: pre-fix, a `-b` run in such a repo left
+the agent's own commit carrying only an in-flight block with no cover ever arriving.
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| `comparable_tree` strips tracked scaffolding, is a no-op when none is tracked, and is idempotent on an already-stripped (latent) tree | `test_comparable_tree_strips_tracked_scaffolding_so_a_clean_tree_reads_as_clean`, `test_comparable_tree_is_a_no_op_when_no_scaffolding_is_tracked`, `test_comparable_tree_is_idempotent_on_an_already_stripped_tree` | real-git |
+| **`-b`: the daemon still covers the agent's own commit** — `_agent_committed_own_work` bails on a dirty tree, so it covered NOTHING in such a repo: the exact loss the persistent watermark exists to prevent | `test_daemon_covers_an_agent_self_commit_in_a_repo_that_tracks_claude_config` | real-git |
+| …and still records latently while the agent's edits ARE uncommitted (the strip must not make a dirty tree read clean), and still leaves no footprint for a pure-Q&A turn | `test_daemon_still_records_latently_while_the_agents_edits_are_uncommitted`, `test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo` | real-git |
+| `-m`: a turn that changed nothing records no latent commit; a real edit still does | `test_a_turn_that_changed_nothing_records_no_latent_commit_in_a_scaffolded_repo`, `test_a_real_edit_is_still_recorded_in_a_scaffolded_repo` | real-git |
+| A turn that edited ONLY the tracked scaffolding records nothing — deliberate, since the snapshot cannot represent it and claiming it would bill a turn against no diff | `test_an_edit_to_the_tracked_scaffolding_itself_is_never_agent_work` | real-git |
+| A stale chain is still reset, and an abandoned chain still pruned/trimmed (both halves of `prune_abandoned_refs` were dead here, so the whole feature was a no-op) | `test_a_stale_chain_is_still_reset_in_a_scaffolded_repo`, `test_an_abandoned_chain_is_still_pruned_in_a_scaffolded_repo`, `test_a_trailing_turn_matching_head_is_still_trimmed_in_a_scaffolded_repo` | real-git |
+| A purely human commit made DURING an agent turn still gets no in-flight footprint | `test_a_human_commit_during_an_agent_turn_gets_no_footprint_in_a_scaffolded_repo` | real-git |
+| The proxy's own `_manual_*` copy agrees with the tracker here too (interactive `-m` is the path users type) | `test_the_proxys_own_manual_copy_agrees_with_the_tracker_in_a_scaffolded_repo` | real-git |
+
+### 6c-i. Guards that were exempt rather than defensive
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| `record()`'s "nothing new since the tip" guard also applies to an EMPTY chain (baseline HEAD) — it previously skipped that case entirely, so an ungated `record()` wrote a phantom first turn against an untouched tree | `test_a_turn_that_changed_nothing_records_no_latent_commit_in_a_scaffolded_repo` | real-git |
+| …but never after a re-anchor past a `git gc --prune`d tip, where HEAD is a fallback parent rather than evidence nothing happened | `test_a_pruned_latent_object_does_not_kill_all_future_tracking` | real-git |
+| The proxy's `_manual_record` survives a pruned latent object too — the re-anchor lived ONLY in the tracker, so the daemon coped and interactive `-m` raised on every turn for the rest of the session | `test_the_proxys_own_manual_copy_also_survives_a_pruned_latent_object` | real-git |
+| The tail trim of `prune_abandoned_refs` is actually exercised: a trailing turn that left the code exactly as HEAD has it is dropped, and the turn that wrote code is kept. (The previous test recorded a "conversation-only" turn that `gate()` silently refused, so the chain never grew a tail and its `len <= before` assertion held no matter what.) | `test_a_trailing_turn_that_left_the_code_as_head_has_it_is_trimmed`, `test_the_trim_keeps_the_turn_that_actually_wrote_code`, `test_a_turn_that_only_talked_never_reaches_the_chain_at_all` | real-git |
+
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -547,10 +577,11 @@ turned out to be real):
   second session finishing first wipes the crash-recovery name of a still-unlinked first one.
 
 **Commit workflow:**
-- `git/repo.py:258` — `snapshot_worktree_tree` strips `.claude/`, `.opencode/` and `.agitrack/`
-  unconditionally, including already-TRACKED files the agent edited. A turn confined to those
-  paths never gates a latent commit, so the eventual commit carries no aGiTrack metadata despite
-  being AI-authored.
+- ~~`git/repo.py:258` — `snapshot_worktree_tree` strips `.claude/`, `.opencode/` and `.agitrack/`
+  unconditionally, including already-TRACKED files the agent edited.~~ **CONFIRMED and fixed —
+  see §6c.** The lead was right about the cause and understated the effect: the damage was not a
+  turn confined to those paths, it was that the snapshot could never equal any raw `^{tree}`, so
+  every "is the working tree clean?" test in three modes answered "dirty" forever.
 - `commit_engine.py:173` — `_prompt_covered_by` is a bag-of-words heuristic that can drop a
   NEGATED user prompt ("don't do X" matching "do X") from the trace.
 - `git/repo.py:574` — `arrived_from_elsewhere` has an untested fallback that can misattribute

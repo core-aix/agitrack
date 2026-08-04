@@ -1660,3 +1660,82 @@ def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
     assert spawned, "the daemon was never autostarted"
     assert "--auto-commit" in spawned[0]
     assert "--manual-commits" not in spawned[0]
+
+
+# --- a repo that TRACKS the agent scaffolding dirs ---------------------------
+#
+# `snapshot_worktree_tree()` strips `.agitrack/` / `.claude/` / `.opencode/`; a raw `^{tree}` does
+# not. So in a repo that COMMITS its `.claude/` config — ordinary practice, a team shares its
+# agent setup like an editorconfig — "is the working tree clean?" answered "dirty" forever, and
+# `_agent_committed_own_work` bails on a dirty tree. The daemon therefore covered NO agent
+# self-commit at all: exactly the loss the persistent watermark exists to prevent, reintroduced
+# by nothing more than a file the user chose to track. `GitRepo.comparable_tree` strips the same
+# paths from the commit side so the comparison means what it says.
+
+
+def _track_the_agent_config(repo: GitRepo, path: Path) -> None:
+    (path / ".claude").mkdir(exist_ok=True)
+    (path / ".claude" / "settings.json").write_text('{"model": "opus"}\n', encoding="utf-8")
+    _git(repo, "add", "-f", ".claude/settings.json")
+    _git(repo, "commit", "-qm", "share the agent config, as teams do")
+    assert repo.rev_parse("HEAD^{tree}") != repo.snapshot_worktree_tree(), "precondition"
+
+
+def test_daemon_covers_an_agent_self_commit_in_a_repo_that_tracks_claude_config(tmp_path):
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    watermark = repo.rev_parse("HEAD")
+    assert runner._tracked_head == watermark
+
+    # The agent commits its OWN work; the tree ends clean apart from the tracked `.claude/` file
+    # the snapshot always strips.
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    runner._process_once()
+
+    head = repo.rev_parse("HEAD")
+    assert head != agent_head, "the agent's own commit went uncovered"
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert parents[1:] == [watermark, agent_head]  # one merge-shaped cover, as in any other repo
+    cover = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert cover.count("# aGiTrack Metadata") == 1  # metadata exactly once
+    assert "covered_commits:" in cover and agent_head[:7] in cover
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")  # no diff
+    assert runner._tracked_head == head
+
+
+def test_daemon_still_records_latently_while_the_agents_edits_are_uncommitted(tmp_path):
+    # The other direction: the strip must not make a genuinely DIRTY tree read as clean, or the
+    # daemon would cover a commit while the work it claims sits uncommitted in the tree.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("one\nuncommitted agent edit\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    assert runner._process_once() is True
+
+    assert repo.rev_parse("HEAD") == head  # manual mode never moves HEAD
+    assert repo.ref_sha(runner._manual.ref()) is not None  # …the turn is on the latent ref
+
+
+def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
+    # A turn that changed nothing must still leave no footprint. Reading the tree as permanently
+    # dirty broke this in the other direction from the cover bug: the daemon's manual path
+    # recorded a latent turn against a tree identical to HEAD's.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "what does this do?", "it does x", 20)])
+
+    runner._process_once()
+
+    assert repo.ref_sha(runner._manual.ref()) in (None, repo.rev_parse("HEAD"))
+    assert runner._manual.pending_count() == 0
