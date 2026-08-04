@@ -2303,14 +2303,17 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"manual snapshot failed: {error!r}")
             self._manual_pending_tree = None
+            self._manual_allow_unchanged = False
             return False
         if self._manual_tree_differs_from_tip(self._manual_pending_tree):
+            self._manual_allow_unchanged = False
             return True
         # An unchanged tree normally means the turn left nothing to record. It does NOT when the
         # agent committed its own work mid-turn: that commit carries an in-flight block only, so
         # the turn's trace and tokens are still owed, and declining here loses them outright.
         # Record with the tree as it stands — the latent commit is metadata, not a diff.
-        return bool(self._uncovered_backend_commits())
+        self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
+        return self._manual_allow_unchanged
 
     def _manual_record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
@@ -2326,8 +2329,13 @@ class ProxyRunner:
                 return None
         tip = self.repo.ref_sha(self._manual_ref())
         parent = tip or self.repo.rev_parse("HEAD")
-        if tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
-            return None  # defensive: nothing new since the latent tip
+        allow_unchanged = getattr(self, "_manual_allow_unchanged", False)
+        self._manual_allow_unchanged = False
+        if not allow_unchanged and tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
+            # Defensive: nothing new since the latent tip. Skipped when the gate explicitly
+            # allowed an unchanged tree (the agent committed the turn's work itself), or this
+            # guard would veto the record the gate just approved and the tokens would vanish.
+            return None
         sha = self.repo.commit_tree(tree, parents=[parent], message=message)
         self.repo.update_ref(self._manual_ref(), sha)
         self._render_manual_trailer()

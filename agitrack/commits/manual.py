@@ -55,8 +55,17 @@ class ManualCommitTracker:
         # Supplies the currently-running turn's facts (or None) so a commit the AGENT makes
         # mid-turn still carries attribution — see :meth:`render_trailer`.
         self._in_flight_fn = in_flight_fn
+        # "Is a turn still OWED a record even though the tree has not changed?" Set by the caller
+        # just before it records, from the same uncovered-commit list the recorded body will name
+        # in ``covered_commits``. True when the agent committed its own work mid-turn: that commit
+        # carries an in-flight block but not the turn's trace or tokens. Without this both gate()
+        # and record() read "unchanged tree" as "nothing happened" and the accounting is dropped.
+        self.owed_record = False
         # Cached working-tree snapshot from gate(), reused by record() so it doesn't re-snapshot.
         self._pending_tree: str | None = None
+        # Set by gate() when it allowed an unchanged tree; consumed by record(), whose own
+        # "nothing new since the tip" guard would otherwise refuse the very record gate approved.
+        self._allow_unchanged = False
         # Poll/fallback state: last HEAD we saw, whether the fold hooks are installed, and the
         # last post-commit signal mtime we reacted to.
         self.last_head: str | None = None
@@ -252,8 +261,15 @@ class ManualCommitTracker:
         except Exception as error:
             self._debug(f"manual snapshot failed: {error!r}")
             self._pending_tree = None
+            self._allow_unchanged = False
             return False
-        return self._tree_differs_from_tip(self._pending_tree)
+        if self._tree_differs_from_tip(self._pending_tree):
+            self._allow_unchanged = False
+            return True
+        # Unchanged tree, but the agent may have committed the turn's work itself — in which
+        # case the record is still owed and must be made against the tree as it stands.
+        self._allow_unchanged = bool(self.owed_record)
+        return self._allow_unchanged
 
     def record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
@@ -269,8 +285,12 @@ class ManualCommitTracker:
                 return None
         tip = self.repo.ref_sha(self.ref())
         parent = tip or self.repo.rev_parse("HEAD")
-        if tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
-            return None  # defensive: nothing new since the latent tip
+        allow_unchanged, self._allow_unchanged = self._allow_unchanged, False
+        if not allow_unchanged and tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
+            # Defensive: nothing new since the latent tip. Skipped when gate() explicitly allowed
+            # an unchanged tree (the agent committed the turn's work itself), or this guard would
+            # veto the record gate just approved and the turn's tokens would vanish.
+            return None
         sha = self.repo.commit_tree(tree, parents=[parent], message=message)
         self.repo.update_ref(self.ref(), sha)
         self.render_trailer()
