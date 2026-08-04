@@ -9,6 +9,11 @@ from agitrack.transcripts.opencode import (
     turns_after,
 )
 
+# Forks a real pseudo-terminal (OpenCode's export runs under a pty). Pinned to a single
+# xdist worker — see the `xdist_group` marker note in pyproject.toml: concurrent workers
+# forking ptys exhaust the OS pty pool, producing failures that never reproduce alone.
+pytestmark = pytest.mark.xdist_group("pty")
+
 
 def test_parse_exported_session_turns_model_and_tokens():
     session = parse_exported_session(

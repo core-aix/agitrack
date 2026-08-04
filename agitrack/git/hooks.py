@@ -30,6 +30,7 @@ from pathlib import Path
 ENV_GUARD = "AGITRACK_WORKTREE_GUARD"
 
 _MARKER = "# AGITRACK-BASE-COMMIT-GUARD"
+_REFTX_MARKER = "# AGITRACK-BASE-REFTX-GUARD"
 _ORIG_SUFFIX = ".agitrack-orig"
 
 _HOOK_SCRIPT = f"""#!/bin/sh
@@ -58,6 +59,65 @@ fi
 exit 0
 """
 
+# The SAME guard at an enforcement point `--no-verify` cannot reach.
+#
+# `git commit --no-verify` skips `pre-commit` (and `commit-msg`) — that is git's documented
+# behaviour and no hook can change it. So the guard above is advisory: an agent that passes the
+# flag walks straight past it, its commit lands on the user's base branch, and nothing ever
+# reconciles it (in worktree mode `_uncovered_backend_commits` only scans the session's managed
+# turn branch, so a base-branch commit is invisible to it forever).
+#
+# `reference-transaction` is not skipped by `--no-verify` — verified against real git — and a
+# non-zero exit on the `prepared` phase aborts the whole ref update, so the commit never lands.
+# It is therefore the backstop, and `pre-commit` stays as the FRIENDLY first line: it fails
+# earlier, with a better message, and works on git < 2.28 where this hook does not exist.
+#
+# Scope is deliberately narrow, because this hook fires on EVERY ref update — fetch, checkout,
+# tag, branch, reset — and over-reaching here would break the agent's git entirely rather than
+# just blocking a commit. Measured against real git, each operation touches:
+#
+#     commit         refs/heads/<branch>   old = the previous commit   (a MOVE)
+#     branch create  refs/heads/<name>     old = 0000…                 (a CREATE)
+#     checkout       HEAD only
+#     tag            refs/tags/<name>
+#     fetch          refs/remotes/…
+#
+# So the rule is exactly "a branch in the base repo MOVED": ``refs/heads/*`` with a non-zero old
+# value. Checkout, tag and fetch are untouched. Branch CREATION is deliberately allowed too — it
+# moves no history, and `pre-commit` already covers the (rare) first-commit-on-a-new-branch case
+# for anyone not bypassing it.
+_REFTX_HOOK_SCRIPT = f"""#!/bin/sh
+{_REFTX_MARKER}
+# Installed by aGiTrack. Backstop for the pre-commit guard, which git's hook-bypass flag
+# skips (deliberately not named here — the agent can read this file); a
+# harmless no-op for everyone else (the marker below is set ONLY on the agent's process).
+# Stdin is "<old> <new> <ref>" per line and is consumed here, so it is replayed to any chained
+# project hook below.
+_agitrack_refs=$(cat)
+if [ "$1" = "prepared" ] && [ -n "${{{ENV_GUARD}}}" ]; then
+  case "$(git rev-parse --absolute-git-dir 2>/dev/null)" in
+    */worktrees/*)
+      : ;;  # inside a linked worktree (the agent's sandbox) -> allowed
+    *)
+      # Only a branch that MOVED: creations (old all-zeros), HEAD, tags and remote refs pass.
+      if printf '%s\\n' "$_agitrack_refs" | awk '$3 ~ /^refs\\/heads\\// && $1 !~ /^0+$/ {{ found = 1 }} END {{ exit !found }}'; then
+        # As with the pre-commit guard, never name git's bypass flag: this is only ever shown
+        # to the AGENT, and there is no bypass for this hook anyway.
+        echo "aGiTrack: this is a worktree session — commit inside your worktree, not the base repo." >&2
+        echo "aGiTrack auto-commits and merges your worktree changes for you." >&2
+        exit 1
+      fi ;;
+  esac
+fi
+# Chain to any project reference-transaction hook aGiTrack moved aside, replaying its stdin.
+_agitrack_orig="$0{_ORIG_SUFFIX}"
+if [ -x "$_agitrack_orig" ]; then
+  printf '%s\\n' "$_agitrack_refs" | "$_agitrack_orig" "$@"
+  exit $?
+fi
+exit 0
+"""
+
 
 # ---------------------------------------------------------------------------
 # Manual-commit-mode hooks (opt-in, --manual-commits): fold the pending agent
@@ -74,6 +134,11 @@ _MANUAL_DONE_MARKER = "# AGITRACK-MANUAL-COMMIT-DONE"
 _PENDING_TRAILER_REL = ".agitrack/manual-pending-trailer"
 _MANUAL_REF_REL = ".agitrack/manual-ref"
 _MANUAL_SIGNAL_REL = ".agitrack/manual-commit-signal"
+
+# The metadata header both manual hooks grep for. `prepare-commit-msg` uses it to stay idempotent
+# (never fold twice); `post-commit` uses it to confirm the fold actually happened before it clears
+# the pending chain. They MUST agree — see the note in _POST_COMMIT_SCRIPT.
+_METADATA_HEADER_LINE = "# aGiTrack Metadata"
 
 _PREPARE_COMMIT_MSG_SCRIPT = f"""#!/bin/sh
 {_MANUAL_MSG_MARKER}
@@ -93,7 +158,7 @@ esac
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _trailer="$_root/{_PENDING_TRAILER_REL}"
 # Idempotent: never append twice (the trailer carries its own metadata header).
-if [ -s "$_trailer" ] && ! grep -q '^# aGiTrack Metadata$' "$1"; then
+if [ -s "$_trailer" ] && ! grep -q '^{_METADATA_HEADER_LINE}$' "$1"; then
   printf '\n' >> "$1"
   cat "$_trailer" >> "$1"
 fi
@@ -111,6 +176,15 @@ _POST_COMMIT_SCRIPT = f"""#!/bin/sh
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _reffile="$_root/{_MANUAL_REF_REL}"
 _agitrack_cr="$(printf '\\r')"
+# Only advance the refs if the fold ACTUALLY happened. `prepare-commit-msg` deliberately skips
+# folding for an amend/squash/merge-template commit (source `commit`/`squash`/`merge`, see its
+# case statement), and this hook used to reset regardless — so `git commit --amend --no-edit`
+# with a turn still pending cleared the chain without the trailer ever landing anywhere. The
+# turn's trace and tokens were gone, silently and permanently. The two hooks have to reach the
+# SAME decision, and the commit's own message is the only honest evidence of what was folded.
+if ! git log -1 --format=%B 2>/dev/null | grep -q '^{_METADATA_HEADER_LINE}$'; then
+  exit 0
+fi
 if [ -f "$_reffile" ]; then
   while IFS= read -r _ref || [ -n "$_ref" ]; do
     # Strip a trailing CR: a file written by an older aGiTrack on Windows has CRLF endings, and
@@ -320,16 +394,28 @@ def _remove_hook(hooks_dir: Path, name: str, marker: str, *, debug: Callable[[st
 
 
 def install_base_commit_guard(hooks_dir: Path, *, debug: Callable[[str], None] | None = None) -> bool:
-    """Install the guard as ``<hooks_dir>/pre-commit`` (idempotent). A pre-existing
-    non-aGiTrack hook is moved to ``pre-commit.agitrack-orig`` and chained from ours.
-    Returns True on success."""
-    return _install_hook(hooks_dir, "pre-commit", _HOOK_SCRIPT, _MARKER, debug=debug)
+    """Install the guard (idempotent), as BOTH ``pre-commit`` and ``reference-transaction``.
+    Pre-existing non-aGiTrack hooks are moved to ``<name>.agitrack-orig`` and chained from ours.
+
+    Two hooks because one of them is bypassable: ``--no-verify`` skips ``pre-commit``, so alone
+    it is advisory. ``reference-transaction`` is not skipped and aborts the ref update itself, so
+    the commit cannot land. ``pre-commit`` is kept because it fails earlier, with a friendlier
+    message, and exists on every git version.
+
+    Returns True when the ``pre-commit`` guard installed — the reference-transaction hook is
+    best-effort (git < 2.28 simply never calls it), so its absence must not report failure and
+    make callers think the session is unguarded.
+    """
+    ok = _install_hook(hooks_dir, "pre-commit", _HOOK_SCRIPT, _MARKER, debug=debug)
+    _install_hook(hooks_dir, "reference-transaction", _REFTX_HOOK_SCRIPT, _REFTX_MARKER, debug=debug)
+    return ok
 
 
 def remove_base_commit_guard(hooks_dir: Path, *, debug: Callable[[str], None] | None = None) -> None:
-    """Remove the guard and restore any chained original hook. No-op if the current
-    ``pre-commit`` isn't ours (we never touch a hook we didn't install)."""
+    """Remove both guard hooks and restore any chained originals. No-op for either hook that
+    isn't ours (we never touch a hook we didn't install)."""
     _remove_hook(hooks_dir, "pre-commit", _MARKER, debug=debug)
+    _remove_hook(hooks_dir, "reference-transaction", _REFTX_MARKER, debug=debug)
 
 
 def install_manual_commit_hooks(hooks_dir: Path, *, debug: Callable[[str], None] | None = None) -> bool:

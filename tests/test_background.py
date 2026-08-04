@@ -1546,3 +1546,196 @@ def test_manual_tracker_reconcile_covers_external_commit(tmp_path):
     assert repo.rev_parse("HEAD^{tree}") == user_tree  # cover introduced no diff
     assert "# aGiTrack Metadata" in repo.commit_message(cover)
     assert repo.ref_sha(tracker.ref()) == cover  # ref reset
+
+
+def test_daemon_manual_mode_never_commits_for_the_user(tmp_path):
+    """`agitrack -b --manual-commits`: the user decides when to commit, full stop.
+
+    The daemon's cover path — which exists so an agent commit that leaves a clean tree still
+    gets its trace and tokens — was never gated on manual mode, so it added an unrequested
+    commit to the user's branch. That is the one thing manual mode promises will not happen.
+    The interactive proxy already refuses this; the daemon simply never checked.
+
+    Nothing is lost by refusing: the latent path records the turn instead, and the fold hook
+    combines it into the user's next commit.
+    """
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    # The agent commits its OWN work, leaving the tree clean — the case that triggers a cover.
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") == agent_head, "manual mode must not commit on the user's behalf"
+
+
+def test_daemon_auto_mode_still_covers_an_agent_commit(tmp_path):
+    # The other side, so the manual gate stays narrow: AUTO mode must keep covering, or the
+    # fix would trade an unwanted commit for lost token accounting.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") != agent_head
+    assert "do x" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_manual_daemon_records_a_turn_whose_only_action_was_its_own_midturn_commit(tmp_path):
+    """`-b --manual-commits`, agent self-commits mid-turn, turn ends with a clean tree.
+
+    The daemon's half of the same loss the interactive proxy had: the tracker's `gate()` and
+    `record()` both read an unchanged tree as "nothing happened", so a turn whose work the agent
+    had already committed was dropped — no trace, no tokens, `commit_turns` returning False and
+    nothing said. Manual mode makes it worse: aGiTrack must not commit for the user, so the
+    latent chain is the ONLY place the accounting can live until their next commit folds it in.
+    """
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    # Mid-turn: the agent commits its own work. The tree is clean from here on.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    # The turn finishes having edited nothing further.
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") == agent_head, "manual mode must not commit on the user's behalf"
+    bodies = runner._manual.pending_bodies()
+    assert bodies, "the turn's trace and tokens were dropped instead of held for the user's commit"
+    assert "tokens_since_last_commit_output: 120" in bodies[-1]
+    assert agent_head[:7] in bodies[-1], "the agent's own commit must be attributed in covered_commits"
+
+
+def test_the_daemons_record_guard_still_refuses_a_turn_that_changed_nothing(tmp_path):
+    # The guard is loosened, not removed: with no commit owed a record an unchanged tree really
+    # does mean nothing happened, and recording would chain an empty latent commit every poll.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    assert runner._manual.gate() is True
+    assert runner._manual.record("<aGiTrack> first\n") is not None
+
+    runner._manual.owed_record = False
+    assert runner._manual.gate() is False
+    assert runner._manual.record("<aGiTrack> nothing\n") is None
+
+
+def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
+    # The mirror of the manual-mode autostart test. A regression here silently flips the user's
+    # chosen commit mode after a reboot or a pre-commit-triggered restart: they get aGiTrack
+    # committing for them when they had chosen to commit themselves, or the reverse.
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    bg.write_background_mode(repo, manual=False)  # the last run was AUTO
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned, "the daemon was never autostarted"
+    assert "--auto-commit" in spawned[0]
+    assert "--manual-commits" not in spawned[0]
+
+
+# --- a repo that TRACKS the agent scaffolding dirs ---------------------------
+#
+# `snapshot_worktree_tree()` strips `.agitrack/` / `.claude/` / `.opencode/`; a raw `^{tree}` does
+# not. So in a repo that COMMITS its `.claude/` config — ordinary practice, a team shares its
+# agent setup like an editorconfig — "is the working tree clean?" answered "dirty" forever, and
+# `_agent_committed_own_work` bails on a dirty tree. The daemon therefore covered NO agent
+# self-commit at all: exactly the loss the persistent watermark exists to prevent, reintroduced
+# by nothing more than a file the user chose to track. `GitRepo.comparable_tree` strips the same
+# paths from the commit side so the comparison means what it says.
+
+
+def _track_the_agent_config(repo: GitRepo, path: Path) -> None:
+    (path / ".claude").mkdir(exist_ok=True)
+    (path / ".claude" / "settings.json").write_text('{"model": "opus"}\n', encoding="utf-8")
+    _git(repo, "add", "-f", ".claude/settings.json")
+    _git(repo, "commit", "-qm", "share the agent config, as teams do")
+    assert repo.rev_parse("HEAD^{tree}") != repo.snapshot_worktree_tree(), "precondition"
+
+
+def test_daemon_covers_an_agent_self_commit_in_a_repo_that_tracks_claude_config(tmp_path):
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    watermark = repo.rev_parse("HEAD")
+    assert runner._tracked_head == watermark
+
+    # The agent commits its OWN work; the tree ends clean apart from the tracked `.claude/` file
+    # the snapshot always strips.
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    runner._process_once()
+
+    head = repo.rev_parse("HEAD")
+    assert head != agent_head, "the agent's own commit went uncovered"
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert parents[1:] == [watermark, agent_head]  # one merge-shaped cover, as in any other repo
+    cover = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert cover.count("# aGiTrack Metadata") == 1  # metadata exactly once
+    assert "covered_commits:" in cover and agent_head[:7] in cover
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")  # no diff
+    assert runner._tracked_head == head
+
+
+def test_daemon_still_records_latently_while_the_agents_edits_are_uncommitted(tmp_path):
+    # The other direction: the strip must not make a genuinely DIRTY tree read as clean, or the
+    # daemon would cover a commit while the work it claims sits uncommitted in the tree.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("one\nuncommitted agent edit\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    assert runner._process_once() is True
+
+    assert repo.rev_parse("HEAD") == head  # manual mode never moves HEAD
+    assert repo.ref_sha(runner._manual.ref()) is not None  # …the turn is on the latent ref
+
+
+def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
+    # A turn that changed nothing must still leave no footprint. Reading the tree as permanently
+    # dirty broke this in the other direction from the cover bug: the daemon's manual path
+    # recorded a latent turn against a tree identical to HEAD's.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    _track_the_agent_config(repo, tmp_path)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "what does this do?", "it does x", 20)])
+
+    runner._process_once()
+
+    assert repo.ref_sha(runner._manual.ref()) in (None, repo.rev_parse("HEAD"))
+    assert runner._manual.pending_count() == 0

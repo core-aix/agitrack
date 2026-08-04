@@ -64,11 +64,15 @@ jobs:
       # was reported in the log and the job went green anyway - the Windows leg of the matrix
       # had been passing with real test failures in it for a long time. A step per command
       # has its exit code checked on every OS, whatever the shell.
-      - name: Tests
-        run: uv run coverage run -m pytest -q
-
-      - name: Coverage report
-        run: uv run coverage report
+      # ONE step, deliberately — tests and coverage together. `-n auto` distributes across the
+      # runner's cores (the suite waits on subprocesses, pty drains and poll intervals far more
+      # than it computes, so this is most of the wall clock back; each test is already isolated
+      # by tmp_path and its own AGITRACK_CONFIG_DIR). `--cov` measures INSIDE the xdist workers,
+      # which a wrapping `coverage run` cannot reach — that combination silently reported ~10%
+      # coverage with every test passing. The run fails if coverage drops below the floor in
+      # pyproject.toml, so a regression can no longer slip through green.
+      - name: Tests + coverage
+        run: uv run pytest -q -n auto --cov --cov-report=term:skip-covered
 
   # Native-Windows validation (#118): the package imports and runs natively on Windows
   # (ConPTY via pywinpty, Win32 console, msvcrt locking). Most of the suite is
@@ -97,8 +101,21 @@ jobs:
       - name: Import smoke (native Windows)
         run: uv run python -c "import agitrack, agitrack.cli, agitrack.proxy, agitrack.proxy.platform.nt, agitrack.git.lock; print(agitrack.__version__)"
 
-      - name: Windows-relevant tests + ConPTY
-        run: uv run python -m pytest tests/test_proc.py tests/test_dashboard_daemon.py tests/test_shutdown_request.py tests/test_windows_conpty.py -q
+      # Two groups. The first is Windows-SPECIFIC: ConPTY, process spawning, the daemon and
+      # shutdown paths that use Win32 primitives.
+      #
+      # The second is the platform-AGNOSTIC core — commit engine, state, settings, paths,
+      # git/worktree handling. None of it is terminal-specific, all of it is full of path
+      # handling, and none of it used to run on Windows at all: the MSI is built and installed
+      # on every PR, so a user could install a build whose commit path had never executed on
+      # their OS. Path separators, drive letters and cp1252 encoding are exactly where those
+      # bugs live (the Windows commit-encoding bug is the precedent), so they are cheap to
+      # catch here and expensive to catch in the wild.
+      - name: Windows-specific tests + ConPTY
+        run: uv run python -m pytest tests/test_proc.py tests/test_dashboard_daemon.py tests/test_shutdown_request.py tests/test_windows_conpty.py tests/test_windows_platform.py -q
+
+      - name: Platform-agnostic core on Windows
+        run: uv run python -m pytest tests/test_commit_engine.py tests/test_state.py tests/test_settings.py tests/test_paths.py tests/test_fileio.py tests/test_git_repo.py tests/test_worktree.py tests/test_session_names.py tests/test_backend_parity.py tests/test_git_commit_encoding.py -q
 
   # The Windows MSI is a first-class, standalone install method — a user can download it
   # from the GitHub release and install aGiTrack without pip/pipx/Python (the VSCode

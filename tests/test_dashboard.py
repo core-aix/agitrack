@@ -7,6 +7,7 @@ with token metadata), backend-made commits covered by a merge-shaped cover
 commit (#58), and an agent-merge.
 """
 
+import pytest
 from pathlib import Path
 
 import json
@@ -24,6 +25,13 @@ from agitrack.commits.message import build_in_flight_trailer
 from agitrack.git import GitRepo
 from agitrack.metrics import build_dashboard, build_server, dashboard_data, render_dashboard, render_html
 from agitrack.metrics.collect import CommitStat, resolve_committers
+
+# Binds real TCP ports. Pinned to a single xdist worker (see the `xdist_group` marker note in
+# pyproject.toml): ports are a GLOBAL resource, so concurrent workers race for them — the
+# consecutive-allocation tests assert that base+1 and base+2 are still free, which another
+# worker can falsify between choosing the base and binding it. Unlike a slow test this cannot
+# be fixed by waiting longer; the contention has to be removed.
+pytestmark = pytest.mark.xdist_group("net")
 
 
 def _write_lines(repo: GitRepo, name: str, count: int) -> None:

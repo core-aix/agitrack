@@ -12,6 +12,8 @@ when off (no hooks, no latent commits, existing paths unchanged).
 
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -20,7 +22,13 @@ import pytest
 
 from agitrack.backends.base import TokenUsage
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_agent_commit_message, build_manual_squash_trailer, build_pending_trailer
+from agitrack.commits.manual import prune_abandoned_refs
+from agitrack.commits.message import (
+    build_agent_commit_message,
+    build_manual_squash_trailer,
+    build_pending_trailer,
+    is_fully_tracked_message,
+)
 from agitrack.config import AgitrackState
 from agitrack.config.settings import GlobalConfig
 from agitrack.git import GitRepo
@@ -1443,3 +1451,1075 @@ def test_runner_service_refreshes_after_post_commit_signal(tmp_path):
 
     assert (repo.repo / ".agitrack" / "manual-pending-trailer").exists()
     assert runner._manual_last_head == repo.rev_parse("HEAD")
+
+
+# --- the agent committing MID-TURN in no-worktree auto mode ------------------
+#
+# The reported loss. When the agent runs `git commit` ITSELF while its turn is still running,
+# the prepare-commit-msg hook stamps that commit with an IN-FLIGHT block: attribution only, no
+# trace, no tokens — and the block says in so many words that "the turn's full interaction
+# trace and token usage land in a later commit".
+#
+# That later commit has to actually happen. The agent has already committed every file it
+# touched, so when the turn finishes the tree is CLEAN — and both the fold and the staleness
+# check used to read "clean" as "already accounted for" and stop. The turn's tokens then lived
+# only on the hidden latent ref and never reached the branch: silently lost, exactly as the
+# in-flight commit promised they would not be.
+#
+# `is_fully_tracked_message` already encodes the right rule for this (an in-flight-only block
+# does NOT account for a turn) and `_uncovered_backend_commits` already applies it. These pin
+# that the no-worktree fold applies it too.
+
+
+def _agent_committed_mid_turn(tmp_path, *, manual: bool = False):
+    """A no-worktree session where the agent committed its own work mid-turn, and the turn has
+    since finished. Returns (runner, repo, the agent's commit)."""
+    runner, repo = _noworktree_proxy(tmp_path, manual=manual)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))  # persisted, as production does
+    runner._start_commit_summary = lambda *a, **k: None
+    runner.untracked_before_turn = set()
+
+    # Mid-turn: the agent edits and commits its own work. The hook stamps it in-flight.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    body = _git(repo, "log", "-1", "--format=%B", agent_commit)
+    assert "in_flight: true" in body  # attribution only...
+    assert not is_fully_tracked_message(body)  # ...and explicitly NOT a complete record
+
+    # The turn finishes, having left nothing further to commit: the tree is clean. Recording it
+    # is what the tests below exercise, so the helper stops here.
+    runner._note_in_flight(None)
+    assert repo.snapshot_worktree_tree() == repo.rev_parse("HEAD^{tree}"), "the tree should be clean"
+    return runner, repo, agent_commit
+
+
+def _idle_and_ready_to_cover(runner, repo, *, turn):
+    """Put the runner in the state the reactor reaches when a turn has just finished and the
+    tree is clean, with the finished turn waiting at the parse boundary."""
+    from agitrack.backends.proxy_agents import make_proxy_agent
+    from agitrack.transcripts.types import ExportedSession
+
+    runner.backend = make_proxy_agent("claude")
+    runner.active.agent_parse_result = (
+        "s1",
+        ExportedSession(session_id="s1", model="m", turns=[turn], updated=1.0),
+        None,
+        runner.state,
+    )
+    runner.active.agent_parse_thread = None
+    runner.agent_in_flight = False
+    runner.last_child_output = 0.0  # the backend has gone quiet
+    runner.CHILD_IDLE_SECONDS = 0.0
+    runner.BASE_POLL_SECONDS = 0.0
+    runner._idle_integrate_at = 0.0
+    runner._summary_blocks_integration = lambda _now: False
+
+
+def test_a_turn_the_agent_committed_itself_still_lands_its_tokens(tmp_path):
+    """The reported loss, end to end.
+
+    aGiTrack's whole promise is that the agent's work — and its accounting — reaches git. The
+    agent having committed the CODE itself must not cost the user the TOKENS. This drives the
+    production path (`_integrate_agent_made_commits_if_idle`, which the reactor calls from
+    `_maybe_agent_commit`'s clean-tree branch), not a helper.
+    """
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    assert runner._uncovered_backend_commits() == [agent_commit], "the in-flight commit is still owed a record"
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=4321, output=4321), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    head = repo.rev_parse("HEAD")
+    assert head != agent_commit, "no commit was made to carry the finished turn's trace/tokens"
+    body = _git(repo, "log", "-1", "--format=%B", head)
+    assert "4321" in body, f"the turn's tokens never reached the branch; body was:\n{body}"
+    assert is_fully_tracked_message(body)
+    assert not runner._uncovered_backend_commits(), "the agent's commit is still unaccounted for"
+
+
+def test_the_cover_for_an_agent_commit_introduces_no_diff(tmp_path):
+    # The agent already committed the code, so the accounting must ride a metadata-only commit:
+    # it must never re-apply or revert a single file.
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=7, output=7), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(f"{agent_commit}^{{tree}}")
+    assert (tmp_path / "a.txt").read_text() == "one\nagent work\n"
+
+
+def test_manual_mode_keeps_the_record_pending_instead_of_committing(tmp_path):
+    # In manual-commit mode the user decides when to commit, so aGiTrack must NOT add a cover
+    # commit of its own — the record waits on the latent chain for the user's next commit. The
+    # fix must not trade one broken promise for another.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    runner._note_in_flight(None)
+    _idle_and_ready_to_cover(
+        runner, repo, turn=SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=9, output=9), "m")
+    )
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+
+    assert repo.rev_parse("HEAD") == agent_commit, "manual mode must not commit on the user's behalf"
+    # "Did not commit" must not quietly mean "dropped the record" — but the record is made on the
+    # turn-completion path, not here, so that half is asserted in
+    # `test_manual_mode_records_a_turn_whose_only_action_was_its_own_midturn_commit`. Its absence
+    # is how the record-side refusal survived the first fix: the gate was widened to allow an
+    # unchanged tree and `record()` then vetoed it one step later, with nothing checking.
+
+
+def test_a_clean_tree_under_a_fully_tracked_head_still_drops_the_chain(tmp_path):
+    # The other side, so the fix stays narrow: once HEAD really does account for the turn, a
+    # clean tree means the pending chain IS redundant and must still be dropped — otherwise it
+    # would re-attach its trace to some later, unrelated commit.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._start_commit_summary = lambda *a, **k: None
+    runner.untracked_before_turn = set()
+    runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=10, output=10), "m")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+    runner._auto_fold_latent_pending()  # aGiTrack folds it itself: HEAD now fully accounts
+    assert is_fully_tracked_message(_git(repo, "log", "-1", "--format=%B", "HEAD"))
+
+    runner._reset_stale_manual_ref()
+
+    assert not runner._manual_pending_bodies()
+
+
+# --- the coverage anchor must survive a restart -----------------------------
+
+
+def test_the_noworktree_anchor_survives_a_restart(tmp_path):
+    """`_noworktree_base_head` is what separates "work aGiTrack must account for" from the
+    user's pre-existing history. It used to live only in memory and re-anchor to the current
+    HEAD on every start — so if the agent committed mid-turn (an in-flight block that still
+    owes its trace and tokens) and aGiTrack restarted before the turn finished, the anchor
+    moved ONTO that commit and it could never be seen as uncovered again. The accounting was
+    gone for good. The background daemon had already solved this by persisting its watermark.
+    """
+    runner, repo, agent_commit = _agent_committed_mid_turn(tmp_path)
+    assert runner._uncovered_backend_commits() == [agent_commit]
+
+    # A fresh instance over the SAME repo — the restart. Built directly rather than via the
+    # helper, which would re-init the repo and add history that isn't part of this scenario.
+    from proxy_helpers import make_runner
+
+    restarted = make_runner(
+        repo=repo,
+        base_repo=repo,
+        state=AgitrackState(tmp_path, default_backend="claude"),
+        _use_worktrees=False,
+        _manual_commits=False,
+        worktree=None,
+    )
+    restarted._load_noworktree_anchor()  # what startup does
+
+    assert restarted._uncovered_backend_commits() == [agent_commit], (
+        "the restart re-anchored past the agent's in-flight commit, losing its accounting"
+    )
+
+
+def test_a_first_ever_run_anchors_at_head_and_claims_no_history(tmp_path):
+    # The other half: on a repo aGiTrack has never tracked, everything already in the history
+    # belongs to the user and must never be retroactively attributed to the agent.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    (tmp_path / "prior.txt").write_text("the user's own work\n", encoding="utf-8")
+    _git(repo, "add", "prior.txt")
+    _git(repo, "commit", "-m", "a commit from before aGiTrack existed here")
+
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD")
+    assert runner._uncovered_backend_commits() == []
+
+
+def test_an_anchor_naming_a_vanished_commit_re_anchors_instead_of_failing(tmp_path):
+    # A hard reset or a re-clone can leave a watermark git can no longer resolve. Scanning from
+    # it would raise on every poll; re-anchoring is the safe recovery.
+    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+    runner._noworktree_anchor_path().parent.mkdir(parents=True, exist_ok=True)
+    runner._noworktree_anchor_path().write_text("0" * 40 + "\n", encoding="utf-8")
+
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD")
+
+
+# --- `git commit --no-verify` -----------------------------------------------
+#
+# `--no-verify` skips `pre-commit` and `commit-msg`. It does NOT skip `prepare-commit-msg` or
+# `post-commit` — verified against real git. That distinction decides how much it can cost:
+# in every no-worktree mode the FOLD happens in `prepare-commit-msg`, so the tracking still
+# lands. Worth pinning, because the natural assumption is that --no-verify defeats everything.
+
+
+def test_no_verify_still_folds_the_pending_trace_in_no_worktree_mode(tmp_path):
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._noworktree_base_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "committed with --no-verify", "--no-verify")
+
+    body = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in body, "--no-verify must not cost the commit its tracking"
+    assert "do x" in body
+
+
+def test_manual_mode_records_a_turn_whose_only_action_was_its_own_midturn_commit(tmp_path):
+    """Manual mode, agent self-commits mid-turn, turn ends with a clean tree.
+
+    Two guards had to agree for this to work and only one did. `_manual_gate` was widened to
+    allow an unchanged tree when commits are still owed a record — but `_manual_record` kept its
+    own "nothing new since the latent tip" check and vetoed the very record the gate approved.
+    The turn's trace and tokens were dropped with `committed=False` and no error.
+
+    Manual mode is where this costs the most: aGiTrack must not commit for the user, so the
+    latent chain is the ONLY thing holding the accounting until their next commit folds it in.
+    """
+    runner, repo, _agent_commit = _agent_committed_mid_turn(tmp_path, manual=True)
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=42, output=42), "m")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True, "the turn was refused outright"
+    bodies = runner._manual_pending_bodies()
+    assert bodies, "nothing was recorded, so the turn's tokens are gone"
+    assert "42" in bodies[-1]
+    assert "do x" in bodies[-1]
+
+
+def test_the_record_guard_still_refuses_a_turn_that_genuinely_changed_nothing(tmp_path):
+    # The guard is not simply removed: with no commits owed a record, an unchanged tree really
+    # does mean nothing happened, and recording would chain an empty latent commit per poll.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+
+    # Record a first turn so a latent tip exists — the guard compares against that tip, so with
+    # an empty chain there is nothing for it to refuse.
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    assert runner._manual_record("<aGiTrack> first turn\n") is not None
+
+    # Now nothing has changed and no commit is owed a record: the guard must hold, or every poll
+    # would chain another empty latent commit.
+    assert runner._manual_gate() is False
+    assert runner._manual_record("<aGiTrack> nothing\n") is None
+
+
+def test_setup_falls_back_to_poll_cover_under_a_real_core_hookspath(tmp_path):
+    """The fold hooks can't run under a custom `core.hooksPath`, so aGiTrack must detect that
+    and fall back to poll+cover. Every existing test set `_manual_hooks_installed` by hand; this
+    drives the real `GitRepo.core_hooks_path()` detection, which is what actually decides.
+
+    If detection ever misreported, aGiTrack would believe the fold hook was live when nothing
+    was installed — and every commit in that repo would silently lose its trace and tokens, with
+    the fallback that exists for exactly this case never running.
+    """
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    custom = tmp_path / "shared-hooks"
+    custom.mkdir()
+    _git(repo, "config", "core.hooksPath", str(custom))
+
+    runner._setup_manual_commit_mode()
+
+    assert runner._manual_hooks_installed is False, "aGiTrack thinks its hooks are live when they cannot run"
+    assert not (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+    # …and the fallback really covers a commit the hook could not fold.
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    assert runner._manual_record("<aGiTrack> turn\n\n# aGiTrack Metadata\ncommit_type: agent\n") is not None
+    runner._manual_last_head = None
+    runner._reconcile_manual_external_commit()  # establishes the baseline at the current HEAD
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's own commit")
+    user_head = repo.rev_parse("HEAD")
+
+    runner._reconcile_manual_external_commit()  # now HEAD has moved: cover the user's commit
+
+    assert repo.rev_parse("HEAD") != user_head, "the poll+cover fallback never added the cover"
+    assert "# aGiTrack Metadata" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_hooks_are_installed_when_no_custom_hookspath_is_set(tmp_path):
+    # The other side of the same detection, so the fallback stays the exception.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+
+    runner._setup_manual_commit_mode()
+
+    assert runner._manual_hooks_installed is True
+    assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+
+# --- commit shapes that SKIP the fold --------------------------------------
+#
+# `prepare-commit-msg` deliberately declines to fold for an amend/squash/merge-template commit
+# (git passes source `commit`/`squash`/`merge`) — folding there would duplicate a trailer, or
+# attach one to a merge that contains no agent work. `post-commit` used to reset the latent
+# chain regardless, so the pending turns were cleared with the trailer never landing anywhere:
+# a silent, permanent loss of that turn's trace and tokens. The two hooks must agree, and the
+# commit's own message is the only honest evidence of what was folded.
+
+
+def _tracker(tmp_path, *, hooks=True):
+    repo = _init_repo(tmp_path)
+    if hooks:
+        assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    tracker.setup()
+    return tracker, repo
+
+
+def test_amend_does_not_silently_drop_a_still_pending_turn(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "pending", 999)
+    tracker.render_trailer()
+    assert tracker.pending_count() == 1
+
+    # The user amends an earlier commit, reusing its message: git source is "commit", so the
+    # fold is skipped by design.
+    _git(repo, "commit", "--amend", "--no-edit")
+
+    assert "# aGiTrack Metadata" not in _git(repo, "log", "-1", "--format=%B", "HEAD")  # not folded…
+    # …so it must still be pending, ready for the user's next real commit. Asserted on the
+    # CONTENT rather than the count: an amend rewrites HEAD, so the orphaned old commit also
+    # falls in `HEAD..ref` and inflates the count — the turn surviving is what matters.
+    assert "pending prompt" in "".join(tracker.pending_bodies()), "the turn was cleared without being folded"
+
+
+def test_a_squash_merge_commit_does_not_silently_drop_a_pending_turn(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    base = repo.current_branch()
+    _git(repo, "checkout", "-qb", "feature")
+    (tmp_path / "f.txt").write_text("feature work\n", encoding="utf-8")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-qm", "feature work")
+    _git(repo, "checkout", "-q", base)
+    # A REAL uncommitted agent edit, so the turn is genuinely pending. It used to be recorded
+    # against an untouched tree, which only worked because `record()`'s guard skipped an empty
+    # chain — the turn then existed for a reason the flow being tested had nothing to do with.
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "pending", 555)
+    tracker.render_trailer()
+    assert tracker.pending_count() == 1
+
+    _git(repo, "merge", "-q", "--squash", "feature")
+    subprocess.run(
+        ["git", "-C", str(repo.repo), "commit", "-q"],
+        check=True,
+        env={**os.environ, "GIT_EDITOR": "true"},  # no -m ⇒ git source "squash" ⇒ fold skipped
+    )
+
+    assert "pending prompt" in "".join(tracker.pending_bodies()), (
+        "the turn was cleared by a commit that never folded it"
+    )
+
+
+def test_an_ordinary_commit_still_folds_and_clears_the_chain(tmp_path):
+    # The gate must stay narrow: a normal commit DOES fold, and must still reset the chain, or
+    # every later commit would fold the same turns again.
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "folded", 321)
+    tracker.render_trailer()
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's own commit")
+
+    body = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in body and "321" in body
+    assert tracker.pending_count() == 0, "a folded chain must be cleared or it folds twice"
+
+
+def test_a_second_commit_does_not_refold_an_already_folded_turn(tmp_path):
+    # The consequence of getting the reset wrong in the other direction.
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "once", 42)
+    tracker.render_trailer()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "first")
+
+    (tmp_path / "b.txt").write_text("the user's own later work\n", encoding="utf-8")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "second, unrelated")
+
+    assert "once prompt" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+# --- the latent ref surviving damage ---------------------------------------
+
+
+def test_a_pruned_latent_object_does_not_kill_all_future_tracking(tmp_path):
+    """`git gc --prune` can collect a latent commit — it is unreachable from any branch by
+    design. Every lookup against the now-dangling ref then raised, and because `record()` runs on
+    EVERY turn, the session stopped tracking entirely until someone deleted the ref by hand. The
+    turns already on the pruned chain are gone; the ones after it must not be.
+    """
+    tracker, repo = _tracker(tmp_path, hooks=False)
+    (tmp_path / "a.txt").write_text("turn one\n", encoding="utf-8")
+    _record(tracker, "one", 50)
+    tip = repo.ref_sha(tracker.ref())
+    loose = repo.repo / ".git" / "objects" / tip[:2] / tip[2:]
+    # git stores loose objects READ-ONLY, which on Windows makes unlink() an access error. Make
+    # it writable first so this simulates a prune on every platform rather than only POSIX.
+    loose.chmod(stat.S_IWRITE | stat.S_IREAD)
+    loose.unlink()  # what a prune leaves behind: a ref naming an object that is gone
+
+    (tmp_path / "a.txt").write_text("turn one\nturn two\n", encoding="utf-8")
+    assert tracker.gate() is True
+    sha = tracker.record(
+        "<aGiTrack> two\n\n# Interaction Trace\n\n## User\n\ntwo prompt\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 50\n"
+    )
+
+    assert sha is not None, "record() must re-anchor past a pruned tip, not raise"
+    assert "two prompt" in "".join(tracker.pending_bodies())
+
+
+def test_the_proxys_own_manual_copy_also_survives_a_pruned_latent_object(tmp_path):
+    # The re-anchor lived ONLY in the tracker, so the headless daemon survived a `git gc --prune`
+    # and interactive `-m` — the path a user actually types in — did not: `_manual_record` looked
+    # up the dangling tip and raised, on every turn, for the rest of the session. The two copies
+    # must stay in lockstep (AGENTS.md pins this).
+    from tests.proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    runner = make_runner(
+        repo=repo,
+        base_repo=repo,
+        state=AgitrackState(tmp_path, default_backend="claude"),
+        _manual_commits=True,
+        _use_worktrees=False,
+        worktree=None,
+    )
+    (tmp_path / "a.txt").write_text("turn one\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("one", 50))
+    tip = repo.ref_sha(runner._manual_ref())
+    loose = repo.repo / ".git" / "objects" / tip[:2] / tip[2:]
+    loose.chmod(stat.S_IWRITE | stat.S_IREAD)  # git stores loose objects read-only; Windows enforces it
+    loose.unlink()
+
+    (tmp_path / "a.txt").write_text("turn one\nturn two\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    sha = runner._manual_record(_agent_body("two", 50))
+
+    assert sha is not None, "the proxy's copy must re-anchor past a pruned tip, not raise"
+    assert "did two" in "".join(runner._manual_pending_bodies())
+
+
+# --- the trailer files the sh hooks read ------------------------------------
+
+
+def test_the_trailer_is_written_atomically(tmp_path):
+    """The `sh` hooks read these files from another process during a `git commit` that can land
+    at any moment. An in-place rewrite can be read half-finished — an empty read is harmlessly
+    skipped, but a partial-but-non-empty one folds a truncated metadata block into the user's
+    permanent commit message. Temp file + rename makes a reader see only the old or the new.
+    """
+    from agitrack.commits.manual import write_lf
+
+    target = tmp_path / "nested" / "trailer"
+    write_lf(target, "first\n")
+    write_lf(target, "second, much longer than the first\n")
+
+    assert target.read_text() == "second, much longer than the first\n"
+    assert list(target.parent.glob("*.tmp")) == [], "a temp file was left behind"
+
+
+def test_the_trailer_keeps_lf_endings_on_every_platform(tmp_path):
+    # The hooks read `manual-ref` a line at a time; a CRLF ending leaves a trailing CR on the ref
+    # name, `git update-ref` rejects it, and the turns fold a SECOND time into the next commit.
+    from agitrack.commits.manual import write_lf
+
+    target = tmp_path / "manual-ref"
+    write_lf(target, "refs/agitrack/manual/s1\n")
+
+    assert target.read_bytes() == b"refs/agitrack/manual/s1\n"
+
+
+# --- abandoned sessions ------------------------------------------------------
+#
+# Manual mode is always no-worktree, so every session edits the SAME tree and a user commit
+# folds the pending turns of all of them. Right while those turns still explain the code being
+# committed; wrong once they don't. `reset_stale_ref` only ever looked at the CALLER's ref, so
+# a session abandoned mid-work — a crash, a Ctrl-C, a mode switch, or edits the user discarded —
+# left a chain nothing revisited, and its turns rode into an unrelated later commit, attributing
+# AI authorship and tokens to code that never contained them.
+#
+# The rule, decided from git rather than a clock: keep a session's turns while its code changes
+# are still uncommitted; discard a trailing run of turns that changed nothing.
+
+
+def _abandoned_chain(repo, name: str, tokens: int, session_id: str):
+    """Record one turn under a DIFFERENT session id, as an abandoned session would leave it."""
+    state = AgitrackState(repo.repo, default_backend="claude")
+    state.data["agitrack_session_id"] = session_id
+    tracker = ManualCommitTracker(repo, repo, state)
+    _record(tracker, name, tokens)
+    return tracker.ref()
+
+
+def test_a_discarded_sessions_turns_never_ride_into_an_unrelated_commit(tmp_path):
+    # The reported shape: the agent edits, the user throws the edit away rather than committing
+    # it, and commits something unrelated later. That commit contains none of the agent's work,
+    # so it must carry none of its attribution.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "abandoned", 50, "gone-session")
+    _git(repo, "checkout", "--", "a.txt")  # the user discards the agent's work
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    assert repo.ref_sha(ref) == repo.rev_parse("HEAD"), "the abandoned chain was left to fold later"
+
+
+def test_an_abandoned_sessions_uncommitted_work_is_kept(tmp_path):
+    # The other half of your rule: work that is still uncommitted DOES get committed with its
+    # trace. Discarding here would lose real AI authorship.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit that survives\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "real work", 50, "gone-session")
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    assert repo.ref_sha(ref) != repo.rev_parse("HEAD"), "uncommitted agent work lost its trace"
+
+
+def test_a_turn_that_only_talked_never_reaches_the_chain_at_all(tmp_path):
+    # Why the tail case is rare, and worth pinning because it is the reason a weaker assertion on
+    # the trim below would pass vacuously: `gate()` already refuses a turn that changed no code,
+    # so a pure-Q&A turn is never recorded and there is nothing for the prune to trim.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    (tmp_path / "a.txt").write_text("real agent work\n", encoding="utf-8")
+    _record(tracker, "did the work", 100)
+
+    _record(tracker, "just discussed it", 5)  # same tree ⇒ never recorded
+
+    bodies = "".join(tracker.pending_bodies())
+    assert "did the work prompt" in bodies
+    assert "just discussed it prompt" not in bodies
+    assert len(tracker.pending_bodies()) == 1
+
+
+def _chain_with_a_trailing_turn_that_matches_head(repo: GitRepo, path: Path):
+    """An abandoned chain whose LAST turn left the code exactly as HEAD has it, with someone
+    else's work still uncommitted so the whole-chain discard doesn't apply.
+
+    This is the shape the tail trim exists for: the agent wrote something, then undid it, and the
+    trailing turn therefore contributes nothing to the commit about to be made. Returns
+    ``(sha_to_keep, sha_to_trim, ref)``."""
+    original = (path / "a.txt").read_text(encoding="utf-8")
+    state = AgitrackState(path, default_backend="claude")
+    state.data["agitrack_session_id"] = "gone-session"
+    tracker = ManualCommitTracker(repo, repo, state)
+    (path / "a.txt").write_text("real agent work\n", encoding="utf-8")
+    _record(tracker, "did the work", 100)
+    keep = repo.ref_sha(tracker.ref())
+    (path / "a.txt").write_text(original, encoding="utf-8")  # …and then undid it
+    _record(tracker, "undid it again", 5)
+    trim = repo.ref_sha(tracker.ref())
+    assert keep != trim, "precondition: both turns are on the chain"
+    # A LIVE session's uncommitted work, so `working_tree_is_clean` is False and the prune must
+    # reach the trim rather than discarding the chain outright.
+    (path / "b.txt").write_text("another session is mid-edit\n", encoding="utf-8")
+    return keep, trim, tracker.ref()
+
+
+def test_a_trailing_turn_that_left_the_code_as_head_has_it_is_trimmed(tmp_path):
+    # The tail trim, actually exercised. The previous version of this test recorded a
+    # "conversation-only" turn that `gate()` silently refused, so the chain never grew a tail and
+    # the assertion (`len <= before`) held no matter what the prune did.
+    repo = _init_repo(tmp_path)
+    keep, trim, ref = _chain_with_a_trailing_turn_that_matches_head(repo, tmp_path)
+
+    changed = prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    assert changed == [ref]
+    assert repo.ref_sha(ref) == keep, "the trailing turn was not trimmed"
+    assert repo.ref_sha(ref) != trim
+
+
+def test_the_trim_keeps_the_turn_that_actually_wrote_code(tmp_path):
+    # The other half: trimming must stop at the first turn that contributed code. Walking past it
+    # would discard real AI authorship for work that is still uncommitted.
+    repo = _init_repo(tmp_path)
+    _keep, _trim, ref = _chain_with_a_trailing_turn_that_matches_head(repo, tmp_path)
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/a-live-session", [ref])
+
+    bodies = "".join(_bodies_on(repo, ref))
+    assert "did the work prompt" in bodies, "the turn that wrote code was discarded"
+    assert "undid it again prompt" not in bodies
+
+
+def _bodies_on(repo: GitRepo, ref: str) -> list[str]:
+    """Commit messages still on *ref* and on no branch — what a fold would carry."""
+    return [repo.commit_message(sha) or "" for sha in repo.unlanded_commits(ref)]
+
+
+def test_the_live_sessions_own_chain_is_never_pruned(tmp_path):
+    # A live session owns its chain — `reset_stale_ref` governs it. Pruning it here would fight
+    # that and could drop a turn the session is about to fold itself.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "mine", 50, "my-session")
+    _git(repo, "checkout", "--", "a.txt")  # clean tree: an abandoned chain WOULD be dropped
+
+    prune_abandoned_refs(repo, ref, [ref])  # …but this one is our own
+
+    assert repo.ref_sha(ref) != repo.rev_parse("HEAD")
+
+
+def test_an_already_folded_chain_is_left_alone(tmp_path):
+    # Reachable from HEAD means it was folded/committed already; touching it would be pointless
+    # churn on the ref.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "folded", 50, "gone-session")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's commit")
+    repo.update_ref(ref, repo.rev_parse("HEAD"))
+    before = repo.ref_sha(ref)
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/live", [ref])
+
+    assert repo.ref_sha(ref) == before
+
+
+# --- what the user can see ---------------------------------------------------
+
+
+def test_the_exit_dialog_does_not_claim_tracking_is_lost_when_it_is_not(tmp_path):
+    """The persistent auto-track hook folds the tracking into a `git commit` made after aGiTrack
+    exits — verified. Telling the user otherwise pushed them into committing before they were
+    ready, in the one mode built around them choosing when."""
+    runner, repo, _ = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("t", 1))
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._autotrack_hook_will_survive_exit = lambda: True
+    captured: dict = {}
+    runner._exit_confirmation_popup = lambda title, opts: captured.setdefault("title", title) or opts[1]
+
+    runner._confirm_exit()
+
+    assert "still folds in the interaction tracking" in captured["title"]
+    assert "won't" not in captured["title"]
+
+
+def test_the_exit_dialog_does_warn_when_the_hook_will_not_survive(tmp_path):
+    # The warning is right when it IS right: a custom core.hooksPath or the autotrack opt-out.
+    runner, repo, _ = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("t", 1))
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._autotrack_hook_will_survive_exit = lambda: False
+    captured: dict = {}
+    runner._exit_confirmation_popup = lambda title, opts: captured.setdefault("title", title) or opts[1]
+
+    runner._confirm_exit()
+
+    assert "won't" in captured["title"]
+
+
+def test_the_status_bar_shows_uncommitted_turns_in_manual_mode():
+    # The count existed only in the exit dialog, so while working the user could not tell whether
+    # the agent had done nothing or twenty turns' worth since they last committed.
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    line = ScreenRenderer.status_line(
+        None,  # status_line reads only its keyword args, never `self`
+        cols=200,
+        name="s",
+        session_id=None,
+        backend_name="claude",
+        base_branch=None,
+        worktree=None,
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "",
+        manual_pending=3,
+    )
+
+    assert "3 uncommitted turns" in line
+
+
+def test_the_status_bar_says_nothing_when_no_turns_are_pending():
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    line = ScreenRenderer.status_line(
+        None,  # status_line reads only its keyword args, never `self`
+        cols=200,
+        name="s",
+        session_id=None,
+        backend_name="claude",
+        base_branch=None,
+        worktree=None,
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "",
+        manual_pending=0,
+    )
+
+    assert "uncommitted" not in line
+
+
+# --- the coverage anchor vs a rewritten history ------------------------------
+#
+# The persisted anchor separates "work aGiTrack must account for" from the user's own history.
+# It was validated only by "does this object exist", which a rewritten history passes: a rebase,
+# squash, amend, `reset --hard` or someone else's force-push leaves the old commit as a reachable
+# OBJECT while it stops describing the branch. `git log <orphan>..HEAD` still succeeds against it,
+# so the scan silently ran over the wrong range — walking commits already accounted for and able
+# to re-attribute them. Observed for real after rewriting this repo's own history.
+
+
+def _anchor_runner(tmp_path):
+    from proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    runner = make_runner(
+        repo=repo,
+        base_repo=repo,
+        state=AgitrackState(tmp_path, default_backend="claude"),
+        _use_worktrees=False,
+        worktree=None,
+    )
+    return runner, repo
+
+
+def test_an_anchor_orphaned_by_a_rewrite_is_re_anchored(tmp_path):
+    runner, repo = _anchor_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "a commit that a rewrite will replace")
+    orphaned = repo.rev_parse("HEAD")
+    runner._set_noworktree_base_head(orphaned)
+
+    # Rewrite history: the old commit survives as an object but no longer describes the branch.
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+    assert repo.has_object_local(orphaned), "precondition: the old object is still present"
+    assert not repo.is_ancestor(orphaned, "HEAD"), "precondition: it is no longer on the branch"
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == repo.rev_parse("HEAD"), "a stale anchor must re-anchor at HEAD"
+
+
+def test_a_valid_anchor_still_survives_a_restart(tmp_path):
+    # The check must stay narrow: an anchor that IS on the branch is the whole point of persisting
+    # it, and re-anchoring it would lose coverage of the agent's commits since.
+    runner, repo = _anchor_runner(tmp_path)
+    anchor = repo.rev_parse("HEAD")
+    runner._set_noworktree_base_head(anchor)
+    (tmp_path / "a.txt").write_text("agent work after the anchor\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the agent's own commit")
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner._noworktree_base_head == anchor, "a still-valid anchor must be kept"
+    assert runner._uncovered_backend_commits(), "the commit after the anchor must still read as uncovered"
+
+
+def test_the_daemon_re_anchors_a_watermark_orphaned_by_a_rewrite(tmp_path):
+    # The daemon persists the same watermark and had the same flaw: it checked only that the sha
+    # parsed, which an orphaned commit does.
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    runner = BackgroundRunner(
+        repo, manual_commits=False, _global_config=GlobalConfig(path=tmp_path / "gc.json"), _state=state
+    )
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "to be rewritten")
+    runner._set_tracked_head(repo.rev_parse("HEAD"))
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+
+    runner._tracked_head = None
+    runner._load_tracked_head()
+
+    assert runner._tracked_head == repo.rev_parse("HEAD")
+
+
+# --- the user is told when attribution goes away -----------------------------
+#
+# Every failure path in this area used to log only to `self._debug`, invisible without
+# --verbose. That is the worst possible property for a feature whose whole job is not losing AI
+# attribution: a silent loss can never be noticed, so it can never be reported or investigated.
+
+
+def test_a_rewritten_history_tells_the_user_the_marker_was_reset(tmp_path):
+    runner, repo = _anchor_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("work\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "to be rewritten")
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+    _git(repo, "commit", "--amend", "-m", "rewritten")
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner.message is not None, "the reset was silent"
+    assert "rewritten" in runner.message and "won't be attributed" in runner.message
+
+
+def test_a_valid_anchor_says_nothing(tmp_path):
+    # The notice must be an exception, not noise on every start.
+    runner, repo = _anchor_runner(tmp_path)
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+
+    runner._noworktree_base_head = None
+    runner._load_noworktree_anchor()
+
+    assert runner.message is None
+
+
+def test_discarding_an_abandoned_chain_tells_the_user(tmp_path):
+    # Discarding is the right call — the work is no longer uncommitted — but it is still AI
+    # attribution going away, and the user should hear it rather than find a history quietly
+    # missing a turn.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _abandoned_chain(repo, "abandoned", 50, "gone-session")
+    _git(repo, "checkout", "--", "a.txt")  # the user discarded it
+
+    tracker.setup()
+
+    assert tracker.dropped_chains, "the tracker did not record what it discarded"
+
+
+def test_nothing_is_reported_when_no_chain_is_dropped(tmp_path):
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    tracker = ManualCommitTracker(repo, repo, state)
+
+    tracker.setup()
+
+    assert tracker.dropped_chains == []
+
+
+# --- a repo that TRACKS the agent scaffolding dirs ---------------------------
+#
+# Committing `.claude/settings.json`, a `.claude/commands/` dir or an `.opencode/` config is
+# ordinary practice — a team shares its agent setup the same way it shares an editorconfig. But
+# EVERY "has the working tree changed?" question in manual / no-worktree / background mode is a
+# comparison between `snapshot_worktree_tree()` and some commit's tree, and the snapshot
+# deliberately STRIPS those dirs while a raw `^{tree}` keeps them. So in such a repo the two
+# could never be equal and every one of those questions answered "dirty" forever, which broke
+# each mode in a different direction:
+#
+#   -b  the daemon covered NO agent self-commit at all (`_agent_committed_own_work` bails on a
+#       dirty tree) — the exact data loss the persistent watermark exists to prevent;
+#   -m  `reset_stale_ref` never reset a stale chain and `prune_abandoned_refs` was a total no-op,
+#       so discarded turns rode into unrelated commits, and `gate()` recorded a latent turn for a
+#       turn that changed nothing;
+#   both  a purely human commit made while an agent was mid-turn got stamped as agent work.
+#
+# `GitRepo.comparable_tree` strips the same paths from the commit side, so the comparison means
+# what it says. These tests pin each consequence, because a raw `^{tree}` reads as obviously
+# correct and would be reintroduced by anyone who had not seen this.
+
+
+def _scaffolded_repo(path: Path) -> GitRepo:
+    """A repo like `_init_repo`, except it TRACKS a `.claude/` file the way real projects do."""
+    repo = _init_repo(path)
+    (path / ".claude").mkdir(exist_ok=True)
+    (path / ".claude" / "settings.json").write_text('{"model": "opus"}\n', encoding="utf-8")
+    _git(repo, "add", "-f", ".claude/settings.json")
+    _git(repo, "commit", "-m", "share the agent config, as teams do")
+    return repo
+
+
+def test_comparable_tree_strips_tracked_scaffolding_so_a_clean_tree_reads_as_clean(tmp_path):
+    repo = _scaffolded_repo(tmp_path)
+
+    assert repo.rev_parse("HEAD^{tree}") != repo.snapshot_worktree_tree(), "precondition"
+    assert repo.comparable_tree("HEAD") == repo.snapshot_worktree_tree()
+
+
+def test_comparable_tree_is_a_no_op_when_no_scaffolding_is_tracked(tmp_path):
+    # The overwhelmingly common repo. The stripped tree must be the raw tree exactly — otherwise
+    # this changes behavior for everyone to fix a minority case.
+    repo = _init_repo(tmp_path)
+
+    assert repo.comparable_tree("HEAD") == repo.rev_parse("HEAD^{tree}")
+
+
+def test_comparable_tree_is_idempotent_on_an_already_stripped_tree(tmp_path):
+    # It is applied to latent tips, whose trees are already snapshots. Stripping twice must not
+    # move the answer, or the record guard would compare a tree against a different spelling of
+    # itself and record a duplicate turn.
+    repo = _scaffolded_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    latent = repo.commit_tree(repo.snapshot_worktree_tree(), parents=[repo.rev_parse("HEAD")], message="turn")
+
+    assert repo.comparable_tree(latent) == repo.rev_parse(f"{latent}^{{tree}}")
+
+
+def test_a_turn_that_changed_nothing_records_no_latent_commit_in_a_scaffolded_repo(tmp_path):
+    # `gate()` answering True on a genuinely untouched tree means a pure-Q&A turn is recorded as
+    # a latent commit: a token bill and an AI-authorship claim attached to no code at all.
+    repo = _scaffolded_repo(tmp_path)
+    tracker = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    tracker.setup()
+
+    assert tracker.gate() is False
+    assert tracker.record(_agent_body("just a question", 5)) is None
+    assert tracker.pending_count() == 0
+
+
+def test_a_real_edit_is_still_recorded_in_a_scaffolded_repo(tmp_path):
+    # The other direction: the strip must not blind the gate to actual work.
+    repo = _scaffolded_repo(tmp_path)
+    tracker = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    tracker.setup()
+    (tmp_path / "a.txt").write_text("agent wrote this\n", encoding="utf-8")
+
+    assert tracker.gate() is True
+    assert tracker.record(_agent_body("do the work", 100)) is not None
+    assert tracker.pending_count() == 1
+
+
+def test_an_edit_to_the_tracked_scaffolding_itself_is_never_agent_work(tmp_path):
+    # Deliberate consequence of the strip, stated so it is a decision rather than an accident:
+    # the snapshot cannot represent `.claude/` changes, so a turn that ONLY rewrote the agent's
+    # own config records nothing. Attributing it would be worse — the latent commit's tree would
+    # be identical to the previous one, so it would claim the whole turn against no diff.
+    repo = _scaffolded_repo(tmp_path)
+    tracker = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    tracker.setup()
+    (tmp_path / ".claude" / "settings.json").write_text('{"model": "haiku"}\n', encoding="utf-8")
+
+    assert tracker.gate() is False
+
+
+def test_a_stale_chain_is_still_reset_in_a_scaffolded_repo(tmp_path):
+    # `reset_stale_ref` decides on a CLEAN tree. Never seeing one meant a chain whose work the
+    # user discarded was kept and folded into some unrelated later commit.
+    repo = _scaffolded_repo(tmp_path)
+    tracker = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "work", 50)
+    _git(repo, "checkout", "--", "a.txt")  # the user discards it
+
+    assert tracker.reset_stale_ref() is True
+    assert repo.ref_sha(tracker.ref()) == repo.rev_parse("HEAD")
+
+
+def test_an_abandoned_chain_is_still_pruned_in_a_scaffolded_repo(tmp_path):
+    # Both halves of `prune_abandoned_refs` were dead here: the clean-tree discard (its
+    # `working_tree_is_clean` never held) and the tail trim (it compared a latent tree against a
+    # raw HEAD tree). So the whole feature the previous commit added did nothing in such a repo.
+    repo = _scaffolded_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    ref = _abandoned_chain(repo, "abandoned", 50, "gone-session")
+    _git(repo, "checkout", "--", "a.txt")
+
+    dropped = prune_abandoned_refs(repo, "refs/agitrack/manual/live", [ref])
+
+    assert dropped == [ref]
+    assert repo.ref_sha(ref) == repo.rev_parse("HEAD")
+
+
+def test_a_trailing_turn_matching_head_is_still_trimmed_in_a_scaffolded_repo(tmp_path):
+    repo = _scaffolded_repo(tmp_path)
+    kept, trimmed, ref = _chain_with_a_trailing_turn_that_matches_head(repo, tmp_path)
+
+    prune_abandoned_refs(repo, "refs/agitrack/manual/live", [ref])
+
+    assert repo.ref_sha(ref) == kept, "the trailing turn was not trimmed"
+    assert repo.ref_sha(ref) != trimmed
+
+
+def test_a_human_commit_during_an_agent_turn_gets_no_footprint_in_a_scaffolded_repo(tmp_path):
+    # The "no AI work ⇒ no footprint" promise. The tree check is the only thing enforcing it, so
+    # a permanently-dirty reading stamped the user's own commit as agent work.
+    repo = _scaffolded_repo(tmp_path)
+    tracker = ManualCommitTracker(
+        repo,
+        repo,
+        AgitrackState(tmp_path, default_backend="claude"),
+        in_flight_fn=lambda: {"backend": "claude", "model": "opus"},
+    )
+    tracker.setup()
+
+    assert tracker.in_flight_attribution() is None
+
+    (tmp_path / "a.txt").write_text("but now the agent HAS edited\n", encoding="utf-8")
+    assert tracker.in_flight_attribution() is not None  # …and real work still is attributed
+
+
+def test_the_proxys_own_manual_copy_agrees_with_the_tracker_in_a_scaffolded_repo(tmp_path):
+    # Interactive `-m` runs the ProxyRunner's parallel `_manual_*` copy, which is the path users
+    # actually type in. It carried the identical raw-`^{tree}` defect and must stay in lockstep.
+    from tests.proxy_helpers import make_runner
+
+    repo = _scaffolded_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    runner = make_runner(
+        repo=repo, base_repo=repo, state=state, _manual_commits=True, _use_worktrees=False, worktree=None
+    )
+    tracker = ManualCommitTracker(repo, repo, state)
+
+    assert runner._manual_gate() is False
+    assert runner._manual_gate() == tracker.gate()
+    assert runner._reset_stale_manual_ref() is False  # nothing recorded yet ⇒ nothing to reset
+
+    (tmp_path / "a.txt").write_text("agent edit\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    assert runner._manual_record(_agent_body("work", 10)) is not None
+    _git(repo, "checkout", "--", "a.txt")
+    assert runner._reset_stale_manual_ref() is True

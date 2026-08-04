@@ -625,6 +625,13 @@ class BackgroundRunner:
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
         self._manual.setup()
+        if getattr(self._manual, "dropped_chains", None):
+            count = len(self._manual.dropped_chains)
+            chains = "chain" if count == 1 else "chains"
+            self._print(
+                f"discarded {count} abandoned tracking {chains} from an earlier session — their "
+                "changes are no longer uncommitted, so they had nothing left to attribute."
+            )
         self._install_autotrack_hook()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
@@ -1031,6 +1038,14 @@ class BackgroundRunner:
         turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
         covered = self._agent_committed_own_work(turns) if turn_complete else []
+        # …but NEVER in manual-commit mode: there the user decides when to commit, and aGiTrack
+        # adding a cover commit of its own breaks that contract outright — the user gets an
+        # unrequested commit on their branch. The latent path below records the turn instead and
+        # the fold hook combines it into the user's next commit, losing nothing. The interactive
+        # proxy already refuses this (`_integrate_agent_made_commits_if_idle`); the daemon's own
+        # cover branch was simply never gated on it.
+        if covered and self._manual_commits:
+            covered = []
         if covered:
             # The cover commit is created immediately and the daemon never amends HEAD, so — unlike
             # the async note flow for other commits — its message must LEAD with the summary already.
@@ -1067,6 +1082,10 @@ class BackgroundRunner:
         # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
         # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
         in_flight_covered = self._uncovered_agent_commits(turns) if turn_complete else []
+        # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
+        # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
+        # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
+        self._manual.owed_record = bool(in_flight_covered)
         result = engine.commit_turns(
             turns=turns,
             backend=backend,
@@ -1102,9 +1121,21 @@ class BackgroundRunner:
         except OSError:
             saved = ""
         try:
-            if saved and self.repo.rev_parse(saved):
+            # The watermark must still describe THIS branch, not merely parse. `rev_parse` echoes
+            # a well-formed sha back without checking it exists, and an object can outlive the
+            # branch that contained it — any history rewrite (rebase, squash, amend, reset, a
+            # force-push) orphans it. `git log <orphan>..HEAD` still succeeds, so the scan would
+            # silently run over the wrong range and could re-attribute already-accounted commits.
+            # Re-anchoring at HEAD can only under-claim, never claim the user's own history.
+            if saved and self.repo.has_object_local(saved) and self.repo.is_ancestor(saved, "HEAD"):
                 self._tracked_head = self.repo.rev_parse(saved)
                 return
+            if saved:
+                self._debug(f"tracked-head {saved!r} no longer describes this branch; re-anchoring")
+                self._print(
+                    "the git history was rewritten since this repo was last tracked, so the coverage "
+                    "marker was reset. Agent commits made before the rewrite won't be attributed."
+                )
         except Exception:
             pass
         try:
@@ -1189,7 +1220,10 @@ class BackgroundRunner:
             head = self.repo.rev_parse("HEAD")
             if head == self._tracked_head:
                 return []  # no new commit since we last accounted (e.g. a pure-Q&A turn)
-            if self.repo.snapshot_worktree_tree() != self.repo.rev_parse("HEAD^{tree}"):
+            # `comparable_tree`, not a raw `^{tree}`: the snapshot drops the agent scaffolding
+            # dirs, so in a repo that TRACKS `.claude/` this test read "dirty" forever and the
+            # daemon covered NO agent self-commit at all. See GitRepo.comparable_tree.
+            if self.repo.snapshot_worktree_tree() != self.repo.comparable_tree("HEAD"):
                 return []  # dirty tree ⇒ the agent's edits are uncommitted; record latently instead
             commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
         except Exception as error:
@@ -1260,7 +1294,7 @@ class BackgroundRunner:
         try:
             # Clean working tree vs HEAD ⇒ the agent (or user) already committed its work, and the
             # prepare-commit-msg fold hook folded the tracking into THAT commit — nothing to do.
-            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                 return
         except Exception:
             return

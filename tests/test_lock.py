@@ -2,6 +2,9 @@ import json
 import os
 import subprocess
 import sys
+import time
+
+import pytest
 
 from agitrack.git import RepoLock, already_running_message
 
@@ -186,5 +189,16 @@ def test_lock_released_by_os_when_owner_dies(tmp_path):
     finally:
         child.kill()
         child.wait()
-    assert lock.acquire() is True  # freed by the OS on death, instantly
+    # Freed by the OS on death — no stale file, no reclaim step. The claim is that NOTHING has
+    # to clean up, not that the handle is gone the instant `wait()` returns: on Windows the
+    # lock is released when the OS finishes tearing the process down, which trails `wait()` by
+    # a moment, and under `-n auto` that moment stretches. Retry briefly rather than assert on
+    # the first attempt — a lock that genuinely needed reclaiming would still never come free.
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if lock.acquire():
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the lock was not released when its holder died")
     lock.release()

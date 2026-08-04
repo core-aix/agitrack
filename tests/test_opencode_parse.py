@@ -99,9 +99,89 @@ def test_opencode_parse_token_usage():
     assert parsed is not None
     _display, _final, session_id, _model, tokens = parsed
     assert session_id == "ses-1"
-    assert tokens.context == 8869
+    # `context` is how FULL the window is, so it counts every token the model read — the cached
+    # prefix included. This used to assert `input` alone (8869), which under-reported it by the
+    # whole cache: measured on a live OpenCode turn, input=727 against cache.read=5632, so the
+    # gauge read 727 when the true context was 6365. Claude has always summed the three, so this
+    # is also what makes the number mean the same thing on both backends.
+    # See tests/test_token_accounting.py for the full semantics, pinned against real output.
+    assert tokens.context == 8869 + 2 + 3
     assert tokens.total == 14
     assert tokens.input == 8869
     assert tokens.output == 14
     assert tokens.cache_write == 3
     assert tokens.cache_read == 2
+
+
+# --- turn completeness ------------------------------------------------------
+#
+# `SessionTurn.complete` is how every caller asks "has the agent finished this turn?" —
+# `CommitEngine.finish_parse_if_ready` finds the running turn via `not turns[-1].complete`, and
+# the background tracker refuses to commit a turn that is still being written. OpenCode's
+# parser never set it, so every turn defaulted to complete=True and the whole mid-turn
+# machinery was INERT on this backend: an agent commit made mid-turn got no in-flight
+# attribution, and the daemon would commit a half-written turn. Claude computes the same thing.
+
+
+def _export(finish, *, with_assistant=True):
+    messages = [{"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "fix it"}]}]
+    if with_assistant:
+        info = {"role": "assistant", "id": "a1", "time": {"completed": 5}}
+        if finish is not None:
+            info["finish"] = finish
+        messages.append({"info": info, "parts": [{"type": "text", "text": "working"}]})
+    from agitrack.transcripts.opencode import parse_exported_session
+
+    return parse_exported_session({"info": {"id": "ses-1", "time": {"updated": 1}}, "messages": messages})
+
+
+def test_a_finished_opencode_turn_is_complete():
+    # The real shape, verified against a live `opencode export`: a finished assistant message
+    # records finish: "stop".
+    session = _export("stop")
+    assert session.turns[-1].complete is True
+
+
+def test_a_streaming_opencode_turn_is_not_complete():
+    # Still being written: no terminal reason yet. Reporting this as complete is what let the
+    # tracker commit a turn mid-write and suppressed in-flight attribution entirely.
+    session = _export(None)
+    assert session.turns[-1].complete is False
+
+
+def test_an_unanswered_opencode_prompt_is_not_complete():
+    # The user sent a prompt and the agent has not started: there is no turn to commit.
+    session = _export(None, with_assistant=False)
+    assert session.turns == [] or session.turns[-1].complete is False
+
+
+def test_opencode_completeness_matches_claudes_meaning():
+    # Parity, stated directly: the same situation must answer the same on both backends, or
+    # every caller that branches on `complete` behaves differently depending on the agent.
+    from agitrack.transcripts.claude import parse_rows
+
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "go"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "stop_reason": "tool_use",  # mid-tool-call: still running
+                "content": [{"type": "text", "text": "working"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+    ]
+    claude_turn = parse_rows("s", rows).turns[-1]
+    opencode_turn = _export(None).turns[-1]
+
+    assert claude_turn.complete is False and opencode_turn.complete is False

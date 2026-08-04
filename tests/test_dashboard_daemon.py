@@ -9,6 +9,13 @@ import pytest
 
 from agitrack.metrics import daemon
 
+# Binds real TCP ports. Pinned to a single xdist worker (see the `xdist_group` marker note in
+# pyproject.toml): ports are a GLOBAL resource, so concurrent workers race for them — the
+# consecutive-allocation tests assert that base+1 and base+2 are still free, which another
+# worker can falsify between choosing the base and binding it. Unlike a slow test this cannot
+# be fixed by waiting longer; the contention has to be removed.
+pytestmark = pytest.mark.xdist_group("net")
+
 
 def _repo(tmp_path):
     """A minimal stand-in: the daemon only needs ``repo.repo`` (a writable dir)."""

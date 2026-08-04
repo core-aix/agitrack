@@ -18,6 +18,12 @@ from agitrack.git import GitRepo
 from agitrack.sessions import SharedSessionStore, github_login, redact_transcript
 from agitrack.sessions.identity import slug
 
+# Forks a real pseudo-terminal (OpenCode's export runs under a pty). Pinned to a single
+# xdist worker — see the `xdist_group` marker note in pyproject.toml: concurrent workers
+# forking ptys exhaust the OS pty pool, producing failures that never reproduce alone.
+pytestmark = pytest.mark.xdist_group("pty")
+
+
 _posix_git_gc = pytest.mark.skipif(
     sys.platform == "win32",
     reason="git object reclamation via loose-file removal behaves differently on Windows (objects may be packed)",
