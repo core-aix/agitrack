@@ -314,3 +314,58 @@ def test_the_marker_is_only_ever_set_on_the_agent_child():
         if "ENV_GUARD] = " in line or "ENV_GUARD]=" in line
     ]
     assert len(others) == 1, f"the guard marker is set in more than one place: {others}"
+
+
+# --- a custom core.hooksPath ------------------------------------------------
+#
+# `core.hooksPath` makes git ignore `.git/hooks` entirely, so aGiTrack cannot install anything
+# there that would run. Every code path that consults it does so through
+# `GitRepo.core_hooks_path()`, and the whole suite previously set the resulting boolean BY HAND
+# — the real detection was never exercised. If it ever misreported, aGiTrack would believe its
+# hooks were live when nothing was installed, and silently lose every commit's tracking.
+
+
+def test_core_hooks_path_is_detected_from_real_git_config(tmp_path):
+    from agitrack.git import GitRepo
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q", "-b", "main")
+    repo = GitRepo.discover(repo_dir)
+    assert repo.core_hooks_path() is None  # unset by default
+
+    custom = tmp_path / "shared-hooks"
+    custom.mkdir()
+    _git(repo_dir, "config", "core.hooksPath", str(custom))
+
+    assert repo.core_hooks_path() == str(custom)
+
+
+def test_a_custom_hookspath_really_does_stop_our_hook_from_running(tmp_path):
+    """Why the skip exists at all, proven rather than assumed.
+
+    With `core.hooksPath` set, git looks only there — so a guard written into `.git/hooks` is
+    inert. aGiTrack declines to install rather than pretend it is protected, and (deliberately)
+    does not write into the user's shared hooks directory.
+    """
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    _git(repo_dir, "init", "-q", "-b", "main")
+    _git(repo_dir, "config", "user.email", "t@t")
+    _git(repo_dir, "config", "user.name", "t")
+    (repo_dir / "f.txt").write_text("base\n")
+    _git(repo_dir, "add", ".")
+    _git(repo_dir, "commit", "-qm", "init")
+
+    # Install the guard the normal way, THEN redirect hooksPath elsewhere.
+    assert git_hooks.install_base_commit_guard(repo_dir / ".git" / "hooks")
+    custom = tmp_path / "shared-hooks"
+    custom.mkdir()
+    _git(repo_dir, "config", "core.hooksPath", str(custom))
+
+    # The guard is on disk but git never calls it, so the agent is NOT blocked.
+    (repo_dir / "f.txt").write_text("agent edit\n")
+    result = _git(repo_dir, "commit", "-aqm", "not blocked", guard=True, check=False)
+
+    assert result.returncode == 0, "precondition: a custom hooksPath makes the installed guard inert"
+    assert not (custom / "pre-commit").exists(), "aGiTrack must not write into the user's shared hooks dir"

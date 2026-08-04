@@ -1592,3 +1592,71 @@ def test_daemon_auto_mode_still_covers_an_agent_commit(tmp_path):
 
     assert repo.rev_parse("HEAD") != agent_head
     assert "do x" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_manual_daemon_records_a_turn_whose_only_action_was_its_own_midturn_commit(tmp_path):
+    """`-b --manual-commits`, agent self-commits mid-turn, turn ends with a clean tree.
+
+    The daemon's half of the same loss the interactive proxy had: the tracker's `gate()` and
+    `record()` both read an unchanged tree as "nothing happened", so a turn whose work the agent
+    had already committed was dropped — no trace, no tokens, `commit_turns` returning False and
+    nothing said. Manual mode makes it worse: aGiTrack must not commit for the user, so the
+    latent chain is the ONLY place the accounting can live until their next commit folds it in.
+    """
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    # Mid-turn: the agent commits its own work. The tree is clean from here on.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+
+    # The turn finishes having edited nothing further.
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") == agent_head, "manual mode must not commit on the user's behalf"
+    bodies = runner._manual.pending_bodies()
+    assert bodies, "the turn's trace and tokens were dropped instead of held for the user's commit"
+    assert "tokens_since_last_commit_output: 120" in bodies[-1]
+    assert agent_head[:7] in bodies[-1], "the agent's own commit must be attributed in covered_commits"
+
+
+def test_the_daemons_record_guard_still_refuses_a_turn_that_changed_nothing(tmp_path):
+    # The guard is loosened, not removed: with no commit owed a record an unchanged tree really
+    # does mean nothing happened, and recording would chain an empty latent commit every poll.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    assert runner._manual.gate() is True
+    assert runner._manual.record("<aGiTrack> first\n") is not None
+
+    runner._manual.owed_record = False
+    assert runner._manual.gate() is False
+    assert runner._manual.record("<aGiTrack> nothing\n") is None
+
+
+def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
+    # The mirror of the manual-mode autostart test. A regression here silently flips the user's
+    # chosen commit mode after a reboot or a pre-commit-triggered restart: they get aGiTrack
+    # committing for them when they had chosen to commit themselves, or the reverse.
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    bg.write_background_mode(repo, manual=False)  # the last run was AUTO
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned, "the daemon was never autostarted"
+    assert "--auto-commit" in spawned[0]
+    assert "--manual-commits" not in spawned[0]
