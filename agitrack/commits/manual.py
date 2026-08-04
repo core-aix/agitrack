@@ -17,7 +17,10 @@ mutable poll state it needs. It performs no I/O with the user; callers supply a 
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
 
 from agitrack.commits.message import apply_summary_to_message, build_manual_squash_trailer, build_pending_trailer
 from agitrack.config import AgitrackState
@@ -25,7 +28,7 @@ from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 
 
-def write_lf(path, text: str) -> None:
+def write_lf(path: Path, text: str) -> None:
     """Write *text* with LF endings on every platform.
 
     These files are read by the POSIX ``sh`` commit hooks: ``manual-ref`` a line at a time, and
@@ -33,9 +36,28 @@ def write_lf(path, text: str) -> None:
     ``newline=None``, which on Windows rewrites every ``\n`` as ``\r\n`` — the hook then reads a
     ref name with a trailing CR and ``git update-ref`` rejects it, so the latent refs are never
     advanced and the turns fold a SECOND time into the next commit (caught by Windows CI).
+
+    ATOMIC (temp file + rename), because the reader is a separate process whose timing we do not
+    control: the ``sh`` hooks read these files during a ``git commit`` that can land at any moment,
+    including mid-write. An in-place rewrite can be read half-finished — and while an EMPTY read is
+    harmlessly skipped by the hook's ``[ -s ... ]`` guard (the turn is merely lost), a partial but
+    non-empty one would fold a truncated metadata block straight into the user's permanent commit
+    message. Same guarantee ``state.save()`` already relies on.
     """
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(text)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    finally:
+        # Only reachable with the tmp still present when something above raised; on success
+        # os.replace already consumed it.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 class ManualCommitTracker:
@@ -284,6 +306,14 @@ class ManualCommitTracker:
                 self._debug(f"manual snapshot failed: {error!r}")
                 return None
         tip = self.repo.ref_sha(self.ref())
+        if tip is not None and not self.repo.has_object_local(tip):
+            # The ref names a commit this repo no longer has — `git gc --prune` can collect a
+            # latent commit, which is unreachable from any branch by design. Every lookup against
+            # it then raises, and because `record()` is called on EVERY turn the whole session
+            # would silently stop tracking until someone deleted the ref by hand. Re-anchor at
+            # HEAD instead: the chain restarts, and only the already-lost turns are lost.
+            self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
+            tip = None
         parent = tip or self.repo.rev_parse("HEAD")
         allow_unchanged, self._allow_unchanged = self._allow_unchanged, False
         if not allow_unchanged and tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
