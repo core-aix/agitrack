@@ -22,6 +22,12 @@ class InteractiveUI(Protocol):
     def info(self, message: str, *, level: str = ...) -> None: ...
 
 
+# The console spelling of "Esc" at the user-commit prompt. A word rather than an empty line:
+# an empty answer must keep re-prompting, since a stray Enter should never be read as a decision
+# to leave the user's work uncommitted.
+_SKIP_WORD = "skip"
+
+
 class AgitrackActions:
     def __init__(
         self,
@@ -52,12 +58,35 @@ class AgitrackActions:
             return []
         return [line.strip() for line in output.splitlines() if line.strip()]
 
-    def create_user_commit(self) -> bool:
+    def create_user_commit(self, *, allow_skip: bool = True) -> bool:
+        """Offer to commit the user's own uncommitted changes. True when one was made.
+
+        ``allow_skip`` says whether declining is an acceptable outcome. It is not in worktree
+        mode: the session's worktree is checked out from HEAD, so anything left uncommitted
+        simply is not in the tree the agent works in — the user would be editing one copy while
+        the agent reads another. Under ``--no-worktree`` the agent works in this very tree, so
+        uncommitted changes are still right there and declining costs nothing.
+
+        Declining NEVER leaves the index touched. This method stages on the user's behalf in
+        order to show what a commit would contain; if they then back out, the index is restored
+        to what it was. Leaving it staged was actively harmful during a merge conflict, where
+        `git status` files staged paths under "changes to be committed" and a half-resolved file
+        stops standing out as one still needing work.
+        """
+        staged_before = set(self.repo.staged_paths())
+
+        def restore_index() -> None:
+            try:
+                self.repo.unstage([path for path in self.repo.staged_paths() if path not in staged_before])
+            except Exception:
+                pass  # best-effort: never turn a declined commit into a failure
+
         self.repo.add_tracked()
         self.review_untracked(include_declined=False)
         if not self.repo.has_staged_changes():
             if self.verbose:
                 print("No staged user changes to commit.")
+            restore_index()
             return False
         # Show WHAT is about to be committed before asking for a message: the answer is a
         # decision about these files, and at startup they may be edits the user forgot they
@@ -65,18 +94,28 @@ class AgitrackActions:
         # gets in. The TUI popup already lists them; this is the console path.
         staged = self._staged_paths()
         listing = "\n".join(f"  {path}" for path in staged)
+        skip_hint = (
+            "Esc to continue without committing"
+            if allow_skip
+            else "a commit is required: the agent's worktree is checked out from HEAD, so "
+            "uncommitted changes would not be in it"
+        )
         if self.ui is not None:
             message = ""
             while not message.strip():
                 # Cancelling (Esc) returns None — continue without committing.
                 # Folded into the message rather than passed as a separate field: a UI
                 # implementation only has to render text() to show the file list.
-                question = "User commit message (Esc to continue without committing):"
+                question = f"User commit message ({skip_hint}):"
                 if staged:
                     question = f"Committing {len(staged)} file(s):\n{listing}\n\n{question}"
                 entered = self.ui.text(question)
                 if entered is None:
+                    if not allow_skip:
+                        self.ui.info(f"Cannot skip — {skip_hint}.", level="warn")
+                        continue
                     self.ui.info("Continuing without committing.", level="warn")
+                    restore_index()
                     return False
                 message = entered
                 if not message.strip():
@@ -86,10 +125,30 @@ class AgitrackActions:
             if self.interactive and staged:
                 print(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
                 print(listing)
+            # An explicit word, not an empty line, is the way out. Empty deliberately re-prompts
+            # (a stray Enter must never be read as "don't commit my work"), so without a
+            # sentinel this loop had no exit at all — which is how a --no-worktree start became
+            # impossible with a dirty tree.
+            prompt = f"User commit message (or type '{_SKIP_WORD}' to continue without committing): "
+            if not allow_skip:
+                prompt = "User commit message: "
             while not message.strip():
-                message = input("User commit message: ")
+                try:
+                    message = input(prompt)
+                except (EOFError, KeyboardInterrupt):
+                    print()  # no usable stdin, or interrupted: end cleanly rather than spinning
+                    restore_index()
+                    return False
+                if allow_skip and message.strip().lower() == _SKIP_WORD:
+                    print("Continuing without committing.")
+                    restore_index()
+                    return False
                 if not message.strip():
-                    print("User commit message is required.")
+                    print(
+                        "User commit message is required."
+                        if allow_skip
+                        else f"User commit message is required — {skip_hint}."
+                    )
         self.repo.commit(build_user_commit_message(message=message, agitrack_session_id=self.state.session_id))
         self.state.clear_trace()
         print("Created user commit.")
