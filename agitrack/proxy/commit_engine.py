@@ -651,6 +651,12 @@ class CommitEngine:
             return None, awaited_followups
 
         if not exported_session:
+            # Deliberately does NOT move the pin. An empty transcript is not evidence of a
+            # switch: Claude mints a fresh EMPTY session id on every resume/picker action, and
+            # adopting one drops the user into a blank session on the next start (the same trap
+            # `claude.latest_session_id` and `_sync_tracked_session` avoid by preferring a ref
+            # with a label). A real switch is picked up by `_service_native_session_switch` once
+            # the conversation has content, which is also when its name can be asked for.
             debug_fn(f"agent parse consumed without session session_id={session_id}")
             return False, awaited_followups
 

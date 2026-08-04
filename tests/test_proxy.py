@@ -21,6 +21,12 @@ from agitrack.transcripts import ExportedSession, SessionRef
 from agitrack.config import AgitrackState
 from proxy_helpers import make_runner
 
+# Every test in this module forks a real pseudo-terminal. Pinned to a single xdist worker
+# (see the `xdist_group` marker note in pyproject.toml): N workers forking ptys at once
+# exhausts the OS pty pool, which surfaces as an unrelated-looking failure that never
+# reproduces in isolation.
+pytestmark = pytest.mark.xdist_group("pty")
+
 
 class _FakeBackend:
     name = "fake"
@@ -106,25 +112,47 @@ def test_opencode_spawn_command_embeds_the_worktree_path():
 def test_discover_spawned_session_picks_the_new_session():
     refs = [SessionRef("old", 100.0), SessionRef("new", 200.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = {"old"}
+    runner._pre_spawn_sessions = {"old": 100.0}
     assert runner._discover_spawned_session() == "new"
 
 
 def test_discover_spawned_session_returns_none_when_nothing_new():
     refs = [SessionRef("old", 100.0), SessionRef("older", 50.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = {"old", "older"}
+    runner._pre_spawn_sessions = {"old": 100.0, "older": 50.0}
     assert runner._discover_spawned_session() is None
 
 
 def test_discover_spawned_session_without_snapshot_returns_none():
-    # Without a pre-spawn snapshot we cannot tell aGiTrack's own session apart from a
+    # Without a pre-spawn snapshot we cannot tell this run's conversation apart from a
     # pre-existing unrelated one in the same directory, so discovery returns None and the
     # caller keeps its pinned id. (This is what makes the result always safe to prefer over
     # the pinned id, which is how no-worktree mode follows an in-backend session switch.)
     refs = [SessionRef("a", 100.0), SessionRef("b", 300.0), SessionRef("c", 200.0)]
     runner = _runner_with_sessions(refs)
-    runner._pre_spawn_session_ids = None
+    runner._pre_spawn_sessions = None
+    assert runner._discover_spawned_session() is None
+
+
+def test_switching_BACK_to_an_existing_conversation_is_followed():
+    """Claude `/resume` and OpenCode's session switcher move onto a conversation that already
+    existed, so an id-only snapshot could never see it — the id is in the snapshot either way.
+    What changes is that its transcript starts being written again."""
+    runner = _runner_with_sessions([SessionRef("this-run", 200.0), SessionRef("resumed", 100.0)])
+    runner._pre_spawn_sessions = {"resumed": 100.0}  # existed, untouched, at launch
+
+    assert runner._discover_spawned_session() == "this-run"  # nothing switched yet
+
+    # ...the user runs /resume and types: the old transcript moves on, past this run's.
+    runner.backend._refs = [SessionRef("this-run", 200.0), SessionRef("resumed", 300.0)]
+    assert runner._discover_spawned_session() == "resumed"
+
+
+def test_an_untouched_conversation_is_never_adopted_however_recent():
+    """The safety property. A directory can hold conversations that have nothing to do with this
+    run; they are exactly the ones nobody has written to since launch."""
+    runner = _runner_with_sessions([SessionRef("stranger", 9999.0)])
+    runner._pre_spawn_sessions = {"stranger": 9999.0}
     assert runner._discover_spawned_session() is None
 
 
@@ -11572,3 +11600,293 @@ def test_an_absorbed_reply_cannot_open_the_menu(monkeypatch):
     assert runner.input.capturing is False, "the Ctrl-G palette opened by itself"
     assert bytes(forwarded) == b"", f"the agent was typed at: {bytes(forwarded)!r}"
     assert runner.host_bg_value == b"rgb:1e1e/1e1e/1e1e"
+
+
+# --------------------------------------------------------------------------- in-backend /clear
+#
+# Claude's `/clear` starts a new conversation: verified against the real CLI, it writes a brand-new
+# transcript under a NEW session id the moment it runs. aGiTrack has to follow it or everything
+# after the clear is recorded against the conversation the user just threw away.
+
+
+class _SpawnSnapshotBackend:
+    """Records what `_spawn` snapshots, and whether it pinned an id of its own."""
+
+    name = "fake"
+
+    def __init__(self, refs, *, picks_own_id):
+        self._refs = refs
+        self._picks_own_id = picks_own_id
+        self.spawn_repo = None
+
+    def new_session_id(self):
+        return "pinned-by-agitrack" if self._picks_own_id else None
+
+    def list_sessions(self, repo):
+        return list(self._refs)
+
+    def spawn_command(self, repo, **kwargs):
+        self.spawn_repo = repo
+        return ["fakebin"]
+
+
+def _spawn_with(monkeypatch, backend, *, resume, tmp_path):
+    import agitrack.proxy.runner as runner_mod
+
+    runner = make_runner(repo=types.SimpleNamespace(repo="/repo"), backend=backend, state=AgitrackState(tmp_path))
+    runner.worktree = None
+    runner._should_continue_session = lambda: resume
+    runner._launch_command = lambda: []
+    runner._backend_child_env = lambda: {}
+    runner._fork_next_spawn = False
+    runner._commit_guidance = True
+    runner._use_worktrees = False
+    runner.state.backend_session_id = "before-the-clear" if resume else None
+    monkeypatch.setattr(
+        runner_mod,
+        "make_child_process",
+        lambda command, cwd, extra_env=None: types.SimpleNamespace(child_pid=1, master_fd=3),
+    )
+    runner._spawn()
+    return runner
+
+
+@pytest.mark.parametrize("resume", [False, True], ids=["fresh", "resume"])
+@pytest.mark.parametrize("picks_own_id", [False, True], ids=["backend-assigns-id", "agitrack-pins-id"])
+def test_every_spawn_snapshots_the_sessions_that_existed_first(monkeypatch, tmp_path, resume, picks_own_id):
+    """The snapshot is what lets aGiTrack notice a conversation started INSIDE the backend, and
+    it used to be skipped in exactly the two ordinary cases: Claude pins its id up front, and
+    every relaunch is a resume. With no snapshot `_discover_spawned_session` returns None and the
+    parse falls back to the pinned id forever."""
+    refs = [SessionRef("before-the-clear", 100.0)]
+    backend = _SpawnSnapshotBackend(refs, picks_own_id=picks_own_id)
+    runner = _spawn_with(monkeypatch, backend, resume=resume, tmp_path=tmp_path)
+
+    assert runner._pre_spawn_sessions == {"before-the-clear": 100.0}
+
+
+def test_a_conversation_started_by_clear_is_adopted(monkeypatch, tmp_path):
+    """End state of a `/clear`: the transcript aGiTrack was reading stops, a newer one appears.
+    Discovery must hand the parse the NEW id."""
+    before = [SessionRef("before-the-clear", 100.0)]
+    backend = _SpawnSnapshotBackend(before, picks_own_id=True)
+    runner = _spawn_with(monkeypatch, backend, resume=True, tmp_path=tmp_path)
+
+    # ...the user types /clear, and Claude writes a new transcript beside the old one.
+    backend._refs = [SessionRef("before-the-clear", 100.0), SessionRef("after-the-clear", 200.0)]
+
+    assert runner._discover_spawned_session() == "after-the-clear"
+
+
+def test_the_pinned_session_is_kept_until_something_newer_is_written(monkeypatch, tmp_path):
+    """The snapshot now includes the pinned session's own directory, so discovery must not drift
+    off it while it is still the conversation being written."""
+    backend = _SpawnSnapshotBackend([], picks_own_id=True)
+    runner = _spawn_with(monkeypatch, backend, resume=False, tmp_path=tmp_path)
+    assert runner.state.backend_session_id == "pinned-by-agitrack"
+
+    backend._refs = [SessionRef("pinned-by-agitrack", 100.0)]
+    assert runner._discover_spawned_session() == "pinned-by-agitrack"  # itself, not a stranger
+
+    # A session that predates the launch is never adopted, however recently it was touched.
+    runner._pre_spawn_sessions = {"someone-elses": 9999.0}
+    backend._refs = [SessionRef("someone-elses", 9999.0)]
+    assert runner._discover_spawned_session() is None
+
+
+def test_an_empty_conversation_is_NOT_adopted(tmp_path):
+    """Claude mints a fresh EMPTY session id on every resume/picker action. It is newest by
+    mtime with nothing in it, and adopting one drops the user into a blank session on the next
+    start — the trap `claude.latest_session_id` and `_sync_tracked_session` both guard against.
+    A real switch is picked up by `_service_native_session_switch` once it has content."""
+    from agitrack.proxy.commit_engine import CommitEngine
+
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "real-conversation"
+    runner = make_runner(state=state)
+    runner.active.agent_parse_result = ("empty-throwaway", None, None, state)
+
+    CommitEngine(runner.repo, state).finish_parse_if_ready(
+        session=runner.active,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda _m: None,
+        note_session_change_fn=lambda _s: pytest.fail("an empty transcript is not a switch"),
+        mirror_fn=lambda _s: None,
+        commit_fn=lambda *a, **k: None,
+        on_cancelled_fn=None,
+        note_in_flight_fn=lambda *a, **k: None,
+    )
+    assert state.backend_session_id == "real-conversation"
+
+
+def test_restart_resumes_the_conversation_the_user_switched_to(tmp_path):
+    """The second half of the report: `/clear` then quit, and the next launch reopened the OLD
+    conversation. Startup now re-points the pin at the newest conversation in this directory."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "before-the-clear"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend(
+            [
+                SessionRef("before-the-clear", 100.0, label="old work"),
+                SessionRef("after-the-clear", 200.0, label="new work"),
+            ]
+        ),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "after-the-clear"
+
+
+def test_restart_ignores_an_empty_conversation_however_recent(tmp_path):
+    """The blank-session trap at startup: Claude's resume/picker leaves an empty transcript that
+    is newest by mtime. Resuming into it is the "first restart starts fresh" bug."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "real-conversation"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend(
+            [SessionRef("real-conversation", 100.0, label="work"), SessionRef("empty-throwaway", 999.0)]
+        ),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "real-conversation"
+
+
+def test_restart_keeps_the_pin_when_it_is_still_the_newest(tmp_path):
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "mine"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend([SessionRef("mine", 300.0), SessionRef("older", 100.0)]),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "mine"
+
+
+def test_restart_leaves_a_pin_from_another_directory_alone(tmp_path):
+    """A pin that this directory's listing does not know (a worktree or a renamed repo) is the
+    retargeting path's business, not this one's — hijacking it would break the resume it stages."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "lives-in-a-worktree"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend([SessionRef("someone-else", 900.0)]),
+        state=state,
+    )
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "lives-in-a-worktree"
+
+
+def _switch_runner(tmp_path, refs, *, tracked, named=None):
+    repo = tmp_path / "repo"  # a REAL directory: the name record is read from base_repo.repo
+    repo.mkdir(exist_ok=True)
+    if named:  # seed BEFORE the runner loads its state, or its next save clobbers the record
+        AgitrackState(repo).name_session(*named)
+    state = AgitrackState(repo)
+    state.backend_session_id = tracked
+    runner = make_runner(repo=types.SimpleNamespace(repo=repo), backend=_FakeBackend(refs), state=state)
+    runner.worktree = None
+    runner.running = True
+    runner.agent_in_flight = False
+    runner._session_watch_at = 0.0
+    runner._initialize_session_baseline = lambda: None
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    return runner
+
+
+def test_a_native_switch_to_a_NEW_conversation_asks_for_a_name(tmp_path, monkeypatch):
+    """`/clear` and friends: aGiTrack must notice by itself, without waiting for a turn to end,
+    and ask what to call the new work — the same question `session -> New` asks."""
+    runner = _switch_runner(
+        tmp_path,
+        [SessionRef("old", 100.0, label="old work"), SessionRef("fresh", 200.0, label="new work")],
+        tracked="old",
+    )
+    runner.name = "previous-session"
+    monkeypatch.setattr(runner, "_next_session_name", lambda: "otter")
+    asked = {}
+    monkeypatch.setattr(
+        runner,
+        "_prompt_session_name",
+        lambda title, default: asked.update(title=title, default=default) or "otter",
+    )
+    monkeypatch.setattr(runner, "_persist_session_name", lambda _sid: None)
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "fresh"  # tracking followed
+    assert runner.name == "otter"  # ...and the status bar's name with it
+    assert asked, "the user was never asked to name the new conversation"
+    # A FRESH suggestion. Offering the previous session's name invites keeping it, leaving two
+    # conversations sharing one name and the status bar unable to say which is which.
+    assert asked["default"] == "otter"
+    assert asked["default"] != "previous-session"
+
+
+def test_a_native_switch_BACK_restores_the_old_name_and_id(tmp_path, monkeypatch):
+    """`/resume` onto earlier work: that conversation already has a name the user chose, so it
+    must come back — not be re-asked for, and not left showing the other session's name."""
+    runner = _switch_runner(
+        tmp_path,
+        [SessionRef("recent", 100.0, label="recent work"), SessionRef("earlier", 300.0, label="earlier work")],
+        tracked="recent",
+        named=("earlier", "badger"),
+    )
+    monkeypatch.setattr(runner, "_prompt_session_name", lambda *a, **k: pytest.fail("must not re-ask"))
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "earlier"
+    assert runner.name == "badger"
+
+
+def test_the_switch_watch_ignores_an_empty_conversation(tmp_path, monkeypatch):
+    runner = _switch_runner(
+        tmp_path, [SessionRef("real", 100.0, label="work"), SessionRef("throwaway", 999.0)], tracked="real"
+    )
+    monkeypatch.setattr(runner, "_prompt_session_name", lambda *a, **k: pytest.fail("not a switch"))
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "real"
+
+
+def test_the_switch_watch_never_interrupts_a_running_turn(tmp_path, monkeypatch):
+    runner = _switch_runner(
+        tmp_path, [SessionRef("old", 100.0, label="a"), SessionRef("fresh", 200.0, label="b")], tracked="old"
+    )
+    runner.agent_in_flight = True
+    monkeypatch.setattr(runner, "_prompt_session_name", lambda *a, **k: pytest.fail("mid-turn popup"))
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "old"  # picked up on the next quiet tick
+
+
+def test_the_switch_watch_is_throttled(tmp_path):
+    runner = _switch_runner(
+        tmp_path, [SessionRef("old", 100.0, label="a"), SessionRef("fresh", 200.0, label="b")], tracked="old"
+    )
+    runner._session_watch_at = time.monotonic()  # just ran
+    calls = []
+    runner.backend.list_sessions = lambda repo: calls.append(1) or []
+
+    runner._service_native_session_switch()
+
+    assert not calls, "a directory listing on every reactor tick"

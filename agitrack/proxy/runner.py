@@ -38,6 +38,7 @@ from agitrack.commits import (
     build_manual_squash_trailer,
     build_pending_trailer,
     is_fully_tracked_message,
+    is_in_flight_only_message,
     build_user_commit_message,
     summary_metadata_lines,
     write_lf,
@@ -959,7 +960,9 @@ class ProxyRunner:
         # Session ids that existed before aGiTrack launched a fresh backend session,
         # used to identify (and then pin to) the session aGiTrack actually spawned
         # rather than chasing whichever session is globally newest.
-        self._pre_spawn_session_ids: set[str] | None = None
+        self._pre_spawn_sessions: dict[str, float] | None = None
+        # Throttle for _service_native_session_switch (see SESSION_WATCH_SECONDS).
+        self._session_watch_at = 0.0
         # Raw responses captured from the host terminal so we can answer the
         # same queries OpenCode makes (foreground/background/palette colors and
         # device attributes). Without these, OpenCode cannot detect the real
@@ -1525,9 +1528,17 @@ class ProxyRunner:
         # ``state.backend`` on an unconfigured state now raises. Seed a concrete backend so
         # the test factory keeps producing a launch-ready session unless a test set one.
         # Guarded so tests that pass a non-AgitrackState stub (no ``data`` dict) are untouched.
+        #
+        # The default is overridable via ``backend_name=`` so a test can ask for a session on
+        # the OTHER backend without hand-building a state. It matters that this is reachable:
+        # while it was an unconditional "claude", every one of the ~260 tests built through this
+        # factory ran on Claude and no runner-level behaviour was ever exercised on OpenCode —
+        # which is how OpenCode came to ship with no turn-end signal at all (see
+        # tests/test_turn_end_detection.py).
+        default_backend = runner_overrides.pop("backend_name", "claude")
         state_data = getattr(session.state, "data", None)
         if isinstance(state_data, dict) and not state_data.get("backend"):
-            state_data["backend"] = "claude"
+            state_data["backend"] = default_backend
 
         # Apply runner-level overrides. Names shadowed by a class property are
         # routed through it; a read-only property makes the misuse loud instead
@@ -1619,6 +1630,7 @@ class ProxyRunner:
         # FRESH one starts in the wrong/old dir. Staging only ever moves OUR recorded session id
         # (set for this repo), so it's safe; after it, _spawn's gate sees the dir match and resumes.
         if self.state.backend_session_id and not self._force_new_session:
+            self._resync_pin_to_the_live_conversation()
             self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
@@ -1683,10 +1695,7 @@ class ProxyRunner:
             # commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
             # user hook) and are no-ops when absent, so clearing then re-installing exactly what
             # THIS mode wants makes every mode-switch safe regardless of how the last run ended.
-            self._remove_base_commit_guard()
-            self._teardown_manual_commit_mode()
-            self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
-            self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+            self._reset_hook_slate()
             # Paint once before entering the loop. Every other frame is driven by backend output
             # or a keystroke, so until the backend emits its first byte there was nothing on
             # screen at all — and if that first byte was slow, the terminal sat showing whatever
@@ -1826,25 +1835,30 @@ class ProxyRunner:
         fork = self._fork_next_spawn and resume
         self._fork_next_spawn = False
         if resume:
+            # --fork-session resumes this conversation but mints a NEW id (the original is left
+            # to its running background agent); a plain resume keeps the id it is given.
             session_id = self.state.backend_session_id
-            if fork:
-                # --fork-session resumes this conversation but mints a NEW id (the
-                # original is left to its running background agent). Snapshot existing
-                # sessions so the forked one is discovered and adopted on first parse,
-                # exactly like a backend that assigns its own id.
-                self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
-            else:
-                self._pre_spawn_session_ids = None
         else:
             session_id = self.backend.new_session_id()
             if session_id:
-                # The backend lets aGiTrack choose the id, so it is pinned already.
+                # The backend lets aGiTrack choose the id (Claude), so it is pinned already.
                 self.state.backend_session_id = session_id
-                self._pre_spawn_session_ids = None
-            else:
-                # The backend assigns its own id; snapshot existing sessions so
-                # the one it creates can be identified on the first parse.
-                self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
+        # Snapshot the directory's sessions AND how recently each was written, in EVERY case.
+        # `_discover_spawned_session` uses it to tell "the user switched conversations inside the
+        # backend" from "an unrelated conversation happens to live in this directory", and the
+        # mtime is what makes BOTH kinds of switch visible:
+        #   • to a NEW conversation — Claude `/clear`, OpenCode `/new`: an id that is not in the
+        #     snapshot at all (verified against the real Claude CLI: `/clear` writes a brand-new
+        #     transcript under a new id the moment it runs, before the next prompt).
+        #   • BACK to an EXISTING one — Claude `/resume`, OpenCode's session switcher: the id IS
+        #     in the snapshot, so an id-only snapshot could never see it. A mtime that has moved
+        #     since launch can, and a conversation nobody has touched still cannot.
+        # Taking it unconditionally is also strictly SAFER than skipping it, which is what used to
+        # happen in the two most ordinary cases — Claude pins its id up front, and every relaunch
+        # is a resume. With no snapshot, discovery returns None and the parse falls back to the
+        # pinned id forever, so everything after a `/clear` was recorded against the conversation
+        # the user had just thrown away: no prompts, no tokens, no trace.
+        self._pre_spawn_sessions = {ref.id: ref.updated for ref in self.backend.list_sessions(self.repo.repo)}
         command = self.backend.spawn_command(
             self.repo.repo,
             session_id=session_id,
@@ -1978,6 +1992,27 @@ class ProxyRunner:
             and not sandbox.is_available()
         )
 
+    def _reset_hook_slate(self) -> None:
+        """Start this run from a clean hook slate: clear whatever a previous run left in the base
+        repo's ``.git/hooks``, then install exactly what THIS mode wants.
+
+        A prior run that crashed (no teardown) leaves the OTHER mode's managed hooks behind, and
+        modes switch between runs (worktree ↔ no-worktree/manual). A stale manual fold-hook would
+        rewrite a worktree run's commits; a stale base-commit guard would block a no-worktree
+        run's commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
+        user hook) and are no-ops when absent, so clear-then-install makes every mode switch safe
+        regardless of how the last run ended.
+
+        A method rather than four inline calls in :meth:`run` because the mode-switch tests need
+        to perform exactly this sequence: as a copy in the test file it silently drifted from the
+        original — the copy stayed green while the real startup changed, which is the failure
+        mode the whole composition harness exists to prevent.
+        """
+        self._remove_base_commit_guard()
+        self._teardown_manual_commit_mode()
+        self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
+        self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+
     def _install_base_commit_guard(self) -> None:
         # Install the pre-commit guard in the base repo when active. Skipped (with a note) when a
         # custom core.hooksPath is configured, since our hook in the default dir wouldn't run and
@@ -2016,6 +2051,23 @@ class ProxyRunner:
                     self._install_autotrack_precommit_hook()
         except Exception as error:
             self._debug(f"base-commit guard removal failed: {error!r}")
+
+    def _autotrack_hook_will_survive_exit(self) -> bool:
+        """Whether a `git commit` made AFTER aGiTrack exits will still fold in the tracking.
+
+        That is the persistent auto-track ``pre-commit`` hook's whole job, and it outlives the
+        session — so in the ordinary case the user can exit with turns pending and lose nothing.
+        It is absent in exactly two situations: a custom ``core.hooksPath`` (git ignores the hooks
+        dir we install into) and the ``autotrack_hook: off`` opt-out."""
+        try:
+            if self.base_repo is None or self.base_repo.core_hooks_path():
+                return False
+            if getattr(self.global_config, "autotrack_hook", "auto") == "off":
+                return False
+            return git_hooks.is_autotrack_hook(self.base_repo.hooks_dir() / "pre-commit")
+        except Exception as error:
+            self._debug(f"autotrack hook check failed: {error!r}")
+            return False
 
     def _install_autotrack_precommit_hook(self) -> None:
         """Install (or refresh) the PERSISTENT auto-track ``pre-commit`` hook, honoring the
@@ -2096,6 +2148,29 @@ class ProxyRunner:
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
         self._reset_stale_manual_ref()
+        # …and the same for chains left by sessions that are GONE — a crash, a Ctrl-C, a mode
+        # switch, or edits the user discarded. `_reset_stale_manual_ref` only ever looks at our
+        # own ref, so nothing revisited those and their turns rode into an unrelated later
+        # commit, attributing AI authorship to code that never contained it.
+        try:
+            from agitrack.commits.manual import prune_abandoned_refs
+
+            dropped = prune_abandoned_refs(
+                self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug
+            )
+            if dropped:
+                # Say so. Discarding a chain is the right call (its work is no longer uncommitted),
+                # but it is still AI attribution going away, and the user should hear about it
+                # rather than find out from a history that is quietly missing a turn.
+                count = len(dropped)
+                chains = "chain" if count == 1 else "chains"
+                self._set_message(
+                    f"aGiTrack: discarded {count} abandoned tracking {chains} from an earlier session — "
+                    "their changes are no longer uncommitted, so they had nothing left to attribute.",
+                    seconds=10.0,
+                )
+        except Exception as error:
+            self._debug(f"abandoned-ref prune failed: {error!r}")
         # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
         # didn't fold), and the durable trailer/ref files the hook reads.
         try:
@@ -2254,7 +2329,9 @@ class ProxyRunner:
         empty) — i.e. whether there is uncommitted agent work to account for."""
         tip = self.repo.ref_sha(self._manual_ref())
         try:
-            base_tree = self.repo.rev_parse(f"{tip or 'HEAD'}^{{tree}}")
+            # `comparable_tree`, never a raw `^{tree}` — the snapshot on the other side of this
+            # comparison drops the agent scaffolding dirs. See GitRepo.comparable_tree.
+            base_tree = self.repo.comparable_tree(tip or "HEAD")
         except Exception:
             base_tree = None
         return tree != base_tree
@@ -2268,8 +2345,17 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"manual snapshot failed: {error!r}")
             self._manual_pending_tree = None
+            self._manual_allow_unchanged = False
             return False
-        return self._manual_tree_differs_from_tip(self._manual_pending_tree)
+        if self._manual_tree_differs_from_tip(self._manual_pending_tree):
+            self._manual_allow_unchanged = False
+            return True
+        # An unchanged tree normally means the turn left nothing to record. It does NOT when the
+        # agent committed its own work mid-turn: that commit carries an in-flight block only, so
+        # the turn's trace and tokens are still owed, and declining here loses them outright.
+        # Record with the tree as it stands — the latent commit is metadata, not a diff.
+        self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
+        return self._manual_allow_unchanged
 
     def _manual_record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
@@ -2284,9 +2370,27 @@ class ProxyRunner:
                 self._debug(f"manual snapshot failed: {error!r}")
                 return None
         tip = self.repo.ref_sha(self._manual_ref())
+        re_anchored = False
+        if tip is not None and not self.repo.has_object_local(tip):
+            # Kept in lockstep with `ManualCommitTracker.record`: `git gc --prune` can collect a
+            # latent commit (unreachable from any branch by design), after which every lookup
+            # against the tip raises — and record() runs on EVERY turn, so interactive `-m` would
+            # silently stop tracking for the rest of the session. Re-anchor at HEAD: the chain
+            # restarts and only the already-lost turns are lost.
+            self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
+            tip, re_anchored = None, True
         parent = tip or self.repo.rev_parse("HEAD")
-        if tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
-            return None  # defensive: nothing new since the latent tip
+        allow_unchanged = getattr(self, "_manual_allow_unchanged", False)
+        self._manual_allow_unchanged = False
+        # Defensive: nothing new since the baseline — the latent tip, or HEAD when the chain is
+        # EMPTY (the same baseline the gate uses, and previously exempt from this guard, so an
+        # ungated record() wrote a phantom first turn against an untouched tree). Skipped when the
+        # gate allowed an unchanged tree (the agent committed the turn's work itself) and after a
+        # re-anchor, where HEAD is a fallback parent rather than evidence that nothing happened —
+        # either way the turn's tokens would vanish.
+        baseline = None if re_anchored else (tip or "HEAD")
+        if not allow_unchanged and baseline is not None and tree == self.repo.comparable_tree(baseline):
+            return None
         sha = self.repo.commit_tree(tree, parents=[parent], message=message)
         self.repo.update_ref(self._manual_ref(), sha)
         self._render_manual_trailer()
@@ -2316,7 +2420,22 @@ class ProxyRunner:
             tip = self.repo.ref_sha(self._manual_ref())
             if not tip:
                 return False
-            clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
+            clean = self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD")
+            if clean and is_in_flight_only_message(self.repo.commit_message(head)):
+                # A clean tree normally means the fold hook already combined the pending turns
+                # INTO HEAD, so they are redundant. It does NOT when HEAD carries only an
+                # IN-FLIGHT block: the agent committed while its turn was still running, so that
+                # commit records who made the change but not the turn's trace or tokens — which
+                # are still owed. Dropping the chain here is what loses them for good, and in
+                # manual mode (where aGiTrack must not commit) the chain is the ONLY thing
+                # holding them until the user's next commit folds them in.
+                # Same rule as `_uncovered_backend_commits`: in-flight ≠ accounted for.
+                #
+                # Narrow on purpose: a commit with NO aGiTrack metadata (made outside aGiTrack,
+                # where the hook never ran) still drops the chain as before — that trace is
+                # unavoidably lost, and keeping the chain would re-attach it to some later,
+                # unrelated commit.
+                return False
             if clean or self.repo.is_ancestor(tip, head):
                 self.repo.update_ref(self._manual_ref(), head)
                 return True
@@ -2421,7 +2540,7 @@ class ProxyRunner:
         if not tip:
             return
         try:
-            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                 return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
         except Exception:
             return
@@ -3834,14 +3953,10 @@ class ProxyRunner:
             except Exception as error:
                 self._debug(f"no-worktree leftover scan failed: {error!r}")
                 self._pending_noworktree_cleanup = []
-            # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
-            # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
-            # never touched. Set once (the earliest start); the metadata-reset handles the rest.
+            # Anchor the no-worktree cover scan so commits the agent makes itself from here get
+            # aGiTrack metadata (#35), while pre-existing history is never touched.
             if self._noworktree_base_head is None:
-                try:
-                    self._noworktree_base_head = self.repo.rev_parse("HEAD")
-                except Exception as error:
-                    self._debug(f"no-worktree cover anchor failed: {error!r}")
+                self._load_noworktree_anchor()
             return
         root_state = self.state  # the durable repo-root "last session" record
         backend_name = root_state.backend
@@ -3989,6 +4104,168 @@ class ProxyRunner:
         return max((ref.updated for ref in refs if ref.id == session_id), default=0.0)
 
     _AUTO_NAME_RE = re.compile(r"^session-\d+$")
+
+    def _resync_pin_to_the_live_conversation(self) -> None:
+        """Before resuming, re-point the pin at the conversation most recently written here.
+
+        In-session discovery only runs when a turn completes, so a user who switches conversation
+        inside the backend and QUITS before typing (`/clear`, then Ctrl-C) leaves the pin on the
+        conversation they discarded. The next launch then resumes THAT one — the reported symptom:
+        aGiTrack asked for a name for the new session and reopened the old one under it.
+
+        This asks the same question worktree and background mode ask continuously (`what is the
+        newest human conversation in this directory?`), just once, at startup. The trade-off is
+        the same as theirs: a conversation the user drove here OUTSIDE aGiTrack, more recently
+        than the pinned one, is adopted. That is the honest reading of "most recent work in this
+        directory", and it is what those modes have always done — the pin only ever moves to a
+        conversation `list_sessions` already vouched for as human-driven.
+        """
+        pinned = self.state.backend_session_id
+        if not pinned:
+            return
+        try:
+            listed = self.backend.list_sessions(self.repo.repo)
+        except Exception as error:
+            self._debug(f"pin resync skipped: {error!r}")
+            return
+        # Only conversations that HAVE CONTENT can be resumed into. Claude mints a fresh EMPTY
+        # session id on every resume/picker action; it is newest by mtime and has nothing in it,
+        # and adopting one drops the user into a blank session on the next start. A ref's label
+        # is its first real user prompt, so `label` is None exactly when there is no real turn.
+        refs = {ref.id: ref.updated for ref in listed if ref.label or ref.id == pinned}
+        if pinned not in refs:
+            return  # not our directory's conversation (a worktree/rename case): leave staging to it
+        newest = max(refs.items(), key=lambda item: item[1])
+        if newest[0] == pinned or newest[1] <= refs[pinned]:
+            return
+        self._debug(f"pin resync: {pinned} -> {newest[0]} (newer conversation in this directory)")
+        self.state.backend_session_id = newest[0]
+        self._restore_or_ask_session_name(newest[0], quiet=True)
+
+    # How often to ask the backend which conversation is live. One cheap directory listing;
+    # slow enough to be free, fast enough that the status bar catches up within a breath.
+    SESSION_WATCH_SECONDS = 2.0
+
+    def _service_native_session_switch(self) -> None:
+        """Follow a conversation switch the user made with the BACKEND's OWN commands, live.
+
+        `/clear`, `/resume`, OpenCode's `/new` and its session picker all change which
+        conversation is being written, and until now aGiTrack only noticed at the end of a turn
+        (or not at all). The status bar kept showing the previous name and id, so the one place
+        the user checks was actively wrong about what they were talking to.
+
+        Adopts only a conversation that HAS CONTENT: an empty transcript is not evidence of a
+        switch (Claude mints one on every resume/picker action), and it is also the moment a name
+        can be asked for meaningfully. That costs at most one turn of latency on a brand-new
+        conversation, and buys immunity to the blank-session trap.
+        """
+        now = time.monotonic()
+        # getattr: the runner's session-level fields go through the Session property layer,
+        # so an __init__ assignment is not guaranteed to land as a plain runner attribute.
+        if now - getattr(self, "_session_watch_at", 0.0) < self.SESSION_WATCH_SECONDS:
+            return
+        self._session_watch_at = now
+        if not self.running or self.agent_in_flight or self.input.capturing:
+            return  # never interrupt a running turn or an open palette
+        try:
+            refs = self.backend.list_sessions(self.repo.repo)
+        except Exception as error:
+            self._debug(f"session watch failed: {error!r}")
+            return
+        with_content = [ref for ref in refs if ref.label]
+        if not with_content:
+            return
+        newest = max(with_content, key=lambda ref: ref.updated)
+        current = self.state.backend_session_id
+        if newest.id == current:
+            return
+        ours = next((ref.updated for ref in refs if ref.id == current), None)
+        if ours is not None and newest.updated <= ours:
+            return  # ours is still the live one; a stale sibling must not pull tracking off it
+        self._debug(f"native session switch: {current} -> {newest.id}")
+        self._abandon_summary_for_switched_session(current, newest.id)
+        self.state.backend_session_id = newest.id
+        self.state.last_backend_message_id = None
+        self._initialize_session_baseline()
+        self._restore_or_ask_session_name(newest.id)
+
+    def _abandon_summary_for_switched_session(self, leaving_id: str | None, joining_id: str) -> None:
+        """Drop summary work belonging to the conversation we are switching AWAY from.
+
+        Summary state (``_summary_pending`` / ``_summary_result`` / the rolling
+        ``state.session_summary``) is keyed by SESSION-THE-OBJECT, not by backend conversation
+        id — one slot per aGiTrack session, because normally one aGiTrack session tracks one
+        conversation for its whole life. A native switch (`/clear`, `/resume`, OpenCode's
+        picker) breaks that assumption: the same aGiTrack session is now pointed at a different
+        conversation, while the old one's summary state is still sitting in those slots. Two
+        things then go wrong, both silently:
+
+        * a summary worker started for the OLD conversation's commit lands after the switch and
+          is applied/reported against the NEW conversation — and its ``sha`` is no longer the
+          head it was computed for, so the amend fails and the user is told summarization
+          failed in a session that never asked for one;
+        * ``state.session_summary`` — the ROLLING summary — still describes the old
+          conversation, so the new one's very first commit is summarized "in the context of"
+          work it has nothing to do with, and that wrong context then compounds into every
+          later summary of the new conversation.
+
+        So: forget the pending/finished result for the outgoing conversation, and clear the
+        rolling summary so the new one starts from a blank slate. The worker thread itself is
+        left to finish and die on its own (it is a daemon and holds no lock); only its RESULT
+        is disowned, because joining it here would block the reactor on a live LLM call.
+        """
+        if not leaving_id or leaving_id == joining_id:
+            return
+        pending, result = self._summary_pending, self._summary_result
+        if pending is not None or result is not None:
+            self._debug(f"discarding summary work for {leaving_id} (switched to {joining_id})")
+        self._summary_pending = None
+        self._summary_result = None
+        # A stale rolling summary is not merely useless on a new conversation — it is wrong
+        # input that the next summary is generated FROM.
+        self.state.session_summary = None
+        self.state.session_summary_commit = None
+
+    def _restore_or_ask_session_name(self, session_id: str, *, quiet: bool = False) -> None:
+        """Put the status bar back in step with the conversation now being tracked.
+
+        Two cases, and they must not be confused. A conversation aGiTrack has seen before carries
+        a name the user already chose: going BACK to it (`/resume`) has to restore that name and
+        id, not invent a new one. A conversation it has not seen is new work, and gets asked for
+        a name — the same question `session → New` asks.
+        """
+        try:
+            # `getattr`, not attribute access: a failed lookup here falls through to ASKING for a
+            # name, so an incidental AttributeError would silently re-ask for a conversation the
+            # user has already named — the exact thing this method exists to prevent.
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            known = root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            known = None
+        if known:
+            self.name = known
+            if not quiet:
+                self._set_message(f"Switched back to session '{known}' ({_short_session(session_id)}).")
+            self._render()
+            return
+        # Repaint FIRST so the new id is on the status bar behind the prompt: the question makes
+        # sense only once the user can see that the conversation really did change.
+        self._render()
+        if quiet:
+            return  # startup: the normal naming flow runs right after and would ask twice
+        # A FRESH suggestion, not `self.name`: this conversation is new work, and offering the
+        # previous session's name invites keeping it — leaving two conversations sharing one name
+        # and the status bar unable to say which is which. `_next_session_name` is the same
+        # generator `session -> New` uses, so a switch made inside the backend and one made from
+        # the menu suggest names from the same pool and never collide with a name already taken.
+        name = self._prompt_session_name("New conversation detected", default=self._next_session_name())
+        if name:
+            self.name = name
+            self._persist_session_name(session_id)
+        self._render()
 
     def _repo_latest_session_id(self) -> str | None:
         # The conversation a bare `claude -c` / `opencode` would continue in the
@@ -8428,6 +8705,7 @@ class ProxyRunner:
                 self._service_precompact_summary()
                 self._service_background_sessions()
                 self._service_deferred_switch_offer()  # a switch's copy/commit offer, once reconciled
+                self._service_native_session_switch()  # /clear, /resume, OpenCode's picker
                 if self._base_advanced:
                     self._base_advanced = False
                     self._sync_idle_worktrees_to_base()
@@ -9300,6 +9578,9 @@ class ProxyRunner:
             session_id=self.state.backend_session_id,
             base_branch=self._base_branch,
             current_dir_branch=self._repo_dir_branch,
+            # Manual mode only: committing is the user's job, so the count of turns waiting for
+            # their commit belongs where they can see it, not only in the exit dialog.
+            manual_pending=self._manual_pending_count() if self._manual_commits else 0,
             worktree=self.worktree,
             scroll_back=self.scroll_back,
             user_declined=self._user_declined,
@@ -10542,6 +10823,23 @@ class ProxyRunner:
         # the final response lands. Normal turns always arrive complete, so this is a no-op there.
         turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         uncovered = self._uncovered_backend_commits() if turn_complete else []
+        # The agent committed its own work MID-TURN and left nothing further to commit, so the
+        # tree is clean. The latent gate only fires on a CHANGED tree, so it would record
+        # nothing at all — and the agent's commit carries only an in-flight block, which
+        # explicitly promises the trace and tokens land later. Both paths then decline and the
+        # turn's whole accounting is lost, silently.
+        #
+        # In AUTO mode take the COVER path instead (the metadata-only commit worktree mode
+        # already makes over such hashes). Manual mode must not commit for the user, so it keeps
+        # the latent path — `_manual_gate` widens to record on a clean tree when commits are
+        # owed, and the record waits for the user's next commit to fold it in.
+        use_latent = self._latent_tracking
+        if uncovered and self._noworktree_auto:
+            try:
+                if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
+                    use_latent = False
+            except Exception as error:
+                self._debug(f"clean-tree cover check failed: {error!r}")
         committed = CommitEngine(
             self.repo,
             self.state,
@@ -10563,8 +10861,8 @@ class ProxyRunner:
             # user's or agent's own commit (no-worktree auto also folds it itself, see
             # _auto_fold_latent_pending). In manual-record mode commit_turns never makes a cover —
             # ``backend_commits`` only feeds the recorded body's ``covered_commits`` metadata.
-            manual_gate_fn=self._manual_gate if self._latent_tracking else None,
-            manual_record_fn=self._manual_record if self._latent_tracking else None,
+            manual_gate_fn=self._manual_gate if use_latent else None,
+            manual_record_fn=self._manual_record if use_latent else None,
             backend_commits=uncovered,
         )
         if committed and uncovered and self._latent_tracking:
@@ -10574,10 +10872,93 @@ class ProxyRunner:
             # ``tracked_head`` watermark. HEAD is unchanged by the latent record (it sits at the
             # agent's own commit), so this pins the anchor there.
             try:
-                self._noworktree_base_head = self.repo.rev_parse("HEAD")
+                self._set_noworktree_base_head(self.repo.rev_parse("HEAD"))
             except Exception as error:
                 self._debug(f"no-worktree cover anchor advance failed: {error!r}")
         return committed
+
+    # --- the no-worktree coverage anchor (persistent) -------------------------
+    #
+    # Everything after this sha on the branch is work aGiTrack is responsible for accounting
+    # for; everything before it is the user's pre-existing history and must never be claimed.
+    #
+    # PERSISTED, and deliberately in the same file the background daemon uses. It used to live
+    # only in memory and be re-initialised to the current HEAD on every start, which lost
+    # coverage exactly when it mattered most: if the agent committed mid-turn (leaving an
+    # in-flight block that still owes its trace and tokens) and aGiTrack restarted before the
+    # turn finished, the anchor moved forward ONTO that commit, so it could never be seen as
+    # uncovered again and its accounting was gone for good. The daemon had already solved this
+    # with `tracked-head`; sharing the file also means switching between `-b` and the
+    # interactive TUI carries the watermark across instead of resetting it.
+
+    def _noworktree_anchor_path(self) -> Path | None:
+        # In no-worktree mode `repo` IS the base checkout, so it is the right root either way;
+        # `base_repo` is preferred only because it is the durable one, and it is not always set
+        # yet (early startup, and tests that build a runner directly). None when neither is —
+        # the anchor is then in-memory only, exactly as it was before it became persistent.
+        root = self.base_repo if self.base_repo is not None else self.repo
+        return (root.repo / ".agitrack" / "tracked-head") if root is not None else None
+
+    def _load_noworktree_anchor(self) -> None:
+        """Restore the persisted anchor, or start it at the current HEAD on a repo never tracked
+        before (so pre-existing history is never retroactively attributed to the agent)."""
+        path = self._noworktree_anchor_path()
+        try:
+            saved = path.read_text(encoding="utf-8").strip() if path is not None else ""
+        except OSError:
+            saved = ""
+        if saved:
+            try:
+                # `rev-parse` echoes a well-formed sha back without checking it EXISTS, so the
+                # object store is what decides — a watermark naming a commit this repo no longer
+                # has (a re-clone) must re-anchor rather than leave every later scan running from
+                # a sha git cannot resolve. And presence alone is not enough either:
+                # ANCESTOR of HEAD, not merely present. A watermark can survive as an object while
+                # ceasing to describe this branch — any history rewrite does it: a rebase, a squash, an
+                # amend of an earlier commit, `reset --hard` onto a different line, or a force-push
+                # someone else made. `git log <orphan>..HEAD` still succeeds against such a sha, so the
+                # scan silently runs over the WRONG range: it walks commits that were already accounted
+                # for, and can re-attribute them. (Observed for real after rewriting this repo's history:
+                # the anchor pointed at a commit that no longer existed on the branch.) Re-anchoring at
+                # HEAD is the safe recovery — it can only ever under-claim, never attribute the user's
+                # own history to the agent.
+                if self.repo.has_object_local(saved) and self.repo.is_ancestor(saved, "HEAD"):
+                    self._noworktree_base_head = self.repo.rev_parse(saved)
+                    return
+                # VISIBLE, not just a debug line. Every failure path in this area used to log to
+                # a sink nobody reads without --verbose, so a silent loss of AI attribution could
+                # never be noticed — the single worst property this feature can have. Re-anchoring
+                # means commits between the old anchor and HEAD will not be attributed, and the
+                # user is the only one who can judge whether that matters.
+                self._debug(f"no-worktree anchor {saved!r} no longer describes this branch; re-anchoring")
+                self._set_message(
+                    "aGiTrack: the git history was rewritten since this repo was last tracked, so the "
+                    "coverage marker was reset. Agent commits made before the rewrite won't be attributed.",
+                    seconds=12.0,
+                )
+            except Exception as error:
+                self._debug(f"stale no-worktree anchor {saved!r}: {error!r}")
+        try:
+            self._set_noworktree_base_head(self.repo.rev_parse("HEAD"))
+        except Exception as error:
+            self._debug(f"no-worktree cover anchor failed: {error!r}")
+
+    def _set_noworktree_base_head(self, sha: str | None) -> None:
+        self._noworktree_base_head = sha
+        if not sha:
+            return
+        path = self._noworktree_anchor_path()
+        if path is None:
+            return  # no repo to persist against; the in-memory anchor still works for this run
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)  # .agitrack/ may not exist yet
+            try:
+                self.state.ensure_local_ignore()  # keep .agitrack/ out of the user's commits
+            except Exception as error:  # a stub state in tests, or an unwritable exclude file
+                self._debug(f"local ignore for the anchor failed: {error!r}")
+            path.write_text(sha + "\n", encoding="utf-8")
+        except OSError as error:
+            self._debug(f"no-worktree anchor write failed: {error!r}")
 
     def _uncovered_backend_commits(self) -> list[str]:
         """Commits the backend created itself that no aGiTrack commit accounts for
@@ -11041,11 +11422,23 @@ class ProxyRunner:
         pending = self._manual_pending_count()
         if pending:
             turns = "turn" if pending == 1 else "turns"
-            title = (
-                f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. Commit now in aGiTrack "
-                f"({self._menu_label()} → git-commit) to include the interaction tracking — a commit made "
-                "outside aGiTrack won't. (They're saved and will fold into your next commit in aGiTrack.)"
-            )
+            # What happens next depends on whether the PERSISTENT auto-track hook will still be
+            # there once aGiTrack is gone. When it is, a plain `git commit` in any terminal still
+            # folds the tracking in — verified — so telling the user otherwise would push them
+            # into committing before they are ready, in the one mode built around them choosing
+            # when to commit. When it is not (a custom core.hooksPath, or autotrack_hook: off),
+            # the old warning is the true one.
+            if self._autotrack_hook_will_survive_exit():
+                title = (
+                    f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. They're saved — your "
+                    "next `git commit`, in any terminal, still folds in the interaction tracking."
+                )
+            else:
+                title = (
+                    f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. Commit now in aGiTrack "
+                    f"({self._menu_label()} → git-commit) to include the interaction tracking — with the "
+                    "auto-track hook unavailable in this repo, a commit made afterwards won't."
+                )
         choice = self._exit_confirmation_popup(title, ["No, keep working", "Yes, exit (Ctrl-C again)"])
         return choice == "Yes, exit (Ctrl-C again)"
 
@@ -12041,6 +12434,20 @@ class ProxyRunner:
         session_id = getattr(self.state, "backend_session_id", None) if self.state else None
         if not session_id:
             return None
+        # A backend with no stat-able transcript file can still expose the signal directly
+        # (OpenCode keeps its sessions in a SQLite database, so it answers from a bounded
+        # read-only query instead of a path). Ask for that first: without it this method
+        # returns None on such a backend and `_backend_idle_for` degrades to the PTY alone —
+        # which is exactly the failure this whole mechanism exists to prevent, in both
+        # directions (never commits behind an idle heartbeat; commits mid-turn behind a quiet
+        # sub-agent). Cheap enough to call per tick, and any failure just yields None.
+        direct = getattr(self.backend, "session_activity_mtime", None)
+        if direct is not None:
+            try:
+                return direct(session_id)
+            except Exception as error:
+                self._debug(f"transcript activity lookup failed: {error!r}")
+                return None
         cached_id, cached_path = self._transcript_path_cache
         # A MISS must not be cached forever. The transcript often does not exist yet when a
         # session starts (the backend creates it on the first turn), and the miss used to be
@@ -12120,21 +12527,24 @@ class ProxyRunner:
         )
 
     def _discover_spawned_session(self) -> str | None:
-        # Identify the session aGiTrack spawned (or the user switched to inside the
-        # backend): the newest one that did NOT exist before launch. Returns None when no
-        # pre-spawn snapshot was taken — without one we cannot tell aGiTrack's own session
-        # apart from a pre-existing unrelated session in the same directory, so the caller
-        # must keep its pinned id rather than risk grabbing the wrong session. (Because the
-        # snapshot only ever excludes post-launch sessions, the result is always safe to
-        # prefer over the pinned id, which is what lets no-worktree mode follow an
-        # in-backend session switch.) `list_sessions` supplies both halves of the filter:
-        # it already excludes programmatic (SDK) transcripts, so an agent that farms work
-        # out to `claude -p` workers cannot have one of them adopted as the tracked session.
-        snapshot = self._pre_spawn_session_ids
+        # Identify the conversation actually being driven here: the most recently written session
+        # that has been WRITTEN TO SINCE LAUNCH — either it did not exist before (aGiTrack's own
+        # session; a `/clear` or `/new`) or its transcript has moved on since the snapshot (a
+        # `/resume` or session switch back onto an older conversation).
+        #
+        # "Since launch" is the whole safety property. A directory can hold conversations that
+        # have nothing to do with this run, and those are exactly the ones nobody has touched —
+        # so they can never be adopted, however recent they look. Returns None when no snapshot
+        # exists (a restored session object) or when nothing has moved, and the caller then keeps
+        # its pinned id. `list_sessions` supplies the other half of the filter: it already drops
+        # programmatic (SDK) transcripts, so an agent farming work out to `claude -p` workers
+        # cannot have one of them adopted as the tracked conversation.
+        snapshot = self._pre_spawn_sessions
         if snapshot is None:
             return None
         refs = self.backend.list_sessions(self.repo.repo)
-        candidates = [ref for ref in refs if ref.id not in snapshot]
+        # `>` not `>=`: an untouched session must compare equal to its snapshot and drop out.
+        candidates = [ref for ref in refs if ref.updated > snapshot.get(ref.id, float("-inf"))]
         if not candidates:
             return None
         return max(candidates, key=lambda ref: ref.updated).id
@@ -12871,16 +13281,31 @@ class ProxyRunner:
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
-        if self._latent_tracking:
-            # No-worktree modes fold the agent's own commits via the prepare-commit-msg hook
-            # (and _reconcile_manual_external_commit is the cover backup when the hook can't run),
-            # so the #35 cover pass below is superseded — see _service_manual_commit_mode.
-            return
         if not self._use_worktrees:
             # No-worktree: the agent's own commits live on the current branch (there is no
-            # separate base to integrate into). Cover them with aGiTrack metadata — the same
-            # #35 machinery, minus the integration step.
+            # separate base to integrate into). The prepare-commit-msg fold hook normally folds
+            # the pending tracking INTO the agent's commit, and then there is nothing uncovered
+            # and nothing to do here.
+            #
+            # But the hook can only fold a turn that has FINISHED. When the agent commits
+            # MID-TURN it stamps an in-flight block instead — attribution without the trace or
+            # the tokens, and its own text promises they "land in a later commit". If the turn
+            # then finishes having left nothing further to commit (the agent already committed
+            # every file it touched), the tree is clean, the latent fold has nothing to fold,
+            # and that promised later commit never happens: the turn's whole token accounting
+            # is lost, silently. `_uncovered_backend_commits` is precisely the question "is
+            # anything still owed a record?" — it already treats an in-flight-only commit as
+            # uncovered — so let the #35 cover pass run whenever it says yes.
+            #
+            # (This branch used to be unreachable: `_latent_tracking` is defined as
+            # `not _use_worktrees`, so an earlier `if self._latent_tracking: return` fired first
+            # on exactly the sessions this is written for.)
             if not self._uncovered_backend_commits() or self._summary_blocks_integration(now):
+                return
+            if self._manual_commits:
+                # Manual mode: the user decides when to commit, so aGiTrack must not add one.
+                # The pending chain keeps the record and folds into the user's next commit —
+                # `_reset_stale_manual_ref` is what must not throw it away in the meantime.
                 return
             self._attach_trace_to_backend_commits(now)  # parse → commit_turns → cover commit
             return

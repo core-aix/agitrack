@@ -41,6 +41,12 @@ from agitrack.metrics import build_server
 from agitrack.metrics import learn, story, ui
 from agitrack.metrics.collect import CommitStat, build_dashboard
 
+# Binds real TCP ports (the storyline dashboard) and drives background build threads. Pinned
+# to a single xdist worker with the other port-binding suites — see the `xdist_group` note in
+# pyproject.toml.
+pytestmark = pytest.mark.xdist_group("net")
+
+
 DAY = 86400
 
 
@@ -814,7 +820,7 @@ def test_a_stopped_telling_never_blocks_the_next_one(tmp_path, monkeypatch):
     )
     try:
         assert story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite").get("building")
-        assert started.wait(5)
+        assert started.wait(120)  # thread-scheduling latency only — see the note below on `-n auto`
         assert story.cancel_build(tmp_path, "main")["stopped"] is True
 
         # The doomed worker is STILL running, and the next build must start anyway.
@@ -973,7 +979,11 @@ def test_stopping_a_build_releases_the_reader_at_once(tmp_path, monkeypatch):
     )
     try:
         story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-        assert started.wait(5)
+        # Waiting for the worker THREAD to be scheduled, not for any real work — so the bound
+        # only has to outlast scheduler contention. Under `-n auto` five seconds did not, and
+        # this failed intermittently while passing in isolation. See the note in
+        # `test_a_build_runs_in_the_background_and_reports_progress`.
+        assert started.wait(120)
         answer = story.cancel_build(tmp_path, "main")
         assert answer["stopped"] is True
         progress = story.build_progress(tmp_path, "main")
@@ -982,8 +992,11 @@ def test_stopping_a_build_releases_the_reader_at_once(tmp_path, monkeypatch):
     finally:
         release.set()
     # ...and it stays that way once the abandoned worker notices and unwinds, so the page is
-    # not told the same news a second time, in red.
-    for _ in range(50):
+    # not told the same news a second time, in red. Bounded generously: this waits on a thread
+    # being scheduled, not on any real work (the agent is faked), so a tight bound measures
+    # only how busy the machine is — under `-n auto` the original 5s bound failed here
+    # intermittently. Only a worker that never unwinds trips this.
+    for _ in range(1200):
         if not story._BUILDS[story.build_key(tmp_path, "main")]["thread"].is_alive():
             break
         time.sleep(0.1)
@@ -1052,7 +1065,12 @@ def test_a_build_runs_in_the_background_and_reports_progress(tmp_path, monkeypat
 
     started = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     assert started["building"] is True
-    deadline = time.time() + 10
+    # The claim is "the build completes and reports progress", NOT "within N seconds" — the agent
+    # is faked, so elapsed time measures only how soon a background thread gets scheduled. Under
+    # `-n auto` that competes with every other worker, and a 10s bound failed roughly one run in
+    # three on a 14-core machine while passing in isolation. Generous enough that only a genuine
+    # hang trips it; a real regression still fails, just later.
+    deadline = time.time() + 120
     while time.time() < deadline:
         progress = story.build_progress(tmp_path, "main")
         if progress and not progress["running"]:
@@ -1411,7 +1429,10 @@ def test_the_page_script_runs(tmp_path):
     source = re.findall(r"<script>(.*?)</script>", story.story_html(tmp_path), re.S)[-1]
     script = tmp_path / "page.js"
     script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
-    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=60)
+    # Generous on purpose: the bound is here to catch a script that HANGS, not to assert how
+    # fast node starts. A 60s bound timed out on a loaded Windows CI runner under `-n auto`,
+    # which measured the runner rather than the page.
+    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, f"the story page script threw: {result.stdout.strip() or result.stderr.strip()}"
 
 

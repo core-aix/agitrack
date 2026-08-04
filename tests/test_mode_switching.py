@@ -59,12 +59,14 @@ def _mode_runner(tmp_path, *, use_worktrees: bool, manual: bool):
 
 
 def _slate_clean_and_install(runner) -> None:
-    """Reproduce the startup hook sequence from ProxyRunner.run(): clear any stale hooks left by
-    a prior (possibly crashed) run of the OTHER mode, then install exactly what this mode wants."""
-    runner._remove_base_commit_guard()
-    runner._teardown_manual_commit_mode()
-    runner._install_base_commit_guard()
-    runner._setup_manual_commit_mode()
+    """The startup hook sequence — the REAL one that ``ProxyRunner.run()`` calls.
+
+    This used to re-implement the four calls inline, which made every test below assert against
+    a COPY of the startup behaviour: the copy would stay green while `run()` changed, and the
+    mode-switch bug it was written to catch would ship anyway. Calling the same method `run()`
+    calls removes that possibility by construction.
+    """
+    runner._reset_hook_slate()
 
 
 def _hooks_dir(repo: GitRepo) -> Path:

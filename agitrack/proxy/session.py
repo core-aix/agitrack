@@ -87,7 +87,7 @@ class Session:
         "_last_change_at",
         "last_child_output",
         "last_child_output_sample",
-        "_pre_spawn_session_ids",
+        "_pre_spawn_sessions",
         # background commit summarization (#8) — per session so two sessions can
         # summarize concurrently, each with its own worker/result/pending slot
         "_summary_thread",
@@ -145,9 +145,16 @@ class Session:
     # master_fd remain addressable as plain session fields over it.
     # ------------------------------------------------------------------
 
+    # Both read as ``None`` when there is no process yet — the documented meaning of None for
+    # each ("has not been spawned yet, or has been torn down"). Reading straight through to
+    # ``self.process`` raised AttributeError instead, so every ``if session.master_fd is None``
+    # guard in the runner — the exact idiom written to handle this state — crashed on the one
+    # case it exists for. The setters keep raising: assigning an fd to a session that owns no
+    # process is a genuine mistake, and silently swallowing it would lose the fd.
+
     @property
     def child_pid(self) -> int | None:
-        return self.process.child_pid
+        return self.process.child_pid if self.process is not None else None
 
     @child_pid.setter
     def child_pid(self, value: int | None) -> None:
@@ -155,7 +162,7 @@ class Session:
 
     @property
     def master_fd(self) -> int | None:
-        return self.process.master_fd
+        return self.process.master_fd if self.process is not None else None
 
     @master_fd.setter
     def master_fd(self, value: int | None) -> None:
@@ -204,7 +211,7 @@ class Session:
             "_last_change_at": 0.0,
             "last_child_output": 0.0,
             "last_child_output_sample": b"",
-            "_pre_spawn_session_ids": None,
+            "_pre_spawn_sessions": None,
             "_summary_thread": None,
             "_summary_result": None,
             "_summary_pending": None,

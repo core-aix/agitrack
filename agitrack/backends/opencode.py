@@ -156,10 +156,21 @@ class OpenCodeBackend:
             for child_id in child_ids:
                 tokens.add(_subagent_tokens_for_session(self.repo, child_id, visited))
 
+        # OpenCode's event stream names no model — verified against the real CLI, none of
+        # step_start / text / step_finish carries one — so `parsed_model` is None for every run
+        # where the caller didn't pin one, and the commit metadata recorded no model at all for
+        # this backend. Its session store does know, so ask that before giving up. Best-effort:
+        # None simply leaves the previous behaviour.
+        resolved_model = parsed_model or model
+        if not resolved_model and (parsed_session_id or session_id):
+            from agitrack.transcripts.opencode import session_model
+
+            resolved_model = session_model(parsed_session_id or session_id or "")
+
         return AgentResult(
             backend=self.name,
             session_id=parsed_session_id or session_id,
-            model=parsed_model or model,
+            model=resolved_model,
             final_response=final_response.strip(),
             exit_code=exit_code,
             tokens=tokens,
@@ -304,14 +315,22 @@ class OpenCodeBackend:
         input_tokens = self._int_value(tokens.get("input"))
         output_tokens = self._int_value(tokens.get("output"))
         reasoning_tokens = self._int_value(tokens.get("reasoning"))
+        cache_read = self._int_value(cache.get("read"))
+        cache_write = self._int_value(cache.get("write"))
         return TokenUsage(
-            context=input_tokens or None,
+            # ``context`` is how FULL the model's window is, so it must count every token the
+            # model read — the cached prefix included. Counting only ``input`` under-reports it
+            # by the whole cache, which is most of a real conversation: measured on a live
+            # OpenCode turn, input=727 against cache.read=5632, so the gauge read 727 when the
+            # true context was 6365. Claude already sums the three (see backends/claude.py); this
+            # is the same formula, so the number means the same thing on both backends.
+            context=(input_tokens + cache_read + cache_write) or None,
             total=output_tokens + reasoning_tokens,
             input=input_tokens,
             output=output_tokens,
             reasoning=reasoning_tokens,
-            cache_read=self._int_value(cache.get("read")),
-            cache_write=self._int_value(cache.get("write")),
+            cache_read=cache_read,
+            cache_write=cache_write,
         )
 
     def _add_tokens(self, current: TokenUsage, addition: TokenUsage) -> None:
