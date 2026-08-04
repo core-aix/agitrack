@@ -75,6 +75,24 @@ def test_long_summary_first_line_splits_at_first_sentence():
     assert " ".join(message.split("\n\n", 1)[0].split()) == "<aGiTrack> Refactored the parser for clarity."
 
 
+def test_a_summarized_interrupted_commit_keeps_the_interrupted_mark_in_its_subject():
+    # The proxy commits first and amends the summary in later, so the mark has to survive
+    # the amend — and the summarizer cannot be trusted to add it: given an accurate "the
+    # turn was interrupted" body, a real run still produced the subject "Session created
+    # placeholder text files r1.txt through r10.txt" over a two-file diff.
+    message = _base_message(interrupted=True)
+    assert message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
+
+    summarized = apply_summary_to_message(message, "Created placeholder files r1 through r10.")
+
+    assert summarized.splitlines()[0] == "<aGiTrack> (interrupted) Created placeholder files r1 through r10."
+    assert "interrupted: true" in summarized
+
+
+def test_an_uninterrupted_summarized_commit_has_no_such_mark():
+    assert "(interrupted)" not in apply_summary_to_message(_base_message(), "Added the renderer.")
+
+
 def test_applying_a_summary_replaces_the_WHOLE_prompt_led_lead():
     # The lead is now subject + body paragraph(s), so "everything before the first blank
     # line" no longer identifies it: anchored there, a long prompt's continuation would
