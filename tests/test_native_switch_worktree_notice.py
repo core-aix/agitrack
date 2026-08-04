@@ -79,6 +79,17 @@ def _runner(tmp_path, backend_name, *, refs, worktree: bool):
     runner._restore_or_ask_session_name = lambda *a, **k: None
     runner._initialize_session_baseline = lambda: None
     runner._render = lambda *a, **k: None
+
+    # The notice is a BLOCKING popup the user must acknowledge, so capture the popup rather
+    # than the transient message line. Each entry is (title, options, detail-as-one-string).
+    popups: list[tuple[str, list, str]] = []
+
+    def fake_popup(title, options, *, detail=None):
+        popups.append((title, list(options), "\n".join(detail or [])))
+        return "ok"
+
+    runner._select_popup = fake_popup
+    runner.popups = popups
     return runner
 
 
@@ -91,10 +102,12 @@ def test_a_native_switch_says_the_new_conversation_stays_in_this_worktree(tmp_pa
     runner._service_native_session_switch()
 
     assert runner.state.backend_session_id == "new-session"
-    message = runner.message or ""
-    assert "alpha" in message  # names the worktree it is actually sharing
-    assert ".agitrack/worktrees/" in message
-    assert backend_name in message  # names the backend the switch happened inside of
+    assert len(runner.popups) == 1
+    title, options, detail = runner.popups[0]
+    assert options == ["ok"]  # must be acknowledged, not left to fade on a timer
+    assert "alpha" in title  # names the session whose worktree is being shared
+    assert ".agitrack/worktrees/alpha" in detail
+    assert backend_name in detail  # names the backend the switch happened inside of
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
@@ -106,10 +119,10 @@ def test_the_notice_tells_the_user_how_to_get_a_worktree_of_its_own(tmp_path, ba
 
     runner._service_native_session_switch()
 
-    message = runner.message or ""
-    assert runner._menu_label() in message
-    assert "session" in message
-    assert "New session" in message
+    _title, _options, detail = runner.popups[0]
+    assert runner._menu_label() in detail
+    assert "sessions" in detail
+    assert "New session (own worktree)" in detail
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
@@ -118,9 +131,8 @@ def test_the_notice_is_shown_once_per_run_not_on_every_clear(tmp_path, backend_n
     # once; repeating it on every switch would train them to dismiss aGiTrack's popups.
     runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True)
     runner._service_native_session_switch()
-    assert runner.message  # first switch warns
+    assert len(runner.popups) == 1  # first switch warns
 
-    runner.message = None
     runner._session_watch_at = 0.0
     runner.backend.list_sessions = lambda _repo: [
         SessionRef(id="new-session", updated=200.0, label="new"),
@@ -130,7 +142,7 @@ def test_the_notice_is_shown_once_per_run_not_on_every_clear(tmp_path, backend_n
     runner._service_native_session_switch()
 
     assert runner.state.backend_session_id == "third-session"  # the switch itself still happens
-    assert runner.message is None  # but it is not re-announced
+    assert len(runner.popups) == 1  # but it is not re-announced
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
@@ -143,12 +155,12 @@ def test_the_end_of_turn_notice_does_not_repeat_what_the_switch_already_said(tmp
     runner._record_shared_alias_on_drift = lambda *a, **k: None
 
     runner._service_native_session_switch()
-    assert runner.message
+    assert len(runner.popups) == 1
 
-    runner.message = None
     runner._note_backend_session_change("yet-another-session")
 
-    assert runner.message is None
+    assert runner.message is None  # the commit-time notice stays quiet
+    assert len(runner.popups) == 1
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
@@ -161,7 +173,7 @@ def test_no_worktree_mode_says_nothing_because_there_is_no_worktree_to_share(tmp
     runner._service_native_session_switch()
 
     assert runner.state.backend_session_id == "new-session"  # tracking still follows the switch
-    assert runner.message is None
+    assert runner.popups == []
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
@@ -178,4 +190,4 @@ def test_staying_on_the_same_conversation_says_nothing(tmp_path, backend_name):
     runner._service_native_session_switch()
 
     assert runner.state.backend_session_id == "old-session"
-    assert runner.message is None
+    assert runner.popups == []

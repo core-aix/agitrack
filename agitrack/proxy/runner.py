@@ -1039,6 +1039,9 @@ class ProxyRunner:
         self._backend_update_checked_for: str | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
+        # Backends whose repo-root "last session" record has already been written during THIS
+        # exit. First writer wins (see _remember_session_for_backend).
+        self._backends_remembered_on_exit: set[str] = set()
         # Auto-share (issue #55): for sessions the user opted to keep shared, the
         # last-pushed content hash per backend session id, plus the in-flight
         # background push thread (only one at a time). Triggered per commit.
@@ -1406,6 +1409,7 @@ class ProxyRunner:
                 "_precompact_result": None,
                 "_base_poll_at": 0.0,
                 "_warned_backend_session": False,
+                "_backends_remembered_on_exit": set(),
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
                 "_auto_share_outcome": None,
@@ -3802,15 +3806,32 @@ class ProxyRunner:
         info = self.worktree
         if info is None:
             return
+        # FIRST WRITER PER BACKEND WINS during an exit. The exit finalize runs the session the
+        # user quit in FIRST and every other session after it (see _finalize_pending_work), so
+        # the first writer for a backend is its most recently active session — and later writers
+        # are older ones that would otherwise clobber it. Last-wins left this record describing a
+        # DIFFERENT session from `backend_session_id` (which is written only for the exit-resume
+        # session), and startup then mixed the two: the conversation from one session and, via
+        # the `prior_worktree` name fallback, the NAME of another. Observed live as a restart
+        # coming back labelled with the previous session's name.
         try:
+            # Inside the try with everything else: `self.state` is legitimately absent on some
+            # teardown paths, and this method has always been best-effort about that.
+            remembered = self._backends_remembered_on_exit
+            backend_name = self.state.backend
             root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
-            root.remember_session(
-                self.state.backend,
-                session_id=self.state.backend_session_id,
-                worktree=info.name,
-                message_id=self.state.last_backend_message_id,
-                model=self.state.model,
-            )
+            if not (self._exiting and backend_name in remembered):
+                # Recorded only while exiting: a call made BEFORE the exit walk would otherwise
+                # sit in the set and suppress the first — and correct — writer of the walk.
+                if self._exiting:
+                    remembered.add(backend_name)
+                root.remember_session(
+                    backend_name,
+                    session_id=self.state.backend_session_id,
+                    worktree=info.name,
+                    message_id=self.state.last_backend_message_id,
+                    model=self.state.model,
+                )
             # Remember a user-given name (not an auto session-N) keyed by the
             # backend conversation id, so resuming it later restores the name.
             if info.name and not self._AUTO_NAME_RE.match(info.name):
@@ -3962,7 +3983,7 @@ class ProxyRunner:
         backend_name = root_state.backend
         prior_message_id = root_state.last_backend_message_id
         prior_model = root_state.model
-        prior_worktree = (root_state.recall_session(backend_name) or {}).get("worktree")
+        prior_record = root_state.recall_session(backend_name) or {}
         # Which conversation to continue at startup: aGiTrack's own last session if we
         # have one, otherwise the repo's most recent backend conversation (e.g. one
         # you ran with plain claude/opencode before aGiTrack). Resume is by id, which
@@ -3971,6 +3992,13 @@ class ProxyRunner:
             resume_id = None
         else:
             resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        # The worktree name is only a usable fallback NAME for `resume_id` when the record is
+        # ABOUT that conversation. Two records feed this decision and they can disagree: the
+        # resume pointer is written for the session the user quit in, while this per-backend
+        # record was (before the first-writer-wins fix) whichever session finalized last. Naming
+        # the resumed conversation after a worktree belonging to a DIFFERENT conversation is how
+        # a restart came back showing the previous session's name with the new session inside it.
+        prior_worktree = prior_record.get("worktree") if prior_record.get("id") == resume_id else None
         name = self._resolve_startup_session_name(root_state, resume_id, prior_worktree)
         try:
             info, repo = self._open_session_worktree(name)
@@ -4255,17 +4283,34 @@ class ProxyRunner:
         :meth:`_note_backend_session_change` (which catches switches made mid-turn, when this
         watcher stands down): the point is learned once per run, and a user who switches
         conversation often should not be nagged on every `/clear`.
+
+        This BLOCKS on an explicit "ok" rather than fading out on a timer. The user has just
+        started a conversation believing it is a new, isolated one; a notice they can miss
+        leaves them working for an hour under that belief, with two conversations' commits
+        landing on one branch. It is the kind of failure notice
+        ``devtools/menu-workflows.md`` reserves a keypress for. Safe to open here: the switch
+        watcher runs in the reactor's timers phase, the same context that already raises the
+        "New conversation detected" name prompt immediately before this.
         """
         if self.worktree is None or self._warned_backend_session:
             return  # nothing to share (--no-worktree / manual), or already said once
         self._warned_backend_session = True
-        self._set_message(
-            f"This conversation was started inside {self.backend.name}, so it shares session "
-            f"'{self.name}'’s worktree (.agitrack/worktrees/{self.worktree.path.name}) and branch — "
-            "aGiTrack can’t move a running backend into a new one. For a conversation with its own "
-            f"worktree, start it from {self._menu_label()} → session → “+ New session (own worktree)” "
-            "rather than with /clear or /resume.",
-            seconds=14.0,
+        self._select_popup(
+            f"'{self.name}' — new conversation, same worktree",
+            ["ok"],
+            detail=[
+                f"This conversation was started inside {self.backend.name}, so aGiTrack could not",
+                "give it a worktree of its own: the backend is already running with its working",
+                f"directory set to .agitrack/worktrees/{self.worktree.path.name}, and moving a",
+                "running backend would kill the conversation you just started.",
+                "",
+                f"Its changes are therefore tracked on session '{self.name}''s branch, and merge",
+                f"into {self._base_branch or 'the base branch'} along with that session's work.",
+                "",
+                "To get a conversation with its own worktree, start it from",
+                f"  {self._menu_label()} → sessions → “+ New session (own worktree)”",
+                "rather than with the backend's own /clear or /resume.",
+            ],
         )
         self._render()
 
@@ -4876,12 +4921,17 @@ class ProxyRunner:
             and not self._warned_backend_session
         ):
             self._warned_backend_session = True
+            # Sticky, not timed: this says the user's new conversation is NOT isolated, and a
+            # notice they can miss leaves them working under the opposite belief. Sticky (rather
+            # than the blocking "ok" popup _warn_native_switch_shares_worktree opens) because
+            # this path is reached from the commit flow, which does not always run on the
+            # reactor thread — and a modal raised off it would wedge input.
             self._set_message(
                 "Detected a new conversation started inside the backend. It stays in this session's "
                 f"worktree (.agitrack/worktrees/{self.worktree.path.name}), so its changes are tracked on "
                 "this session's branch. For a conversation with its own worktree, start it from "
-                f"{self._menu_label()} → session → “+ New session (own worktree)”.",
-                seconds=12.0,
+                f"{self._menu_label()} → sessions → “+ New session (own worktree)”.",
+                sticky=True,
             )
 
     def _maybe_complete_agent_merge(self) -> None:
@@ -10333,9 +10383,7 @@ class ProxyRunner:
                 + ([] if opened else [remote_browser_hint(url, port)]),
             )
             self._set_message(
-                f"Dashboard live at {url}."
-                if opened
-                else f"Dashboard live. {remote_browser_hint(url, port)}"
+                f"Dashboard live at {url}." if opened else f"Dashboard live. {remote_browser_hint(url, port)}"
             )
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
@@ -10390,13 +10438,11 @@ class ProxyRunner:
                 self._set_message("Backtrace view is building in the background.")
             else:
                 url = str(record.get("url", ""))
-                opened = open_dashboard_in_browser(url)
+                open_dashboard_in_browser(url)
                 self._select_popup(f"Backtrace view live at {url}", ["ok"], detail=detail)
-                self._set_message(
-                    f"Backtrace view live at {url} — opening in your browser."
-                    if opened
-                    else f"Backtrace view live at {url}."
-                )
+                # No "opening in your browser": the browser was opened above, before this is
+                # painted, so announcing it as about to happen is wrong.
+                self._set_message(f"Backtrace view live at {url}.")
         except Exception as error:
             self._debug(f"backtrace substitution failed: {error!r}")
             return False  # never let this block the dashboard the user actually asked for
