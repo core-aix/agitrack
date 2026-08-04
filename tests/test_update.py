@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -322,11 +323,25 @@ def test_install_method_prefers_pipx_over_homebrew(monkeypatch):
 
 
 def _record_run(monkeypatch, *, returncode=0, stdout="", stderr=""):
-    """Stub subprocess.run in the updater, capturing each command it runs."""
+    """Stub subprocess.run in the updater, capturing each command IT runs.
+
+    `agitrack.update.updater.subprocess` is the stdlib module itself, so patching `.run` through
+    it replaces `subprocess.run` PROCESS-WIDE — not just for the updater. Anything else running a
+    subprocess while the test is in flight lands in `calls` too, and an exact-equality assertion
+    then fails on a command the updater never made. That is not hypothetical: a background thread
+    left alive by an earlier test in the same xdist worker calling `has_object_local`
+    (`git cat-file -e`) is enough, which is exactly what failed one CI run while every other run
+    on the same commit passed.
+
+    Filtering by thread is what makes the capture mean "the updater's calls": `apply()` runs
+    synchronously on the calling thread, so anything from another thread is by definition not it.
+    """
     calls: list[list[str]] = []
+    caller = threading.get_ident()
 
     def fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
+        if threading.get_ident() == caller:
+            calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
     monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
