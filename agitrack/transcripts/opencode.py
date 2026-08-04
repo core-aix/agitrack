@@ -676,6 +676,7 @@ def _build_turn(
     effort: str | None = None
     tool_names: list[str] = []
     subagents: list[str] = []
+    skills: list[str] = []
     last_assistant = assistants[-1] if assistants else None
     for assistant in assistants:
         assistant_info = _as_dict(assistant.get("info"))
@@ -684,7 +685,7 @@ def _build_turn(
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
             edits.extend(_edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}))
-        _collect_capabilities(assistant.get("parts"), tool_names, subagents)
+        _collect_capabilities(assistant.get("parts"), tool_names, subagents, skills)
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
             final_response = response
@@ -707,9 +708,7 @@ def _build_turn(
     # would commit a "turn" that was still being written. Claude computes the same thing as
     # ``complete=not in_flight`` (transcripts/claude.py).
     complete = bool(_as_dict(final_info).get("finish"))
-    # OpenCode has no skills concept, so `skills` stays empty; MCP tools and `task` sub-agents
-    # are the extensions it can carry.
-    used = capabilities.collect(tool_names=tool_names, subagents=subagents, mcp_servers=mcp_servers)
+    used = capabilities.collect(tool_names=tool_names, skills=skills, subagents=subagents, mcp_servers=mcp_servers)
     return SessionTurn(
         user_message_id=user_id,
         assistant_message_id=assistant_id,
@@ -735,13 +734,15 @@ def _build_turn(
 
 # OpenCode's sub-agent tool. Its input names the agent being run, when one was chosen.
 _SUBAGENT_TOOL = "task"
+# OpenCode loads a skill through a `skill` tool call whose input names it (1.18+).
+_SKILL_TOOL = "skill"
 
 
-def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[str]) -> None:
-    """Record the tool names an assistant message called, plus the sub-agent each `task` call
-    ran. MCP tools are separated from built-ins later, against the repo's configured servers
-    (OpenCode's `<server>_<tool>` naming is not self-describing — see
-    :mod:`agitrack.transcripts.capabilities`)."""
+def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[str], skills: list[str]) -> None:
+    """Record the tool names an assistant message called, plus the sub-agent each `task` call ran
+    and the skill each `skill` call loaded. MCP tools are separated from built-ins later, against
+    the repo's configured servers (OpenCode's `<server>_<tool>` naming is not self-describing —
+    see :mod:`agitrack.transcripts.capabilities`)."""
     if not isinstance(parts, list):
         return
     for part in parts:
@@ -751,11 +752,19 @@ def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[
         if not tool:
             continue
         tool_names.append(tool)
-        if tool.lower() != _SUBAGENT_TOOL:
+        lowered = tool.lower()
+        if lowered not in (_SUBAGENT_TOOL, _SKILL_TOOL):
             continue
-        state = part.get("state")
-        payload = state.get("input") if isinstance(state, dict) else None
-        payload = payload if isinstance(payload, dict) else {}
+        state = _as_dict(part.get("state"))
+        payload = _as_dict(state.get("input"))
+        if lowered == _SKILL_TOOL:
+            # `{"tool": "skill", "state": {"input": {"name": "repo-lore"}}}`. The completed
+            # call also carries `state.metadata.name`; the input is present from the moment
+            # the call is recorded, so it works for a turn still in flight too.
+            skill = payload.get("name") or _as_dict(state.get("metadata")).get("name")
+            if isinstance(skill, str) and skill.strip():
+                skills.append(skill.strip())
+            continue
         agent = payload.get("subagent_type") or payload.get("agent") or "default"
         if isinstance(agent, str) and agent.strip():
             subagents.append(agent.strip())

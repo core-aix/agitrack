@@ -1141,6 +1141,9 @@ def parse_rows(
     # result carries the file's pre-existing content, which seeds `file_state` so a later Write
     # diffs against it instead of counting the whole (already existing) file as newly added.
     pending_reads: dict[str, str] = {}
+    # A skill invoked as `/<skill>` hot-loads: its body is injected as a meta row and there is NO
+    # `Skill` tool call to see. Held here until the turn it belongs to exists (see below).
+    pending_skill: str | None = None
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -1188,6 +1191,18 @@ def parse_rows(
                         background_last_event[task_id] = _row_timestamp(row) or 0
                 pending_background = notification_kind
                 continue
+            hot_loaded = _hot_loaded_skill(row)
+            if hot_loaded is not None:
+                # Which turn this belongs to depends on how the skill was invoked, and the two
+                # cases differ by whether a command invocation is still pending:
+                #   `/skill`            — no args, so the injected body is what OPENS the turn.
+                #                         `current` is still the PREVIOUS turn here; hold it.
+                #   `/skill do the thing` — the args are an instruction, so the turn was already
+                #                         opened by the command row and the body follows it.
+                if pending_command is None and current is not None:
+                    current.setdefault("skills", []).append(hot_loaded)
+                else:
+                    pending_skill = hot_loaded
             command = _slash_command_name(row)
             if command is not None:
                 # A command carrying a user INSTRUCTION (`/goal …`, `/loop …`, a skill
@@ -1237,12 +1252,14 @@ def parse_rows(
                 "ended_at": stamp,
                 "tool_ids": set(),
                 "tool_names": [],
-                "skills": [],
+                # A skill whose injected body opened THIS turn (bare `/<skill>`) belongs to it.
+                "skills": [pending_skill] if pending_skill else [],
                 "subagents": [],
                 "compactions": pending_compactions,
                 "reasoning_effort": None,
                 "messages": [],
             }
+            pending_skill = None
             pending_compactions = 0
         elif row_type == "attachment":
             queued = _queued_human_prompt(row)
@@ -1778,6 +1795,30 @@ def _slash_command_directive(row: dict) -> str | None:
     if len(args.split()) < _INSTRUCTION_WORDS:
         return None
     return f"{name} {args}"
+
+
+# A skill invoked as `/<skill>` is HOT-LOADED: Claude Code injects the skill's own text as a meta
+# user row and never calls the `Skill` tool, so `_collect_capabilities` (which reads tool_use
+# blocks) sees nothing at all. That injected body opens with the skill's install directory, and
+# that line is the only machine-readable marker the invocation leaves — without reading it, every
+# skill the user runs from the command line is missing from the commit's provenance.
+_SKILL_BASE_DIR_RE = re.compile(r"^Base directory for this skill:\s*(\S.*?)\s*$", re.MULTILINE)
+
+
+def _hot_loaded_skill(row: dict) -> str | None:
+    """The name of a skill hot-loaded by a `/<skill>` slash command, or None.
+
+    Taken from the last path segment of the announced base directory
+    (``~/.claude/skills/<name>``), which is the skill's own directory name.
+    """
+    text = _command_expansion_text(row)
+    if not text:
+        return None
+    match = _SKILL_BASE_DIR_RE.search(text)
+    if match is None:
+        return None
+    name = match.group(1).replace("\\", "/").rstrip("/").rpartition("/")[2]
+    return name or None
 
 
 def _command_expansion_text(row: dict) -> str | None:

@@ -4190,11 +4190,14 @@ def test_backend_session_change_warns_once(tmp_path):
         state=state,
     )
     messages = []
-    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._set_message = lambda message, **kw: messages.append((message, kw))
 
     runner._note_backend_session_change("new")
-    assert messages and "own worktree" in messages[0].lower()
-    assert ".agitrack/worktrees/wt" in messages[0]
+    assert messages and "own worktree" in messages[0][0].lower()
+    assert ".agitrack/worktrees/wt" in messages[0][0]
+    # Sticky, not timed: it says the new conversation is NOT isolated, and a notice that
+    # fades out leaves the user working under the opposite belief.
+    assert messages[0][1].get("sticky") is True
     assert runner._warned_backend_session is True
 
     # It only warns once, not on every subsequent change.
