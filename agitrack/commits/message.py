@@ -263,12 +263,12 @@ def build_agent_commit_message(
         # rest of it is the first paragraph of the body (no # Summary section).
         # The prompts are not duplicated into the message — the interaction trace
         # below already carries them verbatim.
-        lines = _summary_lead_lines(summary)
+        lines = _summary_lead_lines(summary, interrupted=interrupted)
     else:
         subject_prompt, full_subject = _subject_parts(
             _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGITRACK_SUBJECT_PREFIX)
         )
-        lines = [f"{AGITRACK_SUBJECT_PREFIX}{subject_prompt}"]
+        lines = [f"{AGITRACK_SUBJECT_PREFIX}{_interrupted_subject(subject_prompt, interrupted)}"]
         if full_subject:
             # A BLANK line first: git's subject is the whole first paragraph, newlines
             # folded to spaces, so a continuation glued under the first sentence put the
@@ -335,7 +335,10 @@ def apply_summary_to_message(
             rest_start = len(lines)
     rest = lines[rest_start:]
 
-    new_lines = _summary_lead_lines(summary)
+    # Read the fact back off the message being amended (the async path amends a commit built
+    # elsewhere, so no caller has to thread the flag through): the summary-led subject must
+    # carry the same mark the originally built subject did.
+    new_lines = _summary_lead_lines(summary, interrupted="\ninterrupted: true" in message)
     new_lines.append("")
     new_lines.extend(rest)
     if summary_metadata:
@@ -368,7 +371,24 @@ def _is_summary_header(line: str) -> bool:
     return re.sub(r"[^a-zA-Z]", "", line).lower() == "summary"
 
 
-def _summary_lead_lines(summary: str) -> list[str]:
+INTERRUPTED_SUBJECT_MARK = "(interrupted) "
+
+
+def _interrupted_subject(subject: str, interrupted: bool) -> str:
+    """Mark a cancelled turn's subject as such.
+
+    The body note says the turn was interrupted, and the summarizer is given that note —
+    but the subject is written by a model, and it still described the whole REQUEST:
+    "Session created placeholder text files r1.txt through r10.txt" over a two-file diff,
+    with an accurate body underneath. `git log --oneline` shows only the subject, so the
+    one line most people read was the one that overclaimed. The mark is applied here, by
+    aGiTrack, because accuracy about what happened cannot be delegated to the summarizer."""
+    if not interrupted or subject.startswith(INTERRUPTED_SUBJECT_MARK):
+        return subject
+    return f"{INTERRUPTED_SUBJECT_MARK}{subject}"
+
+
+def _summary_lead_lines(summary: str, *, interrupted: bool = False) -> list[str]:
     """Subject + leading body for a summarized message.
 
     Mirrors the prompt-led layout: the summary's first line is the subject
@@ -388,7 +408,7 @@ def _summary_lead_lines(summary: str) -> list[str]:
         remainder.pop(0)
 
     subject, full = _subject_parts(first_line, width=MAX_SUBJECT_WIDTH - len(AGITRACK_SUBJECT_PREFIX))
-    lines = [f"{AGITRACK_SUBJECT_PREFIX}{subject}"]
+    lines = [f"{AGITRACK_SUBJECT_PREFIX}{_interrupted_subject(subject, interrupted)}"]
     # Everything after the first sentence is BODY, separated by a blank line: git reads the
     # first paragraph as the subject, so a summary whose lead paragraph ran four sentences
     # became a four-sentence `git log --oneline` entry.

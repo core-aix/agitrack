@@ -246,6 +246,8 @@ def test_an_interrupted_turn_is_committed_as_interrupted_not_as_completed_work(t
     assert "interrupted: true" in repo.message  # machine-readable
     assert "interrupted this turn before the agent finished" in repo.message  # human-readable
     assert "NOT completed" in repo.message
+    # …and the ONE line `git log --oneline` shows says so too.
+    assert repo.message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
 
 
 def test_the_summarizer_is_told_the_turn_was_interrupted(tmp_path):
