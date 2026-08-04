@@ -65,6 +65,13 @@ class Session:
         # commit / parse tracking
         "agent_in_flight",
         "turn_awaiting_commit",
+        # A cancelled (Esc) turn whose changes the user chose to KEEP ("commit with your
+        # next turn"). Until a commit claims them those changes are still the AGENT's, so
+        # nothing may re-ask about them as if they were the user's own or as leftovers.
+        "cancelled_work_kept",
+        # The untracked paths kept that way. Needed because a no-worktree turn's commit
+        # stages only files that did NOT exist before the turn, and these do.
+        "kept_cancelled_paths",
         "untracked_before_turn",
         "agent_parse_thread",
         "agent_parse_result",
@@ -193,6 +200,8 @@ class Session:
             "file_observer": None,
             "agent_in_flight": False,
             "turn_awaiting_commit": False,
+            "cancelled_work_kept": False,
+            "kept_cancelled_paths": frozenset(),
             "untracked_before_turn": frozenset(),
             "_pending_merge_prompt": False,
             "agent_parse_thread": None,

@@ -456,6 +456,14 @@ def test_source_version_falls_back_to_pyproject_when_metadata_missing():
     assert expected != "0.0.0"  # the checkout declares a real release version
 
 
+def _git_subject(message: str) -> str:
+    """What `git log --oneline` / `%s` shows: the first PARAGRAPH, newlines folded to
+    spaces. Not just the first line — which is why a blank line has to follow the
+    subject for the split at the first sentence to mean anything."""
+    first_paragraph = message.split("\n\n", 1)[0]
+    return " ".join(first_paragraph.split())
+
+
 def test_agent_commit_subject_splits_at_first_sentence():
     # The subject is the first sentence; the rest flows onto the next line. aGiTrack
     # never adds "…" — Git shortens the displayed subject if it's long.
@@ -471,8 +479,12 @@ def test_agent_commit_subject_splits_at_first_sentence():
     lines = message.splitlines()
     assert lines[0] == "<aGiTrack> Fix the failing parser test."  # first sentence only
     assert "..." not in lines[0]
-    # The remainder follows directly on the next line (no blank between).
-    assert lines[1] == "Then add coverage and update the docs."
+    # The remainder is BODY, one blank line down. Git's subject is the first PARAGRAPH
+    # with newlines folded to spaces, so a continuation glued directly under the first
+    # sentence put the whole paragraph back in `git log --oneline`.
+    assert lines[1] == ""
+    assert lines[2] == "Then add coverage and update the docs."
+    assert _git_subject(message) == "<aGiTrack> Fix the failing parser test."
 
 
 def test_agent_commit_subject_without_period_is_kept_whole():
@@ -501,7 +513,9 @@ def test_user_commit_subject_splits_at_first_sentence():
     lines = message.splitlines()
     assert lines[0] == "Save my parser edits."  # first sentence
     assert "..." not in lines[0]
-    assert lines[1] == "They also touch the lexer."
+    assert lines[1] == ""
+    assert lines[2] == "They also touch the lexer."
+    assert _git_subject(message) == "Save my parser edits."
 
 
 def test_commit_message_body_lines_are_wrapped_to_72():

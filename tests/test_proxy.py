@@ -1818,6 +1818,9 @@ class _CancelRepo:
     def has_changes(self):
         return self._changes
 
+    def untracked_entries(self):
+        return list(getattr(self, "untracked", ["u1.txt", "u2.txt"]))
+
     def discard_all_changes(self):
         self.discarded = True
         self._changes = False
@@ -1842,6 +1845,63 @@ def test_handle_cancelled_turn_keep_leaves_changes(tmp_path):
     assert runner.repo.discarded is False
     # The turn was offered, so a second pass won't re-prompt.
     assert "a1" in runner._cancel_prompted
+
+
+def test_kept_cancelled_work_stays_the_agents_until_a_commit_claims_it(tmp_path):
+    # "Keep them (commit with your next turn)" is a promise. The parse is consumed either
+    # way, so without this the leftover files became "the user's own dirt" the instant the
+    # handler returned, and three separate paths then re-asked about them.
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Keep them (commit with your next turn)"
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is False
+    assert runner.cancelled_work_kept is True
+    assert runner.kept_cancelled_paths == frozenset({"u1.txt", "u2.txt"})
+
+    # 1. The next prompt must not offer the agent's kept files as the USER's own commit
+    #    (that commit carries no trace and would empty the promised one). Asserted by
+    #    whether the ownership question is even ASKED, so the test can't pass vacuously
+    #    on some unrelated early return.
+    asked = []
+    # Reports "no user changes" so the control call below stops right after being asked.
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: asked.append(1) or False)
+    assert runner._offer_pre_agent_user_commit() is False
+    assert asked == []
+    runner.cancelled_work_kept = False
+    runner._offer_pre_agent_user_commit()
+    assert asked == [1]  # without the kept work, the user IS asked as before
+    runner.cancelled_work_kept = True
+    # 2. The copy-back watcher must not call them "intentionally unstaged or git-ignored".
+    collected = []
+    runner._collect_copy_candidates = lambda **k: collected.append(k) or ["u1.txt"]
+    runner._request_copy_offer()
+    assert collected == [] and runner._pending_copy_offer is None
+    # 3. The next turn's commit must be able to stage them: in no-worktree mode staging is
+    #    limited to files that did not exist before the turn, and these do.
+    runner._begin_agent_turn()
+    assert runner.untracked_before_turn == frozenset()
+
+
+def test_committing_the_kept_work_ends_the_agents_ownership(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Commit the changes now"
+    runner._create_agent_commit_from_turns_popup = lambda **k: True
+    runner.cancelled_work_kept = True
+    runner.kept_cancelled_paths = frozenset({"u1.txt"})
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is True
+    assert runner.cancelled_work_kept is False
+    assert runner.kept_cancelled_paths == frozenset()
+
+
+def test_discarding_the_kept_work_also_ends_the_agents_ownership(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    answers = iter(["Discard the changes", "Yes, discard"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner.cancelled_work_kept = True
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is True
+    assert runner.cancelled_work_kept is False
 
 
 def test_handle_cancelled_turn_commit_commits_changes(tmp_path):

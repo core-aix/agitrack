@@ -482,7 +482,15 @@ class CommitEngine:
         # cover path, which can't amend HEAD to attach a summary afterwards), summarize it
         # SYNCHRONOUSLY here so the commit message LEADS with the summary, just like every other
         # aGiTrack commit. Other callers (proxy, shell) pass None and keep the async amend flow.
-        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+        # Did the user cancel (Esc) any turn this commit accounts for? A turn that was
+        # interrupted after the agent had said what it was ABOUT to do still commits (its
+        # partial edits are real), but the trace alone reads like a finished turn — and the
+        # trace is all the summarizer gets, so it described the whole request as done. Both
+        # the message and the summarizer input carry the fact.
+        interrupted = any(getattr(turn, "interrupted", False) for turn in turns)
+        trace_text = render_interaction_trace(
+            self.state.pending_trace(), self.state.trace_turn_limit, interrupted=interrupted
+        )
         summary_text: str | None = None
         summary_metadata: list[str] | None = None
         if summarize_fn is not None:
@@ -513,6 +521,7 @@ class CommitEngine:
             compactions=compactions,
             origin_event=origin_event,
             capabilities=capability_metadata,
+            interrupted=interrupted,
         )
         if manual_record_fn is not None:
             # Manual-commit mode: record the turn as a hidden latent commit on the side
