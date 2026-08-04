@@ -822,6 +822,7 @@ class ScreenRenderer:
         summarizer_on: bool = True,
         cwd: str | None = None,
         current_dir_branch: str | None = None,
+        manual_pending: int = 0,
     ) -> str:
         declined = len(user_declined)
         session = f"{name or 'session'}" + (f" [{short_session_fn(session_id)}]" if session_id else "")
@@ -835,7 +836,17 @@ class ScreenRenderer:
         if scroll_back > 0:
             right = f" SCROLLBACK -{scroll_back} (scroll down to resume) "
         else:
-            right = f" unstaged:{declined} " if declined else ""
+            # Manual-commit mode: how many agent turns are recorded but not yet in a commit.
+            # Without this the count existed only in the exit dialog, so while working the user
+            # had no way to tell whether the agent had done nothing or twenty turns' worth since
+            # they last committed — in the one mode where committing is THEIR job.
+            parts = []
+            if manual_pending:
+                turns = "turn" if manual_pending == 1 else "turns"
+                parts.append(f"{manual_pending} uncommitted {turns}")
+            if declined:
+                parts.append(f"unstaged:{declined}")
+            right = (" " + " | ".join(parts) + " ") if parts else ""
         if cwd:
             # The directory the agent works in (its session worktree, or the
             # repo in --no-worktree mode), home-abbreviated. When space runs

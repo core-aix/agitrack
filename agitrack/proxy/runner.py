@@ -2052,6 +2052,23 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"base-commit guard removal failed: {error!r}")
 
+    def _autotrack_hook_will_survive_exit(self) -> bool:
+        """Whether a `git commit` made AFTER aGiTrack exits will still fold in the tracking.
+
+        That is the persistent auto-track ``pre-commit`` hook's whole job, and it outlives the
+        session — so in the ordinary case the user can exit with turns pending and lose nothing.
+        It is absent in exactly two situations: a custom ``core.hooksPath`` (git ignores the hooks
+        dir we install into) and the ``autotrack_hook: off`` opt-out."""
+        try:
+            if self.base_repo is None or self.base_repo.core_hooks_path():
+                return False
+            if getattr(self.global_config, "autotrack_hook", "auto") == "off":
+                return False
+            return git_hooks.is_autotrack_hook(self.base_repo.hooks_dir() / "pre-commit")
+        except Exception as error:
+            self._debug(f"autotrack hook check failed: {error!r}")
+            return False
+
     def _install_autotrack_precommit_hook(self) -> None:
         """Install (or refresh) the PERSISTENT auto-track ``pre-commit`` hook, honoring the
         repo's ``autotrack_hook`` opt-out. Shared by no-worktree startup and the worktree
@@ -2131,6 +2148,16 @@ class ProxyRunner:
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
         self._reset_stale_manual_ref()
+        # …and the same for chains left by sessions that are GONE — a crash, a Ctrl-C, a mode
+        # switch, or edits the user discarded. `_reset_stale_manual_ref` only ever looks at our
+        # own ref, so nothing revisited those and their turns rode into an unrelated later
+        # commit, attributing AI authorship to code that never contained it.
+        try:
+            from agitrack.commits.manual import prune_abandoned_refs
+
+            prune_abandoned_refs(self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"abandoned-ref prune failed: {error!r}")
         # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
         # didn't fold), and the durable trailer/ref files the hook reads.
         try:
@@ -9523,6 +9550,9 @@ class ProxyRunner:
             session_id=self.state.backend_session_id,
             base_branch=self._base_branch,
             current_dir_branch=self._repo_dir_branch,
+            # Manual mode only: committing is the user's job, so the count of turns waiting for
+            # their commit belongs where they can see it, not only in the exit dialog.
+            manual_pending=self._manual_pending_count() if self._manual_commits else 0,
             worktree=self.worktree,
             scroll_back=self.scroll_back,
             user_declined=self._user_declined,
@@ -11345,11 +11375,23 @@ class ProxyRunner:
         pending = self._manual_pending_count()
         if pending:
             turns = "turn" if pending == 1 else "turns"
-            title = (
-                f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. Commit now in aGiTrack "
-                f"({self._menu_label()} → git-commit) to include the interaction tracking — a commit made "
-                "outside aGiTrack won't. (They're saved and will fold into your next commit in aGiTrack.)"
-            )
+            # What happens next depends on whether the PERSISTENT auto-track hook will still be
+            # there once aGiTrack is gone. When it is, a plain `git commit` in any terminal still
+            # folds the tracking in — verified — so telling the user otherwise would push them
+            # into committing before they are ready, in the one mode built around them choosing
+            # when to commit. When it is not (a custom core.hooksPath, or autotrack_hook: off),
+            # the old warning is the true one.
+            if self._autotrack_hook_will_survive_exit():
+                title = (
+                    f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. They're saved — your "
+                    "next `git commit`, in any terminal, still folds in the interaction tracking."
+                )
+            else:
+                title = (
+                    f"Exit aGiTrack? You have {pending} uncommitted agent {turns}. Commit now in aGiTrack "
+                    f"({self._menu_label()} → git-commit) to include the interaction tracking — with the "
+                    "auto-track hook unavailable in this repo, a commit made afterwards won't."
+                )
         choice = self._exit_confirmation_popup(title, ["No, keep working", "Yes, exit (Ctrl-C again)"])
         return choice == "Yes, exit (Ctrl-C again)"
 
