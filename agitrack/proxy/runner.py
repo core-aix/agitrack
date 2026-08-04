@@ -10287,7 +10287,9 @@ class ProxyRunner:
             self._dashboard_port = int(port) if isinstance(port, int) else 0
             opened = open_dashboard_in_browser(url)
             self._set_message(
-                f"Dashboard already running at {url} — opening in your browser."
+                # No "opening in your browser": open_dashboard_in_browser has ALREADY run by
+                # the time this is painted, so announcing it as about to happen is wrong.
+                f"Dashboard already running at {url}."
                 if opened
                 else f"Dashboard already running. {remote_browser_hint(url, int(port) if isinstance(port, int) else 0)}"
             )
@@ -10331,7 +10333,7 @@ class ProxyRunner:
                 + ([] if opened else [remote_browser_hint(url, port)]),
             )
             self._set_message(
-                f"Dashboard live at {url} — opening in your browser."
+                f"Dashboard live at {url}."
                 if opened
                 else f"Dashboard live. {remote_browser_hint(url, port)}"
             )
