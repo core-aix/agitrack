@@ -518,10 +518,46 @@ Closed by the 2026-08-03 coverage audit (see `tests/TEST_PLAN.md` for the measur
 Still open from that audit:
 - `shell/runner.py` is at 56% (was 43%): `_handle_agent_prompt` and `_handle_pre_compaction` are
   covered only indirectly. The command surface is now pinned (§12d); the TURN path is not.
-- `metrics/backtrace.py` daemon lifecycle (66%): start → serve → shutdown, port already bound,
-  stale pidfile.
 - The Windows job now runs the platform-agnostic core, but not the proxy/reactor suites — those
   are POSIX-terminal-specific and would need ConPTY equivalents of `tests/harness.py`.
+
+## Candidate findings from the 2026-08-03/04 subagent audits — NOT yet verified or fixed
+
+Each was reported with a file:line and a grep showing it uncovered, but none has been confirmed
+against the real code path, so treat them as leads rather than known bugs. Recorded here so they
+outlive the conversation they were found in.
+
+**Backend parity** (the recurring shape: a guard Claude has and OpenCode does not — the same
+class as the turn-end signal, `SessionTurn.complete`, and the context calculation, all of which
+turned out to be real):
+- `transcripts/opencode.py:118` — `list_sessions` never filters headless `opencode run`
+  transcripts. Claude's parser drops SDK-driven ones via `ref.programmatic`; OpenCode never sets
+  it, so a headless run in the repo dir can be silently adopted as the tracked conversation.
+- `transcripts/opencode.py:131` — `latest_session_id` lacks the empty-session guard Claude has
+  *and is tested for*; a fresh empty OpenCode session can be persisted as "last session" and
+  resumed blank.
+
+**Session / sharing:**
+- `config/settings.py:590` — the GitHub identity for sharing is cached globally and never
+  re-validated, so every share after `gh auth switch` uses the stale identity.
+- `runner.py` `_service_native_session_switch` — never calls `_note_backend_session_change` /
+  `_record_shared_alias_on_drift`, so a native `/resume` drops auto-share lineage. Adjacent to
+  the summary bug fixed in that same function, and missed because only summary state was reviewed.
+- `config/state.py:294` — `pending_session_name` is a repo-root scalar, not per-session, so a
+  second session finishing first wipes the crash-recovery name of a still-unlinked first one.
+
+**Commit workflow:**
+- `git/repo.py:258` — `snapshot_worktree_tree` strips `.claude/`, `.opencode/` and `.agitrack/`
+  unconditionally, including already-TRACKED files the agent edited. A turn confined to those
+  paths never gates a latent commit, so the eventual commit carries no aGiTrack metadata despite
+  being AI-authored.
+- `commit_engine.py:173` — `_prompt_covered_by` is a bag-of-words heuristic that can drop a
+  NEGATED user prompt ("don't do X" matching "do X") from the trace.
+- `git/repo.py:574` — `arrived_from_elsewhere` has an untested fallback that can misattribute
+  foreign commits.
+- `background.py` — the trivial-monitor-tick deferral is never driven through `_process_once`;
+  all its tests call `CommitEngine.finish_parse_if_ready` directly.
+
 
 Remaining from the 2026-06-27 self-audit — lower-risk message/guard branches, to be filled:
 - `runner.py:_change_session_merge_branch_menu` — the "'X' is running a turn — change its merge branch when idle" refusal for an in-flight session (happy-path retarget IS tested).

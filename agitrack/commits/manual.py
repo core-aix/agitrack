@@ -93,6 +93,8 @@ class ManualCommitTracker:
         self.last_head: str | None = None
         self.hooks_installed = False
         self._signal_mtime: float | None = None
+        # Latent chains `setup()` discarded, for the driver to report to the user.
+        self.dropped_chains: list[str] = []
 
     # --- identity / paths ---------------------------------------------------
 
@@ -125,7 +127,9 @@ class ManualCommitTracker:
         # unrelated commit. Startup is the natural moment: any ref other than ours belongs to a
         # session that is no longer running. See `prune_abandoned_refs` for the rule.
         try:
-            prune_abandoned_refs(self.repo, self.ref(), self.pending_refs(), debug=self._debug)
+            # Recorded rather than only logged: the driver surfaces it, because AI attribution
+            # going away must never be something the user can only discover with --verbose.
+            self.dropped_chains = prune_abandoned_refs(self.repo, self.ref(), self.pending_refs(), debug=self._debug)
         except Exception as error:
             self._debug(f"abandoned-ref prune failed: {error!r}")
         try:
