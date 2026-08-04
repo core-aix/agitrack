@@ -1075,6 +1075,10 @@ class BackgroundRunner:
         # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
         # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
         in_flight_covered = self._uncovered_agent_commits(turns) if turn_complete else []
+        # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
+        # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
+        # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
+        self._manual.owed_record = bool(in_flight_covered)
         result = engine.commit_turns(
             turns=turns,
             backend=backend,

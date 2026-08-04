@@ -1468,10 +1468,10 @@ def test_runner_service_refreshes_after_post_commit_signal(tmp_path):
 # that the no-worktree fold applies it too.
 
 
-def _agent_committed_mid_turn(tmp_path):
-    """A no-worktree AUTO session where the agent committed its own work mid-turn, and the turn
-    has since finished. Returns (runner, repo, the agent's commit)."""
-    runner, repo = _noworktree_proxy(tmp_path, manual=False)
+def _agent_committed_mid_turn(tmp_path, *, manual: bool = False):
+    """A no-worktree session where the agent committed its own work mid-turn, and the turn has
+    since finished. Returns (runner, repo, the agent's commit)."""
+    runner, repo = _noworktree_proxy(tmp_path, manual=manual)
     assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
     runner._manual_hooks_installed = True
     runner._set_noworktree_base_head(repo.rev_parse("HEAD"))  # persisted, as production does
@@ -1576,6 +1576,11 @@ def test_manual_mode_keeps_the_record_pending_instead_of_committing(tmp_path):
     runner._integrate_agent_made_commits_if_idle(time.monotonic())
 
     assert repo.rev_parse("HEAD") == agent_commit, "manual mode must not commit on the user's behalf"
+    # "Did not commit" must not quietly mean "dropped the record" — but the record is made on the
+    # turn-completion path, not here, so that half is asserted in
+    # `test_manual_mode_records_a_turn_whose_only_action_was_its_own_midturn_commit`. Its absence
+    # is how the record-side refusal survived the first fix: the gate was widened to allow an
+    # unchanged tree and `record()` then vetoed it one step later, with nothing checking.
 
 
 def test_a_clean_tree_under_a_fully_tracked_head_still_drops_the_chain(tmp_path):
@@ -1683,3 +1688,98 @@ def test_no_verify_still_folds_the_pending_trace_in_no_worktree_mode(tmp_path):
     body = _git(repo, "log", "-1", "--format=%B", "HEAD")
     assert "# aGiTrack Metadata" in body, "--no-verify must not cost the commit its tracking"
     assert "do x" in body
+
+
+def test_manual_mode_records_a_turn_whose_only_action_was_its_own_midturn_commit(tmp_path):
+    """Manual mode, agent self-commits mid-turn, turn ends with a clean tree.
+
+    Two guards had to agree for this to work and only one did. `_manual_gate` was widened to
+    allow an unchanged tree when commits are still owed a record — but `_manual_record` kept its
+    own "nothing new since the latent tip" check and vetoed the very record the gate approved.
+    The turn's trace and tokens were dropped with `committed=False` and no error.
+
+    Manual mode is where this costs the most: aGiTrack must not commit for the user, so the
+    latent chain is the ONLY thing holding the accounting until their next commit folds it in.
+    """
+    runner, repo, _agent_commit = _agent_committed_mid_turn(tmp_path, manual=True)
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=42, output=42), "m")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True, "the turn was refused outright"
+    bodies = runner._manual_pending_bodies()
+    assert bodies, "nothing was recorded, so the turn's tokens are gone"
+    assert "42" in bodies[-1]
+    assert "do x" in bodies[-1]
+
+
+def test_the_record_guard_still_refuses_a_turn_that_genuinely_changed_nothing(tmp_path):
+    # The guard is not simply removed: with no commits owed a record, an unchanged tree really
+    # does mean nothing happened, and recording would chain an empty latent commit per poll.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+
+    # Record a first turn so a latent tip exists — the guard compares against that tip, so with
+    # an empty chain there is nothing for it to refuse.
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    assert runner._manual_record("<aGiTrack> first turn\n") is not None
+
+    # Now nothing has changed and no commit is owed a record: the guard must hold, or every poll
+    # would chain another empty latent commit.
+    assert runner._manual_gate() is False
+    assert runner._manual_record("<aGiTrack> nothing\n") is None
+
+
+def test_setup_falls_back_to_poll_cover_under_a_real_core_hookspath(tmp_path):
+    """The fold hooks can't run under a custom `core.hooksPath`, so aGiTrack must detect that
+    and fall back to poll+cover. Every existing test set `_manual_hooks_installed` by hand; this
+    drives the real `GitRepo.core_hooks_path()` detection, which is what actually decides.
+
+    If detection ever misreported, aGiTrack would believe the fold hook was live when nothing
+    was installed — and every commit in that repo would silently lose its trace and tokens, with
+    the fallback that exists for exactly this case never running.
+    """
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    custom = tmp_path / "shared-hooks"
+    custom.mkdir()
+    _git(repo, "config", "core.hooksPath", str(custom))
+
+    runner._setup_manual_commit_mode()
+
+    assert runner._manual_hooks_installed is False, "aGiTrack thinks its hooks are live when they cannot run"
+    assert not (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+    # …and the fallback really covers a commit the hook could not fold.
+    runner._set_noworktree_base_head(repo.rev_parse("HEAD"))
+    (tmp_path / "a.txt").write_text("agent work\n", encoding="utf-8")
+    assert runner._manual_gate() is True
+    assert runner._manual_record("<aGiTrack> turn\n\n# aGiTrack Metadata\ncommit_type: agent\n") is not None
+    runner._manual_last_head = None
+    runner._reconcile_manual_external_commit()  # establishes the baseline at the current HEAD
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "the user's own commit")
+    user_head = repo.rev_parse("HEAD")
+
+    runner._reconcile_manual_external_commit()  # now HEAD has moved: cover the user's commit
+
+    assert repo.rev_parse("HEAD") != user_head, "the poll+cover fallback never added the cover"
+    assert "# aGiTrack Metadata" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_hooks_are_installed_when_no_custom_hookspath_is_set(tmp_path):
+    # The other side of the same detection, so the fallback stays the exception.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+
+    runner._setup_manual_commit_mode()
+
+    assert runner._manual_hooks_installed is True
+    assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
