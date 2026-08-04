@@ -155,6 +155,9 @@ TRACE_ROLE_HEADING_LEVEL = 2
 # backend-made commits (issue #35) checks message bodies for this exact text,
 # so keep the builders and the detector on one definition.
 METADATA_HEADER = "# aGiTrack Metadata"
+# The section every aGiTrack agent commit body opens with, and therefore the boundary
+# between a message's lead (subject + body paragraphs) and its recorded sections.
+TRACE_HEADER = "# Interaction Trace"
 # Marks a metadata block as the PARTIAL record of a turn that was still running when the
 # commit was made (see `build_in_flight_trailer`). Callers that ask "is this commit already
 # accounted for?" must answer NO for such a commit: it carries attribution but not the turn's
@@ -253,6 +256,7 @@ def build_agent_commit_message(
     compactions: int = 0,
     origin_event: dict | None = None,
     capabilities: dict[str, list[str]] | None = None,
+    interrupted: bool = False,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
@@ -266,8 +270,11 @@ def build_agent_commit_message(
         )
         lines = [f"{AGITRACK_SUBJECT_PREFIX}{subject_prompt}"]
         if full_subject:
-            # The truncated subject flows straight into its full text with no blank
-            # line between them, so the extended subject reads as one continued line.
+            # A BLANK line first: git's subject is the whole first paragraph, newlines
+            # folded to spaces, so a continuation glued under the first sentence put the
+            # entire paragraph back into `git log --oneline` (a real 286-character entry).
+            # The blank line is what makes the split at the first sentence actually hold.
+            lines.append("")
             lines.extend(_body_lines(full_subject))
     lines.append("")
     lines.extend(
@@ -289,6 +296,7 @@ def build_agent_commit_message(
             compactions=compactions,
             origin_event=origin_event,
             capabilities=capabilities,
+            interrupted=interrupted,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -314,11 +322,18 @@ def apply_summary_to_message(
     if not summary.strip() or "\nsummary_model:" in message:
         return message
     lines = message.splitlines()
+    # Everything from the trace header on is kept; the prompt-led lead above it is replaced
+    # by the summary. Anchoring on the header rather than the first blank line matters now
+    # that a long prompt's continuation is its own paragraph — the blank line no longer
+    # marks the end of the lead, and the old prompt text would have survived into the body.
     try:
-        subject_end = lines.index("")
-    except ValueError:
-        subject_end = len(lines)
-    rest = lines[subject_end + 1 :]
+        rest_start = next(index for index, line in enumerate(lines) if line.startswith(TRACE_HEADER))
+    except StopIteration:
+        try:
+            rest_start = lines.index("") + 1
+        except ValueError:
+            rest_start = len(lines)
+    rest = lines[rest_start:]
 
     new_lines = _summary_lead_lines(summary)
     new_lines.append("")
@@ -374,11 +389,13 @@ def _summary_lead_lines(summary: str) -> list[str]:
 
     subject, full = _subject_parts(first_line, width=MAX_SUBJECT_WIDTH - len(AGITRACK_SUBJECT_PREFIX))
     lines = [f"{AGITRACK_SUBJECT_PREFIX}{subject}"]
-    if full:
-        lines.extend(_body_lines(full))
-    if remainder:
+    # Everything after the first sentence is BODY, separated by a blank line: git reads the
+    # first paragraph as the subject, so a summary whose lead paragraph ran four sentences
+    # became a four-sentence `git log --oneline` entry.
+    paragraphs = [text for text in (full, "\n".join(remainder).rstrip()) if text]
+    if paragraphs:
         lines.append("")
-        lines.extend(_body_lines("\n".join(remainder).rstrip()))
+        lines.extend(_body_lines("\n\n".join(paragraphs)))
     return lines
 
 
@@ -401,13 +418,17 @@ def _trace_role_lines(item: dict) -> list[str]:
     return [f"## {label}", "", *_body_lines(content), ""]
 
 
-def render_interaction_trace(trace: list[dict], trace_turn_limit: int) -> str:
+def render_interaction_trace(trace: list[dict], trace_turn_limit: int, *, interrupted: bool = False) -> str:
     """The interaction-trace body exactly as it is appended to an aGiTrack commit:
     role headings plus masked, heading-nested content (same as the commit's
     ``# Interaction Trace`` section, without the header). This is the *sole* input
     given to the summarizer, so the summary reflects the committed trace and
-    nothing else — no diff, no out-of-band context."""
-    lines: list[str] = []
+    nothing else — no diff, no out-of-band context.
+
+    ``interrupted`` carries the one fact the trace cannot show on its own: that the user
+    cancelled the turn. Without it the summarizer reads an agent's "I'll do X now" as X
+    having been done."""
+    lines: list[str] = list(_interrupted_note_lines(interrupted))
     for item in _limit_trace_turns(trace, trace_turn_limit):
         lines.extend(_trace_role_lines(item))
     return "\n".join(lines).strip()
@@ -432,8 +453,12 @@ def _trace_and_metadata_lines(
     compactions: int = 0,
     origin_event: dict | None = None,
     capabilities: dict[str, list[str]] | None = None,
+    interrupted: bool = False,
 ) -> list[str]:
-    lines: list[str] = ["# Interaction Trace", ""]
+    lines: list[str] = [TRACE_HEADER, ""]
+    # The interruption leads every other note: it changes how the whole trace below
+    # should be read (a request stated is not a request carried out).
+    lines.extend(_interrupted_note_lines(interrupted))
     # Session-level events (a fork/copy this session began from, any context
     # compactions in these turns) lead the trace as a note, so the conversation log
     # itself shows when the context — and the token counts riding on it — changed.
@@ -453,6 +478,10 @@ def _trace_and_metadata_lines(
         [
             METADATA_HEADER,
             "commit_type: agent",
+            # Machine-readable counterpart of the note above, so the dashboard and any
+            # later reader can tell a cancelled turn from a completed one without
+            # parsing prose. Emitted only when true: an ordinary commit is unchanged.
+            *(["interrupted: true"] if interrupted else []),
             f"backend: {backend}",
             f"model: {model or 'unknown'}",
         ]
@@ -524,6 +553,26 @@ def _capability_lines(capabilities: dict[str, list[str]] | None) -> list[str]:
         if values:
             lines.append(_capability_line(key, values))
     return lines
+
+
+def _interrupted_note_lines(interrupted: bool) -> list[str]:
+    """Lead-in note for a turn the user CANCELLED (Esc) before the agent finished.
+
+    Such a turn still commits — the partial edits are real work and dropping them would
+    strand them — but nothing in the message used to say so, and the reader has no other
+    way to tell: an agent that answers "I'll create the ten files now" and is stopped after
+    two leaves a trace that reads exactly like a completed turn. Worse, that trace is the
+    summarizer's SOLE input, so the generated subject asserted the whole request as done
+    ("Ten sequential text files r1.txt through r10.txt were created") over a two-file diff.
+    The note states the fact for both readers at once: the human, and the summarizer."""
+    if not interrupted:
+        return []
+    note = (
+        "The user interrupted this turn before the agent finished it. Only the changes "
+        "already made at that point are recorded here, so the request as stated in the "
+        "trace below was NOT completed."
+    )
+    return [*_note_block(_mask_secrets(note)), ""]
 
 
 def _session_event_note_lines(*, compactions: int, origin_event: dict | None) -> list[str]:
@@ -663,7 +712,9 @@ def build_user_commit_message(
     subject, full_subject = _subject_parts(_mask_secrets(user_message), width=MAX_SUBJECT_WIDTH)
     lines = [subject]
     if full_subject:
-        # Extended subject continues directly under the subject line (no blank).
+        # Blank line first, so git's subject is the first sentence and not the whole
+        # paragraph (see build_agent_commit_message).
+        lines.append("")
         lines.extend(_body_lines(full_subject))
     lines.append("")
     lines.extend(
@@ -768,7 +819,7 @@ def build_in_flight_trailer(
     # running prompt — the same placement as the session-event / covered-commits lead-in notes,
     # not floating above the header. The section header is always present so the note has a home
     # even when the running turn has no prompt text yet.
-    body: list[str] = ["# Interaction Trace", "", *note, ""]
+    body: list[str] = [TRACE_HEADER, "", *note, ""]
     if prompt and prompt.strip():
         # _trace_role_lines masks and heading-nests the prompt, exactly as a real trace does.
         body.extend(_trace_role_lines({"role": "user", "content": prompt}))

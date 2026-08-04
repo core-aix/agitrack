@@ -946,6 +946,12 @@ class ProxyRunner:
         # commit. Unlike ``agent_in_flight`` (cleared by an idle TIMER), this stays set
         # across the quiet window between the agent finishing and the commit landing.
         self.turn_awaiting_commit = False
+        # An interrupted turn whose changes the user chose to KEEP for the next turn's commit.
+        # The parse that carried the cancellation is consumed either way, so without this the
+        # kept work would be reclassified as the user's own dirt the moment the handler
+        # returned — and offered back to them as a plain user commit, with no trace.
+        self.cancelled_work_kept = False
+        self.kept_cancelled_paths: frozenset[str] = frozenset()
         # Untracked paths that already existed when the current turn began: they are the USER's
         # files, not this turn's output, so the turn's commit must not sweep them in.
         self.untracked_before_turn: frozenset[str] = frozenset()
@@ -11303,6 +11309,9 @@ class ProxyRunner:
 
         def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
+            # The promise made to "keep them for your next turn" is now kept: this commit
+            # carries those files, so they stop being agent work awaiting a commit.
+            self._forget_kept_cancelled_work()
             self.events.emit(
                 "commit",
                 sha=(sha or "")[:12],
@@ -12579,6 +12588,12 @@ class ProxyRunner:
         simply wrong — most visibly under --no-worktree, where the agent edits this very tree."""
         if self._manual_commits or self.turn_awaiting_commit:
             return False
+        if self.cancelled_work_kept:
+            # An interrupted turn's changes the user chose to keep "for your next turn": they
+            # are the agent's, and this prompt IS that next turn, so its commit will claim
+            # them with a full trace. Offering them here as the user's own would take the same
+            # files out of that commit and into an untraced user commit instead.
+            return False
         if self._noworktree_auto:
             # A just-completed turn's changes may still sit UNCOMMITTED in the tree, recorded only
             # as a latent commit: no-worktree auto folds them into a real commit on a throttled
@@ -12940,7 +12955,10 @@ class ProxyRunner:
         self.agent_in_flight = True
         self.turn_awaiting_commit = True
         try:
-            self.untracked_before_turn = frozenset(self.repo.untracked_entries())
+            # Files kept from an interrupted turn are the AGENT's work awaiting this very
+            # commit, so they must not count as "already there" — that exclusion is what
+            # kept them out of the commit that was promised to include them.
+            self.untracked_before_turn = frozenset(self.repo.untracked_entries()) - self.kept_cancelled_paths
         except Exception as error:
             # Unknown baseline: fall back to the worktree rule (stage the turn's files, minus any
             # the user explicitly declined) rather than blocking the commit on a prompt.
@@ -13220,6 +13238,30 @@ class ProxyRunner:
                     self._integrate_session_turn()
         return committed
 
+    def _remember_kept_cancelled_work(self) -> None:
+        """Record that an interrupted turn's changes were KEPT for the next turn's commit.
+
+        "Keep them (commit with your next turn)" is a promise, and three other paths used to
+        break it. The parse is consumed either way, so ``turn_awaiting_commit`` drops and the
+        agent's leftover files become "the user's own dirt": the copy-back watcher offered to
+        copy them to the base repo as "intentionally unstaged or git-ignored", the next prompt
+        offered them as a plain USER commit (no trace, no attribution), and under --no-worktree
+        the next turn's commit skipped them because they already existed when it began. This
+        flag keeps the work owned by the agent until a commit actually claims it."""
+        self.cancelled_work_kept = True
+        try:
+            self.kept_cancelled_paths = frozenset(self.repo.untracked_entries())
+        except Exception as error:
+            # Worst case the paths are unknown: ownership (the flag) still holds, and the
+            # worktree commit path stages every non-declined untracked file anyway.
+            self._debug(f"kept-cancelled untracked snapshot failed: {error!r}")
+            self.kept_cancelled_paths = frozenset()
+
+    def _forget_kept_cancelled_work(self) -> None:
+        """A commit claimed the kept work (or the user discarded it): ownership ends here."""
+        self.cancelled_work_kept = False
+        self.kept_cancelled_paths = frozenset()
+
     def _handle_cancelled_turn(self, turns) -> bool:
         """Offer commit-or-discard for a user-cancelled turn's leftover changes.
 
@@ -13252,6 +13294,7 @@ class ProxyRunner:
             ["Keep them (commit with your next turn)", "Commit the changes now", "Discard the changes"],
         )
         if choice is None or choice.startswith("Keep"):
+            self._remember_kept_cancelled_work()
             self._set_message("Keeping the agent's changes — they'll be committed with your next turn.")
             self._render()
             return False
@@ -13264,6 +13307,8 @@ class ProxyRunner:
                 quiet=False,
                 prompt_untracked=self.worktree is None,
             )
+            if committed:
+                self._forget_kept_cancelled_work()
             self._set_message(
                 "Committed the agent's interrupted changes." if committed else "Nothing staged to commit."
             )
@@ -13282,6 +13327,7 @@ class ProxyRunner:
                 self._set_message("Could not discard the changes.")
                 self._render()
                 return False
+            self._forget_kept_cancelled_work()
             self._set_message("Discarded the agent's interrupted changes.")
             self._render()
             return True
@@ -13478,6 +13524,12 @@ class ProxyRunner:
         decides — only a merge CONFLICT (its own popup) holds integration up."""
         if self._pending_copy_offer is not None:
             return  # a previously collected batch is still waiting to be presented
+        if self.cancelled_work_kept:
+            # Those files are an interrupted turn's work, kept for the next turn's commit —
+            # not leftovers "intentionally unstaged or git-ignored", which is what this offer
+            # would call them seconds after aGiTrack promised to commit them. The exit offer
+            # is deliberately NOT gated: nothing may vanish with the worktree unasked.
+            return
         collected = self._collect_copy_candidates(context=context)
         if collected is not None:
             self._pending_copy_offer = (context, collected)

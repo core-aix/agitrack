@@ -68,7 +68,26 @@ def test_long_summary_first_line_splits_at_first_sentence():
     lines = message.splitlines()
     assert lines[0] == "<aGiTrack> Refactored the parser for clarity."
     assert "..." not in lines[0]
-    assert lines[1] == "It also speeds up large files."
+    # A blank line, then the rest as body: git's subject is the whole first paragraph, so
+    # without it a four-sentence summary became a four-sentence `git log --oneline` entry.
+    assert lines[1] == ""
+    assert lines[2] == "It also speeds up large files."
+    assert " ".join(message.split("\n\n", 1)[0].split()) == "<aGiTrack> Refactored the parser for clarity."
+
+
+def test_applying_a_summary_replaces_the_WHOLE_prompt_led_lead():
+    # The lead is now subject + body paragraph(s), so "everything before the first blank
+    # line" no longer identifies it: anchored there, a long prompt's continuation would
+    # survive the amend and sit under the summary as if it were part of it.
+    message = _base_message(latest_prompt="Add the renderer. Then cache it and update the docs.")
+    assert "Then cache it and update the docs." in message
+
+    summarized = apply_summary_to_message(message, "Added the widget renderer.")
+
+    lead = summarized.split("# Interaction Trace")[0]
+    assert lead.splitlines()[0] == "<aGiTrack> Added the widget renderer."
+    assert "Then cache it and update the docs." not in lead
+    assert "# Interaction Trace" in summarized  # the recorded sections are untouched
 
 
 def test_summary_first_line_without_period_is_kept_whole():
