@@ -224,6 +224,64 @@ def test_commit_turns_omits_conversation_anchor_when_no_message_id(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_an_interrupted_turn_is_committed_as_interrupted_not_as_completed_work(tmp_path):
+    # A turn the user cancelled (Esc) still commits — its partial edits are real work — but
+    # it must SAY so. Claude answers "I'll create the ten files now" before its first tool
+    # call, so an interrupted turn carries a final_response and reads exactly like a
+    # finished one; the commit then documented ten files over a two-file diff.
+    engine, repo, state = _engine(tmp_path)
+    turn = _turn("create ten files r1..r10", "I'll create the ten files now.")
+    turn.interrupted = True
+
+    assert (
+        engine.commit_turns(
+            turns=[turn],
+            backend="claude",
+            backend_session_id="s1",
+            model="m",
+            stage_untracked_fn=_noop_stage,
+        )
+        is True
+    )
+    assert "interrupted: true" in repo.message  # machine-readable
+    assert "interrupted this turn before the agent finished" in repo.message  # human-readable
+    assert "NOT completed" in repo.message
+    # …and the ONE line `git log --oneline` shows says so too.
+    assert repo.message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
+
+
+def test_the_summarizer_is_told_the_turn_was_interrupted(tmp_path):
+    # The trace is the summarizer's SOLE input, so the fact has to travel in the trace
+    # text itself: otherwise the subject line asserts the whole request as done.
+    engine, repo, state = _engine(tmp_path)
+    seen: list[str] = []
+    turn = _turn("create ten files r1..r10", "I'll create the ten files now.")
+    turn.interrupted = True
+
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+        summarize_fn=lambda trace: (seen.append(trace), ("Started creating the files.", []))[1],
+    )
+
+    assert seen and "interrupted this turn before the agent finished" in seen[0]
+
+
+def test_an_ordinary_turn_carries_no_interruption_note(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[_turn("add a file", "Added it.")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert "interrupted" not in repo.message
+
+
 def test_commit_turns_surfaces_compactions_and_clears_origin_event(tmp_path):
     # The commit message records the compaction count (summed across the committed
     # turns) and the session's fork/copy origin; the origin event is one-shot, cleared

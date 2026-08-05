@@ -237,6 +237,36 @@ def test_integrate_conflict_leave_for_later_keeps_work_unintegrated(tmp_path):
     assert "agitrack/test/s1/t1" in main.list_branches("agitrack/")
 
 
+def test_leave_for_later_is_remembered_so_the_conflict_box_stops_coming_back(tmp_path):
+    # The conflict box is raised from a POLL (the background-session service, every couple of
+    # seconds), and "Leave for later" recorded nothing — so live it came straight back at 1s, 3s
+    # and 4s after being dismissed. An answer about this exact (base, session) pair sticks.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base)
+    _commit(work, "f.txt", "worktree change\n", "wt change")
+    _commit(main, "f.txt", "base change\n", "base change")
+
+    runner = _integration_runner(main, work, base, "s1")
+    asked: list[str] = []
+    runner._select_popup = lambda title, options: asked.append(title) or options[-1]  # "Leave for later"
+
+    runner._integrate_session_turn()
+    runner._integrate_session_turn()
+    runner._integrate_session_turn()
+
+    assert len(asked) == 1  # asked once, not once per poll
+
+    # The user asking again from the MENU must still get an answer, not silence.
+    runner._prompt_resolve_conflict(work.current_branch(), force=True)
+    assert len(asked) == 2
+
+    # And a genuinely new situation — this session commits another turn — asks again by itself.
+    _commit(work, "f.txt", "worktree change 2\n", "wt change 2")
+    runner._integrate_session_turn()
+    assert len(asked) == 3
+
+
 def test_finalize_agent_merge_commits_and_advances(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
@@ -1184,6 +1214,88 @@ def test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated(tmp_path):
     assert info.path.exists()  # unintegrated work is never discarded
 
 
+def _exit_prompt_runner(main, live, base, live_info):
+    # An interactive exit, sitting in the ONE open session ('session-1'); anything else under
+    # .agitrack/worktrees is idle (no session has it open).
+    runner = _integration_runner(main, live, base, "session-1")
+    runner.worktree = live_info
+    runner.sessions = [runner.active]
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = object()
+    return runner
+
+
+def test_the_exit_question_names_the_worktrees_no_session_has_open(tmp_path):
+    # A worktree stops being a live session without being deleted: `/clear` → "give it its own
+    # worktree" moves the conversation out and DROPS the session it left, stopping a session keeps
+    # its worktree recoverable, and a worktree kept by an earlier run stays on disk. None of those
+    # are in `sessions`, so a question built from live sessions alone named only some of the
+    # directories it was deciding about — quitting right after a relocation showed just the NEW
+    # worktree's path, while quitting from an older session showed them all.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    live_info, live = _make_session(main, "session-1", base)
+    idle_info, _idle = _make_session(main, "session-2", base)
+
+    runner = _exit_prompt_runner(main, live, base, live_info)
+    shown: dict = {}
+    runner._select_popup = lambda title, options, detail=None: (
+        shown.update(title=title, detail=detail or []) or "Keep them"
+    )
+
+    assert runner._should_delete_worktrees_on_exit() is False
+    listed = " ".join(shown["detail"])
+    assert str(live_info.path) in listed
+    assert str(idle_info.path) in listed  # the idle one is part of the decision, so it is named
+    assert runner._exit_idle_worktrees == ["session-2"]
+
+    # "Keep them" keeps every one of them, idle included.
+    runner._delete_idle_worktrees_on_exit()
+    assert idle_info.path.exists()
+
+
+def test_choosing_delete_on_exit_removes_the_idle_worktrees_too(tmp_path):
+    # The answer applies to everything the question listed. Before, "Delete them" removed only the
+    # live sessions' worktrees and silently left the idle ones on disk — with no way to say
+    # otherwise, since the next run's question would not mention them either.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    live_info, live = _make_session(main, "session-1", base)
+    idle_info, idle = _make_session(main, "session-2", base)
+    _commit(idle, "idle.txt", "x\n", "<aGiTrack> idle work")
+
+    runner = _exit_prompt_runner(main, live, base, live_info)
+    runner._select_popup = lambda *a, **k: "Delete them"
+
+    assert runner._should_delete_worktrees_on_exit() is True
+    runner._delete_idle_worktrees_on_exit()
+
+    assert not idle_info.path.exists()
+    assert "session-2" not in [w.name for w in WorktreeManager(main).list()]
+    # Its committed work was integrated on the way out, not discarded with the directory.
+    assert (main.repo / "idle.txt").exists()
+
+
+def test_choosing_delete_on_exit_keeps_an_idle_worktree_that_still_holds_work(tmp_path):
+    # Same safety rule the live sessions get: uncommitted work is never discarded to honor a
+    # delete answer — that worktree stays, and the next startup surfaces it.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    live_info, live = _make_session(main, "session-1", base)
+    idle_info, idle = _make_session(main, "session-2", base)
+    (idle.repo / "leftover.txt").write_text("stranded\n")
+
+    runner = _exit_prompt_runner(main, live, base, live_info)
+    runner._select_popup = lambda *a, **k: "Delete them"
+
+    assert runner._should_delete_worktrees_on_exit() is True
+    runner._delete_idle_worktrees_on_exit()
+
+    assert idle_info.path.exists()
+    assert (idle_info.path / "leftover.txt").read_text() == "stranded\n"
+
+
 def test_remove_worktree_on_signal_exit_keeps_dirty_worktree(tmp_path):
     # On a signal teardown (terminal/window closed: screen is None) there is no UI to
     # offer the copy, so a worktree with leftover files is KEPT rather than silently
@@ -1237,7 +1349,7 @@ def test_integrate_active_session_conflict_prompts(tmp_path):
     runner = _integration_runner(main, work, base, "session-1")
     runner.worktree = info
     prompted = []
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
 
     runner._integrate_active_session()
 

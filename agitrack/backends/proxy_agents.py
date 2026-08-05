@@ -203,6 +203,17 @@ class ProxyAgent(Protocol):
         from ``base_repo`` (e.g. a plain CLI run in the repo root). Returns True
         if mirrored. No-op for backends without per-directory transcript files."""
 
+    def forget_session_in(self, repo: Path, session_id: str) -> bool:
+        """Stop ``repo`` from being recorded as a place this conversation ran, WITHOUT
+        touching the conversation itself. Returns True if anything was dropped.
+
+        For a backend that files transcripts per directory (Claude), a conversation that moved
+        to another directory leaves a copy behind, and that copy keeps answering "this session
+        belongs to the worktree it left" — the mix-up after a restart. A backend whose store is
+        keyed by id alone (OpenCode) records one directory per session and simply retargets it,
+        so it has nothing to forget."""
+        return False
+
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         """The working directory the backend most recently recorded for a session,
         or None if it doesn't record one. Used to detect a resume that drifted the
@@ -334,6 +345,11 @@ class OpenCodeProxyAgent:
         # anywhere); there's no per-directory transcript file to link.
         return False
 
+    def forget_session_in(self, repo: Path, session_id: str) -> bool:
+        # Nothing to forget: one session records exactly one directory, and relocating it
+        # (retarget_working_dir) moves that record rather than leaving a copy behind.
+        return False
+
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return None  # not tracked for OpenCode
 
@@ -441,6 +457,12 @@ class ClaudeProxyAgent:
 
     def mirror_to_base(self, base_repo: Path, worktree: Path, session_id: str) -> bool:
         return claude_session.link_session(session_id, worktree, base_repo)
+
+    def forget_session_in(self, repo: Path, session_id: str) -> bool:
+        # Claude files one transcript per directory, so a conversation that moved to another
+        # worktree leaves a copy in the one it left. Drop it (only ever a duplicate — see
+        # forget_session_in) so the old worktree stops claiming the conversation.
+        return claude_session.forget_session_in(repo, session_id)
 
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return claude_session.session_cwd(session_id, since=since)
