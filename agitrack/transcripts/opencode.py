@@ -465,7 +465,12 @@ def _debug(repo: Path, message: str) -> None:
         return
     try:
         path = repo / ".agitrack" / "proxy-debug.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.parent.is_dir():
+            # Never CREATE the directory: this is called with whatever cwd the caller had, and
+            # `list_worktree_sessions` passes the worktrees ROOT — which made debug runs grow a
+            # phantom `.agitrack/worktrees/.agitrack/`, a directory that reads as a session
+            # worktree to anything listing them. A real repo always has `.agitrack` already.
+            return
         with path.open("a", encoding="utf-8") as handle:
             handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
     except OSError:

@@ -4057,10 +4057,7 @@ class ProxyRunner:
         # have one, otherwise the repo's most recent backend conversation (e.g. one
         # you ran with plain claude/opencode before aGiTrack). Resume is by id, which
         # the backend resolves regardless of which directory it runs in.
-        if self._force_new_session:
-            resume_id = None
-        else:
-            resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        resume_id = None if self._force_new_session else self._startup_resume_id(root_state)
         # The worktree name is only a usable fallback NAME for `resume_id` when the record is
         # ABOUT that conversation. Two records feed this decision and they can disagree: the
         # resume pointer is written for the session the user quit in, while this per-backend
@@ -4128,6 +4125,27 @@ class ProxyRunner:
                     return key
         except Exception as error:
             self._debug(f"resolve-session-name conversation scan failed: {error!r}")
+        return None
+
+    def _startup_resume_id(self, root_state) -> str | None:
+        """The conversation a fresh launch should resume.
+
+        Two records normally answer this, and a SIGKILL destroys both: the root resume pointer is
+        written only by the graceful exit path (`_persist_last_session_record`), and the repo scan
+        looks in the BASE project directory while a worktree session's conversation is keyed by
+        the WORKTREE path. So a killed run came back as a brand-new randomly-named session with a
+        fresh conversation while the real one sat in `.agitrack/worktrees/<name>` — no work lost,
+        but the session's identity was. The worktree scan is the same question the `--no-worktree`
+        start already asks, so ask it here too before giving up. Recovering the id also recovers
+        the NAME: `_adopt_pending_session_name` needs a conversation to key the surviving
+        `pending_session_name` to, and returns None without one."""
+        resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        if resume_id:
+            return resume_id
+        newest = self._newest_worktree_session()
+        if newest is not None:
+            self._debug(f"no resume pointer (crash?); continuing the newest worktree conversation {newest[0]}")
+            return newest[0]
         return None
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
