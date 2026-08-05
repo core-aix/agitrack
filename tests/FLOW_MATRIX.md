@@ -263,6 +263,7 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | Committed-but-unmerged work integrates into base | `test_committed_but_unmerged_work_is_integrated` | real-git |
 | Conflict → abort + resolve-options prompt | `test_integrate_conflict_aborts_and_prompts_resolve_options`, `test_integrate_conflict_prompts_then_starts_agent_merge` | real-git |
 | Conflict "leave for later" keeps work unintegrated | `test_integrate_conflict_leave_for_later_keeps_work_unintegrated` | real-git |
+| **…and is REMEMBERED**: the box is raised from a background poll, so an unrecorded answer meant the same question returned every couple of seconds (measured live at 1s, 3s, 4s after dismissal). The answer is keyed to the (base tip, session tip) pair, so a new turn or an advanced base still asks — and the menu's own "integrate this session" forces the question rather than being met with silence | `test_leave_for_later_is_remembered_so_the_conflict_box_stops_coming_back` | real-git |
 | Conflict on exit → left for next startup | `test_integrate_conflict_on_exit_leaves_for_startup` | real-git |
 | `--delay-merge`: defer until explicit menu choice | `test_delay_merge_defers_integration_and_names_working_dir`, `test_delay_merge_menu_choice_integrates`, `test_delay_merge_off_integrates_immediately` | real-git / mock |
 | Resolve-conflict dispatch (auto / manual / leave) | `test_prompt_resolve_conflict_dispatches_auto/manual`, `_leave_does_not_merge` | mock |

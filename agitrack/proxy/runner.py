@@ -5144,11 +5144,32 @@ class ProxyRunner:
             self._debug(f"integration failed for '{self.name}': {error!r}")
             return "skip"
 
-    def _prompt_resolve_conflict(self, source_branch: str) -> None:
+    def _conflict_signature(self, source_branch: str) -> tuple[str, str] | None:
+        """What the unresolved conflict IS: the base tip and the session's tip.
+
+        Answering "leave for later" is an answer about this exact pair. If either moves — the
+        base gains work, or this session commits another turn — the situation is new and worth
+        asking about again. None when the shas can't be read, which simply means "ask"."""
+        try:
+            base = self.base_repo.rev_parse(self._base_branch) if self._base_branch else ""
+            return (base, self.repo.rev_parse(source_branch))
+        except Exception as error:
+            self._debug(f"conflict signature failed: {error!r}")
+            return None
+
+    def _prompt_resolve_conflict(self, source_branch: str, *, force: bool = False) -> None:
         # A finished turn cannot fast-forward into the base because it conflicts
         # with work another session already integrated. Surface the same resolve
         # options the session menu offers for a conflicting session, labelled
         # with this session and its backend, then dispatch the choice.
+        signature = self._conflict_signature(source_branch)
+        if not force and signature is not None and signature == self.conflict_deferred_for:
+            # Already answered "leave for later" for this exact state. The box is raised from a
+            # background POLL, so without this the same question returned every couple of
+            # seconds — measured live at 1s, 3s and 4s after the user dismissed it. `force` is
+            # for the menu, where the user has just explicitly asked to integrate and must not
+            # be met with silence.
+            return
         backend = getattr(self.backend, "name", "?")
         choice = self._select_popup(
             f"Session '{self.name}' ({backend}) finished, but its changes conflict with '{self._base_branch}'.",
@@ -5159,6 +5180,7 @@ class ProxyRunner:
             ],
         )
         if not choice or choice.startswith("Leave"):
+            self.conflict_deferred_for = signature  # don't ask again until something changes
             self._set_message(
                 f"'{self.name}' has unintegrated work that conflicts with '{self._base_branch}'. "
                 f"Resolve it any time via {self._menu_label()} → session.",
@@ -5166,6 +5188,7 @@ class ProxyRunner:
             )
             self._render()
             return
+        self.conflict_deferred_for = None  # they chose to resolve it now
         self._start_merge_for_active(auto=choice.startswith("Merge automatically"))
 
     def _integrate_session_on_exit(self) -> None:
@@ -5821,7 +5844,9 @@ class ProxyRunner:
             self._render()
             return
         if result == "conflict":
-            self._prompt_resolve_conflict(self.repo.current_branch())
+            # force: the user just picked "integrate this session" from the menu, so a previous
+            # "leave for later" must not swallow the answer to a question they asked again.
+            self._prompt_resolve_conflict(self.repo.current_branch(), force=True)
             return
         self._set_message(f"'{self.name}' has nothing to integrate.")
         self._render()

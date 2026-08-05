@@ -237,6 +237,36 @@ def test_integrate_conflict_leave_for_later_keeps_work_unintegrated(tmp_path):
     assert "agitrack/test/s1/t1" in main.list_branches("agitrack/")
 
 
+def test_leave_for_later_is_remembered_so_the_conflict_box_stops_coming_back(tmp_path):
+    # The conflict box is raised from a POLL (the background-session service, every couple of
+    # seconds), and "Leave for later" recorded nothing — so live it came straight back at 1s, 3s
+    # and 4s after being dismissed. An answer about this exact (base, session) pair sticks.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base)
+    _commit(work, "f.txt", "worktree change\n", "wt change")
+    _commit(main, "f.txt", "base change\n", "base change")
+
+    runner = _integration_runner(main, work, base, "s1")
+    asked: list[str] = []
+    runner._select_popup = lambda title, options: asked.append(title) or options[-1]  # "Leave for later"
+
+    runner._integrate_session_turn()
+    runner._integrate_session_turn()
+    runner._integrate_session_turn()
+
+    assert len(asked) == 1  # asked once, not once per poll
+
+    # The user asking again from the MENU must still get an answer, not silence.
+    runner._prompt_resolve_conflict(work.current_branch(), force=True)
+    assert len(asked) == 2
+
+    # And a genuinely new situation — this session commits another turn — asks again by itself.
+    _commit(work, "f.txt", "worktree change 2\n", "wt change 2")
+    runner._integrate_session_turn()
+    assert len(asked) == 3
+
+
 def test_finalize_agent_merge_commits_and_advances(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
@@ -1237,7 +1267,7 @@ def test_integrate_active_session_conflict_prompts(tmp_path):
     runner = _integration_runner(main, work, base, "session-1")
     runner.worktree = info
     prompted = []
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
 
     runner._integrate_active_session()
 

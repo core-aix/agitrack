@@ -5577,7 +5577,7 @@ def _integration_runner(merge_ok):
 def test_integrate_conflict_aborts_and_prompts_resolve_options():
     runner = _integration_runner(merge_ok=False)
     calls = []
-    runner._prompt_resolve_conflict = lambda src: calls.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(src)
     runner._advance_base_to = lambda src: calls.append(("advance", src))
 
     runner._integrate_session_turn()
@@ -5589,7 +5589,7 @@ def test_integrate_conflict_aborts_and_prompts_resolve_options():
 def test_integrate_clean_merge_advances_base_without_prompt():
     runner = _integration_runner(merge_ok=True)
     calls = []
-    runner._prompt_resolve_conflict = lambda src: calls.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(("prompt", src))
     runner._advance_base_to = lambda src: calls.append(("advance", src))
 
     runner._integrate_session_turn()
@@ -5626,7 +5626,7 @@ def test_no_created_notice_when_nothing_pending():
 
 def test_conflict_does_not_fire_created_notice():
     runner = _integration_runner(merge_ok=False)
-    runner._prompt_resolve_conflict = lambda src: None
+    runner._prompt_resolve_conflict = lambda src, **_kw: None
     runner._commit_merged_pending = True
 
     assert runner._integrate_turn_or_conflict() == "conflict"
@@ -5638,7 +5638,7 @@ def test_integrate_conflict_on_exit_leaves_for_startup():
     runner = _integration_runner(merge_ok=False)
     runner._exiting = True
     prompted = []
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
     runner._advance_base_to = lambda src: None
 
     runner._integrate_session_turn()
@@ -5822,7 +5822,7 @@ def test_service_background_integrates_idle_session_cleanly():
     calls = []
     runner._with_session = lambda session, fn: calls.append(session.name) or "integrated"
     runner._switch_active = lambda i: calls.append(("switch", i))
-    runner._prompt_resolve_conflict = lambda src: calls.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(("prompt", src))
 
     runner._service_background_sessions()
 
@@ -5846,7 +5846,7 @@ def test_service_background_integrates_even_when_not_in_flight():
     serviced = []
     runner._with_session = lambda session, fn: serviced.append(session.name) or "integrated"
     runner._switch_active = lambda i: serviced.append(("switch", i))
-    runner._prompt_resolve_conflict = lambda src: serviced.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: serviced.append(("prompt", src))
 
     runner._service_background_sessions()
 
@@ -5875,7 +5875,7 @@ def test_service_background_conflict_switches_and_prompts():
         runner.repo = _Repo()
 
     runner._switch_active = _switch
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
 
     runner._service_background_sessions()
 

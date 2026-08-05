@@ -79,6 +79,11 @@ class Session:
         # excludes them, so a file the user never consented to stage cannot ride into an
         # agent commit that does not mention it.
         "user_untracked_since_fold",
+        # (base sha, source sha) the user last answered "Leave for later" for. The conflict box
+        # is raised from a POLL, so without remembering the answer it came straight back every
+        # couple of seconds. Both shas are in the key so a genuinely new situation — the base
+        # moved, or this session committed again — still asks.
+        "conflict_deferred_for",
         "agent_parse_thread",
         "agent_parse_result",
         "agent_parse_active",
@@ -210,6 +215,7 @@ class Session:
             "kept_cancelled_paths": frozenset(),
             "untracked_before_turn": frozenset(),
             "user_untracked_since_fold": None,
+            "conflict_deferred_for": None,
             "_pending_merge_prompt": False,
             "agent_parse_thread": None,
             "agent_parse_result": None,
