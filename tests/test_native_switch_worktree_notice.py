@@ -534,6 +534,37 @@ def test_a_merely_touched_transcript_does_not_read_as_a_switch(tmp_path, backend
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
+def test_a_fresh_session_is_never_dragged_onto_a_conversation_from_a_PREVIOUS_run(tmp_path, backend_name):
+    # Found live under --no-worktree --new-session. A fresh session has an id but no transcript
+    # until its first prompt, so every conversation in the directory looks newer than "ours" —
+    # and the previous run's conversation was adopted as a switch: status bar and state file said
+    # the OLD conversation while the backend really was running the new one, and the name given
+    # at the startup prompt seconds earlier was asked for a second time.
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=False, answer=YES)
+    runner.state.backend_session_id = "fresh-session"  # minted by --new-session; no transcript yet
+    # SWITCHED is entirely pre-launch (the harness snapshots it as such), i.e. history.
+
+    runner._service_native_session_switch()
+
+    assert runner.popups == []  # no "New conversation detected — name this session?"
+    assert runner.state.backend_session_id == "fresh-session"  # still tracking what we spawned
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_an_unbound_session_still_adopts_a_conversation_WRITTEN_since_launch(tmp_path, backend_name):
+    # The other half: the guard must not stop a fresh session from picking up the conversation
+    # its own backend just wrote (that is how a blank session gets bound at all).
+    runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=False, answer=NO)
+    runner.state.backend_session_id = "fresh-session"
+    runner._pre_spawn_sessions = {"old-session": 100.0}  # new-session did not exist at launch
+    runner._prompt_popup = lambda *a, **k: "beta"  # the no-worktree naming path, answered
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "new-session"
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
 def test_a_real_switch_is_still_adopted_when_its_messages_are_newer(tmp_path, backend_name):
     runner = _runner(tmp_path, backend_name, refs=SWITCHED, worktree=True, answer=NO)
     messages = {"old-session": 1_000.0, "new-session": 2_000.0}
