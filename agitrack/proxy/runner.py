@@ -11796,6 +11796,18 @@ class ProxyRunner:
         # different backend (e.g. a Claude id while the session runs OpenCode) is invalid there and
         # makes every summary fail — drop it and use the backend's default instead.
         model = compatible_summarization_model(backend_name, model)
+        if model is None and backend_name == "opencode":
+            # Fall back to the model this SESSION runs, not to the backend's own global default.
+            # The summarizer deliberately runs OUTSIDE the repo (see below), so the project's
+            # `opencode.json` model pin cannot apply there — and OpenCode then reaches for
+            # whatever its global default is, which on a machine that pins models per project is
+            # one the user may have no access to at all. Measured live: EVERY OpenCode summary
+            # failed this way ("summarizer backend exited with 1", a 403 from the default
+            # provider), silently, leaving raw prompts as commit subjects where Claude sessions
+            # got real summaries. Claude is left alone: its CLI's own default is the right
+            # choice there, and the recorded session model can carry a variant suffix its
+            # `--model` flag would reject.
+            model = compatible_summarization_model(backend_name, self.state.model)
         # The summarizer must NOT run in the session worktree (or the repo):
         # its headless calls record real backend sessions keyed by cwd, which
         # the parse worker / exit adoption would then resume instead of the
