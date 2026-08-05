@@ -670,6 +670,29 @@ def test_remove_all_installed_hooks_removes_everything_and_restores_chains(tmp_p
     assert not (hooks_dir / "post-commit").exists()
 
 
+def test_remove_all_installed_hooks_also_removes_the_REFERENCE_TRANSACTION_guard(tmp_path):
+    # Found live. The base-commit guard is installed as BOTH pre-commit and
+    # reference-transaction, but `--remove-hooks` only ever removed the first: after the
+    # documented full opt-out the repo kept an aGiTrack hook firing on EVERY ref update
+    # (commit, branch create, fetch, checkout, reset), and the user's own hook stayed shadowed
+    # in .agitrack-orig — while the command printed "Any chained project hooks were restored."
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    project = "#!/bin/sh\necho mine\n"
+    (hooks_dir / "reference-transaction").write_text(project, encoding="utf-8")
+    (hooks_dir / "reference-transaction").chmod(0o755)
+    git_hooks.install_base_commit_guard(hooks_dir)
+    assert "AGITRACK-BASE-REFTX-GUARD" in (hooks_dir / "reference-transaction").read_text()
+
+    removed = git_hooks.remove_all_installed_hooks(hooks_dir)
+
+    assert "reference-transaction" in removed
+    assert (hooks_dir / "reference-transaction").read_text() == project  # restored byte-for-byte
+    assert not (hooks_dir / "reference-transaction.agitrack-orig").exists()
+    assert not (hooks_dir / "pre-commit").exists()  # the guard's other half is gone too
+
+
 def test_remove_all_installed_hooks_noop_when_none(tmp_path):
     repo = _init_repo(tmp_path)
     hooks_dir = repo.repo / ".git" / "hooks"
