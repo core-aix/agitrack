@@ -998,6 +998,85 @@ def test_precommit_sync_no_ai_work_is_a_noop(tmp_path, monkeypatch):
     assert not trailer_file.exists() or trailer_file.read_text().strip() == ""
 
 
+def test_a_background_run_records_the_backend_it_was_given(tmp_path, monkeypatch):
+    # `agitrack -b --backend claude` used to record the choice NOWHERE: the state was seeded with
+    # that same value as an in-memory default, so the "differs from what the state resolves to?"
+    # test was always false. Everything downstream then saw a repo with no backend at all.
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = _init_repo(tmp_path)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+    config = GlobalConfig(path=cfg / "config.json")
+    assert config.default_backend is None  # a machine that has never chosen one
+
+    runner = BackgroundRunner(repo, backend="claude", _global_config=config)
+
+    assert runner.state.data.get("backend") == "claude"  # written to the repo's state FILE
+    assert GlobalConfig(path=cfg / "config.json").default_backend == "claude"
+
+
+def test_the_commit_hook_installs_as_soon_as_the_repo_state_names_a_backend(tmp_path, monkeypatch):
+    # The hook's "is a backend configured?" question used to be asked as `runner.state.backend`,
+    # which RAISES when none is, straight into a blanket `except Exception: return 0` — so with
+    # nothing recorded the hook was a silent no-op (no fold hooks, no trace, the commit's AI work
+    # lost) while `agitrack -s` still said "Auto-start on commit: on". The unanswerable case must
+    # still never fail the user's commit; the answerable one must work, and it is the one the
+    # backend-recording fix above now produces on every `-b` run.
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    (cfg / "config.json").write_text('{"privacy_ack": true}', encoding="utf-8")  # no default_backend
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+
+    assert precommit_sync(repo) == 0  # never fails the user's commit
+    assert not (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+    # With a backend recorded in the repo's own state, the very same call DOES install them.
+    (repo.repo / ".agitrack").mkdir(exist_ok=True)
+    (repo.repo / ".agitrack" / "state.json").write_text('{"backend": "claude"}', encoding="utf-8")
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+
+    assert precommit_sync(repo) == 0
+    assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+
+def test_the_hook_names_the_backend_when_it_auto_starts_the_daemon(tmp_path, monkeypatch):
+    # The spawned daemon resolves `--backend or the GLOBAL default` and never reads this repo's
+    # state, so without an explicit --backend it died on startup ("No coding agent backend is
+    # configured.") seconds after the commit told the user tracking had started.
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    (cfg / "config.json").write_text('{"autotrack_hook": "auto"}', encoding="utf-8")  # no default
+    (repo.repo / ".agitrack").mkdir(exist_ok=True)
+    (repo.repo / ".agitrack" / "state.json").write_text('{"backend": "claude"}', encoding="utf-8")
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: backend)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        "agitrack.proxy.background.spawn_background_daemon",
+        lambda _repo, *, extra_args: spawned.append(list(extra_args)),
+    )
+
+    precommit_sync(repo)
+
+    assert spawned and "--backend" in spawned[0]
+    assert spawned[0][spawned[0].index("--backend") + 1] == "claude"
+
+
 def test_precommit_sync_defers_to_a_running_tracker(tmp_path, monkeypatch):
     # When a live tracker holds the repo lock, precommit_sync does nothing (that tracker's own
     # fold hooks handle this commit) — it must never double-track.
