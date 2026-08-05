@@ -230,6 +230,10 @@ _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\
 # a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
 _OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
 
+# "No argument given", for parameters where None is itself a meaningful value (a transcript
+# that genuinely has no mtime) and so cannot double as the default.
+_UNSET: object = object()
+
 # The host terminal's ANSWERS to the capability queries `detect_host_terminal` sends: the
 # foreground/background/palette colour reports (OSC 10/11/4), the primary device attributes
 # reply, and the kitty keyboard flags reply. One arriving on STDIN is a late answer, not a
@@ -568,7 +572,7 @@ class ProxyInput:
                     continue
                 if char in {b"\r", b"\n"}:
                     typed = self.buffer.decode(errors="ignore").strip()
-                    command = self.selected() or typed
+                    command = self._resolve_command(typed)
                     self.buffer.clear()
                     self.capturing = False
                     self.selected_index = 0
@@ -623,12 +627,43 @@ class ProxyInput:
     def text(self) -> str:
         return self.buffer.decode(errors="ignore")
 
+    def _named(self, head: str) -> list[str]:
+        """Commands whose NAME starts with `head` — strictly, with no fallback."""
+        return [command for command in self.extra_commands + self.COMMANDS if command.startswith(head)]
+
     def matches(self) -> list[str]:
         commands = self.extra_commands + self.COMMANDS
         text = self.text()
         if not text:
             return commands
-        return [command for command in commands if command.startswith(text)] or commands
+        # Filter on the command NAME only. Several commands take an argument (`sessions 2`,
+        # `sessions new`, `agent-backend opencode`), and matching the whole string meant the
+        # moment a space was typed nothing matched. The `or commands` keeps the DISPLAY from
+        # going blank; what Enter runs is decided by _resolve_command, which does not fall back.
+        return self._named(text.split(" ", 1)[0]) or commands
+
+    def _resolve_command(self, typed: str) -> str:
+        """The command Enter should run for `typed` — name resolved, argument preserved.
+
+        Never falls back to the displayed list. Both fallbacks used to run a command the user
+        did not type: with unmerged work present "merge" is PREPENDED to that list, so both
+        `sessions 2` (an argument matched no name) and `frobnicate` (a typo) ran **merge**.
+        """
+        head, _, argument = typed.partition(" ")
+        argument = argument.strip()
+        if not typed:
+            return self.selected() or typed
+        if not self._named(head):
+            # No command by that name: hand the text on so the user is TOLD it is unknown.
+            return typed
+        selected = self.selected()
+        if not argument:
+            return selected or typed
+        if selected and (selected == typed or selected.startswith(typed)):
+            # The whole typed string is itself a command name ("exit aGiTrack"), not a name
+            # plus an argument — appending the "argument" would duplicate half the name.
+            return selected
+        return f"{selected or head} {argument}"
 
     def selected(self) -> str | None:
         matches = self.matches()
@@ -831,12 +866,20 @@ class ProxyRunner:
             # which may be unset (there is no hardcoded fallback).
             else AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         )
-        if backend and backend != self.state.backend:
-            self.state.remember_backend_session()
+        if backend:
+            if backend != self.state.backend:
+                self.state.remember_backend_session()
+                self.state.backend_session_id = self.state.stored_backend_session(backend)
+                self.state.last_backend_message_id = None
+            # Record the explicit `--backend` choice even when it only CONFIRMS what the state
+            # already resolves to. On a fresh repo the state was seeded with this very flag as an
+            # in-memory default, so `backend != self.state.backend` was false and nothing was ever
+            # written: `--backend claude` (documented as "also saved as the global default") left
+            # both the state file and the global config empty, and every later reader of them saw
+            # no backend at all.
             self.state.backend = backend
-            self.global_config.default_backend = backend
-            self.state.backend_session_id = self.state.stored_backend_session(backend)
-            self.state.last_backend_message_id = None
+            if self.global_config.default_backend != backend:
+                self.global_config.default_backend = backend
         self.backend = make_proxy_agent(self.state.backend)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose)
         self.verbose = verbose
@@ -942,9 +985,21 @@ class ProxyRunner:
         # commit. Unlike ``agent_in_flight`` (cleared by an idle TIMER), this stays set
         # across the quiet window between the agent finishing and the commit landing.
         self.turn_awaiting_commit = False
+        # An interrupted turn whose changes the user chose to KEEP for the next turn's commit.
+        # The parse that carried the cancellation is consumed either way, so without this the
+        # kept work would be reclassified as the user's own dirt the moment the handler
+        # returned — and offered back to them as a plain user commit, with no trace.
+        self.cancelled_work_kept = False
+        self.kept_cancelled_paths: frozenset[str] = frozenset()
         # Untracked paths that already existed when the current turn began: they are the USER's
         # files, not this turn's output, so the turn's commit must not sweep them in.
         self.untracked_before_turn: frozenset[str] = frozenset()
+        # The same question across a whole no-worktree fold (which can absorb several turns):
+        # the files present before every one of them. None until the first turn after a fold.
+        self.user_untracked_since_fold: frozenset[str] | None = None
+        # (base sha, session sha) the user last answered "Leave for later" for, so the conflict
+        # box — raised from a poll — asks once per situation rather than every couple of seconds.
+        self.conflict_deferred_for: tuple[str, str] | None = None
         self.pre_agent_reconciled_status = ""
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
@@ -1039,6 +1094,9 @@ class ProxyRunner:
         self._backend_update_checked_for: str | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
+        # Backends whose repo-root "last session" record has already been written during THIS
+        # exit. First writer wins (see _remember_session_for_backend).
+        self._backends_remembered_on_exit: set[str] = set()
         # Auto-share (issue #55): for sessions the user opted to keep shared, the
         # last-pushed content hash per backend session id, plus the in-flight
         # background push thread (only one at a time). Triggered per commit.
@@ -1162,9 +1220,14 @@ class ProxyRunner:
         self._switch_offer_parse_started = False
         self._exiting = False
         self._finalized_on_exit = False
-        # The exit-time "delete this run's worktrees or keep them?" decision, asked once and
-        # applied to every session (None = not yet asked). See _should_delete_worktrees_on_exit.
+        # The exit-time "delete this repo's session worktrees or keep them?" decision, asked
+        # once and applied to every one of them (None = not yet asked). See
+        # _should_delete_worktrees_on_exit.
         self._exit_delete_worktrees: bool | None = None
+        # The IDLE session worktrees the same answer applies to: on disk but not open in this
+        # run. Captured when the question is asked (before any removal empties the live
+        # sessions' own records) and consumed by _delete_idle_worktrees_on_exit.
+        self._exit_idle_worktrees: list[str] = []
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
         # exit so they can deal with the worktree files themselves (see _run_exit_flow).
         self._exit_aborted = False
@@ -1406,6 +1469,7 @@ class ProxyRunner:
                 "_precompact_result": None,
                 "_base_poll_at": 0.0,
                 "_warned_backend_session": False,
+                "_backends_remembered_on_exit": set(),
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
                 "_auto_share_outcome": None,
@@ -1428,6 +1492,7 @@ class ProxyRunner:
                 "_env_from_base": {},
                 "_env_copy_watermark": {},
                 "_exit_delete_worktrees": None,
+                "_exit_idle_worktrees": [],
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
                 "_full_agent_messages": False,
@@ -1606,7 +1671,13 @@ class ProxyRunner:
         # choose (the working tree stays dirty on purpose; turns are tracked latently).
         if not self._manual_commits and self.actions.has_pre_agent_user_changes():
             print("User changes detected before the agent starts.")
-            self.actions.create_user_commit()
+            # Skippable only WITHOUT worktrees. A worktree session is checked out from HEAD, so
+            # anything left uncommitted is simply absent from the tree the agent works in — the
+            # user would be editing one copy while the agent reads another, and the agent's
+            # commits would then look like they reverted work the user never committed. Under
+            # --no-worktree the agent edits this very tree, so uncommitted changes are still
+            # right there and declining costs nothing.
+            self.actions.create_user_commit(allow_skip=not self._use_worktrees)
         # Base-merge-only: run even the first session in a worktree so the base
         # branch is only advanced by integration, never edited by a live agent.
         self._base_branch = self.base_repo.current_branch()
@@ -2563,7 +2634,11 @@ class ProxyRunner:
         try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())
-            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
+            # The user's own untracked files (see _begin_agent_turn) are NOT this turn's output:
+            # staging them here put a file the user never agreed to commit into an agent commit
+            # that says nothing about it. They stay untracked until the user stages them.
+            theirs = self.user_untracked_since_fold or frozenset()
+            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined and p not in theirs])
             if not self.repo.has_staged_changes():
                 return
             # The message already carries the folded metadata, so the prepare-commit-msg hook's
@@ -2583,6 +2658,9 @@ class ProxyRunner:
                 "latent": folded,
                 "single": len(bodies) == 1,
             }
+            # This fold is closed: the next turn re-establishes which untracked files are the
+            # user's (they may have staged, deleted or added some in the meantime).
+            self.user_untracked_since_fold = None
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
 
@@ -3771,11 +3849,12 @@ class ProxyRunner:
         # are 1:1, so names must be unique). Returns the chosen name, or None on
         # cancel / empty input. The hint must match the MODE — under --no-worktree there is no
         # worktree to promise, and the sessions menu already says "shares this directory".
-        prompt = (
-            "Name for the new session (its own git worktree):"
-            if self._use_worktrees
-            else "Name for the new session (shares this directory):"
-        )
+        #
+        # The field label says what the name BUYS, not "name for the new session" again: the
+        # popup already carries a title, and every caller's title says which session is being
+        # named — so repeating it here read as the same sentence twice, in slightly different
+        # words. Callers keep their titles free of "Name for…" for the same reason.
+        prompt = "It gets its own git worktree. Name:" if self._use_worktrees else "It shares this directory. Name:"
         while True:
             name = self._prompt_popup(title, prompt, default=default)
             if name is None or not name.strip():
@@ -3802,15 +3881,32 @@ class ProxyRunner:
         info = self.worktree
         if info is None:
             return
+        # FIRST WRITER PER BACKEND WINS during an exit. The exit finalize runs the session the
+        # user quit in FIRST and every other session after it (see _finalize_pending_work), so
+        # the first writer for a backend is its most recently active session — and later writers
+        # are older ones that would otherwise clobber it. Last-wins left this record describing a
+        # DIFFERENT session from `backend_session_id` (which is written only for the exit-resume
+        # session), and startup then mixed the two: the conversation from one session and, via
+        # the `prior_worktree` name fallback, the NAME of another. Observed live as a restart
+        # coming back labelled with the previous session's name.
         try:
+            # Inside the try with everything else: `self.state` is legitimately absent on some
+            # teardown paths, and this method has always been best-effort about that.
+            remembered = self._backends_remembered_on_exit
+            backend_name = self.state.backend
             root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
-            root.remember_session(
-                self.state.backend,
-                session_id=self.state.backend_session_id,
-                worktree=info.name,
-                message_id=self.state.last_backend_message_id,
-                model=self.state.model,
-            )
+            if not (self._exiting and backend_name in remembered):
+                # Recorded only while exiting: a call made BEFORE the exit walk would otherwise
+                # sit in the set and suppress the first — and correct — writer of the walk.
+                if self._exiting:
+                    remembered.add(backend_name)
+                root.remember_session(
+                    backend_name,
+                    session_id=self.state.backend_session_id,
+                    worktree=info.name,
+                    message_id=self.state.last_backend_message_id,
+                    model=self.state.model,
+                )
             # Remember a user-given name (not an auto session-N) keyed by the
             # backend conversation id, so resuming it later restores the name.
             if info.name and not self._AUTO_NAME_RE.match(info.name):
@@ -3962,15 +4058,19 @@ class ProxyRunner:
         backend_name = root_state.backend
         prior_message_id = root_state.last_backend_message_id
         prior_model = root_state.model
-        prior_worktree = (root_state.recall_session(backend_name) or {}).get("worktree")
+        prior_record = root_state.recall_session(backend_name) or {}
         # Which conversation to continue at startup: aGiTrack's own last session if we
         # have one, otherwise the repo's most recent backend conversation (e.g. one
         # you ran with plain claude/opencode before aGiTrack). Resume is by id, which
         # the backend resolves regardless of which directory it runs in.
-        if self._force_new_session:
-            resume_id = None
-        else:
-            resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        resume_id = None if self._force_new_session else self._startup_resume_id(root_state)
+        # The worktree name is only a usable fallback NAME for `resume_id` when the record is
+        # ABOUT that conversation. Two records feed this decision and they can disagree: the
+        # resume pointer is written for the session the user quit in, while this per-backend
+        # record was (before the first-writer-wins fix) whichever session finalized last. Naming
+        # the resumed conversation after a worktree belonging to a DIFFERENT conversation is how
+        # a restart came back showing the previous session's name with the new session inside it.
+        prior_worktree = prior_record.get("worktree") if prior_record.get("id") == resume_id else None
         name = self._resolve_startup_session_name(root_state, resume_id, prior_worktree)
         try:
             info, repo = self._open_session_worktree(name)
@@ -3997,6 +4097,10 @@ class ProxyRunner:
             self.state.last_backend_message_id = prior_message_id
             self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
+        # Heal a worktree an earlier aGiTrack left holding a conversation that has since moved to
+        # a sibling (see _release_sibling_owned_conversations). `resume_id` is what the durable
+        # record asks this run to continue, so it is kept whatever else is cleaned up.
+        self._release_sibling_owned_conversations(keep=resume_id)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
 
     def _resolve_session_name(self, session_id: str | None) -> str | None:
@@ -4027,6 +4131,27 @@ class ProxyRunner:
                     return key
         except Exception as error:
             self._debug(f"resolve-session-name conversation scan failed: {error!r}")
+        return None
+
+    def _startup_resume_id(self, root_state) -> str | None:
+        """The conversation a fresh launch should resume.
+
+        Two records normally answer this, and a SIGKILL destroys both: the root resume pointer is
+        written only by the graceful exit path (`_persist_last_session_record`), and the repo scan
+        looks in the BASE project directory while a worktree session's conversation is keyed by
+        the WORKTREE path. So a killed run came back as a brand-new randomly-named session with a
+        fresh conversation while the real one sat in `.agitrack/worktrees/<name>` — no work lost,
+        but the session's identity was. The worktree scan is the same question the `--no-worktree`
+        start already asks, so ask it here too before giving up. Recovering the id also recovers
+        the NAME: `_adopt_pending_session_name` needs a conversation to key the surviving
+        `pending_session_name` to, and returns None without one."""
+        resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        if resume_id:
+            return resume_id
+        newest = self._newest_worktree_session()
+        if newest is not None:
+            self._debug(f"no resume pointer (crash?); continuing the newest worktree conversation {newest[0]}")
+            return newest[0]
         return None
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
@@ -4132,7 +4257,12 @@ class ProxyRunner:
         # session id on every resume/picker action; it is newest by mtime and has nothing in it,
         # and adopting one drops the user into a blank session on the next start. A ref's label
         # is its first real user prompt, so `label` is None exactly when there is no real turn.
-        refs = {ref.id: ref.updated for ref in listed if ref.label or ref.id == pinned}
+        # Ranked by CONTENT recency, not the file's mtime. aGiTrack touches transcripts itself —
+        # staging a resume, mirroring to the base repo, retargeting a recorded cwd — so an
+        # abandoned conversation can be the newest FILE here while carrying nothing newer than
+        # the pinned one. Moving the pin onto it is what made a session come back running a
+        # conversation the user had thrown away with `/clear`, under that session's name.
+        refs = {ref.id: self._session_recency(ref.id, ref.updated) for ref in listed if ref.label or ref.id == pinned}
         if pinned not in refs:
             return  # not our directory's conversation (a worktree/rename case): leave staging to it
         newest = max(refs.items(), key=lambda item: item[1])
@@ -4177,17 +4307,469 @@ class ProxyRunner:
             return
         newest = max(with_content, key=lambda ref: ref.updated)
         current = self.state.backend_session_id
+        if not current:
+            # Nothing is bound yet, so this cannot be a switch — there is nothing to switch
+            # away FROM. See _bind_first_conversation.
+            self._bind_first_conversation(with_content)
+            return
         if newest.id == current:
             return
         ours = next((ref.updated for ref in refs if ref.id == current), None)
+        if ours is None and not self._written_since_launch(newest):
+            # Our conversation exists only as an ID: --new-session (and any blank session) mints
+            # one, and the backend writes no transcript until the first prompt. Every OTHER
+            # conversation in the directory is therefore "newer than ours", so a --no-worktree run
+            # adopted the PREVIOUS run's conversation as a switch: the status bar and state file
+            # named the old conversation while the backend really was running the new one, and the
+            # name given at the startup prompt seconds earlier was asked for a second time. A
+            # conversation not written since this run started is history, not a switch. (A genuine
+            # `/resume` of an old conversation DOES write to it, so it still counts as one.)
+            self._debug(f"ignoring {newest.id}: not written since launch and our conversation is still empty")
+            return
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
+        if self._session_recency(newest.id, newest.updated) <= self._session_recency(current, ours or 0.0):
+            # The listing ranks by FILE mtime, which aGiTrack's own writes move: staging a resume,
+            # mirroring a conversation to the base repo and retargeting a recorded cwd all touch a
+            # transcript without adding a message to it. So confirm against the message timestamps
+            # before believing a conversation has taken over — otherwise a conversation the user
+            # abandoned reads as a fresh switch, and gets adopted (and named) as this session's.
+            self._debug(f"ignoring {newest.id}: newer file, but no newer messages than {current}")
+            return
+        if not self._conversation_idle(newest.id, self.CHILD_IDLE_SECONDS):
+            # The new conversation's first turn is still RUNNING. A conversation becomes visible
+            # here the moment the user's prompt is written — long before the agent has answered
+            # it — and every signal that normally says "the agent is busy" is keyed to the
+            # conversation just left, which `/clear` froze. So without this the switch was
+            # handled mid-turn: the commit below captured a turn with no response yet, and the
+            # offer opened a modal over a working agent (which then relocated the session away
+            # from files the turn had not written yet). Come back when it has finished.
+            self._debug(f"native switch to {newest.id} deferred: its turn is still running")
+            return
         self._debug(f"native session switch: {current} -> {newest.id}")
+        # Captured BEFORE the tracked id moves: if the conversation is relocated to a worktree of
+        # its own, this is what the outgoing session must be put back to (see
+        # _restore_outgoing_session_identity).
+        prior_message_id = self.state.last_backend_message_id
         self._abandon_summary_for_switched_session(current, newest.id)
         self.state.backend_session_id = newest.id
         self.state.last_backend_message_id = None
         self._initialize_session_baseline()
+        self._rebase_baseline_for_new_conversation(newest.id)
+        # Commit the turn that just ran BEFORE any dialog. A conversation is only visible here
+        # once it HAS CONTENT, so by the time a switch is detected its first turn has already
+        # finished and its changes are sitting in the tree. Two things would otherwise eat it:
+        # the offer below is a modal, and a modal blocks the reactor — and with it the commit
+        # pass — for as long as the user takes to answer; and relocation moves the session out
+        # from under those changes entirely. Observed live as a `/clear`, a turn that wrote a
+        # file, and no commit for it anywhere.
+        self._commit_latest_turn_sync()
+        outcome = self._relocate_switched_conversation(
+            newest.id, previous_id=current, previous_message_id=prior_message_id
+        )
+        if outcome == self._RELOCATION_MOVED:
+            return
+        if self.worktree is not None:
+            # STAYING PUT in worktree mode: the session keeps its name. A worktree session and
+            # its name are 1:1 — the name IS the directory — so renaming here (which is what
+            # _restore_or_ask_session_name does for an unknown conversation) splits the two:
+            # the status bar and the turn branches take the new name while the directory keeps
+            # the old, exit cleanup then removes the worktree by its directory name and leaks
+            # the branches filed under the other one, and _remember_session_for_backend finally
+            # overwrites the chosen name with the directory's — so the name the user typed is
+            # lost and two conversations end up sharing one. Link the new conversation to THIS
+            # session's name instead; the offer above is where a differently-named session is
+            # made, and it makes a directory to match.
+            #
+            # This holds however the offer ended, including backing out of the naming step: the
+            # conversation IS running in this session — its turns commit on this session's branch
+            # and the status bar says so — and the record has to say what is actually happening.
+            # (The commit flow files the same link independently, via
+            # `_note_backend_session_change`, so withholding it here would only produce a
+            # half-state.) What used to hurt was the consequence, not the record: going back to
+            # the session's EARLIER conversation demanded a new name. It no longer does — see
+            # `_reopen_conversation_in_session` — and the resume list now shows each conversation's
+            # own prompt, so two conversations of one session are told apart.
+            self._persist_session_name(newest.id)
+            self._render()
+            return
         self._restore_or_ask_session_name(newest.id)
+
+    def _rebase_baseline_for_new_conversation(self, session_id: str) -> None:
+        """Don't let a BRAND-NEW conversation's first turn be written off as already accounted for.
+
+        ``initialize_session_baseline`` sets ``last_backend_message_id`` to the newest complete
+        turn, meaning "everything up to here is already committed". That is right for a resume at
+        startup, where those turns really were committed by an earlier run. It is exactly wrong
+        for a conversation the user just started with `/clear`: the switch watcher can only see a
+        conversation once it HAS CONTENT, so the first turn has already run — and marking it
+        accounted-for means its changes are never committed by anyone. The file the agent just
+        wrote stays in the tree with no commit, in either worktree.
+
+        "Brand new" is decided by the ``_pre_spawn_sessions`` snapshot, the same since-launch
+        filter the commit path uses: a conversation absent from it did not exist when the backend
+        started, so nothing of it can have been committed. A conversation that WAS there (a
+        `/resume` back onto older work) keeps the computed baseline — resetting that would
+        re-commit its whole history as one enormous turn.
+        """
+        snapshot = self._pre_spawn_sessions
+        if snapshot is None or session_id in snapshot:
+            return
+        self._debug(f"conversation {session_id} is new since launch; committing its turns from the start")
+        self.state.last_backend_message_id = None
+
+    # What came of the own-worktree offer. "Declined" is a decision (the user chose to keep the
+    # conversation in this session); "cancelled" is the absence of one (Esc / quit at the name
+    # prompt, or a relocation that could not proceed) — and the caller treats them differently.
+    _RELOCATION_MOVED = "moved"
+    _RELOCATION_DECLINED = "declined"
+    _RELOCATION_CANCELLED = "cancelled"
+
+    def _relocate_switched_conversation(
+        self, session_id: str, *, previous_id: str | None = None, previous_message_id: str | None = None
+    ) -> str:
+        """Offer the just-switched-to conversation a worktree of its own, and make it.
+
+        A conversation started with the backend's own `/clear` or `/resume` runs in the process
+        aGiTrack already spawned, whose cwd is this session's worktree — so by default it shares
+        that worktree, that turn branch and that merge target with the conversation before it.
+        aGiTrack CAN give it its own, the same way ``sessions → New session`` and ``Resume a past
+        conversation`` do: create a worktree and respawn the backend there with ``--resume``, so
+        the conversation itself is preserved and only the process moves.
+
+        That costs a backend restart, so it is asked rather than assumed. Returns True when the
+        relocation happened and the caller must not touch the outgoing session any further.
+
+        The retirement of the OLD process is the delicate part and the reason this is not simply
+        ``_new_session``: that process has ALREADY left the old conversation and is writing the
+        new one. Leaving it alive would put two backends on a single transcript. So its child is
+        torn down and only then does the new session spawn. The outgoing worktree, its commits
+        and its conversation all survive — it simply becomes dormant, and reappears in the
+        sessions menu as an idle worktree to resume.
+        """
+        if self.worktree is None or not self._use_worktrees:
+            return self._RELOCATION_DECLINED  # --no-worktree / manual: no worktrees to hand out
+        choice = self._select_popup(
+            "New conversation — give it its own worktree?",
+            [
+                "Yes — move it to a new worktree (the backend restarts)",
+                f"No — keep it here, in '{self.name}'",
+            ],
+            # Kept under ~62 characters a line: the popup does not re-wrap, so a longer line
+            # folds at the box edge and the overflow lands hard against the left border.
+            detail=[
+                f"This conversation started inside {self.backend.name}, in the process",
+                f"aGiTrack spawned for session '{self.name}'. Unless it moves, it",
+                "shares that session's worktree",
+                f"(.agitrack/worktrees/{self.worktree.path.name}), its branch, and",
+                f"its merge into {self._base_branch or 'the base branch'}.",
+                "",
+                "Moving it makes a worktree of its own and restarts the",
+                "backend there, resuming this same conversation.",
+                f"Session '{self.name}' keeps its worktree and its commits, and",
+                "stays available under sessions → resume.",
+            ],
+        )
+        if choice is None or choice.startswith("No"):
+            # Esc reads as "leave it alone" — a decision to keep the conversation in this session,
+            # so it takes this session's name (unlike backing out of the naming step below).
+            return self._RELOCATION_DECLINED
+        # NOTHING UNCOMMITTED MAY BE LEFT BEHIND. The caller commits the just-finished turn
+        # before opening this offer, but that commit can decline to capture the turn (observed
+        # live: a `/clear` turn that CREATED a file left it untracked and the turn branch empty).
+        # Relocating on top of that would walk the session away from changes no commit holds —
+        # they would sit untracked in a worktree the user has left, which is the silent-loss
+        # failure aGiTrack exists to prevent. So refuse, and stay put: the ordinary commit pass
+        # picks the turn up once the reactor is running again (verified live), and the offer
+        # comes back on the next switch.
+        if self.repo.has_changes():
+            self._debug("relocation declined: outgoing worktree still has uncommitted changes")
+            self._select_popup(
+                "Not moved — this turn isn't committed yet",
+                ["ok"],
+                detail=[
+                    f"The turn that just ran left changes in '{self.name}' that are not",
+                    "committed yet, and moving the session now would leave them behind",
+                    "in a worktree you are no longer in.",
+                    "",
+                    f"This conversation stays in '{self.name}' for now. The changes are",
+                    "committed as usual in a moment.",
+                ],
+            )
+            return self._RELOCATION_CANCELLED  # asked to move and could not: not a choice to stay
+        name = self._name_for_switched_conversation(session_id)
+        if name is None:
+            # Backed out of naming (Esc, or quitting): the conversation stays where it is, but the
+            # user never said it belongs to this session, so it is not given this session's name.
+            self._set_message(
+                f"Not moved — no name given. This conversation is still running in '{self.name}'; "
+                "the offer comes back on the next conversation switch.",
+                seconds=10.0,
+            )
+            return self._RELOCATION_CANCELLED
+        outgoing = self.active
+        # Land the turn that has just been committed on the base branch BEFORE cutting the new
+        # worktree from it. The turn belongs to the conversation being moved, but it ran — and
+        # was committed — in the worktree being left; a worktree cut from a base branch that
+        # does not have it yet opens WITHOUT the files the conversation just created, and the
+        # resumed agent reads its own last turn as never having happened ("b.txt isn't there…
+        # it landed outside this working directory", live). Same call the pre-prompt path makes,
+        # so --delay-merge and conflicts are handled exactly as they are everywhere else.
+        self._integrate_committed_turn_before_new_turn()
+        self._stop_file_watcher()
+        self._teardown_child()  # the process that switched; the new session spawns its own
+        self._new_session(name, resume_session_id=session_id)
+        if not (self.sessions and self.sessions[-1] is self.active):
+            # _new_session bailed (e.g. the worktree could not be created) and left a bare
+            # session behind. Put the outgoing one back rather than stranding the runner with
+            # no screen and no PTY; its child is gone, and the session-exit handling respawns.
+            self._debug("relocation failed to start the new session; restoring the outgoing one")
+            self.active = outgoing
+            self._render()
+            return self._RELOCATION_CANCELLED
+        if outgoing in self.sessions:
+            self.sessions.remove(outgoing)
+        self._restore_outgoing_session_identity(outgoing, previous_id, previous_message_id, moved=session_id)
+        self._set_message(
+            f"Moved this conversation into its own worktree '{name}'. "
+            f"Session '{getattr(outgoing, 'name', '?')}' is idle — resume it from the sessions menu.",
+            seconds=10.0,
+        )
+        self._render()
+        return self._RELOCATION_MOVED
+
+    def _restore_outgoing_session_identity(
+        self, outgoing, previous_id: str | None, previous_message_id: str | None, *, moved: str
+    ) -> None:
+        """Give the session the conversation just LEFT its own identity back.
+
+        Detecting the switch re-points the (still active) session at the new conversation —
+        necessarily, because the turn that has just run belongs to it and has to be committed
+        here. Relocation then carries that conversation off to a worktree of its own, and unless
+        this runs, the worktree it left behind is still recorded as running it: two worktrees,
+        one conversation. That record outlives the run, and the next start resolves the moved
+        conversation's NAME from whichever worktree claims it (``_resolve_session_name`` scans
+        worktree state, then the backend's per-worktree conversation listing) — which is the
+        reported "after a restart the two worktrees are mixed up", and why deleting the worktrees
+        was the only cure.
+
+        Two records have to be put back, in both places a worktree can claim a conversation:
+
+        * the outgoing worktree's ``.agitrack/state.json`` — restored to the conversation it was
+          on before the switch, so a later resume of that session continues ITS work, and so
+          ``_adopt_latest_backend_session`` on exit doesn't re-adopt the moved one;
+        * the outgoing worktree's per-directory transcript (Claude keeps one per project dir):
+          the moved conversation ran in that directory, so a copy of it sits there and makes the
+          old worktree the answer to "which session is this conversation?" forever. It is dropped
+          once the new worktree's copy is in place — the conversation itself is untouched.
+        """
+        state = getattr(outgoing, "state", None)
+        if state is not None:
+            try:
+                state.backend_session_id = previous_id  # setter re-points backend_session_repo too
+                state.last_backend_message_id = previous_message_id
+                self._debug(f"outgoing session restored to conversation {previous_id}")
+            except Exception as error:
+                self._debug(f"restoring the outgoing session's conversation failed: {error!r}")
+        worktree = getattr(outgoing, "worktree", None)
+        # The OUTGOING session's backend: it is the one that recorded the conversation there, and
+        # by now `self.backend` belongs to the session that has just taken over.
+        forget = getattr(getattr(outgoing, "backend", None) or self.backend, "forget_session_in", None)
+        if forget is None or worktree is None or getattr(worktree, "path", None) is None:
+            return
+        try:
+            if forget(worktree.path, moved):
+                self._debug(f"dropped {moved}'s transcript from the worktree it moved out of")
+        except Exception as error:
+            self._debug(f"forget_session_in failed: {error!r}")
+
+    def _sibling_worktree_conversations(self) -> dict[str, str]:
+        """``conversation id -> the OTHER worktree that records it as its own``.
+
+        Read from each sibling worktree's own ``.agitrack/state.json``, which is where a session
+        says which conversation it is running. Two worktrees naming the same conversation is
+        corruption by construction — aGiTrack never runs one conversation in two places."""
+        owners: dict[str, str] = {}
+        if self.worktree is None:
+            return owners
+        try:
+            for info in self._worktrees().list():
+                if info.name == self.worktree.name:
+                    continue
+                sid = AgitrackState(
+                    info.path, default_backend=getattr(self.global_config, "default_backend", None)
+                ).backend_session_id
+                if sid:
+                    owners[sid] = info.name
+        except Exception as error:
+            self._debug(f"sibling worktree scan failed: {error!r}")
+        return owners
+
+    def _release_sibling_owned_conversations(self, *, keep: str | None = None) -> None:
+        """Let go of a conversation that belongs to a SIBLING session — the self-heal.
+
+        Relocation now leaves both worktrees consistent, but a worktree that was mixed up by an
+        EARLIER aGiTrack (or by a relocation interrupted part-way) stays mixed up on disk: its
+        state file still names the conversation that moved out, and Claude's copy of that
+        conversation still sits in its project directory. Both outlive the run, which is why the
+        only cure used to be deleting the worktrees. So a worktree session checks, as it opens,
+        whether what it is holding is really its own:
+
+        * its RECORDED conversation, when a sibling worktree claims the same one and the durable
+          name record does not name US as its session — released, and this worktree falls back to
+          the newest conversation it genuinely owns (its own work, not the one that moved away);
+        * any sibling-owned TRANSCRIPT left in this worktree's project directory — dropped, so
+          ``latest_session_id`` here stops answering with someone else's conversation and
+          ``_adopt_latest_backend_session`` cannot re-adopt it on the way out. Only ever a
+          duplicate: ``forget_session_in`` refuses to remove a conversation's last copy.
+
+        ``keep`` is the conversation the user explicitly asked to resume in this action; it is
+        never released or dropped, so resuming a past conversation under a new name still works
+        while its old worktree is still on disk.
+        """
+        if self.worktree is None or not self._use_worktrees:
+            return
+        owners = self._sibling_worktree_conversations()
+        if not owners:
+            return
+        mine = self.state.backend_session_id
+        if mine and mine != keep and mine in owners and self._recorded_session_name(mine) != self.worktree.name:
+            # Prefer what this run was asked to continue here; otherwise this worktree's own
+            # newest work. (At startup the two differ exactly when the state file is the corrupt
+            # one and the durable record still knows which conversation belongs here.)
+            replacement = keep if keep and keep not in owners else self._own_conversation_here(exclude=set(owners))
+            self._debug(
+                f"'{self.worktree.name}' was holding {mine}, which belongs to '{owners[mine]}'; "
+                f"releasing it for {replacement}"
+            )
+            self.state.backend_session_id = replacement
+            self.state.last_backend_message_id = None
+            mine = replacement
+        forget = getattr(self.backend, "forget_session_in", None)
+        if forget is None:
+            return
+        for sid in owners:
+            if sid in (mine, keep):
+                continue
+            try:
+                if forget(self.repo.repo, sid):
+                    self._debug(f"dropped sibling conversation {sid} from '{self.worktree.name}'")
+            except Exception as error:
+                self._debug(f"forget_session_in failed for {sid}: {error!r}")
+
+    def _recorded_session_name(self, session_id: str | None) -> str | None:
+        """The name the durable repo-root record gives a conversation (None if unknown)."""
+        try:
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            return root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            return None
+
+    def _own_conversation_here(self, *, exclude: set[str]) -> str | None:
+        """The newest conversation WITH CONTENT recorded in this session's directory, ignoring
+        ``exclude`` (conversations that belong to other sessions). None when there is none — a
+        fresh conversation is then started, which is the right answer for a worktree whose only
+        conversation turned out to be somebody else's."""
+        try:
+            refs = [ref for ref in self.backend.list_sessions(self.repo.repo) if ref.label and ref.id not in exclude]
+        except Exception as error:
+            self._debug(f"own-conversation lookup failed: {error!r}")
+            return None
+        return max(refs, key=lambda ref: ref.updated).id if refs else None
+
+    def _name_for_switched_conversation(self, session_id: str) -> str | None:
+        """The name for a conversation being moved into its own worktree: the one it already
+        carries if aGiTrack has seen it, otherwise asked for with a fresh suggestion. None when
+        the user cancels. A fresh suggestion (not the current session's name) because the new
+        worktree is a sibling of the current one and two live sessions cannot share a name."""
+        try:
+            root = AgitrackState(
+                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
+            )
+            known = root.session_name_for(session_id)
+        except Exception as error:
+            self._debug(f"session name lookup failed: {error!r}")
+            known = None
+        if known and not self._live_session_name_taken(known):
+            return known
+        # Re-ask until the name is free. A session and its worktree are 1:1, so accepting a name
+        # another LIVE session already holds would point two backends at one directory — the
+        # same reason `_resume_conversation` asks again rather than silently renaming.
+        title = "This conversation is moving to a session of its own"
+        while True:
+            chosen = self._prompt_session_name(title, default=self._next_session_name())
+            if chosen is None:
+                return None
+            if not self._live_session_name_taken(chosen):
+                return chosen
+            title = f"'{chosen}' is already open — two live sessions can't share a worktree"
+
+    def _bind_first_conversation(self, with_content: list) -> None:
+        """Adopt the conversation this session just started — WITHOUT asking for a name again.
+
+        A session started with ``--new-session`` (and any fresh session) has no
+        ``backend_session_id`` until the backend writes its first transcript, which happens on
+        the user's FIRST PROMPT. Until that moment the switch watcher is tracking nothing, so
+        the conversation appearing looked exactly like a native switch: aGiTrack asked "New
+        conversation detected — name this session?" for a session the user had named seconds
+        earlier at the startup prompt. Two questions for one session, and answering the second
+        with a different name splits the name record between the two.
+
+        There is no switch here. Bind the id, KEEP the name already chosen, and make the link
+        durable so a crash before the first commit doesn't lose it.
+
+        Which conversation is "ours" needs two filters at once, and neither alone is enough.
+        WRITTEN SINCE LAUNCH (the ``_pre_spawn_sessions`` snapshot, as the commit path uses):
+        under ``--no-worktree`` the directory can hold conversations from long before this run,
+        and an unbound session must never adopt one of those however recent it looks. HAS REAL
+        CONTENT: Claude mints empty transcripts on picker actions, and they sort newest —
+        binding to one strands the session on a blank conversation. So the candidate is the
+        newest conversation satisfying BOTH, not merely the newest of either.
+        """
+        snapshot = self._pre_spawn_sessions
+        if snapshot is None:
+            return  # a restored session object has no snapshot; adopting blind is not safe
+        # `>` not `>=`: a conversation nobody has touched compares equal to its snapshot entry
+        # and drops out. Absent from the snapshot means it did not exist at launch — ours.
+        fresh = [ref for ref in with_content if ref.updated > snapshot.get(ref.id, float("-inf"))]
+        if not fresh:
+            return  # nothing of ours written yet — stay unbound and look again next tick
+        spawned = max(fresh, key=lambda ref: ref.updated).id
+        self._debug(f"binding session '{self.name}' to its first conversation {spawned}")
+        self.state.backend_session_id = spawned
+        self.state.last_backend_message_id = None
+        self._initialize_session_baseline()
+        if spawned not in snapshot:
+            # The conversation did not exist at launch, so every turn in it is OURS and there is
+            # no history to skip. The baseline just computed assumes a RESUME — "everything
+            # already recorded predates us" — and parks the watermark on the newest complete
+            # turn. For a backend whose conversation only becomes visible once its first turn
+            # FINISHES (OpenCode's session store), that turn is the newest complete one, so the
+            # baseline swallowed the very work it was binding to: nothing was committed, and the
+            # file it wrote was later offered back as "intentionally unstaged or git-ignored".
+            # (A conversation that WAS in the snapshot is one the user resumed inside the
+            # backend; there the baseline is right and its older turns must not be re-committed.)
+            self.state.last_backend_message_id = None
+        # Durable now, keyed by the id that finally exists. This also clears the pending-name
+        # record written at startup, when there was no conversation to key the name to.
+        self._persist_session_name(spawned)
+        self._render()
+
+    def _written_since_launch(self, ref) -> bool:
+        """Whether ``ref`` has been written since aGiTrack spawned this session's backend.
+
+        The same test ``_bind_first_conversation`` uses, against the ``_pre_spawn_sessions``
+        snapshot: absent from it means the conversation did not exist at launch (ours), and a
+        newer mtime than its snapshot entry means it has been written since (also ours). With no
+        snapshot (a restored session object) the question cannot be answered, so keep the old
+        behaviour rather than block a real switch."""
+        snapshot = self._pre_spawn_sessions
+        if snapshot is None:
+            return True
+        return ref.updated > snapshot.get(ref.id, float("-inf"))
 
     def _abandon_summary_for_switched_session(self, leaving_id: str | None, joining_id: str) -> None:
         """Drop summary work belonging to the conversation we are switching AWAY from.
@@ -4464,10 +5046,19 @@ class ProxyRunner:
             if info.name == self.name:  # the active session, handled below
                 continue
             try:
-                if not self._cleanup_stale_worktree(info):
-                    flagged.append(info.name)
+                if self._cleanup_stale_worktree(info):
+                    continue
+                # Committed work is integrated by the call above; UNCOMMITTED work left by a
+                # crash needs the recovery policy (commit a finished turn, then merge). Startup
+                # used to stop here and merely flag it, so the same SIGKILL left the turn
+                # committed+merged when the user ran `agitrack --recover` (what the editor
+                # extension does) and uncommitted behind a warning when they simply relaunched.
+                if self._recover_stale_worktree(info):
+                    continue
+                flagged.append(info.name)
             except Exception as error:
                 self._debug(f"reconcile skipped '{info.name}': {error!r}")
+                flagged.append(info.name)
         self._delete_orphan_merged_branches()
         notes: list[str] = []
         if active_pending:
@@ -4483,6 +5074,24 @@ class ProxyRunner:
             else:
                 instruction = f"Open {self._menu_label()} → session to resolve them."
             self._set_message("⚠ " + "; ".join(notes) + ".\n" + instruction, seconds=12.0)
+
+    def _recover_stale_worktree(self, info) -> bool:
+        """Finish what a crashed session left in `info`: commit its finished turn, then merge.
+
+        The same policy (and the same code) as `agitrack --recover`, run here because startup
+        already holds the repo lock that the standalone entry point would take. Returns True
+        when nothing is left for the user to deal with. A turn that was still in flight is
+        never committed — the policy leaves it and reports it flagged, as before."""
+        try:
+            from agitrack.recovery import RecoveryService
+
+            report = RecoveryService(self.base_repo, self.global_config, debug_fn=self._debug).recover_worktree(info)
+        except Exception as error:
+            self._debug(f"startup recovery of '{info.name}' failed: {error!r}")
+            return False
+        if report.recovered or report.integrated:
+            self._debug(f"startup recovered '{info.name}': {report.summary()}")
+        return not report.flagged
 
     def _cleanup_stale_worktree(self, info) -> bool:
         # Integrate a dormant worktree's pending commits (if any) and delete it.
@@ -4600,11 +5209,32 @@ class ProxyRunner:
             self._debug(f"integration failed for '{self.name}': {error!r}")
             return "skip"
 
-    def _prompt_resolve_conflict(self, source_branch: str) -> None:
+    def _conflict_signature(self, source_branch: str) -> tuple[str, str] | None:
+        """What the unresolved conflict IS: the base tip and the session's tip.
+
+        Answering "leave for later" is an answer about this exact pair. If either moves — the
+        base gains work, or this session commits another turn — the situation is new and worth
+        asking about again. None when the shas can't be read, which simply means "ask"."""
+        try:
+            base = self.base_repo.rev_parse(self._base_branch) if self._base_branch else ""
+            return (base, self.repo.rev_parse(source_branch))
+        except Exception as error:
+            self._debug(f"conflict signature failed: {error!r}")
+            return None
+
+    def _prompt_resolve_conflict(self, source_branch: str, *, force: bool = False) -> None:
         # A finished turn cannot fast-forward into the base because it conflicts
         # with work another session already integrated. Surface the same resolve
         # options the session menu offers for a conflicting session, labelled
         # with this session and its backend, then dispatch the choice.
+        signature = self._conflict_signature(source_branch)
+        if not force and signature is not None and signature == self.conflict_deferred_for:
+            # Already answered "leave for later" for this exact state. The box is raised from a
+            # background POLL, so without this the same question returned every couple of
+            # seconds — measured live at 1s, 3s and 4s after the user dismissed it. `force` is
+            # for the menu, where the user has just explicitly asked to integrate and must not
+            # be met with silence.
+            return
         backend = getattr(self.backend, "name", "?")
         choice = self._select_popup(
             f"Session '{self.name}' ({backend}) finished, but its changes conflict with '{self._base_branch}'.",
@@ -4615,6 +5245,7 @@ class ProxyRunner:
             ],
         )
         if not choice or choice.startswith("Leave"):
+            self.conflict_deferred_for = signature  # don't ask again until something changes
             self._set_message(
                 f"'{self.name}' has unintegrated work that conflicts with '{self._base_branch}'. "
                 f"Resolve it any time via {self._menu_label()} → session.",
@@ -4622,6 +5253,7 @@ class ProxyRunner:
             )
             self._render()
             return
+        self.conflict_deferred_for = None  # they chose to resolve it now
         self._start_merge_for_active(auto=choice.startswith("Merge automatically"))
 
     def _integrate_session_on_exit(self) -> None:
@@ -4796,10 +5428,16 @@ class ProxyRunner:
             and not self._warned_backend_session
         ):
             self._warned_backend_session = True
+            # Reached only when the live watcher could NOT offer its own-worktree choice — a
+            # switch made mid-turn, while the watcher stands down. Sticky rather than a modal:
+            # this runs from the commit flow, which does not always execute on the reactor
+            # thread, and a modal raised off it would wedge input.
             self._set_message(
-                "Detected a new conversation started inside the backend. Its changes are tracked on "
-                f"this session's branch. To get a separate branch, start sessions with {self._menu_label()} → session → New.",
-                seconds=12.0,
+                "Detected a new conversation started inside the backend, mid-turn. It stays in this "
+                f"session's worktree (.agitrack/worktrees/{self.worktree.path.name}), so its changes are "
+                "tracked on this session's branch. For a conversation with its own worktree, start it "
+                f"from {self._menu_label()} → sessions → “+ New session (own worktree)”.",
+                sticky=True,
             )
 
     def _maybe_complete_agent_merge(self) -> None:
@@ -5271,7 +5909,9 @@ class ProxyRunner:
             self._render()
             return
         if result == "conflict":
-            self._prompt_resolve_conflict(self.repo.current_branch())
+            # force: the user just picked "integrate this session" from the menu, so a previous
+            # "leave for later" must not swallow the answer to a question they asked again.
+            self._prompt_resolve_conflict(self.repo.current_branch(), force=True)
             return
         self._set_message(f"'{self.name}' has nothing to integrate.")
         self._render()
@@ -5546,7 +6186,15 @@ class ProxyRunner:
         options: list[str] = []
         for ref in sessions:
             mark = "● " if ref.id in live_ids else "  "
-            label = (names.get(ref.id) or ref.label or "(no prompt recorded)").strip()[:48]
+            # NAME and PROMPT, not one or the other. A session can hold several conversations —
+            # every `/clear` that stayed in it adds one, and they are ALL named after that session
+            # — so a name-only row rendered them as two identical "alpha" lines with no way to
+            # tell which held your work. The first prompt is what distinguishes them.
+            name, prompt = names.get(ref.id), (ref.label or "").strip()
+            if name and prompt and prompt != name:
+                label = f"{name} · {prompt}"[:64]
+            else:
+                label = (name or prompt or "(no prompt recorded)").strip()[:64]
             options.append(f"{mark}{_short_session(ref.id)}  {self._format_age(ref.updated)}  {label}")
         choice = self._select_popup("Resume a conversation (newest first)", options)
         if choice is None:  # Esc → back up one level to the sessions menu
@@ -5564,14 +6212,24 @@ class ProxyRunner:
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
                 self._switch_to_session_index(index)
                 return
-        if self._live_session_name_taken(name):
-            # The name is occupied by a different LIVE session. Two live sessions can't share a
-            # name — a session and its git worktree are 1:1, so they'd share a worktree and run
-            # two backends in one directory. Don't silently rename: ASK the user, explaining
-            # why, and offer a random word they can keep or change (Esc cancels the resume).
+        held_by = self._live_session_index_for_name(name)
+        if held_by is not None and self._conversation_belongs_to_session(session_id, held_by, backend=backend):
+            # It is not a name CLASH — it is the same session. This conversation ran in that
+            # live session's worktree (a `/clear` left it behind there, or the user answered
+            # "keep it here"), so going back to it is a conversation switch inside that session,
+            # not a second session that needs a name of its own. Being asked to invent a name to
+            # return to your own earlier conversation — and having it renamed for good — is the
+            # reported bug; there is no second worktree to name here.
+            self._reopen_conversation_in_session(held_by, session_id, name)
+            return
+        if held_by is not None:
+            # A genuine clash: a DIFFERENT session holds this name. Two live sessions can't share
+            # one — a session and its git worktree are 1:1, so they would run two backends in one
+            # directory. Don't silently rename: ASK, explaining why, and offer a random word they
+            # can keep or change (Esc cancels the resume).
             chosen = self._prompt_session_name(
-                f"A session named '{name}' is already open, so this resumed conversation needs a "
-                f"different name (two live sessions can't share a worktree). New name:",
+                f"A session named '{name}' is already open, and it is a different session — "
+                f"two live sessions can't share a worktree",
                 default=self._next_session_name(),
             )
             if chosen is None:
@@ -5585,8 +6243,53 @@ class ProxyRunner:
         self._new_session(name, resume_session_id=session_id, backend=backend)
 
     def _live_session_name_taken(self, name: str) -> bool:
+        return self._live_session_index_for_name(name) is not None
+
+    def _live_session_index_for_name(self, name: str) -> int | None:
+        """Index of the LIVE session holding ``name``, or None. Names are compared sanitized,
+        exactly as the worktree directory they map to."""
         sanitized = _sanitize_name(name)
-        return any(_sanitize_name(self._session_name(index)) == sanitized for index in range(len(self.sessions)))
+        for index in range(len(self.sessions)):
+            if _sanitize_name(self._session_name(index)) == sanitized:
+                return index
+        return None
+
+    def _conversation_belongs_to_session(self, session_id: str, index: int, *, backend: str | None = None) -> bool:
+        """Whether ``session_id`` is an earlier conversation OF the live session at ``index`` —
+        one that ran in its worktree — rather than an unrelated conversation whose name happens
+        to collide.
+
+        Decided from the durable name record (which session a conversation was last named
+        under), backed by the worktree's own directory: a `/clear` conversation that stayed
+        behind is filed under that session's name AND has its transcript there. A shared session
+        being imported (``backend`` pins a backend for it) is never "the same session" — it is
+        another machine's conversation that merely arrives with a colliding name.
+        """
+        if backend is not None or not (0 <= index < len(self.sessions)):
+            return False
+        session = self.sessions[index]
+        worktree = getattr(session, "worktree", None)
+        if worktree is None:
+            return False  # --no-worktree: sessions share a directory, so "belongs to" means nothing
+        name = self._session_name(index)
+        if self._recorded_session_name(session_id) != name:
+            return False
+        try:
+            repo = getattr(session, "repo", None)
+            recorded_here = {ref.id for ref in self.backend.list_sessions(repo.repo)} if repo is not None else set()
+        except Exception as error:
+            self._debug(f"conversation-ownership listing failed: {error!r}")
+            return False
+        return session_id in recorded_here
+
+    def _reopen_conversation_in_session(self, index: int, session_id: str, name: str) -> None:
+        """Put a live session back on one of its own earlier conversations, in place: same
+        worktree, same name, only the backend process restarts (with ``--resume``)."""
+        self._switch_to_session_index(index)
+        self._commit_latest_turn_sync()  # don't let the outgoing conversation's turn go unrecorded
+        self._set_message(f"Reopening '{name}' on conversation {_short_session(session_id)}…")
+        self._render()
+        self._switch_to_session(session_id)
 
     def _live_session_for_lineage(self, owner: str, name: str) -> int | None:
         """Index of a live session that is the SAME shared session as ``owner/name`` —
@@ -7729,6 +8432,20 @@ class ProxyRunner:
             ["Got it"],
         )
 
+    def _active_backend_name(self) -> str | None:
+        """The backend the CURRENT session is running, or None when it cannot be told.
+
+        Read from the live proxy agent first (always right for this run) and only then from
+        the session state, whose getter RAISES when no backend is configured anywhere — this
+        is called precisely to avoid that raise reaching a session-creating path."""
+        name = getattr(self.backend, "name", None)
+        if name:
+            return str(name)
+        try:
+            return self.state.backend
+        except Exception:
+            return None
+
     def _new_session(
         self,
         name: str,
@@ -7745,6 +8462,15 @@ class ProxyRunner:
         # shared-tree caveat, which used to be raised from inside the branch below.)
         if not self._use_worktrees:
             self._warn_parallel_no_worktree_sessions()
+        # The backend THIS RUN is using, read before the swap below empties `self.active`.
+        # A new session inherits it. Seeding the new state from the global default alone was
+        # not enough: `agitrack --backend claude` on a repo with no configured default never
+        # recorded one, so the new state resolved to no backend at all and
+        # `make_proxy_agent(self.state.backend)` raised "No coding agent backend is configured
+        # for this session" — a crash mid-relocation, after the new worktree existed and
+        # before the outgoing session's identity was restored, which left BOTH worktrees
+        # claiming one conversation: exactly the corruption the relocation fix prevents.
+        inherited_backend = backend or self._active_backend_name()
         # Fresh per-session runtime state; the outgoing active session keeps
         # its state on its own Session object in self.sessions.
         self.active = Session.bare()
@@ -7763,7 +8489,9 @@ class ProxyRunner:
             self.repo = repo
             self._base_branch = base  # this session integrates into `base` (per-session)
             self.turn = self._turn_from_branch(repo.current_branch())
-            self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+            self.state = AgitrackState(
+                info.path, default_backend=inherited_backend or self.global_config.default_backend
+            )
             if base_branch is None:
                 # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
                 # any merge branch a prior run assigned it, confirming the change with the user.
@@ -7782,7 +8510,9 @@ class ProxyRunner:
             self.repo = self.base_repo
             self._base_branch = self.base_repo.current_branch()
             self.turn = 0
-            self.state = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            self.state = AgitrackState(
+                self.base_repo.repo, default_backend=inherited_backend or self.global_config.default_backend
+            )
             if not resume_session_id:
                 # A blank session is a FRESH conversation, not a continuation of whatever
                 # the shared base-dir state last recorded (worktree sessions each got a
@@ -7801,6 +8531,12 @@ class ProxyRunner:
             self.state.backend_session_id = resume_session_id
             self._persist_session_name(resume_session_id)
         self.backend = make_proxy_agent(self.state.backend)
+        # Reopening a dormant worktree passes no conversation: it runs whatever its state file
+        # says, so that file has to be trustworthy. Heal it here if an earlier aGiTrack left it
+        # pointing at (or holding a copy of) a conversation that has since moved to a sibling
+        # worktree — the "switched to the old session and got the new one" report. Before
+        # staging, so a conversation this call is explicitly resuming is never touched.
+        self._release_sibling_owned_conversations(keep=resume_session_id)
         if resume_session_id:
             # Stage the transcript into THIS session's directory before spawning, so a
             # `--resume` finds it. Crucial when the conversation last ran somewhere else:
@@ -10205,7 +10941,9 @@ class ProxyRunner:
             self._dashboard_port = int(port) if isinstance(port, int) else 0
             opened = open_dashboard_in_browser(url)
             self._set_message(
-                f"Dashboard already running at {url} — opening in your browser."
+                # No "opening in your browser": open_dashboard_in_browser has ALREADY run by
+                # the time this is painted, so announcing it as about to happen is wrong.
+                f"Dashboard already running at {url}."
                 if opened
                 else f"Dashboard already running. {remote_browser_hint(url, int(port) if isinstance(port, int) else 0)}"
             )
@@ -10249,9 +10987,7 @@ class ProxyRunner:
                 + ([] if opened else [remote_browser_hint(url, port)]),
             )
             self._set_message(
-                f"Dashboard live at {url} — opening in your browser."
-                if opened
-                else f"Dashboard live. {remote_browser_hint(url, port)}"
+                f"Dashboard live at {url}." if opened else f"Dashboard live. {remote_browser_hint(url, port)}"
             )
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
@@ -10306,13 +11042,11 @@ class ProxyRunner:
                 self._set_message("Backtrace view is building in the background.")
             else:
                 url = str(record.get("url", ""))
-                opened = open_dashboard_in_browser(url)
+                open_dashboard_in_browser(url)
                 self._select_popup(f"Backtrace view live at {url}", ["ok"], detail=detail)
-                self._set_message(
-                    f"Backtrace view live at {url} — opening in your browser."
-                    if opened
-                    else f"Backtrace view live at {url}."
-                )
+                # No "opening in your browser": the browser was opened above, before this is
+                # painted, so announcing it as about to happen is wrong.
+                self._set_message(f"Backtrace view live at {url}.")
         except Exception as error:
             self._debug(f"backtrace substitution failed: {error!r}")
             return False  # never let this block the dashboard the user actually asked for
@@ -10765,6 +11499,9 @@ class ProxyRunner:
 
         def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
+            # The promise made to "keep them for your next turn" is now kept: this commit
+            # carries those files, so they stop being agent work awaiting a commit.
+            self._forget_kept_cancelled_work()
             self.events.emit(
                 "commit",
                 sha=(sha or "")[:12],
@@ -11083,6 +11820,18 @@ class ProxyRunner:
         # different backend (e.g. a Claude id while the session runs OpenCode) is invalid there and
         # makes every summary fail — drop it and use the backend's default instead.
         model = compatible_summarization_model(backend_name, model)
+        if model is None and backend_name == "opencode":
+            # Fall back to the model this SESSION runs, not to the backend's own global default.
+            # The summarizer deliberately runs OUTSIDE the repo (see below), so the project's
+            # `opencode.json` model pin cannot apply there — and OpenCode then reaches for
+            # whatever its global default is, which on a machine that pins models per project is
+            # one the user may have no access to at all. Measured live: EVERY OpenCode summary
+            # failed this way ("summarizer backend exited with 1", a 403 from the default
+            # provider), silently, leaving raw prompts as commit subjects where Claude sessions
+            # got real summaries. Claude is left alone: its CLI's own default is the right
+            # choice there, and the recorded session model can carry a variant suffix its
+            # `--model` flag would reject.
+            model = compatible_summarization_model(backend_name, self.state.model)
         # The summarizer must NOT run in the session worktree (or the repo):
         # its headless calls record real backend sessions keyed by cwd, which
         # the parse worker / exit adoption would then resume instead of the
@@ -11479,19 +12228,30 @@ class ProxyRunner:
                     self._set_message("Exit cancelled — kept working; the background sessions are still running.")
                     self._render()
                     return False
+            head_before_finalize = self._base_head_sha()
             self._finalize_pending_work()
             if self._exit_aborted and not self._popup_exit_force:
-                # Esc on the on-exit copy offer: undo the "we're exiting" state and stay
-                # running so the user can deal with the files. Already-made commits/merges
-                # stand (they never lose work); nothing was deleted.
+                # Esc on an on-exit popup: undo the "we're exiting" state and stay running so
+                # the user can deal with the files. Already-made commits/merges stand (they
+                # never lose work); nothing was deleted.
                 self._exiting = False
                 self._finalized_on_exit = False
+                # Finalize STOPPED the git worker (so its exit-time commits could run on this
+                # thread without racing it). Staying running with no worker meant the automatic
+                # commit pipeline was dead for the rest of the session: a finished turn sat
+                # uncommitted until something else happened to run git on the main thread —
+                # measured live at 3m25s.
+                self._start_git_worker()
                 # Finalize disabled host mouse/focus/paste reporting up front; we're staying
                 # running, so restore it for the live session.
                 self._enable_host_mouse()
+                # Only claim commits when some were actually made: an abort at the keep/delete
+                # question happens BEFORE `_commit_latest_turn_sync`, so the reassurance was
+                # being printed over an exit that had committed nothing at all.
+                committed = self._base_head_sha() != head_before_finalize
                 self._set_message(
                     "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
-                    "need, then exit again. (Commits already made this exit were kept.)",
+                    "need, then exit again." + (" (Commits already made this exit were kept.)" if committed else ""),
                     seconds=12.0,
                 )
                 self._render()
@@ -11501,6 +12261,14 @@ class ProxyRunner:
             return True
         finally:
             self._popup_exit_pending = False
+
+    def _base_head_sha(self) -> str | None:
+        """The base repo's HEAD, or None when it can't be read. Used to tell whether a step
+        actually committed anything before saying so."""
+        try:
+            return self.base_repo.rev_parse("HEAD")
+        except Exception:
+            return None
 
     def _running_background_session_names(self) -> list[str]:
         # Names of background (non-active) sessions whose backend is still working.
@@ -11602,6 +12370,10 @@ class ProxyRunner:
                 self.active = saved
             if self._exit_aborted:
                 return  # Esc on a session's copy offer — stop finalizing the rest
+        # The keep/delete answer covers the idle worktrees the question listed too, so honor it
+        # for them here — after every live session has been finalized above (a session's own
+        # worktree is removed by its finalize, and must not be swept a second time as "idle").
+        self._delete_idle_worktrees_on_exit()
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
@@ -11643,11 +12415,32 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"adopt latest backend session failed: {error!r}")
             return
-        if latest and latest != self.state.backend_session_id:
-            self._debug(f"adopting backend session {latest} (was {self.state.backend_session_id})")
-            self.state.backend_session_id = latest
-            self.state.last_backend_message_id = None  # recomputed from the transcript on resume
-            self._persist_session_name(latest)
+        if not latest or latest == self.state.backend_session_id:
+            return
+        tracked = self.state.backend_session_id
+        if tracked and self._session_recency(latest, 0.0) < self._session_recency(tracked, 0.0):
+            # Never adopt BACKWARDS. "Latest" is whatever the backend reports as this directory's
+            # most recent conversation, and a conversation aGiTrack merely touched (staged,
+            # mirrored, retargeted) can hold that title while carrying nothing newer than what we
+            # are already on. Adopting it re-files this session's NAME onto a dead conversation
+            # (`_persist_session_name` below), which is how a session came back, after a restart,
+            # running a conversation the user had abandoned with `/clear` hours earlier.
+            self._debug(f"not adopting {latest}: it is older than the tracked conversation")
+            return
+        if latest in self._sibling_worktree_conversations():
+            # Not ours to adopt. A conversation that ran here and then moved to its own worktree
+            # leaves a copy of its transcript behind, and on an old aGiTrack that copy can still
+            # be the newest thing in this directory — so this would adopt a SIBLING's conversation
+            # and, worse, re-file its name under this session (``_persist_session_name``). That
+            # rewrite is what made a later start open this worktree running the other session's
+            # conversation. The stale copy is cleaned up when the worktree next opens; until then,
+            # simply decline it.
+            self._debug(f"not adopting {latest}: it belongs to another session's worktree")
+            return
+        self._debug(f"adopting backend session {latest} (was {self.state.backend_session_id})")
+        self.state.backend_session_id = latest
+        self.state.last_backend_message_id = None  # recomputed from the transcript on resume
+        self._persist_session_name(latest)
 
     def _persist_last_session_record(self) -> None:
         # Save just the resume pointer for the current (primary) session into the
@@ -11713,15 +12506,43 @@ class ProxyRunner:
         # terminate() nulls the fd/pid on the session-owned process in place.
         self.active.process.terminate()
 
+    def _idle_worktrees_on_exit(self) -> list[WorktreeInfo]:
+        """This repo's session worktrees that are NOT open in this run.
+
+        A worktree stops being a live session without being deleted, and more often than the
+        exit question used to assume: ``/clear`` → "give it its own worktree" moves the
+        conversation out and DROPS the session it left behind (``_relocate_switched_conversation``
+        removes it from ``self.sessions``), stopping a session from the sessions menu keeps its
+        worktree recoverable, and every worktree a previous run kept stays on disk (they are
+        persistent by design). None of those are in ``self.sessions``, so an exit question built
+        from live sessions alone named only some of the directories it was deciding about — and
+        answering "Delete them" then left the rest on disk with no way to say otherwise. The
+        decision covers all of them, so the question has to list all of them.
+        """
+        if not self._use_worktrees:
+            return []
+        live = {
+            name for session in self.sessions if (name := getattr(getattr(session, "worktree", None), "name", None))
+        }
+        try:
+            return [info for info in self._worktrees().list() if info.name not in live]
+        except Exception as error:
+            self._debug(f"exit idle-worktree scan failed: {error!r}")
+            return []
+
     def _should_delete_worktrees_on_exit(self) -> bool:
-        """Ask once per exit whether to delete this run's session worktrees or keep them,
+        """Ask once per exit whether to delete this repo's session worktrees or keep them,
         spelling out their exact on-disk locations so the user can find them either way. The
-        answer is cached and applied to every session's worktree. A signal teardown (no UI)
-        defaults to KEEP. Pressing Esc CANCELS the exit (sets ``_exit_aborted``) rather than
-        choosing for the user — so a stray keystroke never deletes or commits them to leaving."""
+        answer is cached and applied to EVERY session worktree — the live sessions' and the idle
+        ones left by an earlier run or by a session that ended during this one. A signal teardown
+        (no UI) defaults to KEEP. Pressing Esc CANCELS the exit (sets ``_exit_aborted``) rather
+        than choosing for the user — so a stray keystroke never deletes or commits them to
+        leaving."""
         if self._exit_delete_worktrees is not None:
             return self._exit_delete_worktrees
-        # The exact directories the decision applies to (every live session that has one).
+        # The exact directories the decision applies to: every live session's worktree, plus
+        # every idle one on disk. Captured now, before the per-session finalize starts removing
+        # them (which clears the very records this list is built from).
         listing: list[str] = []
         for session in self.sessions:
             wt = getattr(session, "worktree", None)
@@ -11729,18 +12550,24 @@ class ProxyRunner:
                 listing.append(str(wt.path))
         if not listing and self.worktree is not None:
             listing = [str(self.worktree.path)]
+        idle = self._idle_worktrees_on_exit()
+        self._exit_idle_worktrees = [info.name for info in idle]
+        live_paths = set(listing)
+        listing += [f"{info.path}  (idle — no session open in it)" for info in idle if str(info.path) not in live_paths]
         if not listing:
-            # No worktrees this run (e.g. --no-worktree): nothing to decide, don't prompt.
+            # No worktrees at all (e.g. --no-worktree): nothing to decide, don't prompt.
             self._exit_delete_worktrees = False
             return False
         if self.screen is None:
             self._exit_delete_worktrees = False
             return False
         choice = self._select_popup(
-            "Delete this run's session worktree(s) on exit, or keep them for next time?\n"
+            "Delete this repo's session worktree(s) on exit, or keep them for next time?\n"
             "Keeping preserves each session's full environment and any work-in-progress so it "
             "resumes instantly next time; deleting reclaims the disk (committed work has already "
-            "been integrated into your branch). The worktree(s) are at:\n\nLocation(s):",
+            "been integrated into your branch). This covers the idle worktrees too — any one "
+            "still holding uncommitted or unmerged work is kept regardless, so nothing is lost. "
+            "The worktree(s) are at:\n\nLocation(s):",
             ["Keep them", "Delete them"],
             detail=listing,
         )
@@ -11751,6 +12578,37 @@ class ProxyRunner:
             return False
         self._exit_delete_worktrees = choice == "Delete them"
         return self._exit_delete_worktrees
+
+    def _delete_idle_worktrees_on_exit(self) -> None:
+        """Apply the exit-time DELETE answer to the worktrees no session had open.
+
+        Same safety rule the live sessions get: a worktree is removed only once its work is
+        provably in the base. ``_cleanup_stale_worktree`` integrates whatever it can and returns
+        False for anything left uncommitted, mid-merge or conflicting — those keep their
+        directory (and are surfaced again by the next startup reconcile) rather than being
+        discarded on the way out. Nothing here can abort the exit: it runs after the last
+        session has been finalized, with no UI left to ask anything."""
+        names = self._exit_idle_worktrees
+        self._exit_idle_worktrees = []
+        if not names or not self._exit_delete_worktrees:
+            return
+        try:
+            infos = {info.name: info for info in self._worktrees().list()}
+        except Exception as error:
+            self._debug(f"exit idle-worktree removal skipped: {error!r}")
+            return
+        for name in names:
+            info = infos.get(name)
+            if info is None:
+                continue  # already gone (removed by a session finalize, or externally)
+            try:
+                if not self._cleanup_stale_worktree(info):
+                    self._debug(f"keeping idle worktree '{name}' on exit: its work is not integrated")
+                    continue
+                self._worktrees().remove(name)
+                self._debug(f"removed idle worktree '{name}' on exit (user chose delete)")
+            except Exception as error:
+                self._debug(f"exit removal of idle worktree '{name}' failed: {error!r}")
 
     def _finalize_worktree_on_exit(self) -> None:
         # On exit aGiTrack asks (once) whether to KEEP this run's session worktrees — preserving
@@ -12019,6 +12877,12 @@ class ProxyRunner:
         about to claim them. Offering to commit (or stage) them as the user's own work there is
         simply wrong — most visibly under --no-worktree, where the agent edits this very tree."""
         if self._manual_commits or self.turn_awaiting_commit:
+            return False
+        if self.cancelled_work_kept:
+            # An interrupted turn's changes the user chose to keep "for your next turn": they
+            # are the agent's, and this prompt IS that next turn, so its commit will claim
+            # them with a full trace. Offering them here as the user's own would take the same
+            # files out of that commit and into an untraced user commit instead.
             return False
         if self._noworktree_auto:
             # A just-completed turn's changes may still sit UNCOMMITTED in the tree, recorded only
@@ -12381,12 +13245,26 @@ class ProxyRunner:
         self.agent_in_flight = True
         self.turn_awaiting_commit = True
         try:
-            self.untracked_before_turn = frozenset(self.repo.untracked_entries())
+            # Files kept from an interrupted turn are the AGENT's work awaiting this very
+            # commit, so they must not count as "already there" — that exclusion is what
+            # kept them out of the commit that was promised to include them.
+            self.untracked_before_turn = frozenset(self.repo.untracked_entries()) - self.kept_cancelled_paths
+            # Files that predate EVERY turn folded so far are the USER's, not any turn's output:
+            # a file the agent writes in turn 1 is absent from turn 1's snapshot, so intersecting
+            # the snapshots singles out exactly the ones no turn created. The no-worktree fold
+            # can then leave them alone even when the user answered nothing at all (Esc on the
+            # untracked prompt neither stages nor declines, and they were being swept into an
+            # agent commit whose message never mentioned them).
+            previous = self.user_untracked_since_fold
+            self.user_untracked_since_fold = (
+                self.untracked_before_turn if previous is None else (previous & self.untracked_before_turn)
+            )
         except Exception as error:
             # Unknown baseline: fall back to the worktree rule (stage the turn's files, minus any
             # the user explicitly declined) rather than blocking the commit on a prompt.
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
+            self.user_untracked_since_fold = frozenset()
 
     # How often the commit-gate trace may log while nothing changes. The gate is evaluated on
     # every pipeline pass; without a throttle a stuck runner would write thousands of identical
@@ -12476,7 +13354,45 @@ class ProxyRunner:
             self._transcript_path_cache = (None, None)  # vanished — re-resolve next time
             return None
 
-    def _backend_idle_for(self, seconds: float) -> bool:
+    def _conversation_activity_mtime(self, session_id: str | None) -> float | None:
+        """Last-activity mtime of ANY conversation, not just the tracked one. Same two sources as
+        :meth:`_active_transcript_mtime` (a direct query, else the transcript file), without its
+        path cache — this is asked about a conversation aGiTrack is not tracking yet, so caching
+        by id would fight the active session's entry."""
+        if not session_id:
+            return None
+        direct = getattr(self.backend, "session_activity_mtime", None)
+        if direct is not None:
+            try:
+                return direct(session_id)
+            except Exception as error:
+                self._debug(f"conversation activity lookup failed: {error!r}")
+                return None
+        resolver = getattr(self.backend, "session_transcript_path", None)
+        if resolver is None:
+            return None
+        try:
+            path = resolver(session_id)
+            return path.stat().st_mtime if path is not None else None
+        except Exception as error:  # a missing/unreadable transcript is simply "unknown"
+            self._debug(f"conversation transcript lookup failed for {session_id}: {error!r}")
+            return None
+
+    def _conversation_idle(self, session_id: str, seconds: float) -> bool:
+        """Whether the backend has finished working IN ``session_id`` (as opposed to in the
+        conversation aGiTrack currently tracks).
+
+        The distinction only matters after a native switch, and there it is the whole ballgame.
+        `/clear` freezes the tracked conversation's transcript, so every idleness signal keyed to
+        it reads "the agent is done" the instant the user switches away — while the agent is in
+        fact working on the FIRST TURN of the new conversation. Acting on that read committed a
+        turn that had not happened yet ("committing finished turn with no final text response",
+        seen live) and opened a modal over a running agent; answering it relocated the session
+        out from under a turn still writing files, stranding them uncommitted in the worktree the
+        user had just left. So the switch waits for the conversation it is switching TO."""
+        return self._backend_idle_for(seconds, transcript_mtime=self._conversation_activity_mtime(session_id))
+
+    def _backend_idle_for(self, seconds: float, *, transcript_mtime: "float | None | object" = _UNSET) -> bool:
         """Whether the backend has produced NOTHING for ``seconds`` — judged by the PTY output
         and the session transcript together.
 
@@ -12500,9 +13416,14 @@ class ProxyRunner:
         it has been quiet for ``TRANSCRIPT_IDLE_FACTOR`` x the window, the backend is idle no
         matter how loud the terminal is. The factor keeps the PTY authoritative for the common
         case (both quiet ⇒ idle at ``seconds``) and only overrules a chattering one, so a real
-        sub-agent still gets the full transcript-freshness guard above."""
-        mtime = self._active_transcript_mtime()
-        transcript_quiet_for = None if mtime is None else time.time() - mtime
+        sub-agent still gets the full transcript-freshness guard above.
+
+        ``transcript_mtime`` overrides which transcript is consulted. The default (the ACTIVE
+        session's) is wrong in exactly one place: right after a native switch, where the tracked
+        conversation is the one the user just left — frozen, therefore "quiet", while the agent
+        is busy in the conversation they switched TO. See ``_conversation_idle``."""
+        mtime = self._active_transcript_mtime() if transcript_mtime is _UNSET else transcript_mtime
+        transcript_quiet_for = time.time() - mtime if isinstance(mtime, (int, float)) else None
         if transcript_quiet_for is not None and transcript_quiet_for < seconds:
             return False  # real backend work — possibly a sub-agent printing nothing to the PTY
         if time.monotonic() - self.last_child_output >= seconds:
@@ -12610,13 +13531,53 @@ class ProxyRunner:
                 self._render()
             if integrate:
                 # Interactive integration only for the active session. The
-                # sync/background commit path passes integrate=False. While a
-                # background summary is pending, integration is deferred so the
-                # summary can be amended in first; the idle-integration path
-                # picks the commit up once it lands (or the wait deadline passes).
-                if not self._summary_blocks_integration(time.monotonic()):
-                    self._integrate_session_turn()
+                # sync/background commit path passes integrate=False.
+                self._integrate_or_defer_after_commit()
         return committed
+
+    def _integrate_or_defer_after_commit(self) -> None:
+        """What happens to a turn the moment its commit lands: merge it, or say where it is.
+
+        Under ``--delay-merge`` nothing is merged, so there is nothing to wait for a summary
+        for — only the user to be told where their held-back work is. Routing the notice
+        through the summary-gated integration below meant it never appeared at all in the
+        DEFAULT configuration: a summary is always in flight immediately after a commit, and
+        the idle catch-up path returns early under --delay-merge by design. Proven live — with
+        summaries off the notice paints, with them on the string never reaches the terminal.
+
+        Otherwise: while a background summary is pending, integration is deferred so the
+        summary can be amended in first; the idle-integration path picks the commit up once it
+        lands (or the wait deadline passes).
+        """
+        if self._delay_merge:
+            self._notify_merge_deferred()
+            return
+        if not self._summary_blocks_integration(time.monotonic()):
+            self._integrate_session_turn()
+
+    def _remember_kept_cancelled_work(self) -> None:
+        """Record that an interrupted turn's changes were KEPT for the next turn's commit.
+
+        "Keep them (commit with your next turn)" is a promise, and three other paths used to
+        break it. The parse is consumed either way, so ``turn_awaiting_commit`` drops and the
+        agent's leftover files become "the user's own dirt": the copy-back watcher offered to
+        copy them to the base repo as "intentionally unstaged or git-ignored", the next prompt
+        offered them as a plain USER commit (no trace, no attribution), and under --no-worktree
+        the next turn's commit skipped them because they already existed when it began. This
+        flag keeps the work owned by the agent until a commit actually claims it."""
+        self.cancelled_work_kept = True
+        try:
+            self.kept_cancelled_paths = frozenset(self.repo.untracked_entries())
+        except Exception as error:
+            # Worst case the paths are unknown: ownership (the flag) still holds, and the
+            # worktree commit path stages every non-declined untracked file anyway.
+            self._debug(f"kept-cancelled untracked snapshot failed: {error!r}")
+            self.kept_cancelled_paths = frozenset()
+
+    def _forget_kept_cancelled_work(self) -> None:
+        """A commit claimed the kept work (or the user discarded it): ownership ends here."""
+        self.cancelled_work_kept = False
+        self.kept_cancelled_paths = frozenset()
 
     def _handle_cancelled_turn(self, turns) -> bool:
         """Offer commit-or-discard for a user-cancelled turn's leftover changes.
@@ -12650,6 +13611,7 @@ class ProxyRunner:
             ["Keep them (commit with your next turn)", "Commit the changes now", "Discard the changes"],
         )
         if choice is None or choice.startswith("Keep"):
+            self._remember_kept_cancelled_work()
             self._set_message("Keeping the agent's changes — they'll be committed with your next turn.")
             self._render()
             return False
@@ -12662,6 +13624,8 @@ class ProxyRunner:
                 quiet=False,
                 prompt_untracked=self.worktree is None,
             )
+            if committed:
+                self._forget_kept_cancelled_work()
             self._set_message(
                 "Committed the agent's interrupted changes." if committed else "Nothing staged to commit."
             )
@@ -12680,6 +13644,7 @@ class ProxyRunner:
                 self._set_message("Could not discard the changes.")
                 self._render()
                 return False
+            self._forget_kept_cancelled_work()
             self._set_message("Discarded the agent's interrupted changes.")
             self._render()
             return True
@@ -12876,6 +13841,12 @@ class ProxyRunner:
         decides — only a merge CONFLICT (its own popup) holds integration up."""
         if self._pending_copy_offer is not None:
             return  # a previously collected batch is still waiting to be presented
+        if self.cancelled_work_kept:
+            # Those files are an interrupted turn's work, kept for the next turn's commit —
+            # not leftovers "intentionally unstaged or git-ignored", which is what this offer
+            # would call them seconds after aGiTrack promised to commit them. The exit offer
+            # is deliberately NOT gated: nothing may vanish with the worktree unasked.
+            return
         collected = self._collect_copy_candidates(context=context)
         if collected is not None:
             self._pending_copy_offer = (context, collected)

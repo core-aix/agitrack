@@ -127,6 +127,27 @@ class GitRepo:
     def add_tracked(self) -> None:
         self._run(["git", "add", "-u"])
 
+    def staged_paths(self) -> list[str]:
+        """Paths currently in the index (names only). Used to snapshot the index BEFORE a
+        prompt stages things on the user's behalf, so backing out of that prompt can put the
+        index back exactly as it was."""
+        output = self._run(["git", "diff", "--cached", "--name-only"], check=False).stdout
+        return [line for line in output.splitlines() if line]
+
+    def unstage(self, paths: list[str]) -> None:
+        """Drop ``paths`` from the index, leaving the WORKING TREE untouched — the undo for a
+        staging the user then declined. Staging on their behalf and leaving it there is not
+        harmless: during a merge conflict `git status` groups staged paths under "changes to be
+        committed", which is precisely where a half-resolved file stops being visible as one
+        still needing attention."""
+        if not paths:
+            return
+        # `reset` is the portable spelling (`restore --staged` needs git >= 2.23), but it fails
+        # on an unborn HEAD — where "unstage" means removing the path from the index entirely.
+        result = self._run(["git", "reset", "-q", "HEAD", "--", *paths], check=False)
+        if result.returncode != 0:
+            self._run(["git", "rm", "--cached", "-q", "--", *paths], check=False)
+
     def discard_all_changes(self) -> None:
         """Reset the working tree to HEAD, discarding every uncommitted change:
         staged and unstaged tracked edits (``reset --hard``) plus untracked files

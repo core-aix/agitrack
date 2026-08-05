@@ -97,6 +97,25 @@ class RecoveryService:
         finally:
             lock.release()
 
+    def recover_worktree(self, info: WorktreeInfo) -> RecoveryReport:
+        """Apply the same policy to ONE worktree, for a caller that already holds the repo lock.
+
+        Startup reconciliation is that caller. This module's docstring calls the launch-time
+        path the *lazy* form of this recovery, but startup only ever integrated work that was
+        already COMMITTED: after a SIGKILL, `agitrack --recover` committed and merged a finished
+        turn while simply relaunching aGiTrack left the same turn uncommitted behind a "stale
+        session needs attention" warning. Same crash, different outcome depending on how the
+        user came back."""
+        report = RecoveryReport()
+        try:
+            integration = IntegrationService(self.base_repo, self.base_repo.current_branch())
+            self._recover_one(info, integration, WorktreeManager(self.base_repo), report)
+        except Exception as error:
+            self._debug(f"recover: '{info.name}' failed: {error!r}")
+            if info.name not in report.flagged:
+                report.flagged.append(info.name)
+        return report
+
     # ------------------------------------------------------------------
 
     def _recover_locked(self) -> RecoveryReport:

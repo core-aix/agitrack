@@ -670,6 +670,29 @@ def test_remove_all_installed_hooks_removes_everything_and_restores_chains(tmp_p
     assert not (hooks_dir / "post-commit").exists()
 
 
+def test_remove_all_installed_hooks_also_removes_the_REFERENCE_TRANSACTION_guard(tmp_path):
+    # Found live. The base-commit guard is installed as BOTH pre-commit and
+    # reference-transaction, but `--remove-hooks` only ever removed the first: after the
+    # documented full opt-out the repo kept an aGiTrack hook firing on EVERY ref update
+    # (commit, branch create, fetch, checkout, reset), and the user's own hook stayed shadowed
+    # in .agitrack-orig — while the command printed "Any chained project hooks were restored."
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    project = "#!/bin/sh\necho mine\n"
+    (hooks_dir / "reference-transaction").write_text(project, encoding="utf-8")
+    (hooks_dir / "reference-transaction").chmod(0o755)
+    git_hooks.install_base_commit_guard(hooks_dir)
+    assert "AGITRACK-BASE-REFTX-GUARD" in (hooks_dir / "reference-transaction").read_text()
+
+    removed = git_hooks.remove_all_installed_hooks(hooks_dir)
+
+    assert "reference-transaction" in removed
+    assert (hooks_dir / "reference-transaction").read_text() == project  # restored byte-for-byte
+    assert not (hooks_dir / "reference-transaction.agitrack-orig").exists()
+    assert not (hooks_dir / "pre-commit").exists()  # the guard's other half is gone too
+
+
 def test_remove_all_installed_hooks_noop_when_none(tmp_path):
     repo = _init_repo(tmp_path)
     hooks_dir = repo.repo / ".git" / "hooks"
@@ -918,6 +941,47 @@ def test_noworktree_auto_folds_latent_turn_into_commit(tmp_path):
     assert msg.count("# aGiTrack Metadata") == 1 and "commit_type: agent" in msg
     assert repo.ref_sha(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref reset
     assert runner._manual_pending_count() == 0
+
+
+def test_the_fold_never_sweeps_in_the_users_own_untracked_file(tmp_path):
+    # Found live: the pre-agent "Untracked Files" popup offers Stage all / Leave them unstaged,
+    # and Esc (documented as "still cancels") records NEITHER — so the file was neither staged
+    # nor declined, and this fold, which stages every untracked path not explicitly declined,
+    # put the user's file into an agent commit whose message never mentions it.
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "user-note.txt").write_text("mine\n", encoding="utf-8")  # the user's own file
+    runner._begin_agent_turn()  # snapshots it as pre-existing (the agent did not write it)
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")  # the turn's output
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))
+
+    runner._auto_fold_latent_pending()
+
+    files = _git(repo, "show", "--pretty=", "--name-only", "HEAD").split()
+    assert files == ["a.txt"], files
+    assert "user-note.txt" in _git(repo, "status", "--porcelain")  # still the user's to commit
+
+
+def test_the_fold_still_commits_a_file_the_AGENT_created_in_an_earlier_turn(tmp_path):
+    # The guard above must not swallow the agent's own output: a file written by turn 1 is
+    # present when turn 2 starts, so a naive "existed before this turn" rule would exclude it
+    # from a fold covering both. Only files predating EVERY folded turn are the user's.
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    runner._begin_agent_turn()
+    (tmp_path / "first.txt").write_text("from turn 1\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))
+    runner._begin_agent_turn()  # turn 2 starts with turn 1's file already on disk
+    (tmp_path / "second.txt").write_text("from turn 2\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do y", 20))
+
+    runner._auto_fold_latent_pending()
+
+    files = sorted(_git(repo, "show", "--pretty=", "--name-only", "HEAD").split())
+    assert files == ["first.txt", "second.txt"], files
 
 
 def test_noworktree_auto_force_fold_lands_even_with_summary_pending(tmp_path):

@@ -175,3 +175,103 @@ def test_nothing_to_recover_with_no_worktrees(tmp_path):
     report = RecoveryService(base, _Config()).recover()
     assert report.did_work() is False
     assert report.summary() == "Nothing to recover."
+
+
+def test_a_plain_RESTART_recovers_what_agitrack_recover_would(tmp_path, monkeypatch):
+    # Found live: after a SIGKILL, `agitrack --recover` committed and merged the crashed
+    # session's finished turn, while simply relaunching aGiTrack left the same turn
+    # uncommitted behind "⚠ 1 stale session(s) need attention". Same crash, different outcome
+    # depending on how the user came back — although this module's docstring calls the
+    # launch-time path the lazy form of exactly this recovery. Startup only ever integrated
+    # work that was already COMMITTED.
+    from proxy_helpers import make_runner
+
+    base, manager, info, _wt, _state = _base_with_worktree(tmp_path, name="crashed")
+    (info.path / "feature.py").write_text("print('hi')\n", encoding="utf-8")  # uncommitted turn work
+    _patch_backend(monkeypatch, _exported(complete=True))
+    live = manager.create("live-session", base=base.current_branch())  # the session being started now
+
+    runner = make_runner(
+        repo=GitRepo(live.path),
+        base_repo=base,
+        _base_branch=base.current_branch(),
+        worktree=live,
+        name="live-session",
+    )
+    runner.worktree_manager = manager
+    runner.global_config = _Config()
+    messages: list[str] = []
+    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._debug = lambda *a, **k: None
+
+    runner._reconcile_sessions_on_startup()
+
+    assert (tmp_path / "feature.py").read_text(encoding="utf-8") == "print('hi')\n"  # committed AND merged
+    assert not any("need attention" in m for m in messages)  # nothing left for the user to chase
+
+
+def test_a_restart_still_flags_a_turn_that_was_never_finished(tmp_path, monkeypatch):
+    # The policy's other half must survive: a turn still in flight when the process died is
+    # never committed — it is left exactly as it is and reported.
+    from proxy_helpers import make_runner
+
+    base, manager, info, _wt, _state = _base_with_worktree(tmp_path, name="crashed")
+    (info.path / "half.py").write_text("incomplete\n", encoding="utf-8")
+    _patch_backend(monkeypatch, _exported(complete=False))
+    live = manager.create("live-session", base=base.current_branch())
+
+    runner = make_runner(
+        repo=GitRepo(live.path),
+        base_repo=base,
+        _base_branch=base.current_branch(),
+        worktree=live,
+        name="live-session",
+    )
+    runner.worktree_manager = manager
+    runner.global_config = _Config()
+    messages: list[str] = []
+    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._debug = lambda *a, **k: None
+
+    runner._reconcile_sessions_on_startup()
+
+    assert (info.path / "half.py").exists()  # untouched
+    assert not (tmp_path / "half.py").exists()  # never merged into the base
+    assert any("crashed" in m for m in messages)  # and surfaced
+
+
+def test_a_crashed_run_resumes_its_own_session_instead_of_starting_a_random_new_one(tmp_path):
+    # Found live: SIGKILL a worktree session, relaunch, and aGiTrack came back as a brand-new
+    # randomly-named session ("ember") with a fresh conversation, while the real one sat under
+    # .agitrack/worktrees/alpha. No work was lost — the identity was. Both records that normally
+    # answer "what do I resume?" die with the process: the root pointer is written only by the
+    # graceful exit path, and the repo scan looks in the BASE project dir while a worktree
+    # session's conversation is keyed by the WORKTREE path.
+    from proxy_helpers import make_runner
+
+    base = GitRepo.init(tmp_path)
+    runner = make_runner(repo=base, base_repo=base)
+    runner._repo_latest_session_id = lambda: None  # nothing in the base project dir
+    runner._newest_worktree_session = lambda: ("ses-from-the-worktree", 123.0)
+    root_state = AgitrackState(tmp_path, default_backend="claude")  # crash state: no pointer
+
+    assert root_state.backend_session_id is None
+    assert runner._startup_resume_id(root_state) == "ses-from-the-worktree"
+
+    # …and with a conversation to key it to, the name the crashed run chose is recovered too.
+    root_state.remember_pending_session_name("alpha")
+    assert runner._adopt_pending_session_name(root_state, "ses-from-the-worktree") == "alpha"
+
+
+def test_the_recorded_resume_pointer_still_wins_when_there_is_one(tmp_path):
+    # A graceful exit's pointer must not be overridden by a merely-newer worktree transcript.
+    from proxy_helpers import make_runner
+
+    base = GitRepo.init(tmp_path)
+    runner = make_runner(repo=base, base_repo=base)
+    runner._repo_latest_session_id = lambda: "from-the-repo-scan"
+    runner._newest_worktree_session = lambda: ("from-the-worktree", 999.0)
+    root_state = AgitrackState(tmp_path, default_backend="claude")
+    root_state.backend_session_id = "the-session-i-quit-in"
+
+    assert runner._startup_resume_id(root_state) == "the-session-i-quit-in"

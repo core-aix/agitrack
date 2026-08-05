@@ -771,6 +771,40 @@ def test_delay_merge_defers_integration_and_names_working_dir(tmp_path):
     assert any(str(tmp_path) in m and "not merged" in m for m in msgs)
 
 
+def test_delay_merge_notice_reaches_the_user_even_while_a_summary_is_in_flight(tmp_path):
+    # Found live: with summarization ON (the default) the notice NEVER appeared. The commit path
+    # only reached `_integrate_session_turn` — which holds the notice — when no summary was in
+    # flight, and immediately after a commit one always is; the idle catch-up path returns early
+    # under --delay-merge by design, so nothing ever told the user their work was held back.
+    # Nothing is merged here, so there is no reason to wait for a summary before speaking.
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._summary_blocks_integration = lambda _now: True  # a summary IS in flight
+    integrated: list = []
+    runner._integrate_session_turn = lambda: integrated.append(True)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    runner._integrate_or_defer_after_commit()
+
+    assert integrated == []  # still no merge behind the user's back
+    assert any("not merged" in m and str(tmp_path) in m for m in msgs)  # but they are TOLD
+
+    # And with --delay-merge OFF the summary hold still defers the merge, as before.
+    runner._delay_merge = False
+    runner._integrate_or_defer_after_commit()
+    assert integrated == []
+
+
 def test_delay_merge_off_integrates_immediately(tmp_path):
     import types
 
@@ -821,6 +855,49 @@ def test_proxy_input_matches_puts_extra_commands_first():
     assert "sessions" in inp.matches()
     inp.extra_commands = []
     assert inp.matches()[0] == "sessions"  # default order unchanged when nothing extra
+
+
+def _palette_command(typed: str, *, extra: list[str] | None = None) -> str | None:
+    """What Ctrl-G runs when the user types `typed` and presses Enter."""
+    from agitrack.proxy.runner import ProxyInput
+
+    inp = ProxyInput()
+    inp.extra_commands = list(extra or [])
+    inp.feed(b"\x07")
+    inp.feed(typed.encode())
+    return inp.feed(b"\r")[2]
+
+
+def test_the_palette_keeps_a_typed_ARGUMENT_instead_of_running_another_command():
+    # Found live. The palette filtered on the whole typed string, so the moment a space was
+    # typed nothing matched, the filter fell back to the FULL command list, and Enter ran its
+    # first entry. `sessions 2` merely opened the picker — and with unmerged work present
+    # (which PREPENDS "merge" to that list) it ran MERGE. `sessions <n>`, `sessions new` and
+    # `agent-backend <name>` were all unreachable from the UI as a result.
+    assert _palette_command("sessions 2") == "sessions 2"
+    assert _palette_command("sessions 2", extra=["merge"]) == "sessions 2"
+    assert _palette_command("sessions new", extra=["merge"]) == "sessions new"
+    assert _palette_command("agent-backend opencode") == "agent-backend opencode"
+    # A prefix still resolves to the full command name, argument carried through.
+    assert _palette_command("sess 2") == "sessions 2"
+
+
+def test_an_unknown_command_name_is_reported_not_silently_swapped_for_another():
+    # The same fallback, the other way in: a typo matched nothing, the display list fell back to
+    # every command, and Enter ran its first entry — `frobnicate` performed a MERGE. `_run_command`
+    # has always had an "Unknown aGiTrack command: …" message; it was simply unreachable.
+    assert _palette_command("frobnicate") == "frobnicate"
+    assert _palette_command("frobnicate", extra=["merge"]) == "frobnicate"
+    assert _palette_command("xyz 1") == "xyz 1"
+
+
+def test_the_palette_still_resolves_plain_commands_and_names_containing_a_space():
+    assert _palette_command("git-commit", extra=["merge"]) == "git-commit"
+    assert _palette_command("merge", extra=["merge"]) == "merge"
+    assert _palette_command("", extra=["merge"]) == "merge"  # empty buffer runs the selection
+    # "exit aGiTrack" is a command NAME with a space in it, not a name plus an argument.
+    assert _palette_command("exit aGiTrack", extra=["merge"]) == "exit aGiTrack"
+    assert _palette_command("exit") == "exit aGiTrack"
 
 
 def _merge_runner(tmp_path):
@@ -1818,6 +1895,9 @@ class _CancelRepo:
     def has_changes(self):
         return self._changes
 
+    def untracked_entries(self):
+        return list(getattr(self, "untracked", ["u1.txt", "u2.txt"]))
+
     def discard_all_changes(self):
         self.discarded = True
         self._changes = False
@@ -1842,6 +1922,63 @@ def test_handle_cancelled_turn_keep_leaves_changes(tmp_path):
     assert runner.repo.discarded is False
     # The turn was offered, so a second pass won't re-prompt.
     assert "a1" in runner._cancel_prompted
+
+
+def test_kept_cancelled_work_stays_the_agents_until_a_commit_claims_it(tmp_path):
+    # "Keep them (commit with your next turn)" is a promise. The parse is consumed either
+    # way, so without this the leftover files became "the user's own dirt" the instant the
+    # handler returned, and three separate paths then re-asked about them.
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Keep them (commit with your next turn)"
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is False
+    assert runner.cancelled_work_kept is True
+    assert runner.kept_cancelled_paths == frozenset({"u1.txt", "u2.txt"})
+
+    # 1. The next prompt must not offer the agent's kept files as the USER's own commit
+    #    (that commit carries no trace and would empty the promised one). Asserted by
+    #    whether the ownership question is even ASKED, so the test can't pass vacuously
+    #    on some unrelated early return.
+    asked = []
+    # Reports "no user changes" so the control call below stops right after being asked.
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: asked.append(1) or False)
+    assert runner._offer_pre_agent_user_commit() is False
+    assert asked == []
+    runner.cancelled_work_kept = False
+    runner._offer_pre_agent_user_commit()
+    assert asked == [1]  # without the kept work, the user IS asked as before
+    runner.cancelled_work_kept = True
+    # 2. The copy-back watcher must not call them "intentionally unstaged or git-ignored".
+    collected = []
+    runner._collect_copy_candidates = lambda **k: collected.append(k) or ["u1.txt"]
+    runner._request_copy_offer()
+    assert collected == [] and runner._pending_copy_offer is None
+    # 3. The next turn's commit must be able to stage them: in no-worktree mode staging is
+    #    limited to files that did not exist before the turn, and these do.
+    runner._begin_agent_turn()
+    assert runner.untracked_before_turn == frozenset()
+
+
+def test_committing_the_kept_work_ends_the_agents_ownership(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Commit the changes now"
+    runner._create_agent_commit_from_turns_popup = lambda **k: True
+    runner.cancelled_work_kept = True
+    runner.kept_cancelled_paths = frozenset({"u1.txt"})
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is True
+    assert runner.cancelled_work_kept is False
+    assert runner.kept_cancelled_paths == frozenset()
+
+
+def test_discarding_the_kept_work_also_ends_the_agents_ownership(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    answers = iter(["Discard the changes", "Yes, discard"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner.cancelled_work_kept = True
+
+    assert runner._handle_cancelled_turn([_cancelled_turn()]) is True
+    assert runner.cancelled_work_kept is False
 
 
 def test_handle_cancelled_turn_commit_commits_changes(tmp_path):
@@ -4183,15 +4320,21 @@ def test_backend_session_change_warns_once(tmp_path):
     state = AgitrackState(tmp_path)
     state.backend_session_id = "old"
     runner = make_runner(
-        worktree=object(),
+        # The notice names the worktree the new conversation landed in, so this needs a
+        # worktree with a real path rather than a bare sentinel.
+        worktree=types.SimpleNamespace(name="wt", path=tmp_path / "wt", branch=""),
         _warned_backend_session=False,
         state=state,
     )
     messages = []
-    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._set_message = lambda message, **kw: messages.append((message, kw))
 
     runner._note_backend_session_change("new")
-    assert messages and "separate branch" in messages[0].lower()
+    assert messages and "own worktree" in messages[0][0].lower()
+    assert ".agitrack/worktrees/wt" in messages[0][0]
+    # Sticky, not timed: it says the new conversation is NOT isolated, and a notice that
+    # fades out leaves the user working under the opposite belief.
+    assert messages[0][1].get("sticky") is True
     assert runner._warned_backend_session is True
 
     # It only warns once, not on every subsequent change.
@@ -5468,7 +5611,7 @@ def _integration_runner(merge_ok):
 def test_integrate_conflict_aborts_and_prompts_resolve_options():
     runner = _integration_runner(merge_ok=False)
     calls = []
-    runner._prompt_resolve_conflict = lambda src: calls.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(src)
     runner._advance_base_to = lambda src: calls.append(("advance", src))
 
     runner._integrate_session_turn()
@@ -5480,7 +5623,7 @@ def test_integrate_conflict_aborts_and_prompts_resolve_options():
 def test_integrate_clean_merge_advances_base_without_prompt():
     runner = _integration_runner(merge_ok=True)
     calls = []
-    runner._prompt_resolve_conflict = lambda src: calls.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(("prompt", src))
     runner._advance_base_to = lambda src: calls.append(("advance", src))
 
     runner._integrate_session_turn()
@@ -5517,7 +5660,7 @@ def test_no_created_notice_when_nothing_pending():
 
 def test_conflict_does_not_fire_created_notice():
     runner = _integration_runner(merge_ok=False)
-    runner._prompt_resolve_conflict = lambda src: None
+    runner._prompt_resolve_conflict = lambda src, **_kw: None
     runner._commit_merged_pending = True
 
     assert runner._integrate_turn_or_conflict() == "conflict"
@@ -5529,7 +5672,7 @@ def test_integrate_conflict_on_exit_leaves_for_startup():
     runner = _integration_runner(merge_ok=False)
     runner._exiting = True
     prompted = []
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
     runner._advance_base_to = lambda src: None
 
     runner._integrate_session_turn()
@@ -5713,7 +5856,7 @@ def test_service_background_integrates_idle_session_cleanly():
     calls = []
     runner._with_session = lambda session, fn: calls.append(session.name) or "integrated"
     runner._switch_active = lambda i: calls.append(("switch", i))
-    runner._prompt_resolve_conflict = lambda src: calls.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: calls.append(("prompt", src))
 
     runner._service_background_sessions()
 
@@ -5737,7 +5880,7 @@ def test_service_background_integrates_even_when_not_in_flight():
     serviced = []
     runner._with_session = lambda session, fn: serviced.append(session.name) or "integrated"
     runner._switch_active = lambda i: serviced.append(("switch", i))
-    runner._prompt_resolve_conflict = lambda src: serviced.append(("prompt", src))
+    runner._prompt_resolve_conflict = lambda src, **_kw: serviced.append(("prompt", src))
 
     runner._service_background_sessions()
 
@@ -5766,7 +5909,7 @@ def test_service_background_conflict_switches_and_prompts():
         runner.repo = _Repo()
 
     runner._switch_active = _switch
-    runner._prompt_resolve_conflict = lambda src: prompted.append(src)
+    runner._prompt_resolve_conflict = lambda src, **_kw: prompted.append(src)
 
     runner._service_background_sessions()
 
@@ -6082,6 +6225,55 @@ def test_new_session_no_worktree_runs_in_base_dir_not_a_worktree(tmp_path):
     assert runner.repo is base
     assert len(runner.sessions) == 2  # the new session was actually started
     assert "warn" in events  # the shared-tree caveat was surfaced
+
+
+def test_a_new_session_inherits_the_runs_backend_when_none_is_configured(tmp_path):
+    # Found live: `agitrack --backend claude` on a repo with no configured default never
+    # recorded one anywhere, so a NEW session's state (seeded only from the global default)
+    # resolved to no backend and `make_proxy_agent(self.state.backend)` raised "No coding
+    # agent backend is configured for this session". That crash landed mid-relocation — after
+    # the new worktree existed, before the outgoing session's identity was restored — leaving
+    # BOTH worktrees recording the same conversation, the very corruption the relocation
+    # fix exists to prevent. The run's own backend is the answer, and it is always known.
+    import types
+
+    runner, _base, _events = _no_worktree_new_session_runner(tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend=None)
+    runner.backend = types.SimpleNamespace(name="claude")  # what this run is actually using
+
+    runner._new_session("second")
+
+    assert runner.state.backend == "claude"
+
+
+def test_a_new_worktree_session_inherits_the_runs_backend_too(tmp_path):
+    # Same defect, on the path that actually crashed: the /clear "move it to its own
+    # worktree" relocation, which goes through the worktree branch of _new_session.
+    import types
+
+    from agitrack.git import GitRepo
+
+    runner, base, _events = _no_worktree_new_session_runner(tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend=None)
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner._use_worktrees = True
+    worktree_dir = tmp_path / "wt"
+    worktree_dir.mkdir()
+    wt_repo = GitRepo.init(worktree_dir)
+    (worktree_dir / "f.txt").write_text("x\n", encoding="utf-8")
+    wt_repo.stage_paths(["f.txt"])
+    wt_repo.commit("seed")
+    runner._open_session_worktree = lambda name, **kw: (
+        types.SimpleNamespace(name=name, path=worktree_dir),
+        wt_repo,
+    )
+    runner._merge_target_default = lambda: "main"
+    runner._reconcile_merge_branch = lambda _base: None
+    runner._release_sibling_owned_conversations = lambda **kw: None
+
+    runner._new_session("beta")
+
+    assert runner.state.backend == "claude"
 
 
 def test_new_session_no_worktree_blank_starts_fresh_conversation(tmp_path):
@@ -8720,6 +8912,57 @@ def test_popup_exit_flow_aborted_by_esc_on_copy_offer_stays_running():
     assert any("Exit cancelled" in m for m in msgs)
 
 
+def test_an_aborted_exit_restarts_the_git_worker_and_does_not_claim_commits_it_never_made():
+    # Found live. Finalize STOPS the git worker so its exit-time commits can't race it. On an
+    # abort the flow stayed running with no worker at all, so the automatic commit pipeline was
+    # dead for the rest of the session — a finished turn sat uncommitted for 3m25s. And the
+    # abort at the keep/delete question happens BEFORE any commit, yet the notice still said
+    # "(Commits already made this exit were kept.)".
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._enable_host_mouse = lambda: None
+    runner._base_head_sha = lambda: "same-sha"  # nothing was committed during this finalize
+    started: list[str] = []
+    runner._start_git_worker = lambda: started.append("git-worker")
+
+    def finalize():
+        runner.events.append("finalize")
+        runner._exit_aborted = True
+
+    runner._finalize_pending_work = finalize
+
+    assert runner._run_exit_flow() is False
+    assert started == ["git-worker"]  # the pipeline is alive again
+    assert any("Exit cancelled" in m for m in msgs)
+    assert not any("Commits already made" in m for m in msgs)  # it made none, so it says none
+
+
+def test_an_aborted_exit_that_DID_commit_still_says_so():
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._enable_host_mouse = lambda: None
+    runner._start_git_worker = lambda: None
+    heads = iter(["before", "after"])  # HEAD moved during finalize
+    runner._base_head_sha = lambda: next(heads)
+
+    def finalize():
+        runner._exit_aborted = True
+
+    runner._finalize_pending_work = finalize
+
+    runner._run_exit_flow()
+
+    assert any("Commits already made this exit were kept." in m for m in msgs)
+
+
 def test_popup_exit_flow_double_ctrl_c_still_finalizes():
     runner = _popup_exit_runner()
 
@@ -10438,10 +10681,13 @@ def _collision_resume_runner(tmp_path):
 
 
 def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
-    # Resuming a conversation whose name collides with a LIVE session must PROMPT the user
-    # (explaining why, suggesting a random word) — never silently rename.
+    # Resuming a conversation whose name collides with a DIFFERENT live session must PROMPT the
+    # user (explaining why, suggesting a random word) — never silently rename. (A conversation
+    # belonging to that same session takes the reopen-in-place path instead; see
+    # test_worktree_conversation_ownership.)
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: True
+    runner._live_session_index_for_name = lambda name: 0
+    runner._conversation_belongs_to_session = lambda sid, index, **k: False
     asked = []
     runner._prompt_session_name = lambda title, *, default: asked.append((title, default)) or "bar"
 
@@ -10456,7 +10702,8 @@ def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
 
 def test_resume_name_collision_cancel_aborts_resume(tmp_path):
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: True
+    runner._live_session_index_for_name = lambda name: 0
+    runner._conversation_belongs_to_session = lambda sid, index, **k: False
     runner._prompt_session_name = lambda *a, **k: None  # Esc / cancel
 
     runner._resume_conversation("foo", "ses_1")
@@ -10466,7 +10713,7 @@ def test_resume_name_collision_cancel_aborts_resume(tmp_path):
 
 def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
     runner = _collision_resume_runner(tmp_path)
-    runner._live_session_name_taken = lambda name: False
+    runner._live_session_index_for_name = lambda name: None
     runner._prompt_session_name = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt"))
 
     runner._resume_conversation("foo", "ses_1")
@@ -11890,3 +12137,28 @@ def test_the_switch_watch_is_throttled(tmp_path):
     runner._service_native_session_switch()
 
     assert not calls, "a directory listing on every reactor tick"
+
+
+def test_restart_ignores_a_conversation_that_is_only_a_newer_FILE(tmp_path):
+    """aGiTrack touches transcripts itself — staging a resume, mirroring to the base repo,
+    retargeting a recorded cwd — none of which adds a message. Live, that made a conversation
+    abandoned with `/clear` the newest FILE in a worktree, and the pin moved onto it: the session
+    came back running the thrown-away conversation, under that session's name."""
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "the-real-one"
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/repo"),
+        backend=_FakeBackend(
+            [
+                SessionRef("the-real-one", 100.0, label="real work"),
+                SessionRef("abandoned", 200.0, label="hi"),  # newer file, older messages
+            ]
+        ),
+        state=state,
+    )
+    messages = {"the-real-one": 2_000.0, "abandoned": 1_000.0}
+    runner.backend.session_last_activity = lambda sid: messages.get(sid)
+
+    runner._resync_pin_to_the_live_conversation()
+
+    assert state.backend_session_id == "the-real-one"

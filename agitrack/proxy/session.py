@@ -65,7 +65,25 @@ class Session:
         # commit / parse tracking
         "agent_in_flight",
         "turn_awaiting_commit",
+        # A cancelled (Esc) turn whose changes the user chose to KEEP ("commit with your
+        # next turn"). Until a commit claims them those changes are still the AGENT's, so
+        # nothing may re-ask about them as if they were the user's own or as leftovers.
+        "cancelled_work_kept",
+        # The untracked paths kept that way. Needed because a no-worktree turn's commit
+        # stages only files that did NOT exist before the turn, and these do.
+        "kept_cancelled_paths",
         "untracked_before_turn",
+        # Untracked files that predate EVERY turn folded so far (the intersection of each
+        # turn's start snapshot since the last fold), i.e. the USER's own files rather than
+        # any turn's output. None until the first turn after a fold. The no-worktree fold
+        # excludes them, so a file the user never consented to stage cannot ride into an
+        # agent commit that does not mention it.
+        "user_untracked_since_fold",
+        # (base sha, source sha) the user last answered "Leave for later" for. The conflict box
+        # is raised from a POLL, so without remembering the answer it came straight back every
+        # couple of seconds. Both shas are in the key so a genuinely new situation — the base
+        # moved, or this session committed again — still asks.
+        "conflict_deferred_for",
         "agent_parse_thread",
         "agent_parse_result",
         "agent_parse_active",
@@ -193,7 +211,11 @@ class Session:
             "file_observer": None,
             "agent_in_flight": False,
             "turn_awaiting_commit": False,
+            "cancelled_work_kept": False,
+            "kept_cancelled_paths": frozenset(),
             "untracked_before_turn": frozenset(),
+            "user_untracked_since_fold": None,
+            "conflict_deferred_for": None,
             "_pending_merge_prompt": False,
             "agent_parse_thread": None,
             "agent_parse_result": None,

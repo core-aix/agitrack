@@ -32,6 +32,7 @@ __all__ = [
     "import_shared_session",
     "prepare_resume",
     "link_session",
+    "forget_session_in",
     "session_cwd",
     "retarget_session_cwd",
     "parse_rows",
@@ -139,6 +140,40 @@ def _session_path(repo: Path, session_id: str) -> Path:
     return _project_dir(repo) / f"{session_id}.jsonl"
 
 
+# How much of a transcript's tail to read when asking when it last had a message. Generous
+# enough to span several rows of a long turn, small enough to be free on a 150 MB session.
+_TAIL_BYTES = 65536
+
+
+def _content_updated(path: Path, fallback: float) -> float:
+    """When this conversation last had a MESSAGE, read from the tail of its transcript.
+
+    The file's mtime cannot answer this. aGiTrack itself touches transcripts — hardlinking one
+    into a worktree for a resume, mirroring it to the base repo, rewriting a recorded cwd — none
+    of which adds a message, all of which bump the mtime. Observed live: a conversation
+    abandoned by `/clear` hours earlier was linked into a worktree, became the newest file
+    there, and was adopted as that session's conversation, taking the session's NAME with it —
+    so the next start opened the session on the dead conversation and the real one came back
+    under a fresh name.
+
+    A transcript is append-only JSONL, so the newest message timestamp is at the end: only the
+    tail is read, whatever the file's size. ``fallback`` (the mtime) is used when the tail
+    carries no timestamp at all."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return fallback
+    for raw in reversed(_TIMESTAMP_RE.findall(tail)):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return fallback
+
+
 def latest_session_id(repo: Path) -> str | None:
     refs = list_sessions(repo)
     # Prefer the newest conversation that actually has a user prompt. Claude mints
@@ -154,7 +189,11 @@ def latest_session_id(repo: Path) -> str | None:
     pool = resumable or refs
     if not pool:
         return None
-    return max(pool, key=lambda ref: ref.updated).id
+    # Ranked by CONTENT recency, not the file's mtime — see _content_updated for what mtime
+    # ranking cost here (a dead conversation aGiTrack had merely touched being adopted as the
+    # session's own).
+    project = _project_dir(repo)
+    return max(pool, key=lambda ref: _content_updated(project / f"{ref.id}.jsonl", ref.updated)).id
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
@@ -406,6 +445,37 @@ def link_session(session_id: str, src_repo: Path, dst_repo: Path) -> bool:
         os.link(src, dst)
     except FileExistsError:
         return True
+    except OSError:
+        return False
+    return True
+
+
+def forget_session_in(repo: Path, session_id: str) -> bool:
+    """Drop ``repo``'s copy of a conversation's transcript — the conversation itself lives on.
+
+    Claude files a transcript per working directory, so a conversation that RAN in one directory
+    and then moved to another (aGiTrack relocating a `/clear`-started conversation into its own
+    worktree) leaves a copy behind in the directory it left. That copy is not harmless: it is
+    what ``list_worktree_sessions`` and ``latest_session_id`` read, so the old worktree goes on
+    claiming a conversation that is now somebody else's — which is how, after a restart, two
+    worktrees end up mixed up.
+
+    Refuses unless the conversation is recorded somewhere ELSE, so this can only ever remove a
+    duplicate, never the last copy. Returns True when a copy was removed."""
+    if not session_id:
+        return False
+    target = _session_path(Path(repo), session_id)
+    if not target.is_file():
+        return False
+    elsewhere = [
+        path
+        for path in _projects_root().glob(f"*/{session_id}.jsonl")
+        if path.is_file() and path.resolve() != target.resolve()
+    ]
+    if not elsewhere:
+        return False  # the only copy — dropping it would lose the conversation
+    try:
+        target.unlink()
     except OSError:
         return False
     return True
@@ -814,6 +884,13 @@ def session_last_activity(session_id: str) -> float | None:
     path = _find_session_file(session_id)
     if path is None:
         return None
+    # The tail first: this is asked on a timer (the conversation-switch watcher), and a session's
+    # transcript runs to hundreds of megabytes, so reading the whole file to find its LAST
+    # timestamp would put a multi-megabyte read on every tick. Append-only JSONL puts the newest
+    # timestamp at the end. Only a transcript whose tail somehow carries none is read in full.
+    tail = _content_updated(path, float("nan"))
+    if tail == tail:  # not NaN: the tail answered
+        return tail
     try:
         data = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1141,6 +1218,9 @@ def parse_rows(
     # result carries the file's pre-existing content, which seeds `file_state` so a later Write
     # diffs against it instead of counting the whole (already existing) file as newly added.
     pending_reads: dict[str, str] = {}
+    # A skill invoked as `/<skill>` hot-loads: its body is injected as a meta row and there is NO
+    # `Skill` tool call to see. Held here until the turn it belongs to exists (see below).
+    pending_skill: str | None = None
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -1188,6 +1268,18 @@ def parse_rows(
                         background_last_event[task_id] = _row_timestamp(row) or 0
                 pending_background = notification_kind
                 continue
+            hot_loaded = _hot_loaded_skill(row)
+            if hot_loaded is not None:
+                # Which turn this belongs to depends on how the skill was invoked, and the two
+                # cases differ by whether a command invocation is still pending:
+                #   `/skill`            — no args, so the injected body is what OPENS the turn.
+                #                         `current` is still the PREVIOUS turn here; hold it.
+                #   `/skill do the thing` — the args are an instruction, so the turn was already
+                #                         opened by the command row and the body follows it.
+                if pending_command is None and current is not None:
+                    current.setdefault("skills", []).append(hot_loaded)
+                else:
+                    pending_skill = hot_loaded
             command = _slash_command_name(row)
             if command is not None:
                 # A command carrying a user INSTRUCTION (`/goal …`, `/loop …`, a skill
@@ -1237,12 +1329,14 @@ def parse_rows(
                 "ended_at": stamp,
                 "tool_ids": set(),
                 "tool_names": [],
-                "skills": [],
+                # A skill whose injected body opened THIS turn (bare `/<skill>`) belongs to it.
+                "skills": [pending_skill] if pending_skill else [],
                 "subagents": [],
                 "compactions": pending_compactions,
                 "reasoning_effort": None,
                 "messages": [],
             }
+            pending_skill = None
             pending_compactions = 0
         elif row_type == "attachment":
             queued = _queued_human_prompt(row)
@@ -1778,6 +1872,30 @@ def _slash_command_directive(row: dict) -> str | None:
     if len(args.split()) < _INSTRUCTION_WORDS:
         return None
     return f"{name} {args}"
+
+
+# A skill invoked as `/<skill>` is HOT-LOADED: Claude Code injects the skill's own text as a meta
+# user row and never calls the `Skill` tool, so `_collect_capabilities` (which reads tool_use
+# blocks) sees nothing at all. That injected body opens with the skill's install directory, and
+# that line is the only machine-readable marker the invocation leaves — without reading it, every
+# skill the user runs from the command line is missing from the commit's provenance.
+_SKILL_BASE_DIR_RE = re.compile(r"^Base directory for this skill:\s*(\S.*?)\s*$", re.MULTILINE)
+
+
+def _hot_loaded_skill(row: dict) -> str | None:
+    """The name of a skill hot-loaded by a `/<skill>` slash command, or None.
+
+    Taken from the last path segment of the announced base directory
+    (``~/.claude/skills/<name>``), which is the skill's own directory name.
+    """
+    text = _command_expansion_text(row)
+    if not text:
+        return None
+    match = _SKILL_BASE_DIR_RE.search(text)
+    if match is None:
+        return None
+    name = match.group(1).replace("\\", "/").rstrip("/").rpartition("/")[2]
+    return name or None
 
 
 def _command_expansion_text(row: dict) -> str | None:

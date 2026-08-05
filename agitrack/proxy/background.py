@@ -59,6 +59,18 @@ def _read_handshake(repo: GitRepo) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _recorded_backend(state) -> str | None:
+    """The backend this repo/session is configured to use, or None when none is.
+
+    ``AgitrackState.backend`` deliberately RAISES rather than guessing, which is right for a
+    spawn path but wrong inside the commit hook: there the raise was swallowed whole and the
+    hook became a silent no-op. This asks the same question in a form that has a "no" answer."""
+    try:
+        return state.backend
+    except Exception:
+        return None
+
+
 def _live_background_pid(repo: GitRepo) -> int | None:
     """The pid of a live background tracker on this repo, or None (also clears a stale file)."""
     info = _read_handshake(repo)
@@ -468,7 +480,12 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         runner = BackgroundRunner(
             repo, manual_commits=True, backend_command=backend_command, _global_config=config, _lock=lock
         )
-        if not backend_installed(runner.state.backend):
+        # NOT `runner.state.backend`: that RAISES when no backend has ever been recorded, and the
+        # blanket `except` below turned the raise into a silent no-op — no fold hooks installed, no
+        # trace folded, rc 0, the commit's AI work lost, while `agitrack -s` still reported
+        # "Auto-start on commit: on". Ask a question that can be answered with "don't know".
+        backend_name = _recorded_backend(runner.state)
+        if not backend_name or not backend_installed(backend_name):
             return 0
         runner.state.ensure_local_ignore()  # git-ignore .agitrack/ before writing the trailer/ref
         # This hook path folds a trace + metadata into a commit the user is writing THEMSELVES, so
@@ -491,7 +508,13 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         manual = read_background_mode(repo)
         if manual is None:
             manual = config.manual_commits
-        spawn_background_daemon(repo, extra_args=["--manual-commits" if manual else "--auto-commit"])
+        extra_args = ["--manual-commits" if manual else "--auto-commit"]
+        # Name the backend explicitly. The spawned process resolves `--backend or the GLOBAL
+        # default` and never consults this repo's own state, so without this it printed "No coding
+        # agent backend is configured." into background.log and exited seconds after the commit
+        # told the user tracking had started.
+        extra_args += ["--backend", backend_name]
+        spawn_background_daemon(repo, extra_args=extra_args)
         mode_label = "manual" if manual else "auto"
         print(
             f"aGiTrack: started automatically in {mode_label}-commit mode (same as last run) to keep tracking — "
@@ -575,12 +598,20 @@ class BackgroundRunner:
             if _state is not None
             else AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         )
-        if backend and backend != self.state.backend:
-            self.state.remember_backend_session()
+        if backend:
+            if backend != self.state.backend:
+                self.state.remember_backend_session()
+                self.state.backend_session_id = self.state.stored_backend_session(backend)
+                self.state.last_backend_message_id = None
+            # Record the explicit choice even when it only CONFIRMS what the state resolves to.
+            # The state was just seeded with this same value as an in-memory default, so the
+            # "differs?" test above is always false on a first run and NOTHING was written:
+            # `agitrack -b --backend claude` left both the state file and the global config
+            # empty, and every later reader saw no backend at all — the auto-track hook then
+            # silently did nothing and the daemon it spawned died on startup.
             self.state.backend = backend
-            self.global_config.default_backend = backend
-            self.state.backend_session_id = self.state.stored_backend_session(backend)
-            self.state.last_backend_message_id = None
+            if self.global_config.default_backend != backend:
+                self.global_config.default_backend = backend
         if new_session:
             self.state.backend_session_id = None
             self.state.last_backend_message_id = None
@@ -1446,6 +1477,13 @@ class BackgroundRunner:
         # A summarization_model configured for a different backend (e.g. a Claude id under an
         # OpenCode session) is invalid there and fails every summary — drop it for the default.
         model = compatible_summarization_model(backend_name, model)
+        if model is None and backend_name == "opencode":
+            # Same reasoning (and the same fix) as ProxyRunner._make_summarizer: the summarizer
+            # runs from a scratch dir outside the repo, so the project's `opencode.json` model
+            # pin cannot apply and OpenCode falls back to its global default — which failed
+            # every summary here too, leaving the daemon's commits with raw-prompt subjects
+            # while the interactive path had already been fixed. Two copies, one bug.
+            model = compatible_summarization_model(backend_name, self.state.model)
         launch = self._backend_command or None
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch), model=model)
 

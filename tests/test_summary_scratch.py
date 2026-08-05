@@ -51,3 +51,79 @@ def test_shell_summarizer_backend_never_runs_in_the_repo(tmp_path, monkeypatch):
 
     assert backend.repo == summary_scratch_dir()
     assert backend.repo != repo.repo
+
+
+def test_an_opencode_summarizer_uses_the_SESSION_model_not_opencodes_global_default(tmp_path, monkeypatch):
+    # Found live: EVERY OpenCode commit summary failed, silently. The summarizer runs outside
+    # the repo (above), so the project's `opencode.json` model pin cannot apply — and with no
+    # --model OpenCode falls back to its GLOBAL default, which on a machine that pins models per
+    # project is one the user may have no access to (measured: exit 1, a 403 from the provider).
+    # Commit subjects stayed raw prompts where Claude sessions got real summaries.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    repo = GitRepo.init(tmp_path / "wt-oc")
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path / "wt-oc"))
+    runner.global_config = None
+    runner.state.backend = "opencode"
+    runner.state.model = "opencode/deepseek-v4-flash-free"  # what the session is actually running
+
+    summarizer = runner._make_summarizer()
+
+    assert summarizer.model == "opencode/deepseek-v4-flash-free"
+
+
+def test_a_claude_summarizer_still_lets_the_cli_pick_its_own_default(tmp_path, monkeypatch):
+    # Deliberately asymmetric: the Claude CLI's own default is the right choice there, and the
+    # recorded session model can carry a variant suffix (`claude-opus-5[1m]`) that --model rejects.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    repo = GitRepo.init(tmp_path / "wt-cl")
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path / "wt-cl"))
+    runner.global_config = None
+    runner.state.backend = "claude"
+    runner.state.model = "claude-opus-5[1m]"
+
+    assert runner._make_summarizer().model is None
+
+
+def test_a_configured_summarization_model_still_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    repo = GitRepo.init(tmp_path / "wt-cfg")
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path / "wt-cfg"))
+    runner.global_config = None
+    runner.state.backend = "opencode"
+    runner.state.model = "opencode/deepseek-v4-flash-free"
+    runner.state.summarization_model = "anthropic/claude-haiku-4-5"
+
+    assert runner._make_summarizer().model == "anthropic/claude-haiku-4-5"
+
+
+def test_the_DAEMONS_summarizer_also_uses_the_session_model_on_opencode(tmp_path, monkeypatch):
+    # The proxy and the background daemon each build their own summarizer. Fixing only the proxy
+    # left every daemon-made OpenCode commit with a raw-prompt subject: the live `-b` run logged
+    # "summary failed … UnusableSummaryError('summarizer backend exited with 1: ')" for each turn.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = GitRepo.init(tmp_path / "bg-oc")
+    (tmp_path / "bg-oc" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    repo.stage_paths(["seed.txt"])
+    repo.commit("seed")
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda _name: object())
+    runner = BackgroundRunner(repo, backend="opencode")
+    runner.state.model = "opencode/deepseek-v4-flash-free"
+
+    assert runner._make_summarizer().model == "opencode/deepseek-v4-flash-free"
+
+
+def test_the_DAEMONS_summarizer_still_lets_claude_choose(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = GitRepo.init(tmp_path / "bg-cl")
+    (tmp_path / "bg-cl" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    repo.stage_paths(["seed.txt"])
+    repo.commit("seed")
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda _name: object())
+    runner = BackgroundRunner(repo, backend="claude")
+    runner.state.model = "claude-opus-5[1m]"
+
+    assert runner._make_summarizer().model is None
