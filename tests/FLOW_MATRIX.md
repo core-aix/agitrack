@@ -254,6 +254,7 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | AUTO fold bails early (doesn't hang) when the summary worker finished without a note | `test_fold_summary_ready_bails_when_worker_finished_without_note` | real-git |
 | Global `summarization_enabled: false` wins in background mode (not shadowed by state default) | `test_global_summarization_disabled_is_not_shadowed_by_state_default` | mock |
 | `agitrack --remove-hooks` removes all aGiTrack hooks, restores chained originals | `test_remove_all_installed_hooks_removes_everything_and_restores_chains`, `_noop_when_none` | real-git |
+| **…including the `reference-transaction` half of the base-commit guard.** The guard installs as TWO hooks but the opt-out removed only `pre-commit`, so an explicit "remove everything" left an aGiTrack hook running on every ref update (commit, branch, fetch, checkout, reset) and the user's own hook shadowed in `.agitrack-orig` — under a printed "Any chained project hooks were restored." | `test_remove_all_installed_hooks_also_removes_the_REFERENCE_TRANSACTION_guard` | real-git |
 | `.agitrack/` git-ignored before the daemon/hook write state (no `git add -A` leak) | `test_precommit_sync_git_ignores_agitrack_dir` | real-git |
 | **Session discovery is strictly repo-scoped — no cross-repo trace/token contamination** | `test_claude_session.py::test_session_discovery_is_strictly_repo_scoped`, `test_opencode_session.py::test_session_belongs_to_repo` / `_no_matching_directory_returns_no_sessions` | real-git + mock |
 

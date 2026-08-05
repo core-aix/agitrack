@@ -445,6 +445,12 @@ def remove_all_installed_hooks(hooks_dir: Path, *, debug: Callable[[str], None] 
     for name, marker in (
         ("pre-commit", _AUTOTRACK_MARKER),
         ("pre-commit", _MARKER),
+        # The guard is installed as BOTH pre-commit and reference-transaction (see
+        # install_base_commit_guard); omitting the second one meant the documented full opt-out
+        # left an aGiTrack hook running on EVERY ref update (commit, branch, fetch, checkout,
+        # reset) forever, and left the user's own chained hook shadowed in .agitrack-orig —
+        # while `--remove-hooks` printed "Any chained project hooks were restored."
+        ("reference-transaction", _REFTX_MARKER),
         ("prepare-commit-msg", _MANUAL_MSG_MARKER),
         ("post-commit", _MANUAL_DONE_MARKER),
     ):
