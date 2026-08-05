@@ -848,6 +848,15 @@ def test_the_palette_keeps_a_typed_ARGUMENT_instead_of_running_another_command()
     assert _palette_command("sess 2") == "sessions 2"
 
 
+def test_an_unknown_command_name_is_reported_not_silently_swapped_for_another():
+    # The same fallback, the other way in: a typo matched nothing, the display list fell back to
+    # every command, and Enter ran its first entry — `frobnicate` performed a MERGE. `_run_command`
+    # has always had an "Unknown aGiTrack command: …" message; it was simply unreachable.
+    assert _palette_command("frobnicate") == "frobnicate"
+    assert _palette_command("frobnicate", extra=["merge"]) == "frobnicate"
+    assert _palette_command("xyz 1") == "xyz 1"
+
+
 def test_the_palette_still_resolves_plain_commands_and_names_containing_a_space():
     assert _palette_command("git-commit", extra=["merge"]) == "git-commit"
     assert _palette_command("merge", extra=["merge"]) == "merge"
