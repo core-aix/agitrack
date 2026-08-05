@@ -4715,6 +4715,17 @@ class ProxyRunner:
         self.state.backend_session_id = spawned
         self.state.last_backend_message_id = None
         self._initialize_session_baseline()
+        if spawned not in snapshot:
+            # The conversation did not exist at launch, so every turn in it is OURS and there is
+            # no history to skip. The baseline just computed assumes a RESUME — "everything
+            # already recorded predates us" — and parks the watermark on the newest complete
+            # turn. For a backend whose conversation only becomes visible once its first turn
+            # FINISHES (OpenCode's session store), that turn is the newest complete one, so the
+            # baseline swallowed the very work it was binding to: nothing was committed, and the
+            # file it wrote was later offered back as "intentionally unstaged or git-ignored".
+            # (A conversation that WAS in the snapshot is one the user resumed inside the
+            # backend; there the baseline is right and its older turns must not be re-committed.)
+            self.state.last_backend_message_id = None
         # Durable now, keyed by the id that finally exists. This also clears the pending-name
         # record written at startup, when there was no conversation to key the name to.
         self._persist_session_name(spawned)
@@ -12151,19 +12162,30 @@ class ProxyRunner:
                     self._set_message("Exit cancelled — kept working; the background sessions are still running.")
                     self._render()
                     return False
+            head_before_finalize = self._base_head_sha()
             self._finalize_pending_work()
             if self._exit_aborted and not self._popup_exit_force:
-                # Esc on the on-exit copy offer: undo the "we're exiting" state and stay
-                # running so the user can deal with the files. Already-made commits/merges
-                # stand (they never lose work); nothing was deleted.
+                # Esc on an on-exit popup: undo the "we're exiting" state and stay running so
+                # the user can deal with the files. Already-made commits/merges stand (they
+                # never lose work); nothing was deleted.
                 self._exiting = False
                 self._finalized_on_exit = False
+                # Finalize STOPPED the git worker (so its exit-time commits could run on this
+                # thread without racing it). Staying running with no worker meant the automatic
+                # commit pipeline was dead for the rest of the session: a finished turn sat
+                # uncommitted until something else happened to run git on the main thread —
+                # measured live at 3m25s.
+                self._start_git_worker()
                 # Finalize disabled host mouse/focus/paste reporting up front; we're staying
                 # running, so restore it for the live session.
                 self._enable_host_mouse()
+                # Only claim commits when some were actually made: an abort at the keep/delete
+                # question happens BEFORE `_commit_latest_turn_sync`, so the reassurance was
+                # being printed over an exit that had committed nothing at all.
+                committed = self._base_head_sha() != head_before_finalize
                 self._set_message(
                     "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
-                    "need, then exit again. (Commits already made this exit were kept.)",
+                    "need, then exit again." + (" (Commits already made this exit were kept.)" if committed else ""),
                     seconds=12.0,
                 )
                 self._render()
@@ -12173,6 +12195,14 @@ class ProxyRunner:
             return True
         finally:
             self._popup_exit_pending = False
+
+    def _base_head_sha(self) -> str | None:
+        """The base repo's HEAD, or None when it can't be read. Used to tell whether a step
+        actually committed anything before saying so."""
+        try:
+            return self.base_repo.rev_parse("HEAD")
+        except Exception:
+            return None
 
     def _running_background_session_names(self) -> list[str]:
         # Names of background (non-active) sessions whose backend is still working.
@@ -13366,13 +13396,29 @@ class ProxyRunner:
                 self._render()
             if integrate:
                 # Interactive integration only for the active session. The
-                # sync/background commit path passes integrate=False. While a
-                # background summary is pending, integration is deferred so the
-                # summary can be amended in first; the idle-integration path
-                # picks the commit up once it lands (or the wait deadline passes).
-                if not self._summary_blocks_integration(time.monotonic()):
-                    self._integrate_session_turn()
+                # sync/background commit path passes integrate=False.
+                self._integrate_or_defer_after_commit()
         return committed
+
+    def _integrate_or_defer_after_commit(self) -> None:
+        """What happens to a turn the moment its commit lands: merge it, or say where it is.
+
+        Under ``--delay-merge`` nothing is merged, so there is nothing to wait for a summary
+        for — only the user to be told where their held-back work is. Routing the notice
+        through the summary-gated integration below meant it never appeared at all in the
+        DEFAULT configuration: a summary is always in flight immediately after a commit, and
+        the idle catch-up path returns early under --delay-merge by design. Proven live — with
+        summaries off the notice paints, with them on the string never reaches the terminal.
+
+        Otherwise: while a background summary is pending, integration is deferred so the
+        summary can be amended in first; the idle-integration path picks the commit up once it
+        lands (or the wait deadline passes).
+        """
+        if self._delay_merge:
+            self._notify_merge_deferred()
+            return
+        if not self._summary_blocks_integration(time.monotonic()):
+            self._integrate_session_turn()
 
     def _remember_kept_cancelled_work(self) -> None:
         """Record that an interrupted turn's changes were KEPT for the next turn's commit.
