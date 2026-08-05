@@ -1220,9 +1220,14 @@ class ProxyRunner:
         self._switch_offer_parse_started = False
         self._exiting = False
         self._finalized_on_exit = False
-        # The exit-time "delete this run's worktrees or keep them?" decision, asked once and
-        # applied to every session (None = not yet asked). See _should_delete_worktrees_on_exit.
+        # The exit-time "delete this repo's session worktrees or keep them?" decision, asked
+        # once and applied to every one of them (None = not yet asked). See
+        # _should_delete_worktrees_on_exit.
         self._exit_delete_worktrees: bool | None = None
+        # The IDLE session worktrees the same answer applies to: on disk but not open in this
+        # run. Captured when the question is asked (before any removal empties the live
+        # sessions' own records) and consumed by _delete_idle_worktrees_on_exit.
+        self._exit_idle_worktrees: list[str] = []
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
         # exit so they can deal with the worktree files themselves (see _run_exit_flow).
         self._exit_aborted = False
@@ -1487,6 +1492,7 @@ class ProxyRunner:
                 "_env_from_base": {},
                 "_env_copy_watermark": {},
                 "_exit_delete_worktrees": None,
+                "_exit_idle_worktrees": [],
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
                 "_full_agent_messages": False,
@@ -12364,6 +12370,10 @@ class ProxyRunner:
                 self.active = saved
             if self._exit_aborted:
                 return  # Esc on a session's copy offer — stop finalizing the rest
+        # The keep/delete answer covers the idle worktrees the question listed too, so honor it
+        # for them here — after every live session has been finalized above (a session's own
+        # worktree is removed by its finalize, and must not be swept a second time as "idle").
+        self._delete_idle_worktrees_on_exit()
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
@@ -12496,15 +12506,43 @@ class ProxyRunner:
         # terminate() nulls the fd/pid on the session-owned process in place.
         self.active.process.terminate()
 
+    def _idle_worktrees_on_exit(self) -> list[WorktreeInfo]:
+        """This repo's session worktrees that are NOT open in this run.
+
+        A worktree stops being a live session without being deleted, and more often than the
+        exit question used to assume: ``/clear`` → "give it its own worktree" moves the
+        conversation out and DROPS the session it left behind (``_relocate_switched_conversation``
+        removes it from ``self.sessions``), stopping a session from the sessions menu keeps its
+        worktree recoverable, and every worktree a previous run kept stays on disk (they are
+        persistent by design). None of those are in ``self.sessions``, so an exit question built
+        from live sessions alone named only some of the directories it was deciding about — and
+        answering "Delete them" then left the rest on disk with no way to say otherwise. The
+        decision covers all of them, so the question has to list all of them.
+        """
+        if not self._use_worktrees:
+            return []
+        live = {
+            name for session in self.sessions if (name := getattr(getattr(session, "worktree", None), "name", None))
+        }
+        try:
+            return [info for info in self._worktrees().list() if info.name not in live]
+        except Exception as error:
+            self._debug(f"exit idle-worktree scan failed: {error!r}")
+            return []
+
     def _should_delete_worktrees_on_exit(self) -> bool:
-        """Ask once per exit whether to delete this run's session worktrees or keep them,
+        """Ask once per exit whether to delete this repo's session worktrees or keep them,
         spelling out their exact on-disk locations so the user can find them either way. The
-        answer is cached and applied to every session's worktree. A signal teardown (no UI)
-        defaults to KEEP. Pressing Esc CANCELS the exit (sets ``_exit_aborted``) rather than
-        choosing for the user — so a stray keystroke never deletes or commits them to leaving."""
+        answer is cached and applied to EVERY session worktree — the live sessions' and the idle
+        ones left by an earlier run or by a session that ended during this one. A signal teardown
+        (no UI) defaults to KEEP. Pressing Esc CANCELS the exit (sets ``_exit_aborted``) rather
+        than choosing for the user — so a stray keystroke never deletes or commits them to
+        leaving."""
         if self._exit_delete_worktrees is not None:
             return self._exit_delete_worktrees
-        # The exact directories the decision applies to (every live session that has one).
+        # The exact directories the decision applies to: every live session's worktree, plus
+        # every idle one on disk. Captured now, before the per-session finalize starts removing
+        # them (which clears the very records this list is built from).
         listing: list[str] = []
         for session in self.sessions:
             wt = getattr(session, "worktree", None)
@@ -12512,18 +12550,24 @@ class ProxyRunner:
                 listing.append(str(wt.path))
         if not listing and self.worktree is not None:
             listing = [str(self.worktree.path)]
+        idle = self._idle_worktrees_on_exit()
+        self._exit_idle_worktrees = [info.name for info in idle]
+        live_paths = set(listing)
+        listing += [f"{info.path}  (idle — no session open in it)" for info in idle if str(info.path) not in live_paths]
         if not listing:
-            # No worktrees this run (e.g. --no-worktree): nothing to decide, don't prompt.
+            # No worktrees at all (e.g. --no-worktree): nothing to decide, don't prompt.
             self._exit_delete_worktrees = False
             return False
         if self.screen is None:
             self._exit_delete_worktrees = False
             return False
         choice = self._select_popup(
-            "Delete this run's session worktree(s) on exit, or keep them for next time?\n"
+            "Delete this repo's session worktree(s) on exit, or keep them for next time?\n"
             "Keeping preserves each session's full environment and any work-in-progress so it "
             "resumes instantly next time; deleting reclaims the disk (committed work has already "
-            "been integrated into your branch). The worktree(s) are at:\n\nLocation(s):",
+            "been integrated into your branch). This covers the idle worktrees too — any one "
+            "still holding uncommitted or unmerged work is kept regardless, so nothing is lost. "
+            "The worktree(s) are at:\n\nLocation(s):",
             ["Keep them", "Delete them"],
             detail=listing,
         )
@@ -12534,6 +12578,37 @@ class ProxyRunner:
             return False
         self._exit_delete_worktrees = choice == "Delete them"
         return self._exit_delete_worktrees
+
+    def _delete_idle_worktrees_on_exit(self) -> None:
+        """Apply the exit-time DELETE answer to the worktrees no session had open.
+
+        Same safety rule the live sessions get: a worktree is removed only once its work is
+        provably in the base. ``_cleanup_stale_worktree`` integrates whatever it can and returns
+        False for anything left uncommitted, mid-merge or conflicting — those keep their
+        directory (and are surfaced again by the next startup reconcile) rather than being
+        discarded on the way out. Nothing here can abort the exit: it runs after the last
+        session has been finalized, with no UI left to ask anything."""
+        names = self._exit_idle_worktrees
+        self._exit_idle_worktrees = []
+        if not names or not self._exit_delete_worktrees:
+            return
+        try:
+            infos = {info.name: info for info in self._worktrees().list()}
+        except Exception as error:
+            self._debug(f"exit idle-worktree removal skipped: {error!r}")
+            return
+        for name in names:
+            info = infos.get(name)
+            if info is None:
+                continue  # already gone (removed by a session finalize, or externally)
+            try:
+                if not self._cleanup_stale_worktree(info):
+                    self._debug(f"keeping idle worktree '{name}' on exit: its work is not integrated")
+                    continue
+                self._worktrees().remove(name)
+                self._debug(f"removed idle worktree '{name}' on exit (user chose delete)")
+            except Exception as error:
+                self._debug(f"exit removal of idle worktree '{name}' failed: {error!r}")
 
     def _finalize_worktree_on_exit(self) -> None:
         # On exit aGiTrack asks (once) whether to KEEP this run's session worktrees — preserving
