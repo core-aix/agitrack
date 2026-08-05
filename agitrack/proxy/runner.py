@@ -572,7 +572,7 @@ class ProxyInput:
                     continue
                 if char in {b"\r", b"\n"}:
                     typed = self.buffer.decode(errors="ignore").strip()
-                    command = self.selected() or typed
+                    command = self._resolve_command(typed)
                     self.buffer.clear()
                     self.capturing = False
                     self.selected_index = 0
@@ -632,7 +632,26 @@ class ProxyInput:
         text = self.text()
         if not text:
             return commands
-        return [command for command in commands if command.startswith(text)] or commands
+        # Filter on the command NAME only. Several commands take an argument (`sessions 2`,
+        # `sessions new`, `agent-backend opencode`), and matching the whole string meant the
+        # moment a space was typed nothing matched, the `or commands` below handed back the
+        # FULL list, and Enter ran its first entry: `sessions 2` opened the plain picker, and
+        # with unmerged work present (which PREPENDS "merge") it ran `merge` instead.
+        head = text.split(" ", 1)[0]
+        return [command for command in commands if command.startswith(head)] or commands
+
+    def _resolve_command(self, typed: str) -> str:
+        """The command Enter should run for `typed` — name resolved, argument preserved."""
+        selected = self.selected()
+        head, _, argument = typed.partition(" ")
+        argument = argument.strip()
+        if not argument:
+            return selected or typed
+        if selected and (selected == typed or selected.startswith(typed)):
+            # The whole typed string is itself a command name ("exit aGiTrack"), not a name
+            # plus an argument — appending the "argument" would duplicate half the name.
+            return selected
+        return f"{selected or head} {argument}"
 
     def selected(self) -> str | None:
         matches = self.matches()
