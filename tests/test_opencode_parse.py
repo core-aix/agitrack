@@ -185,3 +185,25 @@ def test_opencode_completeness_matches_claudes_meaning():
     opencode_turn = _export(None).turns[-1]
 
     assert claude_turn.complete is False and opencode_turn.complete is False
+
+
+def test_the_debug_log_never_INVENTS_a_directory(tmp_path, monkeypatch):
+    # Found live: with AGITRACK_DEBUG_PROXY=1 an OpenCode run grew a phantom
+    # `.agitrack/worktrees/.agitrack/proxy-debug.log`, because `list_worktree_sessions` logs
+    # against the worktrees ROOT and the logger created whatever parents it needed. Anything
+    # enumerating worktrees then sees a directory that looks like a session.
+    from agitrack.transcripts.opencode import _debug
+
+    monkeypatch.setenv("AGITRACK_DEBUG_PROXY", "1")
+    not_a_repo = tmp_path / "worktrees"
+    not_a_repo.mkdir()
+
+    _debug(not_a_repo, "scanning")
+
+    assert not (not_a_repo / ".agitrack").exists()  # nothing conjured
+
+    # A real repo (its .agitrack already exists) still gets the log.
+    repo = tmp_path / "repo"
+    (repo / ".agitrack").mkdir(parents=True)
+    _debug(repo, "scanning")
+    assert "scanning" in (repo / ".agitrack" / "proxy-debug.log").read_text(encoding="utf-8")

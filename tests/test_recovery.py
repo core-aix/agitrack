@@ -238,3 +238,40 @@ def test_a_restart_still_flags_a_turn_that_was_never_finished(tmp_path, monkeypa
     assert (info.path / "half.py").exists()  # untouched
     assert not (tmp_path / "half.py").exists()  # never merged into the base
     assert any("crashed" in m for m in messages)  # and surfaced
+
+
+def test_a_crashed_run_resumes_its_own_session_instead_of_starting_a_random_new_one(tmp_path):
+    # Found live: SIGKILL a worktree session, relaunch, and aGiTrack came back as a brand-new
+    # randomly-named session ("ember") with a fresh conversation, while the real one sat under
+    # .agitrack/worktrees/alpha. No work was lost — the identity was. Both records that normally
+    # answer "what do I resume?" die with the process: the root pointer is written only by the
+    # graceful exit path, and the repo scan looks in the BASE project dir while a worktree
+    # session's conversation is keyed by the WORKTREE path.
+    from proxy_helpers import make_runner
+
+    base = GitRepo.init(tmp_path)
+    runner = make_runner(repo=base, base_repo=base)
+    runner._repo_latest_session_id = lambda: None  # nothing in the base project dir
+    runner._newest_worktree_session = lambda: ("ses-from-the-worktree", 123.0)
+    root_state = AgitrackState(tmp_path, default_backend="claude")  # crash state: no pointer
+
+    assert root_state.backend_session_id is None
+    assert runner._startup_resume_id(root_state) == "ses-from-the-worktree"
+
+    # …and with a conversation to key it to, the name the crashed run chose is recovered too.
+    root_state.remember_pending_session_name("alpha")
+    assert runner._adopt_pending_session_name(root_state, "ses-from-the-worktree") == "alpha"
+
+
+def test_the_recorded_resume_pointer_still_wins_when_there_is_one(tmp_path):
+    # A graceful exit's pointer must not be overridden by a merely-newer worktree transcript.
+    from proxy_helpers import make_runner
+
+    base = GitRepo.init(tmp_path)
+    runner = make_runner(repo=base, base_repo=base)
+    runner._repo_latest_session_id = lambda: "from-the-repo-scan"
+    runner._newest_worktree_session = lambda: ("from-the-worktree", 999.0)
+    root_state = AgitrackState(tmp_path, default_backend="claude")
+    root_state.backend_session_id = "the-session-i-quit-in"
+
+    assert runner._startup_resume_id(root_state) == "the-session-i-quit-in"
