@@ -997,6 +997,9 @@ class ProxyRunner:
         # The same question across a whole no-worktree fold (which can absorb several turns):
         # the files present before every one of them. None until the first turn after a fold.
         self.user_untracked_since_fold: frozenset[str] | None = None
+        # (base sha, session sha) the user last answered "Leave for later" for, so the conflict
+        # box — raised from a poll — asks once per situation rather than every couple of seconds.
+        self.conflict_deferred_for: tuple[str, str] | None = None
         self.pre_agent_reconciled_status = ""
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
@@ -5019,10 +5022,19 @@ class ProxyRunner:
             if info.name == self.name:  # the active session, handled below
                 continue
             try:
-                if not self._cleanup_stale_worktree(info):
-                    flagged.append(info.name)
+                if self._cleanup_stale_worktree(info):
+                    continue
+                # Committed work is integrated by the call above; UNCOMMITTED work left by a
+                # crash needs the recovery policy (commit a finished turn, then merge). Startup
+                # used to stop here and merely flag it, so the same SIGKILL left the turn
+                # committed+merged when the user ran `agitrack --recover` (what the editor
+                # extension does) and uncommitted behind a warning when they simply relaunched.
+                if self._recover_stale_worktree(info):
+                    continue
+                flagged.append(info.name)
             except Exception as error:
                 self._debug(f"reconcile skipped '{info.name}': {error!r}")
+                flagged.append(info.name)
         self._delete_orphan_merged_branches()
         notes: list[str] = []
         if active_pending:
@@ -5038,6 +5050,24 @@ class ProxyRunner:
             else:
                 instruction = f"Open {self._menu_label()} → session to resolve them."
             self._set_message("⚠ " + "; ".join(notes) + ".\n" + instruction, seconds=12.0)
+
+    def _recover_stale_worktree(self, info) -> bool:
+        """Finish what a crashed session left in `info`: commit its finished turn, then merge.
+
+        The same policy (and the same code) as `agitrack --recover`, run here because startup
+        already holds the repo lock that the standalone entry point would take. Returns True
+        when nothing is left for the user to deal with. A turn that was still in flight is
+        never committed — the policy leaves it and reports it flagged, as before."""
+        try:
+            from agitrack.recovery import RecoveryService
+
+            report = RecoveryService(self.base_repo, self.global_config, debug_fn=self._debug).recover_worktree(info)
+        except Exception as error:
+            self._debug(f"startup recovery of '{info.name}' failed: {error!r}")
+            return False
+        if report.recovered or report.integrated:
+            self._debug(f"startup recovered '{info.name}': {report.summary()}")
+        return not report.flagged
 
     def _cleanup_stale_worktree(self, info) -> bool:
         # Integrate a dormant worktree's pending commits (if any) and delete it.

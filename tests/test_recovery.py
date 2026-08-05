@@ -175,3 +175,66 @@ def test_nothing_to_recover_with_no_worktrees(tmp_path):
     report = RecoveryService(base, _Config()).recover()
     assert report.did_work() is False
     assert report.summary() == "Nothing to recover."
+
+
+def test_a_plain_RESTART_recovers_what_agitrack_recover_would(tmp_path, monkeypatch):
+    # Found live: after a SIGKILL, `agitrack --recover` committed and merged the crashed
+    # session's finished turn, while simply relaunching aGiTrack left the same turn
+    # uncommitted behind "⚠ 1 stale session(s) need attention". Same crash, different outcome
+    # depending on how the user came back — although this module's docstring calls the
+    # launch-time path the lazy form of exactly this recovery. Startup only ever integrated
+    # work that was already COMMITTED.
+    from proxy_helpers import make_runner
+
+    base, manager, info, _wt, _state = _base_with_worktree(tmp_path, name="crashed")
+    (info.path / "feature.py").write_text("print('hi')\n", encoding="utf-8")  # uncommitted turn work
+    _patch_backend(monkeypatch, _exported(complete=True))
+    live = manager.create("live-session", base=base.current_branch())  # the session being started now
+
+    runner = make_runner(
+        repo=GitRepo(live.path),
+        base_repo=base,
+        _base_branch=base.current_branch(),
+        worktree=live,
+        name="live-session",
+    )
+    runner.worktree_manager = manager
+    runner.global_config = _Config()
+    messages: list[str] = []
+    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._debug = lambda *a, **k: None
+
+    runner._reconcile_sessions_on_startup()
+
+    assert (tmp_path / "feature.py").read_text(encoding="utf-8") == "print('hi')\n"  # committed AND merged
+    assert not any("need attention" in m for m in messages)  # nothing left for the user to chase
+
+
+def test_a_restart_still_flags_a_turn_that_was_never_finished(tmp_path, monkeypatch):
+    # The policy's other half must survive: a turn still in flight when the process died is
+    # never committed — it is left exactly as it is and reported.
+    from proxy_helpers import make_runner
+
+    base, manager, info, _wt, _state = _base_with_worktree(tmp_path, name="crashed")
+    (info.path / "half.py").write_text("incomplete\n", encoding="utf-8")
+    _patch_backend(monkeypatch, _exported(complete=False))
+    live = manager.create("live-session", base=base.current_branch())
+
+    runner = make_runner(
+        repo=GitRepo(live.path),
+        base_repo=base,
+        _base_branch=base.current_branch(),
+        worktree=live,
+        name="live-session",
+    )
+    runner.worktree_manager = manager
+    runner.global_config = _Config()
+    messages: list[str] = []
+    runner._set_message = lambda message, **kw: messages.append(message)
+    runner._debug = lambda *a, **k: None
+
+    runner._reconcile_sessions_on_startup()
+
+    assert (info.path / "half.py").exists()  # untouched
+    assert not (tmp_path / "half.py").exists()  # never merged into the base
+    assert any("crashed" in m for m in messages)  # and surfaced
