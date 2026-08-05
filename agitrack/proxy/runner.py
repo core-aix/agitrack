@@ -627,6 +627,10 @@ class ProxyInput:
     def text(self) -> str:
         return self.buffer.decode(errors="ignore")
 
+    def _named(self, head: str) -> list[str]:
+        """Commands whose NAME starts with `head` — strictly, with no fallback."""
+        return [command for command in self.extra_commands + self.COMMANDS if command.startswith(head)]
+
     def matches(self) -> list[str]:
         commands = self.extra_commands + self.COMMANDS
         text = self.text()
@@ -634,17 +638,25 @@ class ProxyInput:
             return commands
         # Filter on the command NAME only. Several commands take an argument (`sessions 2`,
         # `sessions new`, `agent-backend opencode`), and matching the whole string meant the
-        # moment a space was typed nothing matched, the `or commands` below handed back the
-        # FULL list, and Enter ran its first entry: `sessions 2` opened the plain picker, and
-        # with unmerged work present (which PREPENDS "merge") it ran `merge` instead.
-        head = text.split(" ", 1)[0]
-        return [command for command in commands if command.startswith(head)] or commands
+        # moment a space was typed nothing matched. The `or commands` keeps the DISPLAY from
+        # going blank; what Enter runs is decided by _resolve_command, which does not fall back.
+        return self._named(text.split(" ", 1)[0]) or commands
 
     def _resolve_command(self, typed: str) -> str:
-        """The command Enter should run for `typed` — name resolved, argument preserved."""
-        selected = self.selected()
+        """The command Enter should run for `typed` — name resolved, argument preserved.
+
+        Never falls back to the displayed list. Both fallbacks used to run a command the user
+        did not type: with unmerged work present "merge" is PREPENDED to that list, so both
+        `sessions 2` (an argument matched no name) and `frobnicate` (a typo) ran **merge**.
+        """
         head, _, argument = typed.partition(" ")
         argument = argument.strip()
+        if not typed:
+            return self.selected() or typed
+        if not self._named(head):
+            # No command by that name: hand the text on so the user is TOLD it is unknown.
+            return typed
+        selected = self.selected()
         if not argument:
             return selected or typed
         if selected and (selected == typed or selected.startswith(typed)):
