@@ -286,6 +286,7 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | Ctrl-C inside a popup routes through the exit flow | `test_select_popup_ctrl_c_routes_through_exit_flow` | mock |
 | Finalize commits the latest turn non-interactively | `test_finalize_pending_work_commits_non_interactively` | mock |
 | Exit asks keep-or-delete worktrees (default keep); delete only fully-merged | `test_exit_keeps_fully_merged_worktree`, `test_exit_worktree_prompt_lists_paths_and_caches_decision`, `test_finalize_worktree_on_exit_deletes_merged_when_user_chooses`, `test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated` | real-git |
+| The keep/delete question covers EVERY session worktree, idle ones included (relocated-away, stopped, or left by a previous run) | `test_the_exit_question_names_the_worktrees_no_session_has_open`, `test_choosing_delete_on_exit_removes_the_idle_worktrees_too`, `test_choosing_delete_on_exit_keeps_an_idle_worktree_that_still_holds_work` | real-git |
 | Exit/no-worktree cleanup announces "Deleting worktree…" before the (slow) removal | `test_finalize_worktree_on_exit_announces_deletion`, `test_present_pending_noworktree_cleanup_deletes_on_confirm` | real-git |
 | Persist resume pointer (last active, even if not primary / worktree kept) | `test_exit_persists_resume_pointer_*` | mock |
 | `exit`/`quit` command routes through the unified flow | `test_exit_command_routes_through_unified_exit_flow`, `_cancelled_does_not_request_exit` | mock |
