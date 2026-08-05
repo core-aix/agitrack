@@ -823,6 +823,40 @@ def test_proxy_input_matches_puts_extra_commands_first():
     assert inp.matches()[0] == "sessions"  # default order unchanged when nothing extra
 
 
+def _palette_command(typed: str, *, extra: list[str] | None = None) -> str | None:
+    """What Ctrl-G runs when the user types `typed` and presses Enter."""
+    from agitrack.proxy.runner import ProxyInput
+
+    inp = ProxyInput()
+    inp.extra_commands = list(extra or [])
+    inp.feed(b"\x07")
+    inp.feed(typed.encode())
+    return inp.feed(b"\r")[2]
+
+
+def test_the_palette_keeps_a_typed_ARGUMENT_instead_of_running_another_command():
+    # Found live. The palette filtered on the whole typed string, so the moment a space was
+    # typed nothing matched, the filter fell back to the FULL command list, and Enter ran its
+    # first entry. `sessions 2` merely opened the picker — and with unmerged work present
+    # (which PREPENDS "merge" to that list) it ran MERGE. `sessions <n>`, `sessions new` and
+    # `agent-backend <name>` were all unreachable from the UI as a result.
+    assert _palette_command("sessions 2") == "sessions 2"
+    assert _palette_command("sessions 2", extra=["merge"]) == "sessions 2"
+    assert _palette_command("sessions new", extra=["merge"]) == "sessions new"
+    assert _palette_command("agent-backend opencode") == "agent-backend opencode"
+    # A prefix still resolves to the full command name, argument carried through.
+    assert _palette_command("sess 2") == "sessions 2"
+
+
+def test_the_palette_still_resolves_plain_commands_and_names_containing_a_space():
+    assert _palette_command("git-commit", extra=["merge"]) == "git-commit"
+    assert _palette_command("merge", extra=["merge"]) == "merge"
+    assert _palette_command("", extra=["merge"]) == "merge"  # empty buffer runs the selection
+    # "exit aGiTrack" is a command NAME with a space in it, not a name plus an argument.
+    assert _palette_command("exit aGiTrack", extra=["merge"]) == "exit aGiTrack"
+    assert _palette_command("exit") == "exit aGiTrack"
+
+
 def _merge_runner(tmp_path):
     import types
 
