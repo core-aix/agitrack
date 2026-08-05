@@ -199,3 +199,46 @@ def test_a_real_switch_later_still_asks_for_a_name(tmp_path, backend_name):
 
     assert runner.state.backend_session_id == "after-clear"
     assert asked == ["New conversation detected"]
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_binding_to_a_conversation_WE_created_does_not_skip_its_first_turn(tmp_path, backend_name):
+    # Found live via `agent-backend` (a session created mid-run): its first turn was never
+    # committed. Binding computes a resume BASELINE — "everything already recorded predates us,
+    # skip it" — which is right when continuing an existing conversation. But a conversation
+    # that did not exist at launch contains nothing but OUR work, and for a backend whose
+    # conversation only becomes visible once the first turn FINISHES (OpenCode's session store)
+    # the newest complete turn IS that first turn. It was skipped: no commit, and the file it
+    # wrote was later offered back as "intentionally unstaged or git-ignored" leftovers.
+    runner, _asked = _fresh_runner(
+        tmp_path,
+        backend_name,
+        refs=[SessionRef(id="ours", updated=200.0, label="my first prompt")],
+        pre_spawn={},  # nothing existed before this run
+    )
+    # Stand in for the real baseline, which parks the watermark on the newest complete turn.
+    runner._initialize_session_baseline = lambda: setattr(runner.state, "last_backend_message_id", "msg-first-turn")
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "ours"
+    assert runner.state.last_backend_message_id is None  # nothing to skip: the turn is ours
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
+def test_binding_to_a_PRE_EXISTING_conversation_keeps_its_baseline(tmp_path, backend_name):
+    # The other side: a conversation that was already in the directory and has since been
+    # written to is one the user resumed inside the backend. Its older turns are history and
+    # must NOT be re-committed, so the computed baseline stands.
+    runner, _asked = _fresh_runner(
+        tmp_path,
+        backend_name,
+        refs=[SessionRef(id="old", updated=300.0, label="resumed conversation")],
+        pre_spawn={"old": 100.0},  # existed at launch, written to since
+    )
+    runner._initialize_session_baseline = lambda: setattr(runner.state, "last_backend_message_id", "msg-older-turn")
+
+    runner._service_native_session_switch()
+
+    assert runner.state.backend_session_id == "old"
+    assert runner.state.last_backend_message_id == "msg-older-turn"

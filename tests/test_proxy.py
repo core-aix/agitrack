@@ -771,6 +771,40 @@ def test_delay_merge_defers_integration_and_names_working_dir(tmp_path):
     assert any(str(tmp_path) in m and "not merged" in m for m in msgs)
 
 
+def test_delay_merge_notice_reaches_the_user_even_while_a_summary_is_in_flight(tmp_path):
+    # Found live: with summarization ON (the default) the notice NEVER appeared. The commit path
+    # only reached `_integrate_session_turn` — which holds the notice — when no summary was in
+    # flight, and immediately after a commit one always is; the idle catch-up path returns early
+    # under --delay-merge by design, so nothing ever told the user their work was held back.
+    # Nothing is merged here, so there is no reason to wait for a summary before speaking.
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner._menu_label = lambda: "Ctrl-G"
+    runner._summary_blocks_integration = lambda _now: True  # a summary IS in flight
+    integrated: list = []
+    runner._integrate_session_turn = lambda: integrated.append(True)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    runner._integrate_or_defer_after_commit()
+
+    assert integrated == []  # still no merge behind the user's back
+    assert any("not merged" in m and str(tmp_path) in m for m in msgs)  # but they are TOLD
+
+    # And with --delay-merge OFF the summary hold still defers the merge, as before.
+    runner._delay_merge = False
+    runner._integrate_or_defer_after_commit()
+    assert integrated == []
+
+
 def test_delay_merge_off_integrates_immediately(tmp_path):
     import types
 
@@ -8876,6 +8910,57 @@ def test_popup_exit_flow_aborted_by_esc_on_copy_offer_stays_running():
     assert runner.events == ["finalize"]  # finalized (commits stand) but did NOT exit
     assert runner._exiting is False and runner._finalized_on_exit is False  # state restored
     assert any("Exit cancelled" in m for m in msgs)
+
+
+def test_an_aborted_exit_restarts_the_git_worker_and_does_not_claim_commits_it_never_made():
+    # Found live. Finalize STOPS the git worker so its exit-time commits can't race it. On an
+    # abort the flow stayed running with no worker at all, so the automatic commit pipeline was
+    # dead for the rest of the session — a finished turn sat uncommitted for 3m25s. And the
+    # abort at the keep/delete question happens BEFORE any commit, yet the notice still said
+    # "(Commits already made this exit were kept.)".
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._enable_host_mouse = lambda: None
+    runner._base_head_sha = lambda: "same-sha"  # nothing was committed during this finalize
+    started: list[str] = []
+    runner._start_git_worker = lambda: started.append("git-worker")
+
+    def finalize():
+        runner.events.append("finalize")
+        runner._exit_aborted = True
+
+    runner._finalize_pending_work = finalize
+
+    assert runner._run_exit_flow() is False
+    assert started == ["git-worker"]  # the pipeline is alive again
+    assert any("Exit cancelled" in m for m in msgs)
+    assert not any("Commits already made" in m for m in msgs)  # it made none, so it says none
+
+
+def test_an_aborted_exit_that_DID_commit_still_says_so():
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._enable_host_mouse = lambda: None
+    runner._start_git_worker = lambda: None
+    heads = iter(["before", "after"])  # HEAD moved during finalize
+    runner._base_head_sha = lambda: next(heads)
+
+    def finalize():
+        runner._exit_aborted = True
+
+    runner._finalize_pending_work = finalize
+
+    runner._run_exit_flow()
+
+    assert any("Commits already made this exit were kept." in m for m in msgs)
 
 
 def test_popup_exit_flow_double_ctrl_c_still_finalizes():
