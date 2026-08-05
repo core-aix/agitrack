@@ -94,3 +94,36 @@ def test_a_configured_summarization_model_still_wins(tmp_path, monkeypatch):
     runner.state.summarization_model = "anthropic/claude-haiku-4-5"
 
     assert runner._make_summarizer().model == "anthropic/claude-haiku-4-5"
+
+
+def test_the_DAEMONS_summarizer_also_uses_the_session_model_on_opencode(tmp_path, monkeypatch):
+    # The proxy and the background daemon each build their own summarizer. Fixing only the proxy
+    # left every daemon-made OpenCode commit with a raw-prompt subject: the live `-b` run logged
+    # "summary failed … UnusableSummaryError('summarizer backend exited with 1: ')" for each turn.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = GitRepo.init(tmp_path / "bg-oc")
+    (tmp_path / "bg-oc" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    repo.stage_paths(["seed.txt"])
+    repo.commit("seed")
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda _name: object())
+    runner = BackgroundRunner(repo, backend="opencode")
+    runner.state.model = "opencode/deepseek-v4-flash-free"
+
+    assert runner._make_summarizer().model == "opencode/deepseek-v4-flash-free"
+
+
+def test_the_DAEMONS_summarizer_still_lets_claude_choose(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    from agitrack.proxy.background import BackgroundRunner
+
+    repo = GitRepo.init(tmp_path / "bg-cl")
+    (tmp_path / "bg-cl" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    repo.stage_paths(["seed.txt"])
+    repo.commit("seed")
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda _name: object())
+    runner = BackgroundRunner(repo, backend="claude")
+    runner.state.model = "claude-opus-5[1m]"
+
+    assert runner._make_summarizer().model is None
