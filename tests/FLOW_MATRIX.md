@@ -30,6 +30,8 @@ Conventions:
 | Dormant/stale worktree reconciliation | `test_reconcile_flags_conflicting_stale_worktree`, `test_recovery.py::*` | real-git |
 | `--no-worktree`: new session runs on the base tree | `test_new_session_no_worktree_runs_in_base_dir_not_a_worktree` | real-git |
 | `--no-worktree`: blank session starts a fresh conversation | `test_new_session_no_worktree_blank_starts_fresh_conversation` | real-git |
+| **A fresh session is never dragged onto a PREVIOUS run's conversation**: `--new-session` mints an id but no transcript until the first prompt, so every conversation in the directory looked newer than "ours" and the last run's was adopted as a native switch — status bar and state file naming the old conversation while the backend ran the new one, plus a second name prompt seconds after the startup one. A conversation not written since launch is history, not a switch; one written since launch is still adopted | `test_a_fresh_session_is_never_dragged_onto_a_conversation_from_a_PREVIOUS_run`, `test_an_unbound_session_still_adopts_a_conversation_WRITTEN_since_launch` | real-git |
+| **The `--no-worktree` fold never sweeps in the USER's own untracked files**: Esc on the pre-agent untracked prompt neither stages nor declines, and the fold staged every non-declined untracked path — so a file the user never agreed to commit rode into an agent commit that does not mention it. Only files predating EVERY folded turn are the user's, so a file the agent wrote in an earlier turn of the same fold is still committed | `test_the_fold_never_sweeps_in_the_users_own_untracked_file`, `test_the_fold_still_commits_a_file_the_AGENT_created_in_an_earlier_turn` | real-git |
 
 ## 2. Prompt submission (pre-agent commit)
 | Sequence | Test(s) | Kind |

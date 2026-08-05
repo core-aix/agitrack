@@ -73,6 +73,12 @@ class Session:
         # stages only files that did NOT exist before the turn, and these do.
         "kept_cancelled_paths",
         "untracked_before_turn",
+        # Untracked files that predate EVERY turn folded so far (the intersection of each
+        # turn's start snapshot since the last fold), i.e. the USER's own files rather than
+        # any turn's output. None until the first turn after a fold. The no-worktree fold
+        # excludes them, so a file the user never consented to stage cannot ride into an
+        # agent commit that does not mention it.
+        "user_untracked_since_fold",
         "agent_parse_thread",
         "agent_parse_result",
         "agent_parse_active",
@@ -203,6 +209,7 @@ class Session:
             "cancelled_work_kept": False,
             "kept_cancelled_paths": frozenset(),
             "untracked_before_turn": frozenset(),
+            "user_untracked_since_fold": None,
             "_pending_merge_prompt": False,
             "agent_parse_thread": None,
             "agent_parse_result": None,

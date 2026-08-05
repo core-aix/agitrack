@@ -963,6 +963,9 @@ class ProxyRunner:
         # Untracked paths that already existed when the current turn began: they are the USER's
         # files, not this turn's output, so the turn's commit must not sweep them in.
         self.untracked_before_turn: frozenset[str] = frozenset()
+        # The same question across a whole no-worktree fold (which can absorb several turns):
+        # the files present before every one of them. None until the first turn after a fold.
+        self.user_untracked_since_fold: frozenset[str] | None = None
         self.pre_agent_reconciled_status = ""
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
@@ -2591,7 +2594,11 @@ class ProxyRunner:
         try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())
-            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
+            # The user's own untracked files (see _begin_agent_turn) are NOT this turn's output:
+            # staging them here put a file the user never agreed to commit into an agent commit
+            # that says nothing about it. They stay untracked until the user stages them.
+            theirs = self.user_untracked_since_fold or frozenset()
+            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined and p not in theirs])
             if not self.repo.has_staged_changes():
                 return
             # The message already carries the folded metadata, so the prepare-commit-msg hook's
@@ -2611,6 +2618,9 @@ class ProxyRunner:
                 "latent": folded,
                 "single": len(bodies) == 1,
             }
+            # This fold is closed: the next turn re-establishes which untracked files are the
+            # user's (they may have staged, deleted or added some in the meantime).
+            self.user_untracked_since_fold = None
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
 
@@ -4247,6 +4257,17 @@ class ProxyRunner:
         if newest.id == current:
             return
         ours = next((ref.updated for ref in refs if ref.id == current), None)
+        if ours is None and not self._written_since_launch(newest):
+            # Our conversation exists only as an ID: --new-session (and any blank session) mints
+            # one, and the backend writes no transcript until the first prompt. Every OTHER
+            # conversation in the directory is therefore "newer than ours", so a --no-worktree run
+            # adopted the PREVIOUS run's conversation as a switch: the status bar and state file
+            # named the old conversation while the backend really was running the new one, and the
+            # name given at the startup prompt seconds earlier was asked for a second time. A
+            # conversation not written since this run started is history, not a switch. (A genuine
+            # `/resume` of an old conversation DOES write to it, so it still counts as one.)
+            self._debug(f"ignoring {newest.id}: not written since launch and our conversation is still empty")
+            return
         if ours is not None and newest.updated <= ours:
             return  # ours is still the live one; a stale sibling must not pull tracking off it
         if self._session_recency(newest.id, newest.updated) <= self._session_recency(current, ours or 0.0):
@@ -4667,6 +4688,19 @@ class ProxyRunner:
         # record written at startup, when there was no conversation to key the name to.
         self._persist_session_name(spawned)
         self._render()
+
+    def _written_since_launch(self, ref) -> bool:
+        """Whether ``ref`` has been written since aGiTrack spawned this session's backend.
+
+        The same test ``_bind_first_conversation`` uses, against the ``_pre_spawn_sessions``
+        snapshot: absent from it means the conversation did not exist at launch (ours), and a
+        newer mtime than its snapshot entry means it has been written since (also ours). With no
+        snapshot (a restored session object) the question cannot be answered, so keep the old
+        behaviour rather than block a real switch."""
+        snapshot = self._pre_spawn_sessions
+        if snapshot is None:
+            return True
+        return ref.updated > snapshot.get(ref.id, float("-inf"))
 
     def _abandon_summary_for_switched_session(self, leaving_id: str | None, joining_id: str) -> None:
         """Drop summary work belonging to the conversation we are switching AWAY from.
@@ -12994,11 +13028,22 @@ class ProxyRunner:
             # commit, so they must not count as "already there" — that exclusion is what
             # kept them out of the commit that was promised to include them.
             self.untracked_before_turn = frozenset(self.repo.untracked_entries()) - self.kept_cancelled_paths
+            # Files that predate EVERY turn folded so far are the USER's, not any turn's output:
+            # a file the agent writes in turn 1 is absent from turn 1's snapshot, so intersecting
+            # the snapshots singles out exactly the ones no turn created. The no-worktree fold
+            # can then leave them alone even when the user answered nothing at all (Esc on the
+            # untracked prompt neither stages nor declines, and they were being swept into an
+            # agent commit whose message never mentioned them).
+            previous = self.user_untracked_since_fold
+            self.user_untracked_since_fold = (
+                self.untracked_before_turn if previous is None else (previous & self.untracked_before_turn)
+            )
         except Exception as error:
             # Unknown baseline: fall back to the worktree rule (stage the turn's files, minus any
             # the user explicitly declined) rather than blocking the commit on a prompt.
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
+            self.user_untracked_since_fold = frozenset()
 
     # How often the commit-gate trace may log while nothing changes. The gate is evaluated on
     # every pipeline pass; without a throttle a stuck runner would write thousands of identical
