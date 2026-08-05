@@ -1218,9 +1218,15 @@ def parse_rows(
     # result carries the file's pre-existing content, which seeds `file_state` so a later Write
     # diffs against it instead of counting the whole (already existing) file as newly added.
     pending_reads: dict[str, str] = {}
-    # A skill invoked as `/<skill>` hot-loads: its body is injected as a meta row and there is NO
-    # `Skill` tool call to see. Held here until the turn it belongs to exists (see below).
-    pending_skill: str | None = None
+    # The skills currently loaded into this session's context. Loading a skill is not a one-turn
+    # action: it injects standing instructions that keep shaping every later turn, so a skill joins
+    # this roster when it loads and every turn opened afterwards inherits it. Crediting only the
+    # loading turn lost the skill entirely in the common case — a bare `/<skill>` edits nothing, so
+    # that turn never produced a commit, and the whole session's provenance came out empty.
+    # Cleared whenever the context holding the instructions is discarded (compaction, /clear):
+    # past that point the transcript no longer shows the skill in play, and aGiTrack does not claim
+    # capabilities it cannot prove.
+    active_skills: list[str] = []
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -1253,6 +1259,10 @@ def parse_rows(
                 # The summary Claude injects when it compacts the conversation: not a
                 # prompt, but a token-affecting event. Tally it for the next turn.
                 pending_compactions += 1
+                # Compaction replaces the conversation with a summary, so a loaded skill's
+                # verbatim instructions are gone from the context. Whether the summary carried
+                # their gist forward is not something the transcript says, so stop claiming them.
+                active_skills.clear()
                 continue
             notification_kind = _task_notification_kind(row)
             if notification_kind is not None:
@@ -1270,17 +1280,17 @@ def parse_rows(
                 continue
             hot_loaded = _hot_loaded_skill(row)
             if hot_loaded is not None:
-                # Which turn this belongs to depends on how the skill was invoked, and the two
-                # cases differ by whether a command invocation is still pending:
-                #   `/skill`            — no args, so the injected body is what OPENS the turn.
-                #                         `current` is still the PREVIOUS turn here; hold it.
-                #   `/skill do the thing` — the args are an instruction, so the turn was already
-                #                         opened by the command row and the body follows it.
+                _remember_skills(active_skills, (hot_loaded,))
+                # `/skill do the thing` — the args are an instruction, so the command row already
+                # opened the turn and the body follows it; add the skill to that turn directly.
+                # A bare `/skill` has no turn yet (`current` is still the PREVIOUS turn, which
+                # must not be credited): the roster seeds the turn this body is about to open.
                 if pending_command is None and current is not None:
-                    current.setdefault("skills", []).append(hot_loaded)
-                else:
-                    pending_skill = hot_loaded
+                    _remember_skills(current.setdefault("skills", []), (hot_loaded,))
             command = _slash_command_name(row)
+            if command == "/clear":
+                # The context is wiped, so nothing loaded before it is in effect any more.
+                active_skills.clear()
             if command is not None:
                 # A command carrying a user INSTRUCTION (`/goal …`, `/loop …`, a skill
                 # invocation) IS a prompt — fall straight through and open its turn now, exactly
@@ -1329,14 +1339,13 @@ def parse_rows(
                 "ended_at": stamp,
                 "tool_ids": set(),
                 "tool_names": [],
-                # A skill whose injected body opened THIS turn (bare `/<skill>`) belongs to it.
-                "skills": [pending_skill] if pending_skill else [],
+                # Every skill the session has loaded and not discarded is still shaping this turn.
+                "skills": list(active_skills),
                 "subagents": [],
                 "compactions": pending_compactions,
                 "reasoning_effort": None,
                 "messages": [],
             }
-            pending_skill = None
             pending_compactions = 0
         elif row_type == "attachment":
             queued = _queued_human_prompt(row)
@@ -1363,7 +1372,7 @@ def parse_rows(
                         "ended_at": stamp,
                         "tool_ids": set(),
                         "tool_names": [],
-                        "skills": [],
+                        "skills": list(active_skills),
                         "subagents": [],
                         "compactions": pending_compactions,
                         "reasoning_effort": None,
@@ -1397,7 +1406,7 @@ def parse_rows(
                     "ended_at": stamp,
                     "tool_ids": set(),
                     "tool_names": [],
-                    "skills": [],
+                    "skills": list(active_skills),
                     "subagents": [],
                     "compactions": pending_compactions,
                     "reasoning_effort": None,
@@ -1439,6 +1448,11 @@ def parse_rows(
                 current["reasoning_effort"] = "on"
             _collect_tool_use_ids(message, current["tool_ids"])
             _collect_capabilities(message, current)
+            # A `Skill` call loads its instructions into the same context a `/<skill>` does, so it
+            # joins the roster too. Done HERE, as the call is read, rather than when the turn is
+            # finalized: a compaction later in the transcript must be able to clear a skill loaded
+            # before it, and turns are finalized only once the NEXT prompt arrives.
+            _remember_skills(active_skills, current.get("skills") or ())
             if collect_edits:
                 # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
@@ -1880,6 +1894,13 @@ def _slash_command_directive(row: dict) -> str | None:
 # that line is the only machine-readable marker the invocation leaves — without reading it, every
 # skill the user runs from the command line is missing from the commit's provenance.
 _SKILL_BASE_DIR_RE = re.compile(r"^Base directory for this skill:\s*(\S.*?)\s*$", re.MULTILINE)
+
+
+def _remember_skills(roster: list[str], names) -> None:
+    """Add *names* to a skill roster in place, first-seen order, no duplicates."""
+    for name in names or ():
+        if name and name not in roster:
+            roster.append(name)
 
 
 def _hot_loaded_skill(row: dict) -> str | None:

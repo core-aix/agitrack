@@ -590,6 +590,17 @@ def parse_exported_session(
     child_ids_per_turn: list[set[str]] = []
     # Context compactions OpenCode performed within the current turn (see below).
     compactions = 0
+    # Skills loaded into the session's context, still in effect for the turns that follow — the
+    # same roster Claude keeps (see `transcripts.claude.parse_rows`), so a skill loaded once shows
+    # up on every commit it shaped rather than only the turn that ran the `skill` tool. Cleared on
+    # compaction, which discards the instructions it was tracking.
+    active_skills: list[str] = []
+    # The roster as the turn being accumulated OPENED, plus whatever that turn loads. Snapshotted
+    # rather than read at flush time because a turn is only built once the NEXT prompt arrives, by
+    # which point a compaction inside it may already have cleared the roster — that turn still ran
+    # with those skills in effect, and it is the turns AFTER the compaction that lose them.
+    turn_skills: list[str] = []
+    opened_with = 0
     # Per-session running content of each edited file, so each edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
@@ -605,7 +616,13 @@ def parse_exported_session(
             collect_edits=collect_edits,
             file_state=file_state,
             mcp_servers=mcp_servers,
+            active_skills=turn_skills,
         )
+        # Skills this turn LOADED (the tail past the opening snapshot) carry forward even if the
+        # turn also compacted; ones it merely inherited are already in the roster, or were cleared.
+        for name in turn_skills[opened_with:]:
+            if name not in active_skills:
+                active_skills.append(name)
         if turn:
             turn.compaction_count = compactions
             turns.append(turn)
@@ -622,6 +639,8 @@ def parse_exported_session(
             current_user = message
             assistant_group = []
             compactions = 0
+            turn_skills = list(active_skills)
+            opened_with = len(turn_skills)
         elif role == "assistant" and current_user is not None:
             # OpenCode injects its conversation summary as an assistant message
             # marked `summary: true` (mode/agent "compaction"). It is bookkeeping,
@@ -632,6 +651,10 @@ def parse_exported_session(
             # is assistant-only.)
             if msg_info.get("summary") is True or msg_info.get("mode") == "compaction":
                 compactions += 1
+                # The summary replaces the conversation, so a loaded skill's verbatim instructions
+                # are gone. Turns after this one no longer claim it (the one in flight keeps it —
+                # see `turn_skills`), matching Claude's rule for the same event.
+                active_skills.clear()
                 continue
             assistant_group.append(message)
     flush()
@@ -666,7 +689,11 @@ def _build_turn(
     collect_edits: bool = False,
     file_state: dict[str, str] | None = None,
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
+    active_skills: list[str] | None = None,
 ) -> SessionTurn | None:
+    # `active_skills` is the session's live skill roster (see `parse_exported_session`): the turn
+    # starts with everything already loaded, and anything it loads itself is added back for the
+    # turns that follow. A skill is standing instructions in the context, not a one-turn action.
     user_info = _as_dict(user_message.get("info"))
     user_id = str(user_info.get("id") or "")
     if not user_id:
@@ -681,7 +708,8 @@ def _build_turn(
     effort: str | None = None
     tool_names: list[str] = []
     subagents: list[str] = []
-    skills: list[str] = []
+    roster = active_skills if active_skills is not None else []
+    skills: list[str] = list(roster)
     last_assistant = assistants[-1] if assistants else None
     for assistant in assistants:
         assistant_info = _as_dict(assistant.get("info"))
@@ -714,6 +742,9 @@ def _build_turn(
     # ``complete=not in_flight`` (transcripts/claude.py).
     complete = bool(_as_dict(final_info).get("finish"))
     used = capabilities.collect(tool_names=tool_names, skills=skills, subagents=subagents, mcp_servers=mcp_servers)
+    for name in used.skills:
+        if name not in roster:
+            roster.append(name)
     return SessionTurn(
         user_message_id=user_id,
         assistant_message_id=assistant_id,
@@ -732,6 +763,10 @@ def _build_turn(
         edits=edits,
         mcp_servers=used.mcp_servers,
         mcp_tools=used.mcp_tools,
+        # `skills` was collected here but never handed to the turn, so on this backend the field
+        # was empty in EVERY commit regardless of how the skill was invoked. (`plugins` is derived
+        # from the skill names, which is why plugin provenance worked while skills did not.)
+        skills=used.skills,
         subagents=used.subagents,
         plugins=used.plugins,
     )

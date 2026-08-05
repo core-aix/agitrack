@@ -8,7 +8,15 @@ the reason was different on each backend:
   reads ``tool_use`` blocks) saw nothing at all. Only a model-initiated ``Skill`` call was ever
   recorded, and typing the slash command is how a user invokes one.
 * **OpenCode** — the collector never populated ``skills`` on the grounds that OpenCode had no
-  skills concept. It does (1.18+): a ``skill`` tool call whose input names the skill.
+  skills concept. It does (1.18+): a ``skill`` tool call whose input names the skill. Once
+  populated it was still dropped on the floor — ``_build_turn`` computed the list and never
+  passed it to the ``SessionTurn``, so the field stayed empty on this backend either way.
+
+Recording only the INVOKING turn then turned out to be wrong in the first place: a skill is
+standing instructions, not a one-shot action, so it keeps shaping the session until the context
+holding it is discarded. Worse, the commonest invocation — a bare ``/<skill>`` — edits nothing,
+so that lone credited turn produced no commit and the skill reached no commit at all. Skills are
+now carried on a session roster, seeded into each turn and cleared on compaction or ``/clear``.
 
 The shapes here are taken from real transcripts on disk, not invented: Claude's injected body
 opens with ``Base directory for this skill: <dir>``, and OpenCode's part is
@@ -168,7 +176,168 @@ def test_a_model_invoked_skill_tool_is_still_recorded(tmp_path):
     assert session.turns[0].skills == ["deep-research"]
 
 
+def test_a_loaded_skill_stays_in_effect_for_the_turns_that_follow(tmp_path):
+    # The gap that made the whole feature look broken. A bare `/<skill>` loads standing
+    # instructions and edits nothing, so its own turn never produces a commit — crediting only
+    # that turn meant the skill reached NO commit at all, even though every later turn in the
+    # session was written under its rules.
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        _rows(
+            _user("u1", "<command-message>x</command-message>\n<command-name>/academic-writing-style</command-name>"),
+            _user("u2", [{"type": "text", "text": SKILL_BODY}], isMeta=True),
+            _assistant("a1", "Loaded.", "u2"),
+            _user("u3", "tighten the abstract"),
+            _assistant("a2", "Done.", "u3"),
+            _user("u4", "now fix the captions"),
+            _assistant("a3", "Done.", "u4"),
+        )
+    )
+
+    session = export_session_at(path)
+
+    assert [t.skills for t in session.turns] == [["academic-writing-style"]] * 3
+
+
+def test_a_compaction_ends_a_skills_run(tmp_path):
+    # Compaction replaces the conversation with a summary, so the skill's verbatim instructions
+    # are no longer in context. Past that point the transcript cannot show the skill in play, and
+    # a skill that is no longer used must not keep appearing.
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        _rows(
+            _user("u1", "<command-message>x</command-message>\n<command-name>/academic-writing-style</command-name>"),
+            _user("u2", [{"type": "text", "text": SKILL_BODY}], isMeta=True),
+            _assistant("a1", "Loaded.", "u2"),
+            _user("u3", "tighten the abstract"),
+            _assistant("a2", "Done.", "u3"),
+            _user("u4", "<summary>...</summary>", isCompactSummary=True),
+            _user("u5", "now do something unrelated"),
+            _assistant("a3", "Done.", "u5"),
+        )
+    )
+
+    session = export_session_at(path)
+
+    assert [t.skills for t in session.turns] == [["academic-writing-style"], ["academic-writing-style"], []]
+
+
+def test_clear_ends_a_skills_run(tmp_path):
+    # /clear wipes the context outright — the strongest possible "no longer used" signal.
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        _rows(
+            _user("u1", "<command-message>x</command-message>\n<command-name>/academic-writing-style</command-name>"),
+            _user("u2", [{"type": "text", "text": SKILL_BODY}], isMeta=True),
+            _assistant("a1", "Loaded.", "u2"),
+            _user("u3", "<command-message>x</command-message>\n<command-name>/clear</command-name>"),
+            _user("u4", "something unrelated"),
+            _assistant("a2", "Done.", "u4"),
+        )
+    )
+
+    session = export_session_at(path)
+
+    assert [t.skills for t in session.turns] == [["academic-writing-style"], []]
+
+
+def test_a_skill_tool_call_also_stays_in_effect(tmp_path):
+    # The model invoking `Skill` loads instructions into the SAME context a `/<skill>` does, so
+    # it lasts just as long — the invocation route must not change how long the skill counts for.
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        _rows(
+            _user("u1", "use the deep-research skill"),
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "message": {
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "Skill", "input": {"skill": "deep-research"}}],
+                },
+            },
+            _assistant("a2", "Done.", "a1"),
+            _user("u2", "keep going"),
+            _assistant("a3", "Done.", "u2"),
+        )
+    )
+
+    session = export_session_at(path)
+
+    assert [t.skills for t in session.turns] == [["deep-research"], ["deep-research"]]
+
+
 # ------------------------------------------------------------------ OpenCode
+
+
+def _oc_user(message_id, text):
+    return {"info": {"id": message_id, "role": "user"}, "parts": [{"type": "text", "text": text}]}
+
+
+def _oc_assistant(message_id, parts):
+    return {"info": {"id": message_id, "role": "assistant", "finish": "stop"}, "parts": parts}
+
+
+_OC_SKILL_PART = {
+    "type": "tool",
+    "tool": "skill",
+    "callID": "c1",
+    "state": {"status": "completed", "input": {"name": "repo-lore"}},
+}
+
+
+def _oc_session(*messages):
+    return {"info": {"id": "ses_1"}, "messages": list(messages)}
+
+
+def test_opencode_puts_the_loaded_skill_on_the_turn():
+    # `skills` was collected but never passed to the SessionTurn, so on OpenCode the field was
+    # empty in every commit — the per-part collector below passed while the session parse dropped
+    # the result. Asserted end-to-end so a collector-only test cannot mask it again.
+    from agitrack.transcripts.opencode import parse_exported_session
+
+    session = parse_exported_session(
+        _oc_session(_oc_user("m1", "load it"), _oc_assistant("m2", [_OC_SKILL_PART, {"type": "text", "text": "ok"}]))
+    )
+
+    assert session.turns[0].skills == ["repo-lore"]
+
+
+def test_opencode_skill_stays_in_effect_for_the_turns_that_follow():
+    from agitrack.transcripts.opencode import parse_exported_session
+
+    session = parse_exported_session(
+        _oc_session(
+            _oc_user("m1", "load it"),
+            _oc_assistant("m2", [_OC_SKILL_PART, {"type": "text", "text": "ok"}]),
+            _oc_user("m3", "now use it"),
+            _oc_assistant("m4", [{"type": "text", "text": "done"}]),
+        )
+    )
+
+    assert [t.skills for t in session.turns] == [["repo-lore"], ["repo-lore"]]
+
+
+def test_opencode_compaction_ends_a_skills_run():
+    # The turn the compaction happened IN still ran with the skill loaded; the ones after it did
+    # not. Same rule as Claude, so a commit's provenance does not depend on the backend.
+    from agitrack.transcripts.opencode import parse_exported_session
+
+    session = parse_exported_session(
+        _oc_session(
+            _oc_user("m1", "load it"),
+            _oc_assistant("m2", [_OC_SKILL_PART, {"type": "text", "text": "ok"}]),
+            _oc_user("m3", "a long piece of work"),
+            {"info": {"id": "m4", "role": "assistant", "summary": True}, "parts": []},
+            _oc_assistant("m5", [{"type": "text", "text": "done"}]),
+            _oc_user("m6", "something unrelated"),
+            _oc_assistant("m7", [{"type": "text", "text": "done"}]),
+        )
+    )
+
+    assert [t.skills for t in session.turns] == [["repo-lore"], ["repo-lore"], []]
 
 
 def test_opencode_records_the_skill_a_skill_tool_call_loaded():
