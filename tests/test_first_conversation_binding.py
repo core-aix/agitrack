@@ -176,9 +176,12 @@ def test_an_empty_transcript_does_not_bind_the_session(tmp_path, backend_name):
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
-def test_a_real_switch_later_still_asks_for_a_name(tmp_path, backend_name):
+def test_a_real_switch_later_is_followed_under_the_session_name(tmp_path, backend_name):
     # The narrow guard must not swallow the genuine case. Once the session IS bound, a
-    # conversation started with the backend's own /clear is a real switch and still prompts.
+    # conversation started with the backend's own /clear is a real switch and tracking follows
+    # it — keeping this session's name rather than asking for another (see
+    # test_a_native_switch_to_a_NEW_conversation_keeps_the_session_name for why the question
+    # went away: it was a modal, and it stalled the commit fold behind it).
     runner, asked = _fresh_runner(
         tmp_path,
         backend_name,
@@ -189,7 +192,8 @@ def test_a_real_switch_later_still_asks_for_a_name(tmp_path, backend_name):
     assert runner.state.backend_session_id == "ours"
 
     runner._session_watch_at = 0.0
-    runner._persist_session_name = lambda *a, **k: None
+    linked: list = []
+    runner._persist_session_name = lambda sid: linked.append(sid)
     runner.backend.list_sessions = lambda _repo: [
         SessionRef(id="ours", updated=200.0, label="my first prompt"),
         SessionRef(id="after-clear", updated=500.0, label="a brand new topic"),
@@ -197,8 +201,9 @@ def test_a_real_switch_later_still_asks_for_a_name(tmp_path, backend_name):
 
     runner._service_native_session_switch()
 
-    assert runner.state.backend_session_id == "after-clear"
-    assert asked == ["New conversation detected"]
+    assert runner.state.backend_session_id == "after-clear"  # the switch IS followed
+    assert asked == []  # ...silently
+    assert linked == ["after-clear"]  # and the new conversation carries the session's name
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)

@@ -339,7 +339,30 @@ agitrack --backtrace commit --backtrace-branch tracked-history   # write the rec
 - **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
 
-The reconstruction is best-effort from what the transcripts recorded; review it before relying on it. Nothing is uploaded — it all runs locally.
+The reconstruction is best-effort from what the transcripts recorded; review it before relying on it. By default nothing is uploaded — it all runs locally; the one exception is opt-in and described next.
+
+### Across machines and teammates
+
+A transcript only exists on the machine that recorded it, so a plain `--backtrace` shows *one laptop's* view of a project. Two commands together turn it into the **project's** view: everyone pushes their sessions to the shared remote, and the reconstruction pulls them all back.
+
+```bash
+agitrack --share-sessions            # push EVERY local session for this repo to origin, then exit
+agitrack --backtrace                 # reconstructs from local sessions AND everything on origin
+```
+
+- **`--share-sessions` (upload).** Does what the `session` menu's *Share this session* does, for every conversation recorded in this directory (or a subdirectory), on both backends, in one pass — no TUI, no agent launched. Each is published under your GitHub id using the same storage, redaction and cap as an ordinary share (see [Sharing sessions](#sharing-sessions)). **The same consent applies**: transcripts can contain file contents, command output and secrets, the masking is best-effort and not a guarantee, and this uploads *all* of them at once — so review what's in them first. Run it whenever you want to publish a stretch of work; it is safe to repeat.
+  - **Idempotent.** A session already shared with identical content is skipped without a network round trip, so re-running costs almost nothing.
+  - **Never rewinds.** A session whose shared copy already has *more* turns than this machine's is refused, not overwritten — an old laptop coming back online can't roll back everyone else's copy. Those are reported as `behind`; pass `--overwrite-shared` to deliberately replace them.
+  - Sessions keep their aGiTrack name where they have one, otherwise `session-<short-id>`.
+
+- **`--backtrace` (consolidated view).** After the local transcripts, the backtrace fetches every session shared to `origin` for this repo and reconstructs those too. Because each arrives under the GitHub id that shared it, turns can finally be **attributed to a developer** — a transcript records no git author, so before this every reconstructed turn belonged to nobody. The dashboard's *by committer* breakdown, the file browser and the per-turn traces then cover the whole team, and the banner says how much came from where: *"reconstructed 12 agent turn(s) from 3 local session(s) and 9 shared from origin (dana-eng, shiqiangw)"*.
+  - A **fresh clone works**: with no local transcripts at all, `--backtrace` reconstructs the entire shared history of the project.
+  - A session present **both** locally and on origin is counted **once**, and the local copy wins — it is the complete one (shared copies may be capped for transport).
+  - A collaborator's edits are made relative to **their** checkout root, so their line counts are correct even though their absolute paths mean nothing on your machine.
+  - Your own sessions are labeled with your GitHub id **only** when someone else's work is in the view; a single-machine backtrace names nobody and does no identity lookup.
+  - Fetched transcripts are cached outside your checkout, so they never appear as untracked files. Offline, or with no remote, the local reconstruction still works exactly as before.
+
+[Learn](#learn-let-the-agent-coach-you-from-your-own-sessions) and the [efficiency insights](#agent-efficiency-insights) run on the consolidated view too, so "whose sessions to learn from" can genuinely mean a teammate's.
 
 
 ## Sharing sessions
@@ -351,6 +374,8 @@ From the `session` menu (`Ctrl-G` → `session`) — where each session is also 
 - **Share this session** — publishes the current conversation to the remote. The first time, aGiTrack asks you to confirm; a transcript can contain file contents, command output, and secrets, so **review what's in the session before sharing** (aGiTrack also applies best-effort secret masking, but that is *not* a guarantee — don't rely on it). You can choose to keep the shared copy **updated automatically**, or re-share manually.
 - **Resume a shared session** — lists teammates' sessions as `<github-id>/<name>` and continues one in a fresh session worktree.
 - **Manage shared sessions** — see what *you've* shared (with "up to date" vs "local has newer turns"), push the latest turns, toggle auto-update, or unshare.
+
+To publish **everything at once** instead of picking sessions one at a time, use `agitrack --share-sessions` — the same storage and the same consent, applied to every session recorded for the repo. It is what makes a cross-machine, whole-team [backtrace](#across-machines-and-teammates) possible.
 
 Shared sessions also appear in the [dashboard](#dashboard) under **shared sessions**. The storage model and the guarantees behind these actions are described under [Session tracking](#session-tracking).
 
