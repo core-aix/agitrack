@@ -22,7 +22,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The suite shells out to `git commit` in temp repos; the runner has no
       # default git identity, so configure one or those tests fail with
@@ -82,7 +82,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure git identity
         run: |
@@ -130,10 +130,10 @@ jobs:
     name: Build + install Windows MSI
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -185,7 +185,7 @@ jobs:
       # off any PR/branch build — not just at release time. (Uploaded before the install
       # smoke-test below so the artifact is captured even if that step later fails.)
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.version.outputs.MSI_NAME }}
           path: dist/${{ steps.version.outputs.MSI_NAME }}
@@ -229,7 +229,7 @@ jobs:
       run:
         working-directory: editors/vscode
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 20
