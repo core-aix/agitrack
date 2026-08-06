@@ -362,7 +362,17 @@ Added --version using the package metadata; prints and exits.
           <code>agitrack --backtrace commit</code>
           <div class="note">bakes the reconstruction into real commits on a new branch</div>
         </div></div>
+        <div class="step"><div>
+          <code>agitrack --share-sessions</code>
+          <div class="note">pushes every local session to the repo's remote, so the backtrace can span machines</div>
+        </div></div>
       </div>
+      <p style="margin-top:22px">Transcripts only live on the machine that recorded them, so a plain backtrace shows
+      <strong>one laptop's</strong> view. Run <span class="p">agitrack --share-sessions</span> and everyone's sessions go
+      to the repo's remote in one pass; the backtrace then pulls them all back and reconstructs the
+      <strong>whole project</strong> — attributing each turn to the GitHub id that shared it, which a transcript alone
+      can never tell you. A fresh clone with no local transcripts rebuilds the entire history.
+      <a href="docs.html#across-machines-and-teammates">Details in the docs.</a></p>
     </section>
 
     <section class="commit" id="backends">
