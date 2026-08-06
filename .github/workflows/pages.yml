@@ -79,8 +79,28 @@ jobs:
           under Settings > Pages > Build and deployment > Source: GitHub Actions."
           fi
       - uses: actions/configure-pages@v6
+      # The artifact name carries the ATTEMPT number so this workflow can be re-run.
+      #
+      # Re-running a failed Pages run re-executes the whole job, upload included — and artifacts
+      # accumulate across attempts of one run rather than replacing each other. With the default
+      # fixed name the second attempt therefore leaves TWO artifacts called "github-pages", and
+      # `deploy-pages` refuses to pick one ("Multiple artifacts named "github-pages" were
+      # unexpectedly found for this workflow run"). So the retry for a deploy that failed while
+      # queued — the one case where re-running is exactly the right thing — could never work, and
+      # each attempt made the run permanently un-deployable. One name per attempt keeps every
+      # attempt self-contained; `deploy-pages` resolves the name to an artifact id, so the Pages
+      # API never sees the name at all.
       - uses: actions/upload-pages-artifact@v5
         with:
+          name: github-pages-${{ github.run_attempt }}
           path: ${{ runner.temp }}/site
       - id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
+          # 30 minutes, up from the 10-minute default. GitHub parks a deployment in
+          # `deployment_queued` and only then starts publishing; when that queue is slow the
+          # default expires mid-wait, and the action then CANCELS the deployment it was waiting
+          # for — a queue delay is reported as a failed deploy. Waiting longer costs only runner
+          # minutes on a bad day and turns those into successful publishes.
+          timeout: 1800000
