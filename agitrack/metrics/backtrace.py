@@ -66,6 +66,11 @@ class BacktraceView:
     edited_sessions: int = 0  # of those, how many actually changed files
     backends: list[str] = field(default_factory=list)  # backends that contributed
     dropped_sessions: int = 0  # sessions beyond MAX_SESSIONS that were not read
+    # Of `session_count`, how many were pulled from `origin` rather than found on this machine,
+    # and the GitHub ids that shared them. A reconstruction that silently mixes other people's
+    # work into "what happened in this directory" would misrepresent itself, so the banner says.
+    shared_sessions: int = 0
+    contributors: list[str] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -74,9 +79,14 @@ class BacktraceView:
     def banner_text(self) -> str:
         """The plain-text notice that this view is a reconstruction, with the counts."""
         backends = ", ".join(self.backends) if self.backends else "no"
+        local = self.session_count - self.shared_sessions
+        where = f"{local} local session(s)"
+        if self.shared_sessions:
+            who = ", ".join(self.contributors) if self.contributors else "collaborators"
+            where += f" and {self.shared_sessions} shared from origin ({who})"
         parts = [
             f"BACKTRACE — reconstructed {self.dashboard.total_commits} agent turn(s) from "
-            f"{self.session_count} local session(s) ({backends}) in {self.directory}.",
+            f"{where} ({backends}) in {self.directory}.",
             "A historical view of how past coding-agent conversations changed this directory — "
             "not aGiTrack's live repo tracking.",
         ]
@@ -106,6 +116,14 @@ class _Source:
     # is how the daemon notices new turns without reading or parsing anything — see
     # _watch_signature.
     watch: tuple[Path, ...] = ()
+    # The GitHub id to attribute this session's turns to. For a session pulled from `origin`
+    # that is who shared it; for a local one it is the viewer's own login, but only once there
+    # is someone else in the view to distinguish them from (see `_discover`).
+    owner: str = ""
+    # Whether this session came from `origin` rather than this machine. Tracked separately from
+    # `owner` precisely because local sessions also carry an owner — counting "has an owner" as
+    # "is shared" made a machine's own sessions report as pulled from origin.
+    shared: bool = False
 
 
 def _discover(directory: Path) -> list[_Source]:
@@ -143,8 +161,148 @@ def _discover(directory: Path) -> list[_Source]:
             sources.append(_Source("opencode", ref.id, ref.updated, sdir, export, watch=(Path(sdir),)))
     except Exception:
         pass
+    try:
+        remote = _remote_sources(directory, local_ids={s.ref_id for s in sources})
+    except Exception:
+        remote = []  # no repo, no remote, offline — the local reconstruction still stands
+    if remote:
+        # Only once other people's work is in the view does it matter WHOSE each session is —
+        # and then the local ones need a name too, or the same session reads as "unknown" on
+        # the machine that recorded it and as its author's on everyone else's. Resolved once,
+        # and only here: a single-machine backtrace shows no authors at all and must not pay
+        # for a `gh` lookup to say so.
+        mine = _local_owner(directory)
+        sources = [replace(source, owner=mine) for source in sources]
+        sources.extend(remote)
     sources.sort(key=lambda s: s.updated, reverse=True)
     return sources
+
+
+def _local_owner(directory: Path) -> str:
+    """The GitHub id to attribute THIS machine's sessions to. Empty when it can't be resolved,
+    which just leaves them unattributed rather than guessing at a name."""
+    try:
+        from agitrack.sessions import github_login
+
+        login = github_login(GitRepo.discover(directory))
+    except Exception:
+        return ""
+    return "" if login == "anonymous" else login
+
+
+def _remote_sources(directory: Path, *, local_ids: set[str]) -> list[_Source]:
+    """Sessions other machines shared to ``origin``, as reconstructable sources.
+
+    This is what makes a backtrace a view of the PROJECT rather than of one laptop. Sessions
+    reach `origin` via `agitrack --share-sessions` (or an ordinary per-session share); each
+    arrives under the sharer's GitHub id, which is exactly the developer attribution the
+    reconstruction otherwise has no way to know — a transcript records no git author.
+
+    A session already present locally is skipped: the local copy is the machine's own, is never
+    capped for transport, and would otherwise appear twice (its turns emit the same virtual
+    shas, so the duplicate is visible as repeated rows). Local therefore wins on identity, and
+    remote fills in only what this machine has never seen.
+    """
+    from agitrack.sessions import SharedSessionStore
+
+    repo = GitRepo.discover(directory)
+    store = SharedSessionStore(repo)
+    if not repo.remote_exists() and not repo.ref_exists(store.ref):
+        return []
+    store.fetch()
+    cache = _shared_cache_dir(directory)
+    sources: list[_Source] = []
+    for entry in store.entries():
+        session_id = str(entry.manifest.get("session_id") or "")
+        if not session_id or session_id in local_ids:
+            continue
+        backend = str(entry.manifest.get("backend") or "claude")
+        path = _materialize_shared(store, entry, cache, backend, session_id)
+        if path is None:
+            continue
+        export = _shared_export(backend, path)
+        if export is None:
+            continue
+        sources.append(
+            _Source(
+                backend=backend,
+                ref_id=session_id,
+                updated=float(entry.manifest.get("updated") or 0.0),
+                # A shared session ran in SOMEONE ELSE'S checkout, so its edits are absolute
+                # paths under THEIR repo root. Relativizing needs that root, not this one:
+                # against the local directory nothing matches and every edit is dropped, which
+                # showed up as a collaborator contributing "+0 / -0" lines to files they had
+                # plainly written. The transcript records the cwd it ran in; use it.
+                base_dir=_shared_base_dir(backend, path) or str(directory),
+                export=export,
+                watch=(path,),
+                owner=entry.github_id,
+                shared=True,
+            )
+        )
+    return sources
+
+
+def _shared_base_dir(backend: str, path: Path) -> str:
+    """The directory a shared session recorded as its working directory, or "" if unknown."""
+    if backend == "claude":
+        try:
+            return claude._first_cwd(path) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _shared_cache_dir(directory: Path) -> Path:
+    """Where fetched shared transcripts are written so the exporters (which read files, not
+    strings) can parse them. Under the state dir, not the repo: it is derived data, and must
+    never show up as an untracked file in the user's checkout."""
+    path = _state_dir() / "shared" / _dir_key(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _materialize_shared(store, entry, cache: Path, backend: str, session_id: str) -> Path | None:
+    """Write a shared transcript to the cache and return its path (None when unreadable).
+
+    Rewritten only when the content changed: the daemon stats these files to decide whether a
+    rebuild is owed (see `_watch_signature`), so rewriting an identical transcript every poll
+    would make every poll look like new work and re-parse every remote session forever.
+    """
+    text = store.read_transcript(entry)
+    if not text:
+        return None
+    suffix = ".jsonl" if backend == "claude" else ".json"
+    path = cache / f"{entry.github_id}--{session_id}{suffix}"
+    try:
+        if path.exists() and path.read_text(encoding="utf-8", errors="replace") == text:
+            return path
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def _shared_export(backend: str, path: Path) -> "Callable[[], ExportedSession | None] | None":
+    """The exporter for a materialized shared transcript, or None for a backend we can't read.
+
+    Claude's transcript IS the on-disk JSONL, so the ordinary file exporter reads it as-is.
+    OpenCode shares its `{info, messages}` export instead, which has no on-disk form to point
+    an exporter at — so it is parsed from the file's JSON.
+    """
+    if backend == "claude":
+        return partial(claude.export_session_at, path, collect_edits=True)
+    if backend == "opencode":
+
+        def export() -> "ExportedSession | None":
+            try:
+                data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                return None
+            return opencode.parse_exported_session(data, collect_edits=True)
+
+        return export
+    return None
 
 
 # How the served view keeps up with new agent work, without burning CPU to do it.
@@ -267,6 +425,8 @@ def build_backtrace(
     backends: set[str] = set()
     edited_sessions = 0
     included_sessions = 0
+    shared_sessions = 0
+    contributors: set[str] = set()
     # Resuming or rewinding a conversation forks it into a NEW session id that replays the whole
     # earlier transcript, so one real turn shows up in several sessions. The assistant message id is
     # the turn's true identity (it comes from the API), so keep each turn once — otherwise its lines
@@ -316,6 +476,10 @@ def build_backtrace(
         if not kept:
             continue  # a pure fork: every one of its turns already came from another session
         included_sessions += 1
+        if source.shared:
+            shared_sessions += 1
+        if source.owner:
+            contributors.add(source.owner)
         backends.add(str(entry.get("backend") or source.backend))
         if entry.get("edited"):
             edited_sessions += 1
@@ -344,6 +508,8 @@ def build_backtrace(
         edited_sessions=edited_sessions,
         backends=sorted(backends),
         dropped_sessions=dropped,
+        shared_sessions=shared_sessions,
+        contributors=sorted(contributors),
     )
 
 
@@ -430,9 +596,12 @@ def _session_to_stats(
         stats.append(
             CommitStat(
                 sha=sha,
-                # No committer exists for a reconstructed turn — the transcript records no
-                # git author — so it is left blank (the view hides committer chrome entirely).
-                author="",
+                # A reconstructed turn has no git author: the transcript records none. For a
+                # session SHARED from another machine there is one thing we do know — the
+                # GitHub id it was shared under — and that is the whole point of pulling them,
+                # so the view can say who did what. Local sessions stay blank (the viewer's
+                # own work, and the view hides committer chrome when nothing names an author).
+                author=source.owner,
                 email="",
                 subject=_subject(turn),
                 kind="agent",
