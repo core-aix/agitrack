@@ -22,7 +22,13 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  # NOT cancel-in-progress, matching GitHub's own Pages workflow template: a deployment here is a
+  # production publish, and killing one that has already handed off to the Pages API leaves the
+  # run failed ("Deployment cancelled.") rather than merely abandoning a build. Pushes to main
+  # land in bursts (aGiTrack commits per turn), so the window for that is real. Queueing instead
+  # lets the in-flight publish finish, and GitHub skips all but the newest run waiting behind it,
+  # so the site still converges on the latest commit without a wasted deploy.
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -31,11 +37,11 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The demo dashboard is computed from the FULL commit history.
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install aGiTrack (this checkout)
@@ -72,9 +78,9 @@ jobs:
               || echo "::error::could not switch the Pages source to 'workflow' - set it by hand \
           under Settings > Pages > Build and deployment > Source: GitHub Actions."
           fi
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: ${{ runner.temp }}/site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
