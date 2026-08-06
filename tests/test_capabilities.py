@@ -191,7 +191,7 @@ def test_opencode_parser_records_mcp_and_subagents_against_configured_servers():
 
     assert turn.mcp_servers == ["lore"] and turn.mcp_tools == ["lore/lucky_number"]
     assert turn.subagents == ["explorer"]
-    assert turn.skills == []  # OpenCode has no skills concept
+    assert turn.skills == []  # this turn loaded none; see test_skill_capabilities.py for the ones that do
 
 
 def test_opencode_parser_claims_nothing_when_no_mcp_server_is_configured():

@@ -63,6 +63,9 @@ class SessionTurn:
     # ``mcp_tools`` entries are ``server/tool``; ``mcp_servers`` is derived from them.
     mcp_servers: list[str] = field(default_factory=list)
     mcp_tools: list[str] = field(default_factory=list)
+    # Skills are the one capability that OUTLASTS the call that invoked it: loading one injects
+    # standing instructions, so every turn until the context is discarded ran under them and lists
+    # it. A tool call, by contrast, is over when its result comes back.
     skills: list[str] = field(default_factory=list)
     subagents: list[str] = field(default_factory=list)
     # Plugins whose capabilities the turn used, lifted from the ``<plugin>:<skill>`` namespacing

@@ -100,6 +100,12 @@ class Session:
         "live_background_task_ids",
         "status_check_pending",
         "last_poll",
+        # Background-poll backoff: consecutive passes that found the session had produced no
+        # new backend output, and the `last_child_output` value the last pass saw. A background
+        # session's servicing runs on the REACTOR thread, so polling every idle one every couple
+        # of seconds spends the TUI's own thread on git for sessions that cannot have changed.
+        "_bg_poll_misses",
+        "_bg_poll_seen",
         "last_status",
         "last_status_change",
         "_last_change_at",
@@ -138,6 +144,8 @@ class Session:
         state: "AgitrackState | None"
         last_child_output: float
         last_poll: float
+        _bg_poll_misses: int
+        _bg_poll_seen: float
         _summary_thread: "threading.Thread | None"
         _summary_result: "dict | None"
         _summary_pending: "dict | None"
@@ -228,6 +236,8 @@ class Session:
             "pre_agent_reconciled_status": "",
             "status_check_pending": False,
             "last_poll": 0.0,
+            "_bg_poll_misses": 0,
+            "_bg_poll_seen": 0.0,
             "last_status": "",
             "last_status_change": 0.0,
             "_last_change_at": 0.0,

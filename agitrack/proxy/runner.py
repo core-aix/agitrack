@@ -4393,7 +4393,16 @@ class ProxyRunner:
             self._persist_session_name(newest.id)
             self._render()
             return
-        self._restore_or_ask_session_name(newest.id)
+        # Without a worktree the same reasoning holds, minus the directory: the conversation is
+        # running in THIS session, so it takes this session's name rather than being asked for
+        # another one. Asking was wrong twice over. The user had named the session seconds or
+        # minutes earlier and a `/clear` demanded a second name for what is plainly the same
+        # session; and the question is a MODAL, which blocks the reactor — and with it the poll
+        # that folds no-worktree auto mode's latent turns into real commits — until it is
+        # answered. Left unanswered (Esc, or simply not noticed behind the backend's own screen)
+        # nothing committed until aGiTrack exited, and the name was never linked to the new
+        # conversation, so the NEXT run asked for a name too. Both reported together.
+        self._restore_or_ask_session_name(newest.id, adopt=True)
 
     def _rebase_baseline_for_new_conversation(self, session_id: str) -> None:
         """Don't let a BRAND-NEW conversation's first turn be written off as already accounted for.
@@ -4808,13 +4817,17 @@ class ProxyRunner:
         self.state.session_summary = None
         self.state.session_summary_commit = None
 
-    def _restore_or_ask_session_name(self, session_id: str, *, quiet: bool = False) -> None:
+    def _restore_or_ask_session_name(self, session_id: str, *, quiet: bool = False, adopt: bool = False) -> None:
         """Put the status bar back in step with the conversation now being tracked.
 
         Two cases, and they must not be confused. A conversation aGiTrack has seen before carries
         a name the user already chose: going BACK to it (`/resume`) has to restore that name and
         id, not invent a new one. A conversation it has not seen is new work, and gets asked for
         a name — the same question `session → New` asks.
+
+        ``adopt`` takes the third case out of that second one: a conversation the user started
+        INSIDE this session (a native `/clear`) is this session continuing, not new work, so it
+        inherits the session's existing name silently instead of prompting for one.
         """
         try:
             # `getattr`, not attribute access: a failed lookup here falls through to ASKING for a
@@ -4838,6 +4851,12 @@ class ProxyRunner:
         self._render()
         if quiet:
             return  # startup: the normal naming flow runs right after and would ask twice
+        if adopt:
+            # Link the new conversation to the name this session already carries. `self.name` is
+            # left alone — it is still the right label, and the status bar has just repainted with
+            # it against the new id. Nothing is asked, so nothing blocks.
+            self._persist_session_name(session_id)
+            return
         # A FRESH suggestion, not `self.name`: this conversation is new work, and offering the
         # previous session's name invites keeping it — leaving two conversations sharing one name
         # and the status bar unable to say which is which. `_next_session_name` is the same
@@ -8215,6 +8234,41 @@ class ProxyRunner:
             return "skip"
         return self._integrate_turn_or_conflict()
 
+    # How far the background poll may back off for a session that keeps turning up nothing, and
+    # how many empty passes it takes to get there (the interval doubles each time).
+    BACKGROUND_IDLE_POLL_SECONDS = 30.0
+    _BACKGROUND_POLL_MAX_MISSES = 4
+
+    def _background_poll_interval(self, session: Session) -> float:
+        """How often to run this background session's commit/integrate pass.
+
+        ``POLL_SECONDS`` while it is producing work, doubling towards
+        ``BACKGROUND_IDLE_POLL_SECONDS`` once it stops. This pass runs on the REACTOR thread —
+        it swaps ``self.active``, so it cannot go on the git worker — and each one is a burst of
+        git (status, log, integrate) measured at ~25 ms. At a flat 2 s that is a fixed tax per
+        background session on the thread that also services the keyboard, paid forever by
+        sessions that have been idle for hours. A session that produces ANY backend output is
+        back on the fast cadence for its next pass (see :meth:`_note_background_poll`), so
+        finished work is still committed and integrated promptly.
+        """
+        misses = min(getattr(session, "_bg_poll_misses", 0) or 0, self._BACKGROUND_POLL_MAX_MISSES)
+        return min(self.POLL_SECONDS * (2**misses), self.BACKGROUND_IDLE_POLL_SECONDS)
+
+    def _note_background_poll(self, session: Session) -> None:
+        """Record whether this pass has anything new to look at, for the backoff above.
+
+        "New" is the session's backend having SPOKEN since the last pass: a turn cannot have
+        finished — so nothing can be owed a commit — without the agent writing something. The
+        watermark is the ``last_child_output`` timestamp, which the background PTY drain keeps
+        current whether or not the session is on screen.
+        """
+        spoke_at = getattr(session, "last_child_output", 0.0) or 0.0
+        if spoke_at != (getattr(session, "_bg_poll_seen", 0.0) or 0.0):
+            session._bg_poll_seen = spoke_at
+            session._bg_poll_misses = 0
+        else:
+            session._bg_poll_misses = (getattr(session, "_bg_poll_misses", 0) or 0) + 1
+
     def _service_background_sessions(self) -> None:
         # Integrate background sessions as soon as they go idle, so finished work
         # lands in the base without waiting to be switched to. A background
@@ -8233,9 +8287,10 @@ class ProxyRunner:
                 continue
             if now - getattr(session, "last_child_output", 0.0) < self.CHILD_IDLE_SECONDS:
                 continue
-            if now - getattr(session, "last_poll", 0.0) < self.POLL_SECONDS:
+            if now - getattr(session, "last_poll", 0.0) < self._background_poll_interval(session):
                 continue
             session.last_poll = now
+            self._note_background_poll(session)
             if self._with_session(session, self._commit_and_integrate_background) == "conflict":
                 self._switch_active(index)
                 self._prompt_resolve_conflict(self.repo.current_branch())
@@ -12308,6 +12363,17 @@ class ProxyRunner:
             self._finish_agent_parse_if_ready(
                 quiet=True, prompt_untracked=False, integrate=False, require_complete=False
             )
+            if self._noworktree_auto:
+                # In no-worktree AUTO the commit above only records a hidden LATENT commit; the
+                # real one is made by the throttled poll (_auto_fold_latent_pending). Callers
+                # reach here precisely when that poll is about to stop running — a modal is
+                # opening, the session context is being swapped, the process is tearing down — so
+                # "committed synchronously" has to include the fold, or the turn stays latent
+                # until exit. That is the reported `/clear` bug: the switch handler commits before
+                # its dialog for exactly this reason and the latent record alone did not honour
+                # it. Forced past the summary-defer gate, as the pre-prompt fold is: a summary
+                # that lands later amends into the fold commit (see _folded_head_for).
+                self._auto_fold_latent_pending(force=True)
         except Exception as error:  # never block on a commit failure
             self._debug(f"sync commit failed: {error!r}")
 

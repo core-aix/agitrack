@@ -12057,33 +12057,40 @@ def _switch_runner(tmp_path, refs, *, tracked, named=None):
     return runner
 
 
-def test_a_native_switch_to_a_NEW_conversation_asks_for_a_name(tmp_path, monkeypatch):
+def test_a_native_switch_to_a_NEW_conversation_keeps_the_session_name(tmp_path, monkeypatch):
     """`/clear` and friends: aGiTrack must notice by itself, without waiting for a turn to end,
-    and ask what to call the new work — the same question `session -> New` asks."""
+    and follow the new conversation — under the name this session already has.
+
+    It used to ask what to call the new work, on the reasoning that two conversations sharing a
+    name leave the status bar unable to say which is which. Reported live as two faults with one
+    cause: the user had named the session minutes earlier and a `/clear` demanded a second name
+    for plainly the same session, and — because the question is a MODAL — the reactor stopped
+    until it was answered, taking with it the poll that folds no-worktree auto mode's latent
+    turns into real commits. Unanswered, nothing committed until aGiTrack exited. Worktree mode
+    had always kept the session's name here (see `_service_native_session_switch`); this is that
+    same rule, minus the directory."""
     runner = _switch_runner(
         tmp_path,
         [SessionRef("old", 100.0, label="old work"), SessionRef("fresh", 200.0, label="new work")],
         tracked="old",
     )
     runner.name = "previous-session"
-    monkeypatch.setattr(runner, "_next_session_name", lambda: "otter")
     asked = {}
     monkeypatch.setattr(
         runner,
         "_prompt_session_name",
         lambda title, default: asked.update(title=title, default=default) or "otter",
     )
-    monkeypatch.setattr(runner, "_persist_session_name", lambda _sid: None)
+    linked: list = []
+    monkeypatch.setattr(runner, "_persist_session_name", lambda sid: linked.append(sid))
 
     runner._service_native_session_switch()
 
     assert runner.state.backend_session_id == "fresh"  # tracking followed
-    assert runner.name == "otter"  # ...and the status bar's name with it
-    assert asked, "the user was never asked to name the new conversation"
-    # A FRESH suggestion. Offering the previous session's name invites keeping it, leaving two
-    # conversations sharing one name and the status bar unable to say which is which.
-    assert asked["default"] == "otter"
-    assert asked["default"] != "previous-session"
+    assert runner.name == "previous-session"  # ...under the name the user already chose
+    assert not asked, "the user was asked to name a conversation their own session started"
+    # Linked NOW, not at exit: a run that is killed rather than quit must still find the name.
+    assert linked == ["fresh"]
 
 
 def test_a_native_switch_BACK_restores_the_old_name_and_id(tmp_path, monkeypatch):
