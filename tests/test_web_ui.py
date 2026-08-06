@@ -273,6 +273,10 @@ def test_the_banner_command_is_set_apart_from_the_explanation():
         backends=["claude"],
         directory="/tmp/x",
         dropped_sessions=0,
+        # A single-machine view: nothing pulled from origin, so the banner names no
+        # contributors (see test_multi_machine_backtrace.py for the consolidated case).
+        shared_sessions=0,
+        contributors=[],
     )
     view.banner_text = lambda: bt.BacktraceView.banner_text(view)
 

@@ -253,6 +253,23 @@ def main(argv: list[str] | None = None) -> int:
         "dashboard, backtrace dashboard, or background mode), repo name, and PID — then exit. "
         "`--daemons stop` stops all of them (the session you run it from is never stopped).",
     )
+    parser.add_argument(
+        "--share-sessions",
+        action="store_true",
+        help="share EVERY local agent session for this repository to 'origin' in one go, then "
+        "exit — the same thing the sessions menu does per session, for all of them. Use it to "
+        "put a machine's work where collaborators (and your other machines) can see it, and so "
+        "`--backtrace` can reconstruct the project's history across machines rather than only "
+        "from the transcripts on this one. Idempotent: a session already shared unchanged is "
+        "skipped, and one whose shared copy is NEWER is refused rather than rewound (re-run "
+        "with --overwrite-shared to replace it).",
+    )
+    parser.add_argument(
+        "--overwrite-shared",
+        action="store_true",
+        help="with --share-sessions: replace shared copies that are newer than this machine's, "
+        "instead of refusing them. Rewinds them for every collaborator, so it is opt-in.",
+    )
     # --- options without a short form, in rough order of how often they matter ---
     parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument(
@@ -729,6 +746,17 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.proxy.background import repo_status
 
         return repo_status(status_repo)
+
+    if args.share_sessions:
+        # `agitrack --share-sessions`: push every local session for this repo to origin, then
+        # exit. Needs a git repo (the shared store lives on a ref there) but nothing else — no
+        # agent spawn, no privacy prompt, no update check.
+        try:
+            share_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        return _run_share_sessions(share_repo, overwrite=args.overwrite_shared)
 
     if args.remove_hooks:
         # Let the user fully opt out of aGiTrack's commit-time tracking by removing every hook it
@@ -1430,6 +1458,35 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     if status == "unauthenticated" and answer in {"l", "login", "log in"}:
         _run_gh_login()
     return (True, True)
+
+
+def _run_share_sessions(repo: "GitRepo", *, overwrite: bool = False) -> int:
+    """`--share-sessions`: push every local session for ``repo`` to origin, reporting as it goes.
+
+    Progress is printed per session because a bulk share is one network round trip each — a
+    silent minute on a repo with twenty conversations reads as a hang. The exit code reflects
+    whether anything actually FAILED: sessions skipped as unchanged, or refused because the
+    shared copy is newer, are normal outcomes of a re-run and are not errors.
+    """
+    from agitrack.sessions.bulk import share_all
+
+    def progress(index: int, total: int, candidate) -> None:
+        print(f"  [{index}/{total}] {candidate.name} ({candidate.backend})… ", end="", flush=True)
+
+    def on_result(outcome) -> None:
+        detail = f" — {outcome.detail}" if outcome.detail else ""
+        print(f"{outcome.status}{detail}", flush=True)
+
+    print(f"Sharing local sessions for {repo.repo} to origin…")
+    result = share_all(repo, progress=progress, on_result=on_result, overwrite=overwrite)
+    print(f"\n{result.summary()}")
+    if result.shared:
+        print(f"Shared as '{result.login}/…'. Collaborators see them after `agitrack --backtrace`.")
+    failed = [o for o in result.outcomes if o.status == "failed"]
+    if failed:
+        print(f"\n{len(failed)} session(s) could not be shared.")
+        return 1
+    return 0
 
 
 def _run_gh_login() -> None:
