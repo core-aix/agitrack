@@ -479,3 +479,39 @@ def test_save_repo_really_preserves_keys_it_does_not_own(tmp_path):
     assert written["merge_branch"] == "main"
     assert written["log_file"] == "agitrack.log"
     assert written["sandbox"] is False
+
+
+# ---------------------------------------------------------------------------
+# agent_background — how aGiTrack paints behind the agent (see renderer.py)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_background_defaults_to_auto_and_rejects_nonsense(tmp_path):
+    config = GlobalConfig(path=tmp_path / "config.json")
+    assert config.agent_background == "auto"  # follow the agent's own light/dark theme
+
+    config.agent_background = "DARK"  # case-insensitive
+    assert config.agent_background == "dark"
+    config.agent_background = "chartreuse"  # unrecognised ⇒ back to the safe default
+    assert config.agent_background == "auto"
+
+
+def test_agent_background_is_a_seeded_knob_and_repo_overridable(tmp_path):
+    config = GlobalConfig(path=tmp_path / "config.json")
+    config.seed_defaults()
+    assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["agent_background"] == "auto"
+
+    config.load_repo_overlay(tmp_path / "repo")
+    config.set("agent_background", "terminal", scope="repo")  # opt out for this repo only
+    assert config.agent_background == "terminal"
+
+
+def test_agent_background_is_offered_in_the_settings_menu():
+    # Without a menu entry the setting exists only as hand-edited JSON.
+    from agitrack.proxy.runner import ProxyRunner
+
+    specs = ProxyRunner._settings_specs(ProxyRunner.__new__(ProxyRunner))
+    spec = next(entry for entry in specs if entry["key"] == "agent_background")
+    assert spec["kind"] == "choice"
+    assert spec["options"] == list(GlobalConfig.AGENT_BACKGROUND_CHOICES)
+    assert not spec.get("restart")  # it is read every frame, so it applies immediately
