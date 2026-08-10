@@ -3794,18 +3794,40 @@ class ProxyRunner:
         # Re-arm the automatic self-update check so it re-evaluates for the backend being
         # switched to (a sandbox-blocked update is then applied on switch too).
         self._backend_update_checked_for = None
-        # Remember the switch for THIS repo only (repo-scoped), not globally: switching to a
-        # backend in one repo (e.g. to try it) must not change the user's global default for
-        # every other repo. The repo overlay value drives this repo's backend on next launch.
-        self.global_config.set("default_backend", name, scope="repo")
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
             self._debug(f"_switch_backend: name={name} worktree=None -> _restart_agent (respawn in place)")
+            resume_id = self.state.stored_backend_session(name)
+            if not resume_id:
+                # NOTHING TO RESUME MEANS A BRAND-NEW CONVERSATION, so it is named like one.
+                # A different agent, a different transcript, no shared history with what is on
+                # screen — inheriting the outgoing backend's session name silently left two
+                # unrelated conversations wearing one label, which the resume list then could
+                # not tell apart. Deliberately unlike a native `/clear`, which is this same
+                # session continuing and keeps its name on purpose (see
+                # `_service_native_session_switch`); a backend switch is not that.
+                session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
+                if session_name is None:
+                    return  # backing out of the name backs out of the switch, as with worktrees
+                self.name = session_name
+                # Make it durable NOW, exactly as the startup naming flow does. The new backend
+                # has not spawned, so there is no conversation id to key it to and it is stored
+                # as PENDING. Without this the record kept the OUTGOING session's name pending —
+                # observed live: named 'alpha', switched to codex as 'beta', and the state file
+                # still read `pending_session_name: alpha`, so a crash before the first turn
+                # would have linked the previous session's name to the new conversation.
+                #
+                # Written through `self.state`, NOT a second `AgitrackState` on the same path:
+                # without a worktree they are the same file, and the state writes just below
+                # (`remember_backend_session`, `backend`, …) save this object's older in-memory
+                # copy straight over anything another instance wrote. The name vanished.
+                self._record_startup_session_name(self.state, None, session_name)
+            self._remember_repo_backend(name)
             self.state.remember_backend_session()
             self.state.backend = name
             self.backend = make_proxy_agent(name)
-            self.state.backend_session_id = self.state.stored_backend_session(name)
+            self.state.backend_session_id = resume_id
             self.state.last_backend_message_id = None
             # A model belongs to its backend. Worktree sessions each load their own state file,
             # so only this shared-state branch can carry the previous backend's model id into the
@@ -3813,6 +3835,21 @@ class ProxyRunner:
             self.state.model = (self.state.recall_session(name) or {}).get("model")
             self.state.clear_trace()
             self._restart_agent(f"Backend set to {name}")
+            if resume_id:
+                # Going BACK to this backend's conversation restores the name it was given, the
+                # mirror of naming a fresh one above; without it the status bar kept the outgoing
+                # backend's label while a different conversation ran underneath. Never ASK here —
+                # a resumed conversation is by definition not new work.
+                #
+                # Read through `self.state`, not `_restore_or_ask_session_name`: that helper opens
+                # its own `AgitrackState` on the repo root, which without a worktree is the file
+                # `self.state` already has loaded. `save()` writes `data` wholesale, so the two
+                # copies overwrite each other and the lookup misses names this session itself
+                # wrote. (The same two-instance hazard exists wherever a second AgitrackState is
+                # opened on a no-worktree session's own path — see `_persist_session_name`.)
+                known = self.state.session_name_for(resume_id)
+                if known:
+                    self.name = known
             return
         # Keep the current backend's session running in the background and switch
         # to this backend's own session.
@@ -3820,6 +3857,7 @@ class ProxyRunner:
         self._debug(f"_switch_backend: name={name} worktree={self.name} live_index={index}")
         if index is not None:
             self._debug("_switch_backend: -> _switch_active (resume live bg session)")
+            self._remember_repo_backend(name)
             self._switch_active(index)
             return
         # Resume this backend's last conversation if we remember one (recreating
@@ -3827,6 +3865,7 @@ class ProxyRunner:
         record = self._recall_backend_session(name)
         if record and record.get("id"):
             self._debug(f"_switch_backend: -> _new_session resume (fresh spawn) id={record.get('id')}")
+            self._remember_repo_backend(name)
             self._new_session(
                 record.get("worktree") or self._next_session_name(), backend=name, resume_session_id=record["id"]
             )
@@ -3836,7 +3875,22 @@ class ProxyRunner:
         session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
         if session_name is None:
             return
+        self._remember_repo_backend(name)
         self._new_session(session_name, backend=name)
+
+    def _remember_repo_backend(self, name: str) -> None:
+        """Record the switch for THIS repo only (repo-scoped), not globally.
+
+        Switching backend in one repo — to try it, or because one repo suits it — must not
+        change the user's default in every other repo. The repo overlay value drives this repo's
+        backend on next launch.
+
+        Called once per branch of ``_switch_backend``, AFTER that branch has committed to the
+        switch, rather than once up front: both fresh-session branches ask for a name first and
+        treat cancelling as cancelling the switch, and writing the default before the question
+        left a repo permanently pointed at a backend it never actually switched to.
+        """
+        self.global_config.set("default_backend", name, scope="repo")
 
     def _persisted_session_names(self) -> set[str]:
         # Sanitized names recorded for past conversations — both the durable

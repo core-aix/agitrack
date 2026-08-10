@@ -10420,11 +10420,97 @@ def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypa
     runner._restart_agent = lambda msg: None
     runner._set_message = lambda *a, **k: None
     runner._render = lambda *a, **k: None
+    # Nothing is stored for opencode here, so this switch opens a fresh conversation and asks
+    # for its name; answer it, because the subject of this test is the SCOPE of the write.
+    runner._prompt_session_name = lambda title, *, default: "picked"
 
     runner._switch_backend("opencode")
 
     assert ("default_backend", "opencode", "repo") in sets
     assert not any(scope == "global" for _, _, scope in sets)  # global default left alone
+
+
+def _switchable_runner(tmp_path, monkeypatch, *, stored=None):
+    """A no-worktree runner on `claude`, ready to switch, with the naming prompt observable."""
+    import agitrack.proxy.runner as rm
+
+    state = AgitrackState(tmp_path)
+    if stored:
+        state.backend = "opencode"
+        state.backend_session_id = stored
+        state.remember_backend_session()
+        state.backend = "claude"
+    runner = make_runner(state=state, worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner.name = "original"
+    runner.global_config = types.SimpleNamespace(set=lambda key, value, *, scope: None, default_backend="claude")
+    monkeypatch.setattr(rm, "backend_installed", lambda name: True)
+    monkeypatch.setattr(rm, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    runner._restart_agent = lambda msg: None
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_switching_backend_to_a_fresh_conversation_asks_for_a_session_name(tmp_path, monkeypatch):
+    # A backend switch with nothing to resume starts a DIFFERENT conversation — another agent,
+    # another transcript, no shared history. It is new work and is named like new work; silently
+    # inheriting the outgoing backend's name left two unrelated conversations sharing one label.
+    runner = _switchable_runner(tmp_path, monkeypatch)
+    asked: list = []
+
+    def prompt(title, *, default):
+        asked.append((title, default))
+        return "fresh-name"
+
+    runner._prompt_session_name = prompt
+
+    runner._switch_backend("opencode")
+
+    assert asked, "a fresh conversation on the new backend must be named"
+    assert "opencode" in asked[0][0]
+    assert runner.name == "fresh-name"
+    # Durable immediately, as at startup. The new backend has not spawned, so there is no
+    # conversation id yet and the name is held PENDING. Leaving this out kept the OUTGOING
+    # session's name pending, so a crash before the first turn linked the old name to the new
+    # conversation — seen live in a real state file before this was added.
+    assert AgitrackState(runner.base_repo.repo).pending_session_name == "fresh-name"
+
+
+def test_switching_backend_back_to_a_remembered_conversation_restores_its_name(tmp_path, monkeypatch):
+    # The mirror case: going BACK to a conversation this backend already had is not new work, so
+    # it is never asked for a name — it gets back the one it was given. The real
+    # `_restore_or_ask_session_name` runs here rather than a stub, because the thing worth
+    # asserting is that the NAME returns, not that a helper was called.
+    runner = _switchable_runner(tmp_path, monkeypatch, stored="sess-abc")
+    # Named through the session's OWN state object. A second AgitrackState on the same path
+    # would be clobbered by the switch's own saves — the hazard this branch works around.
+    runner.state.name_session("sess-abc", "alpha")
+    runner._prompt_session_name = lambda *a, **k: pytest.fail("a resumed conversation must not be named again")
+
+    runner._switch_backend("opencode")
+
+    assert runner.state.backend_session_id == "sess-abc"
+    assert runner.name == "alpha", "switching back must restore the name that conversation had"
+
+
+def test_backing_out_of_the_name_leaves_the_backend_switch_undone(tmp_path, monkeypatch):
+    # Cancelling the name cancels the SWITCH, as it already did in worktree mode. The repo
+    # default is written per branch, after that branch commits to the switch, so a cancelled
+    # switch cannot leave the repo pointed at a backend it never moved to.
+    runner = _switchable_runner(tmp_path, monkeypatch)
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(
+        set=lambda key, value, *, scope: sets.append((key, value, scope)), default_backend="claude"
+    )
+    runner._prompt_session_name = lambda *a, **k: None
+
+    runner._switch_backend("opencode")
+
+    assert runner.backend.name == "claude"
+    assert runner.state.backend == "claude"
+    assert runner.name == "original"
+    assert sets == [], "a cancelled switch must not record a new repo default"
 
 
 def test_no_worktree_mode_keeps_leftover_worktrees_and_resumes_newest(tmp_path):
