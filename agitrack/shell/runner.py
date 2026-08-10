@@ -5,8 +5,7 @@ import sys
 
 from agitrack.commits import AgitrackActions
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
-from agitrack.backends.claude import ClaudeBackend
-from agitrack.backends.opencode import OpenCodeBackend
+from agitrack.backends import headless_backends
 from agitrack.git import GitRepo
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
@@ -16,10 +15,10 @@ from agitrack.shell.ui import AgitrackPrompt, PromptState
 
 AGITRACK_PREFIX = ":"
 
-BACKENDS = {
-    OpenCodeBackend.name: OpenCodeBackend,
-    ClaudeBackend.name: ClaudeBackend,
-}
+# The headless adapters, from the single registry in agitrack.backends — so a newly registered
+# backend is drivable from shell mode without editing this module. Kept as a module-level dict
+# because tests monkeypatch it to substitute fakes.
+BACKENDS = headless_backends()
 
 
 class AgitrackShell:

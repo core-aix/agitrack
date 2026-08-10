@@ -44,14 +44,19 @@ _ROLLOUT_RE = re.compile(r"^rollout-.*?-([0-9a-fA-F-]{36})\.jsonl$")
 # the symptom (aGiTrack "loses" every session) is far worse than the cost of a directory listing.
 _STATE_DB_GLOB = "state_*.sqlite"
 
-# Tool names Codex uses for its own built-in file editing. Recorded so ``_edits_from_turn``
-# knows which calls carry file changes; everything else is an ordinary tool call.
-_PATCH_TOOL = "apply_patch"
-
-# Codex's sub-agent tool (the ``multi_agent`` feature, stable-on in 0.147.0). A spawned agent
+# Codex's sub-agent tools (the ``multi_agent`` feature, stable-on in 0.147.0). A spawned agent
 # runs as its own THREAD with its own rollout file, so its tokens are absent from the parent's
 # counts — the same shape as OpenCode's `task` tool and Claude's sidechains.
-_SUBAGENT_TOOLS = ("spawn_agent", "agent", "run_agent", "task")
+#
+# The two names do different jobs and only one of them means "a sub-agent ran": ``spawn_agent``
+# starts one, ``wait_agent`` merely blocks on ids already spawned. Counting ``wait_agent`` as a
+# spawn would report two sub-agents for one, so only ``spawn_agent`` marks usage — but
+# ``wait_agent``'s ``targets`` argument is the ONLY place the child's thread id appears in the
+# parent's rollout (``spawn_agent``'s arguments carry just the message), so it is still read for
+# ids. Verified against a live run: spawn_agent{"message":…,"fork_context":true} then
+# wait_agent{"targets":["019fe8e3-7a9d-…"]}.
+_SUBAGENT_SPAWN_TOOL = "spawn_agent"
+_SUBAGENT_WAIT_TOOL = "wait_agent"
 
 # Codex's skill invocation tool. Skills live under ``$CODEX_HOME/skills`` and a plugin-supplied
 # skill is namespaced ``<plugin>:<skill>``, which is what ``capabilities.plugins_from_skills``
@@ -75,10 +80,21 @@ def _sessions_root() -> Path:
     return _codex_home() / "sessions"
 
 
+def _schema_version(path: Path) -> int:
+    """The migration number in ``state_<n>.sqlite``; -1 when it has none."""
+    digits = path.stem.rpartition("_")[2]
+    return int(digits) if digits.isdigit() else -1
+
+
 def _state_dbs() -> list[Path]:
-    """Codex state databases, newest schema first — see ``_STATE_DB_GLOB``."""
+    """Codex state databases, newest schema first — see ``_STATE_DB_GLOB``.
+
+    Sorted NUMERICALLY, not lexicographically: the day Codex ships ``state_10.sqlite``, a string
+    sort puts ``state_5`` first and every id → rollout_path / model / nickname lookup would
+    silently answer from the stale pre-migration database.
+    """
     try:
-        return sorted(_codex_home().glob(_STATE_DB_GLOB), reverse=True)
+        return sorted(_codex_home().glob(_STATE_DB_GLOB), key=_schema_version, reverse=True)
     except OSError:
         return []
 
@@ -293,6 +309,70 @@ def _agent_message(payload: dict) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
+def _content_text(payload: dict) -> str:
+    """The text of a ``response_item`` message, whose ``content`` is a list of typed parts.
+
+    This is the ONLY place the interactive TUI records the conversation. ``codex exec`` writes
+    both ``event_msg`` (``user_message`` / ``agent_message``) *and* a mirrored
+    ``response_item``; the TUI writes only the ``response_item``. Parsing just the events —
+    which is what the exec-derived rollouts taught — produced turns with an EMPTY user prompt
+    for every interactive session, i.e. every real aGiTrack run.
+    """
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+# Codex injects harness context as ordinary ``role: "user"`` messages, each one a single XML-ish
+# element (``<environment_context>…</environment_context>``, ``<skills_instructions>…``). They are
+# not what the human typed, and committing one would put a multi-kilobyte context block in the
+# trace as the user's prompt. Matched structurally — a message that is ENTIRELY one wrapping tag —
+# rather than by a fixed tag list, so a new injection Codex adds later is excluded too.
+_WRAPPED_CONTEXT_RE = re.compile(r"^<([A-Za-z_][\w-]*)>[\s\S]*?</\1>\s*")
+
+
+def _is_harness_injection(text: str) -> bool:
+    """Whether a ``role: "user"`` message is Codex scaffolding rather than something a human typed.
+
+    Two conditions, both required.
+
+    1. The message is ENTIRELY complete ``<tag>…</tag>`` blocks. Several are concatenated into one
+       message in practice — a live turn carried
+       ``<recommended_plugins>…</recommended_plugins><environment_context>…</environment_context>``
+       as a single 3,230-character "prompt" — so blocks are peeled one at a time and it only
+       counts if nothing is left over. Requiring a SINGLE wrapping tag missed exactly that case
+       and put the whole context dump into the commit as the user's prompt.
+    2. At least one tag name is ``snake_case``. Every injection Codex emits is
+       (``environment_context``, ``recommended_plugins``, ``skills_instructions``, …), while
+       markup a human might paste as their whole prompt is not (``<div>…</div>``,
+       ``<Component>…</Component>``, ``<html>…</html>``). Without this a pure-markup prompt was
+       classified as scaffolding and the turn committed with an EMPTY user prompt — dropping a
+       real prompt, which is the worse of the two failures. Keyed on the naming convention
+       rather than a fixed tag list so an injection Codex adds later is still caught.
+    """
+    remaining = text.strip()
+    if not remaining.startswith("<"):
+        return False
+    saw_snake_case_tag = False
+    while remaining:
+        match = _WRAPPED_CONTEXT_RE.match(remaining)
+        if not match:
+            return False  # real prose left over: a human wrote this
+        saw_snake_case_tag = saw_snake_case_tag or "_" in match.group(1)
+        remaining = remaining[match.end() :]
+    return saw_snake_case_tag
+
+
 def _tool_name(payload: dict) -> str:
     name = payload.get("name")
     return name.strip() if isinstance(name, str) else ""
@@ -313,74 +393,71 @@ def _patch_edits(payload: dict, file_state: dict[str, str]) -> list[FileEdit]:
     for path, change in _as_dict(payload.get("changes")).items():
         change = _as_dict(change)
         kind = str(change.get("type") or "update")
-        after = _apply_unified_diff(file_state.get(str(path), ""), str(change.get("unified_diff") or ""))
+        # Codex describes a change one of two ways, and which one depends on the kind: an ADD
+        # carries the whole new file in ``content``, while an UPDATE carries only a
+        # ``unified_diff``. Reading only the diff (the shape an update taught us to expect)
+        # silently produced zero edits for every newly-created file — verified against a live
+        # sub-agent run that created haiku.txt with ``{"type": "add", "content": ...}``.
         if kind == "delete":
             edit = tracked_edit(file_state, str(path), write="")
+        elif isinstance(change.get("content"), str):
+            edit = tracked_edit(file_state, str(path), write=change["content"])
         else:
-            edit = tracked_edit(file_state, str(path), write=after)
+            # An UPDATE names no whole-file content, and the file predates the session, so there
+            # is no baseline to apply the patch to. Hand the hunks over as (old, new) snippet
+            # pairs instead — the same shape Claude's/OpenCode's Edit tool produces — which
+            # ``tracked_edit`` replays against tracked content when it has it and diffs directly
+            # when it doesn't. An earlier version tried to APPLY the diff to an empty baseline;
+            # every hunk landed past the end of a zero-line file and was skipped, so a real
+            # `subtract()` edit was recorded as no change at all.
+            edit = tracked_edit(file_state, str(path), subedits=_hunk_subedits(str(change.get("unified_diff") or "")))
         if edit is not None:
             edits.append(edit)
     return edits
 
 
-def _apply_unified_diff(before: str, diff: str) -> str:
-    """``before`` with ``diff``'s hunks applied, best-effort.
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
-    Codex's ``unified_diff`` is a normal ``@@`` patch. Applying it (rather than storing the raw
-    diff) keeps ``file_state`` a real file image, which is what makes a SECOND edit to the same
-    file in a later turn diff incrementally instead of re-reporting the whole file — the
-    accumulating-diff bug ``tracked_edit`` exists to prevent. A hunk that doesn't line up is
-    skipped rather than guessed at: a wrong file image is worse than a coarse one.
+
+def _hunk_subedits(diff: str) -> list[tuple[str, str]]:
+    """A unified diff as ``(old_text, new_text)`` replacement pairs, one per ``@@`` hunk.
+
+    Each hunk's context lines are kept in BOTH sides so the pair is a real, anchored
+    replacement rather than a bag of changed lines — that anchoring is what lets
+    ``tracked_edit`` apply it to content it is already tracking (so a second edit to the same
+    file diffs incrementally) instead of only ever diffing the snippets against each other.
     """
-    if not diff:
-        return before
-    lines = before.split("\n") if before else []
-    out: list[str] = []
-    cursor = 0
-    for hunk_header, body in _hunks(diff):
-        start = hunk_header - 1 if hunk_header > 0 else 0
-        if start < cursor or start > len(lines):
-            continue  # out of order or past the end — can't be applied safely
-        out.extend(lines[cursor:start])
-        cursor = start
-        for line in body:
-            if line.startswith("+"):
-                out.append(line[1:])
-            elif line.startswith("-"):
-                if cursor < len(lines):
-                    cursor += 1
-            else:
-                if cursor < len(lines):
-                    out.append(lines[cursor])
-                    cursor += 1
-                else:
-                    out.append(line[1:] if line.startswith(" ") else line)
-    out.extend(lines[cursor:])
-    text = "\n".join(out)
-    if before.endswith("\n") and not text.endswith("\n"):
-        text += "\n"
-    return text
+    pairs: list[tuple[str, str]] = []
+    old: list[str] = []
+    new: list[str] = []
 
+    def flush() -> None:
+        if old or new:
+            pairs.append(("\n".join(old), "\n".join(new)))
 
-_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
-
-def _hunks(diff: str):
-    """``(old_start, body_lines)`` for each ``@@`` hunk in a unified diff."""
-    current: list[str] | None = None
-    start = 0
+    started = False
     for line in diff.split("\n"):
-        match = _HUNK_RE.match(line)
-        if match:
-            if current is not None:
-                yield start, current
-            start = int(match.group(1))
-            current = []
+        if _HUNK_RE.match(line):
+            if started:
+                flush()
+            old, new = [], []
+            started = True
             continue
-        if current is not None:
-            current.append(line)
-    if current is not None:
-        yield start, current
+        if not started:
+            continue
+        if line.startswith("+"):
+            new.append(line[1:])
+        elif line.startswith("-"):
+            old.append(line[1:])
+        elif line.startswith("\\"):
+            continue  # "\ No newline at end of file" is a marker, not content
+        else:
+            text = line[1:] if line.startswith(" ") else line
+            old.append(text)
+            new.append(text)
+    if started:
+        flush()
+    return pairs
 
 
 def _new_turn() -> dict:
@@ -390,8 +467,8 @@ def _new_turn() -> dict:
         "agent_messages": [],
         "tool_names": [],
         "skills": [],
-        "subagents": [],
         "child_thread_ids": [],
+        "spawn_count": 0,
         "tokens": TokenUsage(),
         "model": None,
         "started_at": None,
@@ -410,7 +487,7 @@ def parse_rows(
     *,
     collect_edits: bool = False,
     mcp_servers=(),
-    subagent_tokens: "dict[str, TokenUsage] | None" = None,
+    subagent_work: "dict[str, tuple[TokenUsage, list[FileEdit]]] | None" = None,
 ) -> list[SessionTurn]:
     """Codex rollout records → :class:`SessionTurn` objects, one per user prompt.
 
@@ -430,7 +507,7 @@ def parse_rows(
 
     def close(turn: dict, *, complete: bool) -> None:
         turn["complete"] = complete
-        turns.append(_finalize(turn, mcp_servers=mcp_servers, subagent_tokens=subagent_tokens or {}))
+        turns.append(_finalize(turn, mcp_servers=mcp_servers, subagent_work=subagent_work or {}))
 
     for row in rows:
         kind, payload_kind = _row_kind(row)
@@ -461,23 +538,22 @@ def parse_rows(
             continue
 
         if payload_kind == "user_message":
-            text = _agent_message(payload)
-            if not text:
-                continue
-            if current["user_prompt"]:
-                # A second user_message inside one task is a prompt the user QUEUED while the
-                # agent was working; it belongs to this turn but is its own message.
-                current["queued_followups"].append(text)
-            else:
-                current["user_prompt"] = text
+            _add_user_message(current, _agent_message(payload), seen_messages)
             continue
 
         if payload_kind == "agent_message":
-            text = _agent_message(payload)
-            key = f"{current['turn_id']}:{len(current['agent_messages'])}:{text[:80]}"
-            if text and key not in seen_messages:
-                seen_messages.add(key)
-                current["agent_messages"].append(text)
+            _add_agent_message(current, _agent_message(payload), seen_messages)
+            continue
+
+        if kind == "response_item" and payload_kind == "message":
+            # The TUI's only record of the conversation (see _content_text). In an `exec`
+            # rollout this DUPLICATES the event_msg above, so both paths dedupe on the text.
+            role = str(payload.get("role") or "")
+            if role == "user":
+                _add_user_message(current, _content_text(payload), seen_messages)
+            elif role == "assistant":
+                _add_agent_message(current, _content_text(payload), seen_messages)
+            # `developer` / `system` roles are harness scaffolding, never conversation.
             continue
 
         if payload_kind in ("function_call", "custom_tool_call"):
@@ -490,6 +566,17 @@ def parse_rows(
         if payload_kind == "patch_apply_end":
             if collect_edits:
                 current["edits"].extend(_patch_edits(payload, file_state))
+            continue
+
+        if payload_kind == "item_completed":
+            # The interactive TUI reports an applied patch as an item_completed/FileChange
+            # instead of the patch_apply_end the exec path emits — same ``changes`` map. Without
+            # this branch --backtrace reconstructed ZERO file edits for every TUI session, which
+            # is every real aGiTrack run. Only FileChange is read here: the message and command
+            # items duplicate records already handled above.
+            item = _as_dict(payload.get("item"))
+            if collect_edits and str(item.get("type") or "") == "FileChange":
+                current["edits"].extend(_patch_edits(item, file_state))
             continue
 
         if payload_kind == "token_count":
@@ -526,6 +613,32 @@ def parse_rows(
     return turns
 
 
+def _add_user_message(turn: dict, text: str, seen: set[str]) -> None:
+    """Record a human prompt on the turn, ignoring harness injections and duplicates."""
+    if not text or _is_harness_injection(text):
+        return
+    key = f"{turn['turn_id']}:u:{text}"
+    if key in seen:
+        return  # the same message arriving as both an event_msg and a response_item
+    seen.add(key)
+    if turn["user_prompt"]:
+        # A second user message inside one task is a prompt the user QUEUED while the agent was
+        # already working; it belongs to this turn but is its own message.
+        turn["queued_followups"].append(text)
+    else:
+        turn["user_prompt"] = text
+
+
+def _add_agent_message(turn: dict, text: str, seen: set[str]) -> None:
+    if not text:
+        return
+    key = f"{turn['turn_id']}:a:{text}"
+    if key in seen:
+        return
+    seen.add(key)
+    turn["agent_messages"].append(text)
+
+
 def _classify_tool(name: str, payload: dict, turn: dict) -> None:
     """Record a tool call's capability meaning (skill / sub-agent) alongside its raw name.
 
@@ -548,25 +661,43 @@ def _classify_tool(name: str, payload: dict, turn: dict) -> None:
         skill = parsed.get("skill") or parsed.get("name") or parsed.get("skill_name")
         if isinstance(skill, str) and skill.strip():
             turn["skills"].append(skill.strip())
-    elif lowered in _SUBAGENT_TOOLS:
-        agent = parsed.get("agent") or parsed.get("agent_type") or parsed.get("name") or parsed.get("role")
-        turn["subagents"].append(agent.strip() if isinstance(agent, str) and agent.strip() else lowered)
-        thread_id = parsed.get("thread_id") or parsed.get("child_thread_id")
-        if isinstance(thread_id, str) and thread_id.strip():
-            turn["child_thread_ids"].append(thread_id.strip())
+    elif lowered == _SUBAGENT_SPAWN_TOOL:
+        # A spawn call names no agent — Codex assigns the child a nickname ("Ohm") that lives
+        # only in its thread row — so the id is resolved first and the name looked up in
+        # ``_finalize``. The tool name is the fallback so a spawn is never reported as nothing.
+        turn["spawn_count"] += 1
+    elif lowered == _SUBAGENT_WAIT_TOOL:
+        for target in parsed.get("targets") or []:
+            if isinstance(target, str) and target.strip():
+                turn["child_thread_ids"].append(target.strip())
 
 
-def _finalize(turn: dict, *, mcp_servers=(), subagent_tokens: dict[str, TokenUsage]) -> SessionTurn:
+def _finalize(
+    turn: dict, *, mcp_servers=(), subagent_work: dict[str, tuple[TokenUsage, list[FileEdit]]]
+) -> SessionTurn:
     messages = [text for text in turn["agent_messages"] if text]
     tokens = turn["tokens"]
-    for child in turn["child_thread_ids"]:
-        child_usage = subagent_tokens.get(child)
-        if child_usage is not None:
-            tokens.add(child_usage)
+    # Sub-agents are named by resolving the child THREAD ids, not collected during the scan:
+    # a spawn call carries no agent name, only the child thread does (see _agent_nickname).
+    subagents: list[str] = []
+    # De-duplicated: the model can call `wait_agent` more than once on the same child (re-waiting
+    # after a partial return), and each repeat would otherwise add that sub-agent's whole
+    # TokenUsage again and list it twice in the turn's provenance.
+    for child in dict.fromkeys(turn["child_thread_ids"]):
+        work = subagent_work.get(child)
+        if work is not None:
+            tokens.add(work[0])
+            turn["edits"].extend(work[1])  # the delegated file changes belong to this turn
+        subagents.append(_agent_nickname(child) or child)
+    if turn["spawn_count"] and not turn["child_thread_ids"]:
+        # The turn demonstrably spawned an agent but never waited on it, so no child id is
+        # recoverable from this rollout. Record the capability under the tool's own name rather
+        # than dropping it: "a sub-agent ran" is true and provable, only its identity is not.
+        subagents.append(_SUBAGENT_SPAWN_TOOL)
     capability = caps.collect(
         tool_names=turn["tool_names"],
         skills=turn["skills"],
-        subagents=turn["subagents"],
+        subagents=subagents,
         mcp_servers=mcp_servers,
     )
     # Codex's own turn id is the stable identity for BOTH ends of the turn. The other backends
@@ -601,6 +732,57 @@ def _finalize(turn: dict, *, mcp_servers=(), subagent_tokens: dict[str, TokenUsa
 # --- sub-agent tokens --------------------------------------------------------
 
 
+def _agent_nickname(thread_id: str) -> str | None:
+    """The name Codex gave a spawned sub-agent ("Ohm").
+
+    Codex names an agent in its THREAD ROW, never in the parent's rollout, so this is the only
+    way a commit can say which sub-agent ran rather than printing a bare uuid.
+    """
+    for row in _query("SELECT agent_nickname FROM threads WHERE id = ?", (thread_id,)):
+        nickname = row.get("agent_nickname")
+        if isinstance(nickname, str) and nickname.strip():
+            return nickname.strip()
+    # The child's own rollout header repeats it under source.subagent.thread_spawn, so the name
+    # survives a missing/migrated state db exactly like every other fact this module reads.
+    path = session_transcript_path(thread_id)
+    if path is None:
+        return None
+    spawn = _as_dict(
+        _as_dict(_as_dict(_session_meta(_read_rows(path)).get("source")).get("subagent")).get("thread_spawn")
+    )
+    nickname = spawn.get("agent_nickname")
+    return nickname.strip() if isinstance(nickname, str) and nickname.strip() else None
+
+
+def _child_ids_in_rows(rows: list[dict]) -> list[str]:
+    """Child thread ids named by the conversation's own ``wait_agent`` calls.
+
+    The rollout is the authoritative source here, and it must be read as well as the state db:
+    the db's ``thread_spawn_edges`` is the only place a spawn that was never waited on is
+    recorded, but the db is also the part of Codex's store aGiTrack cannot see into when it is
+    missing, mid-migration, or holding the rows in an un-checkpointed WAL. Taking the union
+    means a sub-agent's tokens survive either source being unavailable.
+    """
+    found: list[str] = []
+    for row in rows:
+        _, payload_kind = _row_kind(row)
+        if payload_kind != "function_call":
+            continue
+        payload = _payload(row)
+        if _tool_name(payload).lower() != _SUBAGENT_WAIT_TOOL:
+            continue
+        try:
+            parsed = json.loads(payload.get("arguments") or "{}")
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for target in parsed.get("targets") or []:
+            if isinstance(target, str) and target.strip():
+                found.append(target.strip())
+    return found
+
+
 def _spawned_thread_ids(session_id: str) -> list[str]:
     """Child thread ids Codex spawned from this conversation.
 
@@ -613,40 +795,97 @@ def _spawned_thread_ids(session_id: str) -> list[str]:
     return [str(row.get("child_thread_id") or "") for row in rows if row.get("child_thread_id")]
 
 
-def _subagent_tokens(session_id: str, visited: set[str] | None = None) -> dict[str, TokenUsage]:
-    """``child thread id -> its total consumption``, recursing through nested spawns.
+def _subagent_work(
+    session_id: str,
+    visited: set[str] | None = None,
+    *,
+    extra_children: list[str] | None = None,
+    collect_edits: bool = False,
+) -> dict[str, tuple[TokenUsage, list[FileEdit]]]:
+    """``child thread id -> (its total consumption, the files it changed)``, recursing through
+    nested spawns.
+
+    Edits are collected as well as tokens because a sub-agent's thread is excluded from the
+    session listings (it is not a conversation the user can resume), so nothing else would ever
+    read it — and the files it wrote would vanish from ``--backtrace`` entirely. Verified on a
+    live run: the parent turn recorded no edits at all while its sub-agent's own rollout carried
+    ``haiku.txt (+3)``. The work belongs to the parent turn that delegated it.
 
     ``visited`` breaks cycles: a corrupt or self-referential edge would otherwise recurse until
     the stack blew, taking down the commit that was merely trying to count tokens.
     """
     visited = visited if visited is not None else set()
-    totals: dict[str, TokenUsage] = {}
-    for child in _spawned_thread_ids(session_id):
+    totals: dict[str, tuple[TokenUsage, list[FileEdit]]] = {}
+    children = list(dict.fromkeys([*(extra_children or []), *_spawned_thread_ids(session_id)]))
+    for child in children:
         if child in visited:
             continue
         visited.add(child)
         usage = TokenUsage()
+        edits: list[FileEdit] = []
+        file_state: dict[str, str] = {}
         path = session_transcript_path(child)
         if path is not None:
             for row in _read_rows(path):
                 _, payload_kind = _row_kind(row)
-                if payload_kind != "token_count":
-                    continue
-                info = _as_dict(_payload(row).get("info"))
-                block = _as_dict(info.get("last_token_usage"))
-                if block:
-                    usage.add(_turn_tokens(block, subagent=True))
-        for nested in _subagent_tokens(child, visited).values():
-            usage.add(nested)
-        totals[child] = usage
+                payload = _payload(row)
+                if payload_kind == "token_count":
+                    block = _as_dict(_as_dict(payload.get("info")).get("last_token_usage"))
+                    if block:
+                        usage.add(_turn_tokens(block, subagent=True))
+                elif collect_edits and payload_kind == "patch_apply_end":
+                    edits.extend(_patch_edits(payload, file_state))
+                elif collect_edits and payload_kind == "item_completed":
+                    item = _as_dict(payload.get("item"))
+                    if str(item.get("type") or "") == "FileChange":
+                        edits.extend(_patch_edits(item, file_state))
+        for nested_usage, nested_edits in _subagent_work(child, visited, collect_edits=collect_edits).values():
+            usage.add(nested_usage)
+            edits.extend(nested_edits)
+        totals[child] = (usage, edits)
     return totals
 
 
 # --- session discovery -------------------------------------------------------
 
 
-def _first_cwd(rows: list[dict]) -> str | None:
-    cwd = _session_meta(rows).get("cwd")
+def _read_header(path: Path) -> dict:
+    """The rollout's ``session_meta`` payload, read WITHOUT parsing the whole file.
+
+    ``session_meta`` is always the first record, and the discovery passes only need three fields
+    from it (cwd, source, thread_source). Fully parsing every rollout in ``$CODEX_HOME`` made each
+    ``--backtrace`` / daemon discovery O(the user's entire Codex history) in both I/O and CPU —
+    Claude's equivalent reads only a bounded head for exactly this reason. A few lines are scanned
+    rather than one in case a future version emits a banner before the header.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(5):
+                line = handle.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(row, dict) and row.get("type") == "session_meta":
+                    return _payload(row)
+    except OSError:
+        return {}
+    return {}
+
+
+def recorded_cwd(path: Path) -> str | None:
+    """The working directory a rollout recorded, read from its header alone.
+
+    Public because ``--backtrace`` needs it to relativize a session's (absolute) edit paths:
+    the rollout file's own location under ``~/.codex/sessions/`` relativizes nothing, so using
+    it dropped every reconstructed edit.
+    """
+    cwd = _read_header(path).get("cwd")
     return cwd if isinstance(cwd, str) and cwd else None
 
 
@@ -659,15 +898,38 @@ def _same_repo(directory: object, repo: Path) -> bool:
         return False
 
 
+def _is_agent_thread(header: dict) -> bool:
+    """Whether a rollout header describes a SUB-AGENT's thread rather than a user conversation.
+
+    A spawned agent gets its own rollout file in the same directory, recorded against the same
+    cwd as its parent. Without this filter every sub-agent would appear in the session picker as
+    a resumable conversation and — being the newest file — could be adopted as "the session" on
+    restart, silently switching the user onto a sub-agent's thread. Its tokens are still counted:
+    its tokens AND its file edits are folded into the PARENT turn that spawned it (see
+    ``_subagent_work``).
+    """
+    return str(header.get("thread_source") or "") == "subagent"
+
+
 def _label(rows: list[dict]) -> str | None:
-    """A short human label for the session picker — Codex's own thread title when it set one,
-    otherwise the first user prompt (which is what Codex titles a thread with anyway)."""
+    """A short human label for the session picker: the session's first real user prompt.
+
+    Must read BOTH record forms for the same reason ``parse_rows`` does — the interactive TUI
+    writes only ``response_item`` messages, so reading just ``user_message`` events left every
+    TUI session (i.e. every real aGiTrack session) unlabeled in the picker. Harness injections
+    are skipped or the label would be a slab of ``<environment_context>``.
+    """
     for row in rows:
-        _, payload_kind = _row_kind(row)
+        kind, payload_kind = _row_kind(row)
+        payload = _payload(row)
         if payload_kind == "user_message":
-            text = _agent_message(_payload(row))
-            if text:
-                return text.splitlines()[0][:120]
+            text = _agent_message(payload)
+        elif kind == "response_item" and payload_kind == "message" and payload.get("role") == "user":
+            text = _content_text(payload)
+        else:
+            continue
+        if text and not _is_harness_injection(text):
+            return text.splitlines()[0][:120]
     return None
 
 
@@ -677,17 +939,19 @@ def _refs_for(paths: list[Path]) -> list[SessionRef]:
         session_id = _id_from_path(path)
         if not session_id:
             continue
-        rows = _read_rows(path)
+        header = _read_header(path)
+        if _is_agent_thread(header):
+            continue
         refs.append(
             SessionRef(
                 id=session_id,
                 updated=session_last_activity(session_id) or _mtime(path),
-                label=_label(rows),
+                label=_label(_read_rows(path)),
                 # Codex records how a thread was created. An ``exec`` thread is a headless
                 # `codex exec` run — aGiTrack's OWN summarizer calls look exactly like that —
                 # so it is marked programmatic and kept out of the resume/switch lists, the
                 # same guard Claude's parser applies to `claude -p` transcripts.
-                programmatic=str(_session_meta(rows).get("source") or "") == "exec",
+                programmatic=str(header.get("source") or "") == "exec",
             )
         )
     return refs
@@ -712,7 +976,7 @@ def _repo_rollouts(repo: Path) -> list[Path]:
     if paths:
         return paths
     for path in _rollout_files():
-        if _same_repo(_first_cwd(_read_rows(path)), repo):
+        if _same_repo(recorded_cwd(path), repo):
             paths.append(path)
     return paths
 
@@ -734,9 +998,11 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
     root = os.path.realpath(directory)
     found: list[tuple[SessionRef, str]] = []
     for path in _rollout_files():
-        rows = _read_rows(path)
-        cwd = _first_cwd(rows)
-        if not cwd:
+        # Cheap header check first: most rollouts belong to other directories, and parsing them
+        # in full to find that out is what made this pass scale with the whole Codex history.
+        header = _read_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd or _is_agent_thread(header):
             continue
         try:
             resolved = os.path.realpath(cwd)
@@ -752,8 +1018,8 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
                 SessionRef(
                     id=session_id,
                     updated=session_last_activity(session_id) or _mtime(path),
-                    label=_label(rows),
-                    programmatic=str(_session_meta(rows).get("source") or "") == "exec",
+                    label=_label(_read_rows(path)),
+                    programmatic=str(header.get("source") or "") == "exec",
                 ),
                 str(path),
             )
@@ -768,9 +1034,9 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
     root = os.path.realpath(worktrees_root)
     out: list[tuple[str, SessionRef]] = []
     for path in _rollout_files():
-        rows = _read_rows(path)
-        cwd = _first_cwd(rows)
-        if not cwd:
+        header = _read_header(path)  # header-only filter, as in sessions_under
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd or _is_agent_thread(header):
             continue
         try:
             resolved = os.path.realpath(cwd)
@@ -788,8 +1054,8 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
                 SessionRef(
                     id=session_id,
                     updated=session_last_activity(session_id) or _mtime(path),
-                    label=_label(rows),
-                    programmatic=str(_session_meta(rows).get("source") or "") == "exec",
+                    label=_label(_read_rows(path)),
+                    programmatic=str(header.get("source") or "") == "exec",
                 ),
             )
         )
@@ -800,7 +1066,7 @@ def session_belongs_to_repo(repo: Path, session_id: str) -> bool:
     path = session_transcript_path(session_id)
     if path is None:
         return False
-    return _same_repo(_first_cwd(_read_rows(path)), repo)
+    return _same_repo(recorded_cwd(path), repo)
 
 
 def session_cwd(session_id: str, *, since: float | None = None) -> str | None:
@@ -910,7 +1176,11 @@ def export_session_at(
         rows,
         collect_edits=collect_edits,
         mcp_servers=configured_mcp_servers(repo) if repo is not None else (),
-        subagent_tokens=_subagent_tokens(resolved_id) if resolved_id else {},
+        subagent_work=(
+            _subagent_work(resolved_id, extra_children=_child_ids_in_rows(rows), collect_edits=collect_edits)
+            if resolved_id
+            else {}
+        ),
     )
     return ExportedSession(
         session_id=resolved_id,
@@ -1191,6 +1461,64 @@ def configured_mcp_servers(repo: Path) -> frozenset[str]:
             if match:
                 names.add(match.group(1).strip().strip('"').strip("'"))
     return frozenset(name for name in names if name)
+
+
+_TRUST_SECTION_RE = re.compile(r'^\s*\[\s*projects\s*\.\s*"(.+?)"\s*\]\s*$')
+_TRUST_LEVEL_RE = re.compile(r'^\s*trust_level\s*=\s*"(.+?)"\s*$')
+
+
+def trusted_projects() -> set[str]:
+    """Directories the user has told Codex to trust, from ``$CODEX_HOME/config.toml``.
+
+    Codex asks "Do you trust the contents of this directory?" the first time it runs anywhere
+    new, and records the answer as ``[projects."<path>"] trust_level = "trusted"``. aGiTrack
+    runs each session in a FRESH worktree, which is a new directory every time — so without
+    this the user would face that prompt on every single session, in a directory they never
+    chose. Read (never written): granting trust stays the user's decision, made once for the
+    repository, and ``codex_trust_args`` only ever propagates a grant that already exists.
+    """
+    trusted: set[str] = set()
+    try:
+        text = (_codex_home() / "config.toml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return trusted
+    current: str | None = None
+    for line in text.splitlines():
+        section = _TRUST_SECTION_RE.match(line)
+        if section:
+            current = section.group(1)
+            continue
+        if line.lstrip().startswith("["):
+            current = None  # any other table ends the projects.<path> block
+            continue
+        level = _TRUST_LEVEL_RE.match(line)
+        if level and current and level.group(1).strip() == "trusted":
+            trusted.add(current)
+    return trusted
+
+
+def trust_args(repo: Path, base_repo: Path | None) -> list[str]:
+    """``-c projects."<repo>".trust_level="trusted"`` when — and only when — the user has
+    already trusted the base repository this worktree belongs to.
+
+    Returns [] when the base repo is untrusted (or unknown), so Codex still asks, in full, for
+    a repository the user has never approved. The propagation is narrow on purpose: the
+    worktree is aGiTrack's own checkout of the very repository the user already trusted, and
+    its contents are that repository's contents.
+    """
+    if base_repo is None:
+        return []
+    try:
+        target = os.path.realpath(repo)
+        base = os.path.realpath(base_repo)
+    except OSError:
+        return []
+    if target == base:
+        return []  # not a worktree; Codex's own recorded trust for this path already applies
+    trusted = {os.path.realpath(path) for path in trusted_projects()}
+    if base not in trusted:
+        return []
+    return ["-c", f'projects."{target}".trust_level="trusted"']
 
 
 def looks_like_event_blob(text: str) -> bool:

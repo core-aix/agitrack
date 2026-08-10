@@ -1464,25 +1464,25 @@ class BackgroundRunner:
     def _make_summarizer(self):
         if not self._summarization_enabled():
             return None
-        from agitrack.backends.claude import ClaudeBackend
-        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.backends import backend_class as _backend_class, backend_name as _backend_name
         from agitrack.summaries import Summarizer, summary_scratch_dir
         from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
-        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
+        backend_name = _backend_name(self.state.backend)
+        backend_class = _backend_class(backend_name)
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
         # A summarization_model configured for a different backend (e.g. a Claude id under an
         # OpenCode session) is invalid there and fails every summary — drop it for the default.
         model = compatible_summarization_model(backend_name, model)
-        if model is None and backend_name == "opencode":
+        if model is None and backend_name != "claude":
             # Same reasoning (and the same fix) as ProxyRunner._make_summarizer: the summarizer
-            # runs from a scratch dir outside the repo, so the project's `opencode.json` model
-            # pin cannot apply and OpenCode falls back to its global default — which failed
-            # every summary here too, leaving the daemon's commits with raw-prompt subjects
-            # while the interactive path had already been fixed. Two copies, one bug.
+            # runs from a scratch dir outside the repo, so a project-scoped model pin
+            # (`opencode.json`, `.codex/config.toml`) cannot apply and the backend falls back to
+            # its global default — which failed every summary here too, leaving the daemon's
+            # commits with raw-prompt subjects while the interactive path had already been
+            # fixed. Two copies, one bug.
             model = compatible_summarization_model(backend_name, self.state.model)
         launch = self._backend_command or None
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch), model=model)

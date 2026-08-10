@@ -36,6 +36,7 @@ from agitrack.git import hooks as git_hooks
 from agitrack.metrics.collect import _parse_commit, build_dashboard, collect_manual_pending
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.transcripts.opencode import SessionTurn
+from agitrack.backends.proxy_agents import available_backends
 
 
 def _init_repo(path: Path) -> GitRepo:
@@ -392,7 +393,7 @@ def test_proxy_no_worktree_attributes_an_agent_commit_made_mid_turn(tmp_path, ma
     assert "do x" in msg
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 @pytest.mark.parametrize("manual", [True, False], ids=["manual-commits", "auto-commits"])
 def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, manual, backend_name):
     # Parity with the daemon: when the agent commits mid-turn in a no-worktree interactive
@@ -437,7 +438,7 @@ def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, 
     assert "This commit accounts" in body  # the explanatory note
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_proxy_no_worktree_stop_finalize_does_not_cover_an_unfinished_turn(tmp_path, backend_name):
     # The constraint, interactive side: the exit finalize (require_complete=False) keeps a
     # still-running turn to capture in-flight work, but it must not attribute the agent's mid-turn
@@ -1009,7 +1010,7 @@ def test_noworktree_auto_force_fold_lands_even_with_summary_pending(tmp_path):
     assert runner._manual_pending_count() == 0
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_noworktree_auto_new_prompt_while_summarizing_does_not_offer_user_commit(tmp_path, backend_name):
     # Reported bug: submitting a NEW prompt while aGiTrack is still summarizing the just-finished
     # turn (no-worktree auto) popped the "commit your uncommitted changes" modal — but those

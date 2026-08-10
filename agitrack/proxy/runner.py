@@ -3663,12 +3663,47 @@ class ProxyRunner:
         base = self.base_repo
         if base is None:
             return command
+        if sandbox.will_confine(base=str(base.repo), worktree=str(self.repo.repo)):
+            command = self._relax_nested_backend_sandbox(command)
         return sandbox.wrap_command(
             command,
             base=str(base.repo),
             worktree=str(self.repo.repo),
             allowed_paths=self._allowed_edit_paths,
         )
+
+    def _relax_nested_backend_sandbox(self, command: list[str]) -> list[str]:
+        """Turn off Codex's OWN sandbox on macOS, where it cannot run inside aGiTrack's.
+
+        Codex sandboxes each command it runs with ``sandbox-exec`` (seatbelt), and aGiTrack wraps
+        the whole backend in ``sandbox-exec`` too. Seatbelt does not nest: the inner profile
+        cannot be applied inside the outer one, so every filesystem probe Codex made failed.
+        Observed live — Codex reported "The first filesystem probe hit a sandbox restriction",
+        escalated to asking the user to approve each command by hand, and the turn produced no
+        edit at all. Same nesting limit that already stops a Homebrew self-update running inside
+        the agent sandbox.
+
+        This is a genuine TRADE, not a free removal of a redundant layer. aGiTrack's profile is
+        ``(allow default)`` with a deny on the base repo and the worktrees root (see
+        :func:`sandbox.build_profile`), so it protects the REPOSITORY, not the rest of the disk;
+        Codex's ``workspace-write`` is the stricter one *outside* the repo. Dropping it means the
+        agent can write elsewhere on the machine (``$HOME``, ``/tmp``, other checkouts) as it can
+        under the other two backends, which have no OS sandbox of their own. The alternative is a
+        Codex session that cannot edit any file at all, so the trade is made deliberately and
+        documented in README/AGENTS rather than quietly.
+
+        Scoped as narrowly as the problem: macOS only (where the nesting actually fails —
+        ``bwrap`` on Linux composes fine with Codex's Landlock/seccomp sandbox), Codex only, and
+        only when aGiTrack's confinement is actually active. An unconfined run (``--no-sandbox``,
+        or a platform with no sandbox) keeps Codex's own protection untouched.
+        """
+        if getattr(self.backend, "name", None) != "codex":
+            return command
+        if not sandbox._have_sandbox_exec():
+            return command  # not seatbelt ⇒ the sandboxes compose; leave Codex's alone
+        # `-c` overrides are Codex's own flags, so they must land on the codex command itself —
+        # appending after the sandbox wrapper would pass them to sandbox-exec instead.
+        return [*command, "-c", 'sandbox_mode="danger-full-access"']
 
     def _should_continue_session(self) -> bool:
         session_id = self.state.backend_session_id
@@ -10644,7 +10679,7 @@ class ProxyRunner:
                 "key": "default_backend",
                 "label": "Default coding agent (Claude Code or OpenCode)",
                 "kind": "choice",
-                "options": ["claude", "opencode"],
+                "options": available_backends(),
                 "restart": True,
             },
             # --- session isolation: the worktree toggle, then the sandbox that depends on it ---
@@ -11861,13 +11896,12 @@ class ProxyRunner:
         if not self._summarization_enabled():
             return None
         from agitrack.summaries import Summarizer, summary_scratch_dir
-        from agitrack.backends.claude import ClaudeBackend
-        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.backends import backend_class as _backend_class, backend_name as _backend_name
 
         from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
-        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
+        backend_name = _backend_name(self.state.backend)
+        backend_class = _backend_class(backend_name)
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
@@ -11875,17 +11909,18 @@ class ProxyRunner:
         # different backend (e.g. a Claude id while the session runs OpenCode) is invalid there and
         # makes every summary fail — drop it and use the backend's default instead.
         model = compatible_summarization_model(backend_name, model)
-        if model is None and backend_name == "opencode":
+        if model is None and backend_name != "claude":
             # Fall back to the model this SESSION runs, not to the backend's own global default.
-            # The summarizer deliberately runs OUTSIDE the repo (see below), so the project's
-            # `opencode.json` model pin cannot apply there — and OpenCode then reaches for
-            # whatever its global default is, which on a machine that pins models per project is
-            # one the user may have no access to at all. Measured live: EVERY OpenCode summary
-            # failed this way ("summarizer backend exited with 1", a 403 from the default
-            # provider), silently, leaving raw prompts as commit subjects where Claude sessions
-            # got real summaries. Claude is left alone: its CLI's own default is the right
-            # choice there, and the recorded session model can carry a variant suffix its
-            # `--model` flag would reject.
+            # The summarizer deliberately runs OUTSIDE the repo (see below), so a PROJECT-scoped
+            # model pin cannot apply there — and the backend then reaches for whatever its global
+            # default is, which on a machine that pins models per project is one the user may
+            # have no access to at all. Measured live on OpenCode: EVERY summary failed this way
+            # ("summarizer backend exited with 1", a 403 from the default provider), silently,
+            # leaving raw prompts as commit subjects where Claude sessions got real summaries.
+            # Codex has the same project-scoped pin (`.codex/config.toml`) and so the same
+            # exposure. Claude is left alone: its CLI's own default is the right choice there,
+            # and the recorded session model can carry a variant suffix its `--model` flag
+            # would reject.
             model = compatible_summarization_model(backend_name, self.state.model)
         # The summarizer must NOT run in the session worktree (or the repo):
         # its headless calls record real backend sessions keyed by cwd, which

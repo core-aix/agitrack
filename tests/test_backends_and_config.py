@@ -11,8 +11,8 @@ from agitrack.config import GlobalConfig
 from agitrack.config import AgitrackState
 
 
-def test_available_backends_includes_opencode_and_claude():
-    assert set(available_backends()) == {"opencode", "claude"}
+def test_available_backends_includes_every_registered_backend():
+    assert set(available_backends()) == {"opencode", "claude", "codex"}
 
 
 def test_opencode_proxy_agent_spawn_command():
@@ -23,6 +23,52 @@ def test_opencode_proxy_agent_spawn_command():
     assert agent.new_session_id() is None
     assert agent.spawn_command(repo, session_id=None, resume=False) == ["opencode", repo_s]
     assert agent.spawn_command(repo, session_id="s1", resume=True) == ["opencode", "--session", "s1", repo_s]
+
+
+def test_codex_proxy_agent_spawn_command():
+    agent = make_proxy_agent("codex")
+    repo = Path("/repo")
+    assert agent.name == "codex"
+    # Codex mints its own (UUIDv7) thread id and exposes no flag to pin one, so aGiTrack
+    # discovers the id after the run rather than choosing it up front.
+    assert agent.new_session_id() is None
+    # `-C <dir>`, never a positional: Codex's positional argument is the PROMPT, so passing the
+    # repo there would submit the directory name as the user's first message.
+    assert agent.spawn_command(repo, session_id=None, resume=False) == ["codex", "-C", str(repo)]
+    # Resume is a SUBCOMMAND, and it precedes the options.
+    assert agent.spawn_command(repo, session_id="019f-abc", resume=True) == [
+        "codex",
+        "resume",
+        "019f-abc",
+        "-C",
+        str(repo),
+    ]
+    # A session id without resume must NOT be passed: Codex cannot start a new session under a
+    # chosen id, and `codex <id>` would be read as the prompt.
+    assert agent.spawn_command(repo, session_id="019f-abc", resume=False) == ["codex", "-C", str(repo)]
+
+
+def test_codex_proxy_agent_spawn_command_has_no_system_prompt_append():
+    # Codex's only system-prompt lever (experimental_instructions_file) REPLACES the agent
+    # prompt rather than appending, so sending aGiTrack's note would delete Codex's own coding
+    # instructions. The note is therefore not delivered on this backend — a documented gap.
+    agent = make_proxy_agent("codex")
+    cmd = agent.spawn_command(Path("/repo"), session_id=None, resume=False, commit_guidance=True)
+    assert "--append-system-prompt" not in cmd
+    assert not any("instructions" in part for part in cmd)
+
+
+def test_codex_spawn_command_honours_a_launch_wrapper():
+    agent = make_proxy_agent("codex")
+    repo = Path("/repo")
+    assert agent.spawn_command(repo, session_id="s1", resume=True, executable=["w", "codex"]) == [
+        "w",
+        "codex",
+        "resume",
+        "s1",
+        "-C",
+        str(repo),
+    ]
 
 
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():

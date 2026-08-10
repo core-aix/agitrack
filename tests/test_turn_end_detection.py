@@ -26,8 +26,11 @@ import time
 import pytest
 
 from proxy_helpers import make_runner
+from agitrack.backends.proxy_agents import available_backends
 
-BACKENDS = ["claude", "opencode"]
+# Every registered backend, so a newly added one is covered the moment it is registered
+# (the pattern test_backend_parity.py already uses).
+BACKENDS = available_backends()
 
 
 def _runner_with_transcript(backend_name, tmp_path, *, transcript_age: float | None):

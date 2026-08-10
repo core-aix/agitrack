@@ -2,14 +2,14 @@
 
 aGiTrack stands for *agent + git tracking*. It's a command-line tool that runs an AI coding agent for you and turns each change the agent makes into a git commit automatically — with a record of what you asked, what the agent did, and how many tokens it used. You get a clean, reviewable git history of the AI's work without committing anything by hand.
 
-You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with either one. Support for more agents is planned.
+You can use **Claude (Claude Code)**, **Codex (OpenAI's Codex CLI)** or **OpenCode** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with any of them. Support for more agents is planned.
 
 
 ## Requirements
 
 aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (aGiTrack instead warns if the agent edits the base repo outside its worktree).
 
-You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
+You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex CLI](https://developers.openai.com/codex/cli) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
 ## Install
 
@@ -26,10 +26,11 @@ aGiTrack is a Python package (**Python 3.10+**), installed with `pip` or `pipx`.
    ```bash
    pipx install agitrack
    ```
-3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh` (lets the dashboard show authors by GitHub username):
+3. **Prerequisites** — git (required), a backend (Claude Code, Codex **or** OpenCode), and optionally `gh` (lets the dashboard show authors by GitHub username):
    ```bash
    brew install git
    curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
+   npm install -g @openai/codex                      # … or Codex
    npm install -g opencode-ai                        # … or OpenCode
    brew install gh                                   # optional
    ```
@@ -59,12 +60,13 @@ aGiTrack runs natively on Windows (PowerShell / Windows Terminal — WSL not req
    ```
    This pulls in **`pywinpty`** automatically (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). If `agitrack` isn't found afterward, your Python `Scripts` dir isn't on PATH — install with `pipx install agitrack` (which puts it on PATH for you) or run it as `py -m agitrack`.
 
-**Prerequisites (either option)** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+**Prerequisites (either option)** — git (required), a backend (Claude Code, Codex **or** OpenCode), and optionally `gh`:
 
 ```powershell
 winget install Git.Git
 npm install -g @anthropic-ai/claude-code   # Claude Code … (no Node? winget install OpenJS.NodeJS)
-npm install -g opencode-ai                 # … or OpenCode
+npm install -g @openai/codex               # … or Codex
+   npm install -g opencode-ai                 # … or OpenCode
 winget install GitHub.cli                  # optional
 ```
 
@@ -81,7 +83,7 @@ winget install GitHub.cli                  # optional
    ```bash
    pipx install agitrack
    ```
-3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+3. **Prerequisites** — git (required), a backend (Claude Code, Codex **or** OpenCode), and optionally `gh`:
    ```bash
    sudo apt install git    # (or your package manager)
    curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
@@ -125,7 +127,7 @@ Run in the current repository:
 agitrack
 ```
 
-By default, aGiTrack launches the AI agent's normal interface (OpenCode or Claude) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
+By default, aGiTrack launches the AI agent's normal interface (Claude, Codex or OpenCode) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
 ### Modes at a glance
 
@@ -211,7 +213,7 @@ Background mode **always runs without a worktree** (it implies `--no-worktree`),
 
 Only **one** aGiTrack may run per repository (a foreground TUI or a background daemon — never both, and never two), so they can't fight over commits; a second start is refused. Enable background mode for every run with `"background": true` in `~/.agitrack/config.json`.
 
-Only **repo-local AI work is ever tracked.** aGiTrack keys the backend session strictly to this repository's directory (Claude by its per-directory transcript store, OpenCode by each session's recorded working directory), so a session you drive in a *different* repo is never picked up by this repo's tracker.
+Only **repo-local AI work is ever tracked.** aGiTrack keys the backend session strictly to this repository's directory (Claude by its per-directory transcript store; Codex and OpenCode by each session's recorded working directory), so a session you drive in a *different* repo is never picked up by this repo's tracker.
 
 #### Never forget to start it: track (or auto-start) on commit
 
@@ -235,7 +237,7 @@ In interactive mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick
 
 ```text
 sessions                  switch / start (own worktree) / stop a live session
-agent-backend             switch backend (opencode|claude); shows a picker
+agent-backend             switch backend (claude|codex|opencode); shows a picker
 git-unstaged              show intentionally unstaged files
 git-commit                commit your changes (folds in pending agent turns in --manual-commits mode)
 dashboard                 serve the metrics dashboard in the browser (keeps running after aGiTrack quits, until `agitrack -d stop`)
@@ -325,7 +327,7 @@ Before anything is generated (or if no backend is configured) the page still sho
 
 ## Backtrace — show and commit a history you didn't track from day one
 
-Didn't run aGiTrack from the start? `--backtrace` **reconstructs** how your past Claude and OpenCode sessions changed a directory, purely from the transcripts already on your machine — so you can see (and even bake in) the tracked history retroactively, with no prior aGiTrack use and even in a directory that was never a git repo.
+Didn't run aGiTrack from the start? `--backtrace` **reconstructs** how your past Claude, Codex and OpenCode sessions changed a directory, purely from the transcripts already on your machine — so you can see (and even bake in) the tracked history retroactively, with no prior aGiTrack use and even in a directory that was never a git repo.
 
 ```bash
 agitrack --backtrace                 # serve the reconstructed dashboard (background daemon, opens the browser)
@@ -367,7 +369,7 @@ agitrack --backtrace                 # reconstructs from local sessions AND ever
 
 ## Sharing sessions
 
-You can share a full agent conversation with collaborators through the repo's git remote, and resume each other's sessions. It's **opt-in** — nothing is ever uploaded until you explicitly share a session. Both backends are supported: Claude shares its per-session transcript, and OpenCode shares its session via the built-in `opencode export`/`import`.
+You can share a full agent conversation with collaborators through the repo's git remote, and resume each other's sessions. It's **opt-in** — nothing is ever uploaded until you explicitly share a session. All three backends are supported: Claude and Codex share their per-session transcript files (Claude's `.jsonl` under `~/.claude/projects/`, Codex's rollout under `~/.codex/sessions/`), and OpenCode shares its session via the built-in `opencode export`/`import`.
 
 From the `session` menu (`Ctrl-G` → `session`) — where each session is also marked **⇪ shared** or **⇪ auto-share** if you've shared it:
 
@@ -386,9 +388,28 @@ Shared sessions also appear in the [dashboard](#dashboard) under **shared sessio
 
 ### Backends
 
-aGiTrack runs a separate coding agent rather than talking to an AI model itself. OpenCode and Claude (Claude Code) are interchangeable, and every feature works the same with either. Each repository remembers which agent it uses; your overall default is stored in `~/.agitrack/config.json`.
+aGiTrack runs a separate coding agent rather than talking to an AI model itself. Claude (Claude Code), Codex (the OpenAI Codex CLI) and OpenCode are interchangeable, and every feature works the same with any of them. Each repository remembers which agent it uses; your overall default is stored in `~/.agitrack/config.json`.
 
-To know what to commit, aGiTrack reads the agent's own record of the conversation: `opencode export` for OpenCode, and the transcript Claude keeps under `~/.claude/projects/`. (In JSON mode it instead runs the agent once per prompt and captures its final reply.)
+To know what to commit, aGiTrack reads the agent's own record of the conversation: the transcript Claude keeps under `~/.claude/projects/`, the rollout file Codex appends under `~/.codex/sessions/`, and `opencode export` for OpenCode. (In JSON mode it instead runs the agent once per prompt and captures its final reply.)
+
+Every feature works on every backend, but the agents themselves differ in what they expose. The honest differences:
+
+| | Claude Code | Codex | OpenCode |
+|---|---|---|---|
+| `--backend` name | `claude` | `codex` | `opencode` |
+| Session transcript | one `.jsonl` per session | one rollout `.jsonl` per session | its own session store |
+| aGiTrack picks the session id | yes | no — Codex mints its own | no |
+| Session sharing / resume across machines | yes | yes | yes |
+| aGiTrack's "don't self-commit" note | yes (`--append-system-prompt`) | **no** — see below | **no** |
+| Reasoning tokens reported separately | no (folded into `output`) | yes | yes |
+| Sub-agent tokens counted | yes (sidechains) | yes (spawned threads) | yes (`task` tool) |
+| MCP servers / tools, skills, plugins | yes | yes | MCP only |
+
+Two Codex-specific notes worth knowing:
+
+- **aGiTrack's commit-guidance note is not delivered on Codex.** Claude's CLI can *append* to its system prompt; the only equivalent Codex offers (`experimental_instructions_file`) *replaces* the agent prompt outright, which would delete Codex's own coding instructions. aGiTrack therefore doesn't send the note on this backend — so a Codex agent may occasionally commit on its own. aGiTrack still commits every turn correctly either way; a self-commit just shows up as an extra commit it didn't author. (OpenCode has the same limitation.)
+- **Codex's own sandbox is turned off while aGiTrack's is on.** Codex sandboxes each command with macOS `sandbox-exec`, and aGiTrack already wraps the whole agent in `sandbox-exec` to confine writes to the session worktree. Seatbelt sandboxes don't nest, so leaving both on made every filesystem probe fail and Codex fell back to asking permission for each command. aGiTrack disables the inner one *only* when its own confinement is active — which is the stricter of the two and still fully in force. Under `--no-sandbox`, Codex keeps its own sandbox.
+- **Codex asks whether it trusts a directory.** aGiTrack runs each session in a fresh worktree, which is a new directory every time. If you have already trusted the repository itself, aGiTrack passes that trust through to the worktree so you aren't asked again; if you haven't, Codex asks as normal.
 
 ### Session tracking
 
@@ -403,7 +424,7 @@ When you start a new session you can make it either a **blank session** (a fresh
 - **Only the latest copy is kept — git history never grows.** Shared sessions live on a dedicated custom ref `refs/agitrack/shared-sessions`, stored as a *single, parent-less (orphan) commit* built with `git commit-tree` and no parent. Every update (manual or auto) **rewrites** that ref to a brand-new orphan commit holding only the current snapshot. So no matter how many times a session is updated, the ref is always one commit deep — it never accumulates history or bloats the repo, and **unsharing removes the session completely** (there is no older commit anywhere that still holds it). This deliberately avoids a normal commit chain, whose whole point is to *retain* every past version — exactly what we don't want for a privacy-sensitive transcript.
 - **Updates still transmit only the diff (git deltifies at the pack level, not via history).** Skipping commit history does *not* mean re-uploading the whole transcript each time. Git delta-compresses by **content similarity within a packfile**, and a push builds a *thin pack* that deltas new objects against objects the remote **already has** — independent of whether the commits share any ancestry. So an orphan-commit rewrite still pushes only the turns that changed. The one requirement is that the *previous* version still exist locally as a delta base at push time, so aGiTrack **defers reclaiming it until after the push** (rather than deleting it first, which would have forced a full re-upload every share — costly for an append-only transcript that is re-shared or auto-shared as it grows). Right after the push succeeds, the now-unreferenced previous objects are reclaimed, keeping local storage bounded to just the latest snapshot. Concurrent updates are made safe with `git push --force-with-lease` (each contributor edits only their own subtree), retrying after a sync if the lease is stale.
 - **One session is one entry, named by its contributor set.** A shared session is displayed as `<id1>+<id2>/<name>` — the github ids of everyone who has shared it, sorted (so order never matters), before its name. It is stored once, keyed by its lineage origin (the first sharer's id + name), not by whoever last pushed. So when you resume a teammate's `alice/fix-parser` and share your continuation, it becomes `alice+you/fix-parser` — the **same** entry, now co-owned — rather than a second `you/fix-parser`. Moving a session back and forth between your own machines likewise keeps updating that one entry instead of spawning new names.
-- **Resuming continues the same conversation locally.** Picking a shared session downloads its transcript into your local backend store (Claude's project dir, or via `opencode import`) and continues it in a fresh worktree — using whichever backend recorded it, regardless of which one you're currently on. Your turns are appended to your local copy; sharing again updates that one entry (above), guarded by newest-wins below. Choosing **Keep both** instead deliberately *forks* a separate copy under a new id — a new, independent lineage published as `<you>/<name>` of its own.
+- **Resuming continues the same conversation locally.** Picking a shared session downloads its transcript into your local backend store (Claude's project dir, Codex's sessions dir, or via `opencode import`) and continues it in a fresh worktree — using whichever backend recorded it, regardless of which one you're currently on. Your turns are appended to your local copy; sharing again updates that one entry (above), guarded by newest-wins below. Choosing **Keep both** instead deliberately *forks* a separate copy under a new id — a new, independent lineage published as `<you>/<name>` of its own.
 - **Auto-update rides your commits.** When a session is set to auto-update, aGiTrack re-pushes the latest turns **at commit time** (in the background, only when the content changed) rather than on a busy timer — so it won't hammer the remote. The opt-in is remembered across aGiTrack runs.
 - **Newest wins — a behind machine can't rewind the shared copy.** Transcripts only grow (turns are appended), so aGiTrack compares conversation length on both ends. Sharing from a machine whose copy is *behind* the shared one is refused (it would erase newer turns), and resuming never replaces a local copy with an *older* shared one — it tells you the local one is newer and keeps it by default. This keeps the same session consistent as you move between computers, instead of a stale machine (or its auto-update) dragging everyone back to an earlier state.
 - **No manual git needed.** The Resume menu and the dashboard sync the shared ref for you. (A plain `git clone`/`git fetch` does *not* pull custom refs, so teammates rely on those menus; to inspect by hand: `git ls-remote origin 'refs/agitrack/*'`.) Because it's a custom ref, not a branch or tag, **it won't appear on GitHub's web UI**.
@@ -484,9 +505,9 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 - **No tracking footprint on a non-AI commit.** aGiTrack only ever attributes or covers a commit that actually contains AI-written work. A commit made with **no** agent turns since the last one (purely your own hand-written code) is left completely untouched — no trailer, no cover, no metadata.
 - Agent commits use the `<aGiTrack>` tag and include the full interaction trace since the last code-changing commit.
 - Agent commit metadata includes context token count and generated token usage accumulated since the last code-changing commit.
-  - Token figures are read directly from the backend's session transcript (each assistant message's reported usage) and broken out by category: `input`, `output`, `cache_read`, `cache_write`, and (when the backend reports it) `reasoning`. Both backends report `input` as the *uncached* input (cache reads/writes are tracked separately, never rolled into it), so the categories mean the same thing across backends. The one backend difference is generated tokens: Claude folds extended-thinking and tool-call tokens into `output` (no separate `reasoning`), whereas OpenCode reports `reasoning` as its own bucket alongside `output`. Sub-agent/sidechain turns are counted separately under the matching `subagent_*` categories rather than dropped (both backends do this). Each category is recorded only when the backend reports a non-zero value, so a field a backend never populates (e.g. Claude's separate `reasoning`) simply has no line.
-  - The **generated-token** categories don't overlap: `output` counts only the main agent's generated tokens and `subagent_output` only the sub-agents' — neither includes the other, so a grand total of generated tokens is just the sum of the matching pairs (e.g. `output + subagent_output`, and `reasoning + subagent_reasoning` for OpenCode). The **input** side is different and deliberately *does* overlap: `input` is all *fresh* input processed since the last commit — the uncached remainder **plus** the cache-creation tokens — so `cache_write` is **already included in** `input` (it's shown on its own line only as the "of which was written to the cache" breakdown, not added on top). Counting input this way keeps a first run's input reflecting the full context instead of looking near zero next to the cache. `cache_read` is the one input figure kept fully separate: those tokens were already counted as input when first written and are merely replayed from the cache, so they are never added into `input`.
-  - The **dashboard presents these as a hierarchy** (same layout in the text and web views, for both backends): each base category's headline is the main-agent count **plus** its sub-agent share (`input`, `output`, `cache read`, and — for OpenCode — `reasoning`), with the sub-agent amount and, under `input`, the cache-write amount shown as indented *"of which"* subsets of that headline. Categories with no recorded tokens are omitted, so a backend that doesn't report a field (e.g. no reasoning, or no sub-agent usage) simply shows fewer rows. The summarizer's own usage is listed separately as aGiTrack's overhead.
+  - Token figures are read directly from the backend's session transcript (each assistant message's reported usage) and broken out by category: `input`, `output`, `cache_read`, `cache_write`, and (when the backend reports it) `reasoning`. Every backend reports `input` as the *uncached* input (cache reads/writes are tracked separately, never rolled into it), so the categories mean the same thing across backends — note that this takes a conversion on Codex, whose own `input_tokens` counts the cached prefix too, so aGiTrack subtracts it back out rather than counting the cache twice. The one backend difference is generated tokens: Claude folds extended-thinking and tool-call tokens into `output` (no separate `reasoning`), whereas OpenCode and Codex report `reasoning` as its own bucket alongside `output` (again a conversion on Codex, which nests reasoning *inside* its `output_tokens`, so aGiTrack subtracts it out to keep the two buckets non-overlapping). Sub-agent/sidechain turns are counted separately under the matching `subagent_*` categories rather than dropped (all three backends do this — a Codex sub-agent runs as its own thread with its own rollout file, which aGiTrack finds and folds in). Each category is recorded only when the backend reports a non-zero value, so a field a backend never populates (e.g. Claude's separate `reasoning`) simply has no line.
+  - The **generated-token** categories don't overlap: `output` counts only the main agent's generated tokens and `subagent_output` only the sub-agents' — neither includes the other, so a grand total of generated tokens is just the sum of the matching pairs (e.g. `output + subagent_output`, and `reasoning + subagent_reasoning` for OpenCode and Codex). The **input** side is different and deliberately *does* overlap: `input` is all *fresh* input processed since the last commit — the uncached remainder **plus** the cache-creation tokens — so `cache_write` is **already included in** `input` (it's shown on its own line only as the "of which was written to the cache" breakdown, not added on top). Counting input this way keeps a first run's input reflecting the full context instead of looking near zero next to the cache. `cache_read` is the one input figure kept fully separate: those tokens were already counted as input when first written and are merely replayed from the cache, so they are never added into `input`.
+  - The **dashboard presents these as a hierarchy** (same layout in the text and web views, for every backend): each base category's headline is the main-agent count **plus** its sub-agent share (`input`, `output`, `cache read`, and — for OpenCode and Codex — `reasoning`), with the sub-agent amount and, under `input`, the cache-write amount shown as indented *"of which"* subsets of that headline. Categories with no recorded tokens are omitted, so a backend that doesn't report a field (e.g. no reasoning, or no sub-agent usage) simply shows fewer rows. The summarizer's own usage is listed separately as aGiTrack's overhead.
   - **Note — this differs from the provider's billing model, on purpose.** Anthropic bills cache writes, cache reads, and uncached input as three *separate* line items at *different* prices (a cache write costs more than base input; a cache read costs far less). aGiTrack instead folds cache-creation into `input` so each turn's `input` answers one easy-to-reason-about question — *how much fresh context did this turn actually process?* — rather than mirroring the price sheet. The raw breakdown is never lost: `cache_write` (of which was newly cached) and `cache_read` (replayed from cache) are recorded on their own lines, so you can recover the exact per-rate figures and compute cost if you want to. The same convention applies to the summarizer's own cost (`summary_tokens_input` folds in its cache-creation, with `summary_tokens_cache_read` reported separately).
   - The figures should still be treated as a lower bound: any consumption the backend does not record in the transcript (e.g. internal compaction, retried requests, or usage a provider omits) is not captured, so actual tokens consumed may be higher than reported.
 - Interactive mode baselines the continued backend session on startup so token metadata only includes turns after aGiTrack starts tracking new changes.
@@ -594,7 +615,7 @@ Use the structured JSON prompt-loop (mainly for testing and programmatic drivers
 agitrack --json
 ```
 
-The JSON prompt-loop invokes the backend non-interactively for each prompt (`opencode run --format json` or `claude -p --output-format json`) so aGiTrack can capture the final response and create traceable commits. (`--mode json` is a deprecated alias for `--json`.)
+The JSON prompt-loop invokes the backend non-interactively for each prompt (`opencode run --format json`, `codex exec --json`, or `claude -p --output-format json`) so aGiTrack can capture the final response and create traceable commits. (`--mode json` is a deprecated alias for `--json`.)
 
 In JSON mode, plain text is sent to the active agent backend:
 
@@ -610,7 +631,7 @@ JSON mode aGiTrack commands use `:` so backend-native `/` input is not intercept
 :user-commit               create a user commit
 :stage                     review and stage untracked files
 :unstaged                  show intentionally unstaged files
-:agent-backend <backend>   switch backend (opencode|claude)
+:agent-backend <backend>   switch backend (claude|codex|opencode)
 :exit                      exit
 ```
 
@@ -627,7 +648,7 @@ agitrack --repo path/to/repo --backend claude \
   --permission-mode acceptEdits
 ```
 
-Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default.
+Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default, and aGiTrack launches `codex exec` with `-s workspace-write`.
 
 For a programmatic driver, `agitrack --json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced. For a driver that also needs to *answer* aGiTrack's interactive questions, `agitrack --json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) for the driver to render and reply to.
 
@@ -635,6 +656,7 @@ For a programmatic driver, `agitrack --json --json-events` emits one machine-rea
 
 ```bash
 scripts/demo.sh                      # drive the demo with claude
+scripts/demo.sh --backend codex      # ... or with codex
 scripts/demo.sh --backend opencode   # ... or with opencode
 scripts/demo.sh --model haiku --dir /tmp/agitrack-demo
 ```
@@ -645,7 +667,7 @@ The VSCode extension — on the [Marketplace](https://marketplace.visualstudio.c
 
 ### Forwarding arguments to the backend
 
-aGiTrack does not reduce the backend's own functionality: any argument it doesn't recognize is forwarded verbatim to the backend CLI (`claude` / `opencode`).
+aGiTrack does not reduce the backend's own functionality: any argument it doesn't recognize is forwarded verbatim to the backend CLI (`claude` / `codex` / `opencode`).
 
 ```bash
 agitrack --backend opencode --port 12345      # --port 12345 goes to opencode
@@ -675,7 +697,7 @@ The value is split like a shell command and must ultimately exec the chosen back
 // ~/.agitrack/config.json (or a repo's .agitrack/config.json)
 "backend_command": "somewrapper claude"
 // or, per backend:
-"backend_command": { "claude": "somewrapper claude", "opencode": "somewrapper opencode" }
+"backend_command": { "claude": "somewrapper claude", "codex": "somewrapper codex", "opencode": "somewrapper opencode" }
 ```
 
 A `--backend-command` on the command line overrides the config value for that run. The wrapper applies wherever aGiTrack launches the agent — interactive mode, scripted `--prompt` runs, and the per-turn summarizer.
@@ -721,9 +743,9 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 }
 ```
 
-`default_backend` (`opencode` or `claude`) is used for repositories that have no backend recorded yet. It is updated whenever you pass `--backend` or switch backends with `agent-backend`.
+`default_backend` (`claude`, `codex` or `opencode`) is used for repositories that have no backend recorded yet. It is updated whenever you pass `--backend` or switch backends with `agent-backend`.
 
-`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS and `bubblewrap` on Linux), keeping the base repository and sibling worktrees read-only to the agent. The backend agent's own install/update directories stay writable, so the agent (Claude Code or OpenCode) can still update itself in place while running under aGiTrack. Set it to `false` to disable confinement (or pass `--no-sandbox` for a single run); when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
+`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS and `bubblewrap` on Linux), keeping the base repository and sibling worktrees read-only to the agent. The backend agent's own install/update directories stay writable, so the agent (Claude Code, Codex or OpenCode) can still update itself in place while running under aGiTrack. Set it to `false` to disable confinement (or pass `--no-sandbox` for a single run); when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
 
 `allowed_edit_paths` (default empty) is a list of extra paths the sandbox lets the agent write to, beyond its worktree — for example a shared data directory or a sibling package the agent needs to edit. Specify them in config as a JSON list (`"allowed_edit_paths": ["/srv/data", "../shared"]`), or for a single run on the command line with `--allowed-edit-paths`, separating multiple paths with your platform's `PATH` separator (`:` on macOS/Linux). A command-line value replaces the config list for that run. On macOS the carve-out covers paths that don't exist yet (the agent can create them); under Linux bubblewrap, a path under the read-only base must already exist to become writable.
 

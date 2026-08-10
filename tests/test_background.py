@@ -23,6 +23,7 @@ from agitrack.proxy.background import (
     stop_background,
 )
 from agitrack.transcripts.types import ExportedSession, SessionTurn
+from agitrack.backends.proxy_agents import available_backends
 
 
 def _init_repo(path: Path) -> GitRepo:
@@ -257,7 +258,7 @@ def test_completed_turn_still_covers_the_commit_it_stamped_mid_flight(tmp_path):
     assert runner._is_agitrack_tracked(repo.rev_parse("HEAD")) is True
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tmp_path, backend_name):
     # The dirty-tree hand-off. The agent commits ONCE mid-turn, then keeps editing, so when the
     # turn finishes the tree is still dirty and the clean-tree cover path bails — the turn records
@@ -301,7 +302,7 @@ def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tm
     assert agent_commit[:7] not in second  # already accounted for by the first turn's body
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_stop_finalize_never_covers_a_mid_turn_commit_before_the_final_message(tmp_path, backend_name):
     # The constraint: a cover (which attributes the agent's own commit to AI) is made ONLY after the
     # turn's final message. The stop finalize keeps a still-running turn so in-flight work is captured
@@ -1376,7 +1377,7 @@ def _commit_at(repo: GitRepo, path, name: str, message: str, *, when: int) -> st
 
 
 @pytest.mark.parametrize("manual", [True, False])
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_stale_watermark_never_claims_a_human_commit_from_another_mode(tmp_path, manual, backend_name):
     # THE mode-switch regression. The coverage watermark is PERSISTENT (it must survive the daemon
     # being down when a commit is made), so after a crash — or a switch to interactive/manual mode,

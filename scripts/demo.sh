@@ -4,21 +4,22 @@
 # interaction trace and metadata in the commit messages.
 #
 #   scripts/demo.sh                          # uses claude
+#   scripts/demo.sh --backend codex
 #   scripts/demo.sh --backend opencode
 #   scripts/demo.sh --backend claude --model haiku
 #
 # The demo drives aGiTrack's scripted JSON mode (`agitrack --prompt ...`), which runs
-# each prompt headlessly (`claude -p` / `opencode run`) and commits after each
+# each prompt headlessly (`claude -p` / `codex exec` / `opencode run`) and commits after each
 # one. The demo repository is left behind so you can inspect the history or
 # keep going interactively.
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/demo.sh [--backend claude|opencode] [--model MODEL] [--dir PATH]
+Usage: scripts/demo.sh [--backend claude|codex|opencode] [--model MODEL] [--dir PATH]
 
 Options:
-  --backend NAME   agent backend to demo: claude (default) or opencode
+  --backend NAME   agent backend to demo: claude (default), codex or opencode
   --model MODEL    model to use, forwarded to the backend CLI (optional)
   --dir PATH       where to create the demo repository (default: a fresh
                    directory under $TMPDIR)
@@ -41,8 +42,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$BACKEND" in
-    claude|opencode) ;;
-    *) echo "Unknown backend: $BACKEND (use claude or opencode)" >&2; exit 1 ;;
+    claude|codex|opencode) ;;
+    *) echo "Unknown backend: $BACKEND (use claude, codex or opencode)" >&2; exit 1 ;;
 esac
 
 if ! command -v "$BACKEND" >/dev/null 2>&1; then
@@ -85,7 +86,8 @@ export AGITRACK_CONFIG_DIR="$AGITRACK_HOME"
 trap 'rm -rf "$AGITRACK_HOME"' EXIT
 
 # Headless Claude needs permission to edit files; OpenCode's run mode edits by
-# default. The flag is passed through aGiTrack verbatim to the backend CLI.
+# default, and aGiTrack already launches `codex exec` with `-s workspace-write`.
+# The flag is passed through aGiTrack verbatim to the backend CLI.
 BACKEND_ARGS=()
 if [ "$BACKEND" = "claude" ]; then
     BACKEND_ARGS+=(--permission-mode acceptEdits)

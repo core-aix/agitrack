@@ -2069,6 +2069,7 @@ __BACKTRACE_BANNER__
         <select id="e-backend">
           <option value="">auto (latest session)</option>
           <option value="claude">claude</option>
+          <option value="codex">codex</option>
           <option value="opencode">opencode</option>
         </select>
         <label style="min-width:auto">model</label>

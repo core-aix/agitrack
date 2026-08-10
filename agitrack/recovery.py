@@ -307,13 +307,12 @@ class RecoveryService:
         return True if state_enabled is None else bool(state_enabled)
 
     def _make_summarizer(self, state: AgitrackState):
-        from agitrack.backends.claude import ClaudeBackend
-        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.backends import backend_class as _backend_class, backend_name as _backend_name
         from agitrack.summaries import Summarizer, summary_scratch_dir
         from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_name = "opencode" if state.backend == "opencode" else "claude"
-        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
+        backend_name = _backend_name(state.backend)
+        backend_class = _backend_class(backend_name)
         model = state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model

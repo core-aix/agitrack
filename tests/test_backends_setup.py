@@ -36,6 +36,21 @@ def test_install_hint_claude_mentions_curl():
     assert "curl" in hint
 
 
+def test_install_hint_codex_mentions_npm_and_windows():
+    hint = install_hint("codex")
+    assert "npm" in hint
+    assert "@openai/codex" in hint
+    assert "Windows" in hint
+
+
+def test_install_hint_codex_names_the_product():
+    # The hint is the only thing a user without the CLI sees, so it must name what to install
+    # and where it comes from — not just "install the 'codex' CLI".
+    hint = install_hint("codex")
+    assert "Codex" in hint
+    assert "developers.openai.com" in hint
+
+
 def test_install_hint_opencode_mentions_npm():
     hint = install_hint("opencode")
     assert "npm" in hint
@@ -215,8 +230,12 @@ def test_select_default_backend_shows_status_and_skips_with_enter():
 
 
 def test_select_default_backend_picking_uninstalled_installs_and_selects_it():
-    # claude installed, opencode not: picking '2' (opencode) installs it AND makes it the default
-    # — the single prompt's number is the default choice, not a separate install offer.
+    # claude installed, the rest not: picking '2' installs that backend AND makes it the default
+    # — the single prompt's number is the default choice, not a separate install offer. The
+    # expected name comes from the (alphabetical) registry so a new backend renumbers safely.
+    from agitrack.backends.proxy_agents import available_backends
+
+    second = available_backends()[1]
     installs = []
     config = MagicMock()
 
@@ -230,8 +249,8 @@ def test_select_default_backend_picking_uninstalled_installs_and_selects_it():
             output_fn=lambda _: None,
             install_fn=lambda name, output_fn: installs.append(name) or True,
         )
-    assert installs == ["opencode"]  # the chosen uninstalled backend is installed first
-    assert result == "opencode"  # …and it becomes the default
+    assert installs == [second]  # the chosen uninstalled backend is installed first
+    assert result == second  # …and it becomes the default
 
 
 def test_select_default_backend_none_installed_pick_installs_chosen():

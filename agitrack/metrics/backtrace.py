@@ -32,7 +32,7 @@ from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
-from agitrack.transcripts import claude, opencode
+from agitrack.transcripts import claude, codex, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
 
@@ -152,6 +152,20 @@ def _discover(directory: Path) -> list[_Source]:
     except Exception:
         pass
     try:
+        seen_codex: set[str] = set()
+        for ref, cpath in codex.sessions_under(directory):
+            if ref.id in seen_codex:
+                continue
+            seen_codex.add(ref.id)
+            path = Path(cpath)
+            export = partial(codex.export_session_at, path, collect_edits=True)
+            # base_dir is the directory the SESSION recorded, used to relativize its (absolute)
+            # edit paths — never the rollout file's own location under ~/.codex/sessions/.
+            recorded = codex.recorded_cwd(path) or str(directory)
+            sources.append(_Source("codex", ref.id, ref.updated, recorded, export, watch=(path,)))
+    except Exception:
+        pass
+    try:
         seen_opencode: set[str] = set()
         for ref, sdir in opencode.sessions_under(directory):
             if ref.id in seen_opencode:
@@ -245,6 +259,13 @@ def _remote_sources(directory: Path, *, local_ids: set[str]) -> list[_Source]:
 
 def _shared_base_dir(backend: str, path: Path) -> str:
     """The directory a shared session recorded as its working directory, or "" if unknown."""
+    if backend == "codex":
+        # Same reasoning as Claude below: a shared Codex session ran in someone else's checkout,
+        # so its absolute edit paths only relativize against the root recorded in its rollout.
+        try:
+            return codex.recorded_cwd(path) or ""
+        except Exception:
+            return ""
     if backend == "claude":
         try:
             return claude._first_cwd(path) or ""
@@ -292,6 +313,10 @@ def _shared_export(backend: str, path: Path) -> "Callable[[], ExportedSession | 
     """
     if backend == "claude":
         return partial(claude.export_session_at, path, collect_edits=True)
+    if backend == "codex":
+        # Codex's shared transcript IS its rollout file, so — like Claude and unlike OpenCode —
+        # the on-disk path can be handed straight to the exporter.
+        return partial(codex.export_session_at, path, collect_edits=True)
     if backend == "opencode":
 
         def export() -> "ExportedSession | None":

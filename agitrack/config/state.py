@@ -213,7 +213,7 @@ class AgitrackState:
             return self._default_backend
         raise RuntimeError(
             "No coding agent backend is configured for this session. Run aGiTrack in an "
-            "interactive terminal to choose a default, or pass --backend <claude|opencode>."
+            "interactive terminal to choose a default, or pass --backend <" + "|".join(available_backends()) + ">."
         )
 
     @backend.setter
