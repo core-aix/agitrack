@@ -14,6 +14,7 @@ the frame it produces.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 from proxy_helpers import make_runner
@@ -339,3 +340,97 @@ def test_a_forced_background_is_what_the_backend_is_told(monkeypatch):
     runner.agent_background = "dark"
     runner._answer_terminal_queries(b"\x1b]10;?\x07\x1b]11;?\x07")
     assert written == [b"\x1b]10;rgb:d0d0/d0d0/d0d0\x07\x1b]11;rgb:1c1c/1c1c/1c1c\x07"]
+
+
+# ---------------------------------------------------------------------------
+# Starting in the right colours (no visible flip a beat after launch)
+# ---------------------------------------------------------------------------
+
+
+def test_a_remembered_theme_paints_the_first_frame_before_any_output_arrives():
+    # Inference needs a frame with colour in it, and the backend takes a moment to draw one.
+    # The scheme carried over from the last run covers exactly that gap.
+    renderer = ScreenRenderer(12, 60)
+    renderer.host_bg_value = LIGHT_TERMINAL
+    renderer.agent_background = "auto"
+    renderer.init_screen(12, 60)
+
+    renderer.apply_remembered_theme(True)  # last session's agent painted dark
+    assert renderer._canvas == ("1c1c1c", "d0d0d0")
+    body = renderer.visible_lines(renderer.rows)
+    assert "48;2;28;28;28" in renderer.render_line(body[0], cols=10)  # …and it is already painted
+
+
+def test_an_unknown_or_matching_remembered_theme_changes_nothing():
+    renderer = make_renderer(LIGHT_TERMINAL, b"")
+    renderer.apply_remembered_theme(None)  # never seen this backend before
+    assert renderer._canvas is None
+    renderer.apply_remembered_theme(False)  # light agent, light terminal → no canvas needed
+    assert renderer._canvas is None
+
+
+def test_a_remembered_theme_is_ignored_when_the_user_forced_one():
+    renderer = make_renderer(LIGHT_TERMINAL, b"", setting="terminal")
+    renderer.apply_remembered_theme(True)
+    assert renderer._canvas is None
+
+
+def test_the_first_real_frame_overrules_a_remembered_theme_at_once():
+    # The user switched the agent's theme between sessions: the remembered scheme is a guess,
+    # so it must not need repeated agreement to be replaced.
+    renderer = make_renderer(LIGHT_TERMINAL, LIGHT_AGENT)
+    renderer.apply_remembered_theme(True)  # remembered dark…
+    assert renderer._canvas == ("1c1c1c", "d0d0d0")
+    sample(renderer)  # …but this session's agent is light
+    assert renderer._canvas is None
+
+
+def test_frames_are_sampled_without_a_throttle_until_the_scheme_is_known():
+    # Throttling before the first decision would show the wrong colours for up to a sample
+    # interval at startup — the delay this removes. Afterwards the throttle applies again.
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
+    body = renderer.visible_lines(renderer.rows)
+    renderer.update_canvas(body, now=100.0)  # a plain screen: no opinion, nothing decided
+    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL / 10)
+    assert renderer._canvas == ("1c1c1c", "d0d0d0")  # the very next frame still decided it
+    assert renderer._canvas_decided is True
+
+
+def test_the_scheme_is_remembered_for_the_next_launch():
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
+    remembered: list[bool] = []
+    renderer.remember_agent_theme = remembered.append  # type: ignore[attr-defined]
+    sample(renderer)
+    assert remembered == [True]
+
+
+def test_the_runner_starts_from_the_scheme_the_backend_used_last_time(monkeypatch):
+    written: list[bytes] = []
+    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
+    runner.agent_background = "auto"
+    runner.global_config = SimpleNamespace(agent_theme_seen=lambda backend: True)
+    monkeypatch.setattr("agitrack.proxy.renderer.write_frame", written.append)
+
+    runner._apply_remembered_agent_theme()
+
+    assert runner._canvas == ("1c1c1c", "d0d0d0")
+    # The alternate screen was just cleared to the TERMINAL's background; repaint it in the
+    # agent's, or the user stares at a white screen until the backend's first frame lands.
+    assert written and written[0].endswith(b"\x1b[2J\x1b[H")
+    assert b"48;2;28;28;28" in written[0]
+
+
+def test_the_runner_records_the_scheme_it_observes(monkeypatch):
+    recorded: list[tuple] = []
+    runner = make_runner(backend="opencode")
+    runner.global_config = SimpleNamespace(set_agent_theme_seen=lambda backend, dark: recorded.append((backend, dark)))
+    runner.remember_agent_theme(True)
+    assert recorded == [(runner.active.backend, True)]  # per backend: one may be dark, another light
+
+
+def test_a_missing_or_broken_config_never_blocks_startup():
+    runner = make_runner(host_bg_value=LIGHT_TERMINAL)
+    runner.global_config = None  # e.g. a bare/for_testing runner
+    runner._apply_remembered_agent_theme()  # must not raise: this is only a display head start
+    runner.remember_agent_theme(True)
+    assert runner._canvas is None

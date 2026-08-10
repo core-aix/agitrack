@@ -515,3 +515,37 @@ def test_agent_background_is_offered_in_the_settings_menu():
     assert spec["kind"] == "choice"
     assert spec["options"] == list(GlobalConfig.AGENT_BACKGROUND_CHOICES)
     assert not spec.get("restart")  # it is read every frame, so it applies immediately
+
+
+def test_agent_theme_seen_round_trips_per_backend(tmp_path):
+    # Remembered STATE, not a setting: it exists so a session can open in the right colours
+    # instead of inferring them again while the user watches.
+    config = GlobalConfig(path=tmp_path / "config.json")
+    assert config.agent_theme_seen("claude") is None  # never observed
+
+    config.set_agent_theme_seen("claude", True)
+    config.set_agent_theme_seen("opencode", False)  # one agent dark, another light
+    assert config.agent_theme_seen("claude") is True
+    assert config.agent_theme_seen("opencode") is False
+    assert GlobalConfig(path=tmp_path / "config.json").agent_theme_seen("claude") is True  # survives a restart
+
+
+def test_agent_theme_seen_writes_only_when_it_changed(tmp_path, monkeypatch):
+    # It is recorded from the render path, and the global file is shared by every aGiTrack
+    # process on the machine — so an unchanged value must not rewrite it.
+    config = GlobalConfig(path=tmp_path / "config.json")
+    config.set_agent_theme_seen("claude", True)
+    saves = []
+    monkeypatch.setattr(GlobalConfig, "save", lambda self: saves.append(1))
+    config.set_agent_theme_seen("claude", True)
+    assert saves == []
+    config.set_agent_theme_seen("claude", False)
+    assert saves == [1]
+
+
+def test_agent_theme_seen_is_not_advertised_as_a_setting(tmp_path):
+    # _default_config is the user-facing knob registry; remembered state does not belong in it
+    # (same rule as pending_manual_update / session_sharing).
+    config = GlobalConfig(path=tmp_path / "config.json")
+    config.seed_defaults()
+    assert "agent_theme_seen" not in json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
