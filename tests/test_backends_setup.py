@@ -87,7 +87,7 @@ def test_select_default_backend_invalid_then_skip():
             config,
             input_fn=lambda _: next(calls),
             output_fn=output_lines.append,
-            install_fn=lambda name, output_fn: pytest.fail("invalid/skip answers must not install"),
+            install_fn=lambda name, input_fn, output_fn: pytest.fail("invalid/skip answers must not install"),
         )
 
     assert result == "claude"
@@ -247,7 +247,7 @@ def test_select_default_backend_picking_uninstalled_installs_and_selects_it():
             config,
             input_fn=lambda _: "2",
             output_fn=lambda _: None,
-            install_fn=lambda name, output_fn: installs.append(name) or True,
+            install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
         )
     assert installs == [second]  # the chosen uninstalled backend is installed first
     assert result == second  # …and it becomes the default
@@ -266,7 +266,7 @@ def test_select_default_backend_none_installed_pick_installs_chosen():
             config,
             input_fn=lambda _: "1",
             output_fn=lambda _: None,
-            install_fn=lambda name, output_fn: installs.append(name) or True,
+            install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
         )
     assert installs == ["claude"]
     assert result == "claude"
@@ -282,7 +282,7 @@ def test_select_default_backend_skip_when_none_installed_defaults_to_first():
             config,
             input_fn=lambda _: "",
             output_fn=lambda _: None,
-            install_fn=lambda name, output_fn: pytest.fail("nothing should be installed on skip"),
+            install_fn=lambda name, input_fn, output_fn: pytest.fail("nothing should be installed on skip"),
         )
     assert result == "claude"
 
@@ -304,7 +304,7 @@ def test_install_backend_posix_prefers_official_script(monkeypatch):
         return f"/usr/bin/{exe}" if exe in {"bash", "curl"} else None  # no npm
 
     with patch("agitrack.backends.setup.backend_installed", side_effect=[True]):
-        ok = install_backend("claude", output_fn=lambda _: None, run=fake_run, which=fake_which)
+        ok = install_backend("claude", output_fn=lambda _: None, run=fake_run, which=fake_which, persist_path=False)
     assert ok is True
     # The official installer (bash -lc "curl … | bash") was used, not npm.
     assert ran and ran[0][:2] == ["bash", "-lc"]
@@ -323,7 +323,7 @@ def test_install_backend_uses_npm_when_no_script_tools(monkeypatch):
         return "/usr/bin/npm" if exe == "npm" else None  # npm only, no bash/curl
 
     with patch("agitrack.backends.setup.backend_installed", side_effect=[True]):
-        ok = install_backend("opencode", output_fn=lambda _: None, run=fake_run, which=fake_which)
+        ok = install_backend("opencode", output_fn=lambda _: None, run=fake_run, which=fake_which, persist_path=False)
     assert ok is True
     # npm install -g opencode-ai (resolve_subprocess_command passes it through on POSIX).
     assert any("install" in c and "opencode-ai" in c for c in ran)
@@ -377,6 +377,7 @@ def test_install_backend_announces_a_slow_step_and_closes_the_installers_output(
             output_fn=lines.append,
             run=fake_run,
             which=lambda exe: f"/usr/bin/{exe}" if exe in {"bash", "curl"} else None,
+            persist_path=False,
         )
     assert ok is True
     # A "this takes a while" reassurance, because the installer itself can print nothing.

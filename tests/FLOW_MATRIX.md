@@ -528,6 +528,20 @@ a URL. Every row here is about that record staying honest — a stale one makes 
 | Background tracker restart leaves an in-flight turn for the replacement (no force-capture at the swap); a real stop still captures it | `test_background_restart_leaves_in_flight_turns_for_the_replacement`, `test_background_run_execs_replacement_after_update` | mock |
 | Ctrl-G dashboard is a free-standing daemon like `-d`: it keeps serving after aGiTrack quits AND after the terminal closes, until `-d stop` (popup says so); exit never kills it | `test_proxy_dashboard.py::test_dashboard_command_spawns_process_and_opens_browser`, `test_dashboard_is_never_stopped_by_agitrack_exit` | mock |
 
+## 13b. Terminal appearance: following the agent's colour scheme (`tests/test_agent_theme.py`)
+How the rendered screen looks when the agent's theme and the terminal's disagree — the user
+picks a theme inside the backend, and aGiTrack has to paint the rest of the screen to match.
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Dark agent theme in a light terminal (and the reverse) → the whole screen adapts | `test_dark_agent_in_a_light_terminal_gets_a_dark_canvas`, `test_light_agent_in_a_dark_terminal_gets_a_light_canvas`, `test_unpainted_cells_carry_the_canvas_instead_of_the_terminal_background` | unit |
+| Agent and terminal agree → nothing overridden, frame unchanged | `test_a_matching_terminal_is_left_completely_alone`, `test_without_a_canvas_the_line_is_emitted_exactly_as_before` | unit |
+| User switches the theme INSIDE the agent → aGiTrack follows, idle screen included | `test_switching_the_agent_theme_switches_the_canvas`, `test_the_runner_follows_a_theme_change_while_the_screen_is_idle` | unit |
+| A transient frame (diff, banner) must not flip an established scheme | `test_one_odd_frame_does_not_flip_an_established_canvas`, `test_a_few_coloured_cells_do_not_decide_the_screen`, `test_an_uncoloured_screen_has_no_opinion` | unit |
+| aGiTrack's own chrome (status bar, popups) sits on the same scheme | `test_agitracks_own_chrome_sits_on_the_canvas` | unit |
+| `agent_background` setting: force dark/light, or opt out entirely | `test_forced_dark_and_light_ignore_both_the_agent_and_the_terminal`, `test_terminal_setting_opts_out_of_the_whole_feature`, `test_agent_background_defaults_to_auto_and_rejects_nonsense`, `test_agent_background_is_offered_in_the_settings_menu` | unit |
+| A forced background is also what the backend is told (OSC 10/11) | `test_only_a_forced_background_is_reported_to_the_backend`, `test_a_forced_background_is_what_the_backend_is_told` | mock |
+| Every renderer hook the frame needs is re-exported by the runner (else the screen freezes) | `test_the_runner_exposes_every_canvas_hook_the_renderer_calls` | unit |
+
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -543,7 +557,7 @@ Flows that run on an interactive launch when a required tool, config, or login i
 |---|---|---|
 | Missing **git** (required) → offer install, gate launch if declined | `test_maybe_install_tool_accepts_and_installs`, `test_maybe_install_tool_declined_returns_false` | mock |
 | Missing **gh** (optional) → offer install, continue if declined | `test_gh_check_missing_does_not_offer_login`, `test_maybe_install_tool_*` | mock |
-| **gh unauthenticated** → offer `gh auth login` / continue / quit | `test_gh_check_login_runs_gh_auth_login`, `test_gh_check_unauthenticated_continue`, `test_gh_check_quit_aborts_startup` | mock |
+| **gh unauthenticated** → sign in by DEFAULT (Enter), skip with `s`, or quit | `test_gh_check_unauthenticated_defaults_to_login`, `test_gh_check_unauthenticated_skip_continues_without_login`, `test_gh_check_login_runs_gh_auth_login`, `test_gh_check_quit_aborts_startup` | mock |
 | gh already authed / no GitHub remote → silent | `test_gh_check_silent_when_authenticated`, `test_gh_check_silent_without_a_github_remote` | mock |
 | Missing **git identity** (`user.name`/`user.email`) → prompt and set both | `test_ensure_git_identity_prompts_and_sets_both`, `test_ensure_git_identity_noop_when_already_set` | mock |
 | Missing **backend CLI** → install / switch to installed / manual hint / gate | `test_ensure_installed_backend_returns_installed_backend`, `_switches_to_installed_alternative`, `_quit_raises`, `_is_a_gate_not_an_installer` | mock |
@@ -554,6 +568,13 @@ Flows that run on an interactive launch when a required tool, config, or login i
 | Manual install hints cover all platforms | `test_git_install_hint_covers_all_platforms`, `test_gh_install_hint_covers_all_platforms`, `test_install_hint_claude_mentions_*`, `test_install_hint_opencode_mentions_*` | mock |
 | Scripted / non-TTY run → never prompts | `test_maybe_install_tool_non_tty_returns_false`, `test_gh_check_non_interactive_does_not_prompt`, `test_ensure_installed_backend_non_interactive_raises` | mock |
 | Custom launch command bypasses the install gate | `test_custom_launch_command_bypasses_install_gate` | mock |
+| Installed backend not on the user's PATH → offer to persist it, write the profile entry | `test_install_backend_offers_the_path_entry_after_a_successful_install`, `test_accepting_the_offer_writes_the_entry`, `test_persist_appends_a_marked_line_and_creates_a_missing_profile` | mock |
+| PATH offer declined → profile untouched, manual instructions shown | `test_declining_leaves_the_profile_alone_but_says_how_to_do_it` | mock |
+| PATH write FAILS → reason shown and the user must acknowledge | `test_a_failed_write_is_reported_and_must_be_acknowledged` | mock |
+| PATH already usable (inherited, or written by an earlier run) → nothing asked | `test_nothing_is_asked_when_the_users_shells_already_find_it`, `test_an_entry_written_by_an_earlier_run_is_not_duplicated` | mock |
+| PATH offer on a non-TTY run → instructions only, no prompt, no write | `test_a_piped_run_prints_instructions_instead_of_prompting`, `test_without_a_terminal_the_instructions_are_printed_and_nothing_is_asked` | mock |
+| Every install question drains keys pressed during the previous step | `test_maybe_install_tool_drains_input_before_asking`, `test_first_run_prompts_drain_stale_keypresses_by_default`, `test_ask_drains_before_reading` | mock |
+| Long install announces itself and separates its output from the next question | `test_install_backend_announces_a_slow_step_and_closes_the_installers_output`, `test_install_system_tool_announces_a_slow_step_and_closes_its_output`, `test_maybe_install_tool_question_starts_its_own_block` | mock |
 
 ---
 

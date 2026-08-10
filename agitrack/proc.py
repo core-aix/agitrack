@@ -40,6 +40,14 @@ _IS_WINDOWS = os.name == "nt"
 # Windows: a process that is still running reports this as its exit code.
 _STILL_ACTIVE = 259
 
+# The PATH aGiTrack INHERITED from the shell that launched it, captured at import — before
+# any install prepends a freshly-created bin directory to ``os.environ["PATH"]`` for this
+# process. That distinction is what lets aGiTrack tell "the user's own shells already find
+# this command" from "only aGiTrack finds it, because it just installed it" (see
+# agitrack/path_setup.py). This module is imported by the CLI at startup and by the installer
+# itself, so it is always read before an install can mutate the value.
+INHERITED_PATH = os.environ.get("PATH", "")
+
 
 def which_executable(name: str) -> str | None:
     """Like :func:`shutil.which`, but on Windows only returns a path the OS can actually

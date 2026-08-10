@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -183,6 +184,44 @@ def _add_dirs_to_path(dirs: list[str]) -> None:
         os.environ["PATH"] = os.pathsep.join([*additions, *parts])
 
 
+def _installed_bin_dir(name: str) -> str | None:
+    """The directory the freshly-installed backend CLI actually landed in, resolved from the
+    executable itself rather than guessed — that is the one directory worth putting on the
+    user's PATH (the candidate list above is deliberately broad and mostly irrelevant here)."""
+    found = which_executable(_executable(name))
+    return os.path.dirname(found) if found else None
+
+
+def _offer_path_for(
+    name: str,
+    label: str,
+    *,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> None:
+    """After a successful install, offer to make the CLI reachable from the user's other
+    terminals too. Best-effort and never fatal: the backend already runs under aGiTrack, so
+    nothing here may stand between the user and their session."""
+    from agitrack.path_setup import offer_to_persist_path
+
+    try:
+        directory = _installed_bin_dir(name)
+        if not directory:
+            return
+        offer_to_persist_path(
+            directory,
+            label=label,
+            command=_executable(name),
+            input_fn=input_fn,
+            output_fn=output_fn,
+            # Editing the user's profile needs their consent, so without a terminal to ask
+            # on (a scripted/piped run) it only prints what to do by hand.
+            interactive=sys.stdin.isatty() and sys.stdout.isatty(),
+        )
+    except Exception as error:  # a PATH convenience must never break the install it follows
+        output_fn(f"  (could not check your PATH: {error})\n")
+
+
 def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str], str | None]):
     """Ordered (description, command) install attempts for the current OS. POSIX prefers the
     backend's self-contained official installer (no Node needed); npm is the cross-platform
@@ -200,15 +239,20 @@ def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str],
 def install_backend(
     name: str,
     *,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     which: Callable[[str], str | None] = shutil.which,
+    persist_path: bool = True,
 ) -> bool:
     """Install the single backend CLI `name` automatically (the user opted in at the prompt).
 
     Cross-platform: the backend's official install script on macOS/Linux, npm everywhere,
     with a winget Node bootstrap on Windows when npm is absent. On success the installed
-    CLI's directory is added to this process's PATH so it runs immediately — no restart.
+    CLI's directory is added to this process's PATH so it runs immediately — no restart —
+    and, with the user's consent, to their shell profile / user PATH so the command also
+    works in their OTHER terminals (see agitrack/path_setup.py; ``persist_path=False`` skips
+    that offer for callers with no terminal to ask on).
     Returns True only when the backend is actually runnable afterwards. Never raises."""
     info = _BACKEND_INSTALL.get(name)
     if info is None:
@@ -252,6 +296,8 @@ def install_backend(
 
             ensure_powershell_execution_policy(output_fn)
             output_fn(f"\n{info['label']} installed.\n")
+            if persist_path:
+                _offer_path_for(name, info["label"], input_fn=input_fn, output_fn=output_fn)
             return True
     output_fn(f"\n{info['label']} could not be made runnable automatically.\n")
     output_fn(install_hint(name))
@@ -295,7 +341,10 @@ def select_default_backend(
         if answer.isdigit() and 1 <= int(answer) <= len(names):
             chosen = names[int(answer) - 1]
             if chosen not in installed:
-                install_fn(chosen, output_fn=output_fn)  # explicit pick of an uninstalled one → install now
+                # Explicit pick of an uninstalled one → install now. The same input_fn is
+                # handed down so the installer's own questions (notably the PATH offer that
+                # follows it) are drained and answerable exactly like this one.
+                install_fn(chosen, input_fn=input_fn, output_fn=output_fn)
             break
         output_fn("Please enter a valid number, or press Enter for the default.")
     config.default_backend = chosen

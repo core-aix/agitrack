@@ -84,7 +84,7 @@ def test_select_default_backend_enter_keeps_installed_default(monkeypatch):
         config,
         input_fn=_inputs(""),
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: pytest.fail("Enter on the installed default must not install"),
+        install_fn=lambda name, input_fn, output_fn: pytest.fail("Enter on the installed default must not install"),
     )
     assert chosen == "opencode"
 
@@ -108,7 +108,7 @@ def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
         config,
         input_fn=_inputs(""),  # skip installing opencode
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: pytest.fail("skip must not install anything"),
+        install_fn=lambda name, input_fn, output_fn: pytest.fail("skip must not install anything"),
     )
     assert chosen == "claude"
 
@@ -124,7 +124,7 @@ def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
         config,
         input_fn=_inputs("2"),
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: installs.append(name) or True,
+        install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
     )
     assert installs == [second]
     assert chosen == second
