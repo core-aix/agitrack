@@ -3961,7 +3961,7 @@ class ProxyRunner:
 
     def _recall_backend_session(self, backend: str) -> dict | None:
         try:
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
             return root.recall_session(backend)
         except Exception as error:
             self._debug(f"recall backend session failed: {error!r}")
@@ -3987,7 +3987,7 @@ class ProxyRunner:
             # teardown paths, and this method has always been best-effort about that.
             remembered = self._backends_remembered_on_exit
             backend_name = self.state.backend
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
             if not (self._exiting and backend_name in remembered):
                 # Recorded only while exiting: a call made BEFORE the exit walk would otherwise
                 # sit in the set and suppress the first — and correct — writer of the walk.
@@ -4034,6 +4034,25 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"record startup session name failed: {error!r}")
 
+    def _root_state(self) -> AgitrackState:
+        """The durable repo-root state — this session's OWN object when they are the same file.
+
+        WITHOUT A WORKTREE, ``self.state`` *is* the repo-root state file. ``AgitrackState.save()``
+        writes its whole ``data`` dict (no merge), so a second instance opened on that same path
+        is a second copy of one JSON document and whichever saves last silently discards the
+        other's writes. That is not theoretical: a session name written through a second instance
+        vanished when the session state saved a moment later, leaving ``session_names`` empty and
+        the name unrecoverable — the resume list then showed the conversation unnamed.
+
+        In WORKTREE mode the session state is a different file under the worktree, the two never
+        collide, and a fresh instance reading the latest bytes from disk is exactly right.
+        """
+        root = Path(self.base_repo.repo)
+        state = getattr(self, "state", None)
+        if state is not None and getattr(state, "path", None) == root / ".agitrack" / "state.json":
+            return state
+        return AgitrackState(root, default_backend=getattr(self.global_config, "default_backend", None))
+
     def _persist_session_name(self, session_id: str | None) -> None:
         # Link this session's user-given name to its backend conversation id in
         # the durable repo-root record as soon as the id is known — and again
@@ -4045,7 +4064,7 @@ class ProxyRunner:
         if not session_id or not name or self._AUTO_NAME_RE.match(name):
             return
         try:
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
             if root.session_name_for(session_id) != name:
                 root.name_session(session_id, name)
             if root.pending_session_name:
@@ -4762,9 +4781,7 @@ class ProxyRunner:
     def _recorded_session_name(self, session_id: str | None) -> str | None:
         """The name the durable repo-root record gives a conversation (None if unknown)."""
         try:
-            root = AgitrackState(
-                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
-            )
+            root = self._root_state()
             return root.session_name_for(session_id)
         except Exception as error:
             self._debug(f"session name lookup failed: {error!r}")
@@ -4788,9 +4805,7 @@ class ProxyRunner:
         the user cancels. A fresh suggestion (not the current session's name) because the new
         worktree is a sibling of the current one and two live sessions cannot share a name."""
         try:
-            root = AgitrackState(
-                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
-            )
+            root = self._root_state()
             known = root.session_name_for(session_id)
         except Exception as error:
             self._debug(f"session name lookup failed: {error!r}")
@@ -4926,9 +4941,7 @@ class ProxyRunner:
             # `getattr`, not attribute access: a failed lookup here falls through to ASKING for a
             # name, so an incidental AttributeError would silently re-ask for a conversation the
             # user has already named — the exact thing this method exists to prevent.
-            root = AgitrackState(
-                self.base_repo.repo, default_backend=getattr(self.global_config, "default_backend", None)
-            )
+            root = self._root_state()
             known = root.session_name_for(session_id)
         except Exception as error:
             self._debug(f"session name lookup failed: {error!r}")
@@ -6252,7 +6265,7 @@ class ProxyRunner:
         # Date them by when they were last named (not the Unix epoch, which showed
         # as an absurd "20000d ago").
         try:
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
         except Exception:
             root = None
         for sid, name in self._agitrack_named_sessions().items():
@@ -6275,7 +6288,7 @@ class ProxyRunner:
         names: dict = {}
         record = None
         try:
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
             names.update({str(k): str(v) for k, v in (root.data.get("session_names") or {}).items() if v})
             record = root.recall_session(self.backend.name)
         except Exception:
@@ -8264,7 +8277,7 @@ class ProxyRunner:
             self.worktree = None
             self.name = "main"
             self.repo = self.base_repo
-            self.state = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            self.state = self._root_state()
             self.state.backend = backend_name
             self.backend = make_proxy_agent(backend_name)
             self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
@@ -12608,7 +12621,7 @@ class ProxyRunner:
         # tree and per-turn state (pending trace, etc.) are intentionally dropped.
         self._adopt_latest_backend_session()
         try:
-            root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            root = self._root_state()
             root.data["backend"] = self.state.backend
             root.data["backend_session_id"] = self.state.backend_session_id
             root.data["backend_session_repo"] = self.state.data.get("backend_session_repo")
@@ -13327,11 +13340,13 @@ class ProxyRunner:
         state.keep_declined(repo.untracked_entries())
 
     def _user_state(self) -> AgitrackState:
-        # The user's working tree is the base repo (the session worktree is the
-        # agent's sandbox and only holds tracked files). Its intentionally-unstaged
-        # list and user commits live there. A fresh instance reads the latest
-        # on-disk state so transient base-state writers elsewhere aren't clobbered.
-        return AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+        # The user's working tree is the base repo (the session worktree is the agent's sandbox
+        # and only holds tracked files). Its intentionally-unstaged list and user commits live
+        # there — and callers WRITE through this (`set_shared_origin`), which is why it goes
+        # through `_root_state`: in worktree mode that is still a fresh instance reading the
+        # latest on-disk bytes, and without a worktree it is the session's own object, so those
+        # writes are no longer thrown away by the session state's next save.
+        return self._root_state()
 
     def _reload_user_declined(self) -> None:
         # Re-read the base repo's intentionally-unstaged list (after a command that

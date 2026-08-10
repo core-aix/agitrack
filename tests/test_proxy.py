@@ -10452,6 +10452,35 @@ def _switchable_runner(tmp_path, monkeypatch, *, stored=None):
     return runner
 
 
+def test_a_no_worktree_session_records_names_through_its_own_state(tmp_path):
+    # THE CLOBBER. `AgitrackState.save()` writes its whole `data` dict with no merge, and without
+    # a worktree the session state and the repo-root state are THE SAME FILE. Writing a name
+    # through a second instance therefore survived only until the session state saved next —
+    # which it does on every property setter — and `session_names` came back empty, leaving the
+    # conversation unnamed in the resume list. Seen in a real state file before this was fixed.
+    runner = make_runner(state=AgitrackState(tmp_path), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    runner.name = "alpha"
+
+    runner._persist_session_name("sess-1")
+    runner.state.model = "some-model"  # any setter → save() → used to overwrite the name away
+
+    assert AgitrackState(tmp_path).session_name_for("sess-1") == "alpha"
+
+
+def test_root_state_is_shared_without_a_worktree_and_separate_with_one(tmp_path):
+    # The rule behind the fix, stated once: same file => same object; different files => a fresh
+    # read is right and nothing can collide.
+    shared = make_runner(state=AgitrackState(tmp_path), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    assert shared._root_state() is shared.state
+
+    worktree_dir = tmp_path / "wt"
+    worktree_dir.mkdir()
+    separate = make_runner(
+        state=AgitrackState(worktree_dir), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path)
+    )
+    assert separate._root_state() is not separate.state
+
+
 def test_switching_backend_to_a_fresh_conversation_asks_for_a_session_name(tmp_path, monkeypatch):
     # A backend switch with nothing to resume starts a DIFFERENT conversation — another agent,
     # another transcript, no shared history. It is new work and is named like new work; silently
