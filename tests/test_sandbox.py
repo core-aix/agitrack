@@ -318,7 +318,12 @@ def _relax(backend_name, command):
     return ProxyRunner._relax_nested_backend_sandbox(_FakeRunner(backend_name), command)
 
 
-def test_codex_inner_sandbox_is_disabled_when_agitrack_confines():
+def test_codex_inner_sandbox_is_disabled_when_agitrack_confines(monkeypatch):
+    # seatbelt forced ON rather than inherited from the host: the relaxation is macOS-only, so
+    # reading the real platform made this assert the macOS branch on a Mac and the *opposite*
+    # branch on Linux/Windows, where it failed. Both branches are pinned here instead, and the
+    # test now means the same thing on every runner.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     command = ["codex", "-C", "/repo/.agitrack/worktrees/s1"]
 
     relaxed = _relax("codex", command)
@@ -327,6 +332,17 @@ def test_codex_inner_sandbox_is_disabled_when_agitrack_confines():
     # They must land on the codex command itself; appending after the sandbox wrapper would
     # hand Codex's own `-c` override to sandbox-exec instead.
     assert relaxed[-2:] == ["-c", 'sandbox_mode="danger-full-access"']
+
+
+def test_codex_keeps_its_own_sandbox_where_the_two_compose(monkeypatch):
+    # The other half of the trade: only seatbelt fails to nest. On Linux, bwrap composes with
+    # Codex's Landlock/seccomp sandbox, so Codex keeps its own outside-the-repo protection and
+    # nothing is appended. Without this, narrowing the relaxation to macOS could regress into a
+    # blanket "always disable Codex's sandbox" and no test would notice.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
+    command = ["codex", "-C", "/repo/.agitrack/worktrees/s1"]
+
+    assert _relax("codex", command) == command
 
 
 def test_a_non_codex_backend_is_left_alone():
@@ -363,4 +379,6 @@ def test_codex_install_root_stays_writable_for_self_update(monkeypatch, tmp_path
     monkeypatch.setattr(os.path, "expanduser", lambda p: p.replace("~", str(tmp_path)))
     dirs = sandbox.agent_writable_dirs()
 
-    assert any(d.endswith("/.codex") for d in dirs), dirs
+    # Compare the basename, not a "/.codex" suffix: `agent_writable_dirs` builds these with
+    # os.path.join, so on Windows the separator is a backslash and the suffix never matched.
+    assert any(os.path.basename(d) == ".codex" for d in dirs), dirs
