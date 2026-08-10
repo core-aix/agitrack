@@ -1053,6 +1053,7 @@ class ProxyRunner:
         self._canvas: tuple[str, str] | None = None
         self._canvas_votes = 0
         self._canvas_sampled_at = 0.0
+        self._canvas_decided = False
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
         self.management_lock = _lock if _lock is not None else RepoLock(repo.repo / ".agitrack" / "lock")
@@ -1468,6 +1469,7 @@ class ProxyRunner:
                 "_canvas": None,
                 "_canvas_votes": 0,
                 "_canvas_sampled_at": 0.0,
+                "_canvas_decided": False,
                 "management_lock": None,
                 "base_repo": None,
                 "_repo_dir_branch": None,
@@ -1759,6 +1761,11 @@ class ProxyRunner:
             self._enter_host_screen()
             self._set_raw()  # POSIX saves old_attrs here; Windows enters console raw mode
             self._detect_host_terminal()
+            # The host's own background is known now, so the scheme this backend used last
+            # time can be applied BEFORE the first paint below — otherwise the session opens
+            # in the terminal's colours and visibly flips once the backend has painted enough
+            # to infer from.
+            self._apply_remembered_agent_theme()
             self._resize_child()
             # SIGWINCH/SIGHUP don't exist on native Windows — there the host terminal's
             # resize watcher feeds _resize_child via consume_resize_pending() in the select
@@ -10417,6 +10424,45 @@ class ProxyRunner:
 
     def canvas_sgr_body(self) -> str:
         return ScreenRenderer.canvas_sgr_body(self)
+
+    def _apply_remembered_agent_theme(self) -> None:
+        """Paint the first frame in the scheme this backend used last time.
+
+        Called once the host terminal's own colours are known and before anything is drawn.
+        Without it the session opens in the terminal's colours and flips a beat later, when
+        the backend has finally painted enough for the scheme to be inferred — a visible
+        change of the whole screen right where the user is looking."""
+        try:
+            self.apply_remembered_theme(self.global_config.agent_theme_seen(self._theme_memory_key()))
+            if self._canvas is not None:
+                # Fill the alternate screen with the canvas NOW. `enter_host_screen` cleared it
+                # to the terminal's own background a moment ago, so without this the user
+                # watches a white (or black) screen for as long as the backend takes to draw
+                # its first frame — the flash this whole head start exists to remove.
+                from agitrack.proxy.renderer import write_frame
+
+                write_frame((self.reset_sgr() + "\x1b[2J\x1b[H").encode())
+        except Exception as error:  # a display head start is never worth a failed startup
+            self._debug(f"remembered agent theme unavailable: {error!r}")
+
+    def apply_remembered_theme(self, agent_dark: bool | None) -> None:
+        ScreenRenderer.apply_remembered_theme(self, agent_dark)
+
+    def _theme_memory_key(self) -> str:
+        """Which backend the remembered scheme belongs to — the session's own, since a
+        backend switch mid-run changes who is painting. One user may well run one agent dark
+        and another light, so the memory is per backend, never global."""
+        # getattr, not attribute access: Session's fields are declared in a FIELDS table, so
+        # `backend` is not a statically-known attribute (and a bare Session has none at all).
+        return str(getattr(self.active, "backend", "") or getattr(self.state, "backend", "") or "default")
+
+    def remember_agent_theme(self, dark: bool) -> None:
+        """Record what the running backend is painting, for the NEXT launch. Called from the
+        render path, so it must stay cheap: the config write happens only on a change."""
+        try:
+            self.global_config.set_agent_theme_seen(self._theme_memory_key(), dark)
+        except Exception as error:
+            self._debug(f"could not remember the agent theme: {error!r}")
 
     def reset_sgr(self) -> str:
         return ScreenRenderer.reset_sgr(self)

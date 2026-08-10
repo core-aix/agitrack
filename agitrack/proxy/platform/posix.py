@@ -38,6 +38,11 @@ class PosixHostTerminal:
         # its 0.2s select and will still read whatever that call returns.
         self._parked = threading.Event()
         self._wake_r = self._wake_w = -1
+        # A second self-pipe, in the other direction: the PAUSER pokes it to break the pump out
+        # of that select at once. Without it, handing stdin over costs up to a full 0.2s poll
+        # cycle — paid at startup, before the capability round trip, where it is dead time on a
+        # blank screen (and again on every cooked-mode prompt).
+        self._pause_r = self._pause_w = -1
 
     # ------------------------------------------------------------------
     # stdin reader thread
@@ -76,8 +81,11 @@ class PosixHostTerminal:
         try:
             self._wake_r, self._wake_w = os.pipe()
             os.set_blocking(self._wake_r, False)
+            self._pause_r, self._pause_w = os.pipe()
+            os.set_blocking(self._pause_r, False)
         except OSError:
             self._wake_r = self._wake_w = -1
+            self._pause_r = self._pause_w = -1
             return
         self._stop.clear()
         self._paused.clear()
@@ -98,8 +106,18 @@ class PosixHostTerminal:
             self._parked.clear()
             try:
                 # Bounded wait rather than a blocking read, so a stop is honoured promptly —
-                # there is no portable way to interrupt a thread parked in read(2).
-                if not _select.select([fd], [], [], 0.2)[0]:
+                # there is no portable way to interrupt a thread parked in read(2). The pause
+                # pipe is watched alongside stdin so a hand-over doesn't have to wait out the
+                # timeout; when it fires, drain it and loop, and the top of the loop parks.
+                watch = [fd, self._pause_r] if self._pause_r >= 0 else [fd]
+                readable = _select.select(watch, [], [], 0.2)[0]
+                if self._pause_r in readable:
+                    try:
+                        os.read(self._pause_r, 4096)
+                    except (BlockingIOError, OSError):
+                        pass
+                    continue  # never read stdin on this pass: someone else is taking it
+                if fd not in readable:
                     continue
                 data = os.read(fd, 65536)
             except (BlockingIOError, InterruptedError):
@@ -122,13 +140,14 @@ class PosixHostTerminal:
         reader, self._reader = self._reader, None
         if reader is not None:
             reader.join(timeout=1.0)
-        for fd in (self._wake_r, self._wake_w):
+        for fd in (self._wake_r, self._wake_w, self._pause_r, self._pause_w):
             if fd >= 0:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
         self._wake_r = self._wake_w = -1
+        self._pause_r = self._pause_w = -1
 
     def start(self) -> None:
         pass  # the reader starts with raw mode, not before it (see _start_reader)
@@ -206,6 +225,14 @@ class PosixHostTerminal:
         if not self._reader_owns_stdin():
             return False
         self._paused.set()
+        # Poke the pump out of its select so the hand-over is immediate instead of costing
+        # up to a poll cycle. Best-effort: if the pipe is gone the wait below still works,
+        # just at the old speed.
+        if self._pause_w >= 0:
+            try:
+                os.write(self._pause_w, b"\x00")
+            except OSError:
+                pass
         if not self._parked.wait(timeout):
             # The pump is wedged (a blocked read on a dying tty). Detection would race it, so skip
             # the round trip rather than corrupt the input stream: the cache stays empty, which

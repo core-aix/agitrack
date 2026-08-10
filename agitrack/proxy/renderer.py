@@ -572,6 +572,7 @@ class RendererHost(Protocol):
     _canvas: tuple[str, str] | None
     _canvas_votes: int
     _canvas_sampled_at: float
+    _canvas_decided: bool
     CANVAS_SAMPLE_INTERVAL: float
     CANVAS_VOTES_TO_SWITCH: int
     CANVAS_MIN_BG_CELLS: int
@@ -582,6 +583,7 @@ class RendererHost(Protocol):
     def cell_sgr(self, cell) -> str: ...
     def agent_theme_is_dark(self, body) -> bool | None: ...
     def update_canvas(self, body, *, now: float | None = ...) -> None: ...
+    def apply_remembered_theme(self, agent_dark: bool | None) -> None: ...
     def canvas_sgr_body(self) -> str: ...
     def reset_sgr(self) -> str: ...
     def color_code(self, color: str, *, foreground: bool) -> str | None: ...
@@ -674,6 +676,9 @@ class ScreenRenderer:
         self._canvas: tuple[str, str] | None = None
         self._canvas_votes: int = 0  # consecutive samples agreeing on a DIFFERENT canvas
         self._canvas_sampled_at: float = 0.0
+        # Whether a frame has actually told us the agent's scheme yet. Until it has, every
+        # frame is sampled (no throttle) and any canvas in place is only a remembered guess.
+        self._canvas_decided: bool = False
 
     # ------------------------------------------------------------------
     # Screen initialisation
@@ -919,7 +924,11 @@ class ScreenRenderer:
             self._canvas = None
             return
         moment = time.monotonic() if now is None else now
-        if moment - self._canvas_sampled_at < self.CANVAS_SAMPLE_INTERVAL:
+        # The throttle applies only AFTER the scheme is known. Until then every frame is
+        # examined, so the moment the backend paints something readable the screen is already
+        # in the right colours — throttling here would instead show the wrong scheme for up to
+        # a sample interval at startup, which is precisely when the user is looking at it.
+        if self._canvas_decided and moment - self._canvas_sampled_at < self.CANVAS_SAMPLE_INTERVAL:
             return
         self._canvas_sampled_at = moment
         agent_dark = self.agent_theme_is_dark(body)
@@ -927,16 +936,22 @@ class ScreenRenderer:
             return  # nothing to learn from this frame; keep whatever is painted now
         host_dark = _host_bg_is_dark(self)
         target = None if agent_dark == host_dark else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
+        decided = self._canvas_decided
+        self._canvas_decided = True
+        # Remember the scheme for the NEXT launch of this backend, so that session starts in
+        # the right colours instead of inferring them again from scratch.
+        getattr(self, "remember_agent_theme", lambda dark: None)(agent_dark)
         if target == self._canvas:
             self._canvas_votes = 0
             return
-        # The FIRST canvas is adopted as soon as a frame has an opinion. Waiting for repeats
-        # would be worse than useless here: votes are only cast when something repaints, and
-        # a screen that has gone quiet doesn't — so a mismatched session could sit there,
-        # half dark and half white, until the user typed. Every LATER change (including
-        # dropping back to the terminal's own colours) does need repeated agreement, so a
-        # transient full-screen diff or a coloured banner can't flip an established canvas.
-        if self._canvas is not None:
+        # The first inferred canvas is adopted as soon as a frame has an opinion — including
+        # over a scheme carried in from the last session, which is a guess until the running
+        # agent contradicts it. Waiting for repeats would be worse than useless: votes are only
+        # cast when something repaints, and a screen that has gone quiet doesn't — so a
+        # mismatched session could sit there, half dark and half white, until the user typed.
+        # Every change after that (including dropping back to the terminal's own colours) does
+        # need repeated agreement, so a transient diff or coloured banner can't flip it.
+        if decided:
             self._canvas_votes += 1
             if self._canvas_votes < self.CANVAS_VOTES_TO_SWITCH:
                 return
@@ -949,6 +964,21 @@ class ScreenRenderer:
             f"agent theme {'dark' if agent_dark else 'light'} vs {'dark' if host_dark else 'light'} "
             f"terminal → canvas {target[0] if target else 'off (terminal colours)'}"
         )
+
+    def apply_remembered_theme(self: RendererHost, agent_dark: bool | None) -> None:
+        """Start the session in the scheme this backend used LAST time (``None`` = unknown).
+
+        Inference needs a frame with colour in it, and the backend takes a moment to paint
+        one — so without this the first second of a session is drawn in the terminal's own
+        colours and then visibly flips. The remembered value is only a head start: it is
+        applied before the first frame and replaced without ceremony by the first frame that
+        actually has an opinion, so a theme changed since the last run costs one sample, not
+        a wrong screen for the whole session."""
+        if agent_dark is None or getattr(self, "agent_background", "auto") != "auto":
+            return
+        self._canvas = None if agent_dark == _host_bg_is_dark(self) else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
+        self._canvas_votes = 0
+        self._canvas_decided = False  # a guess, not an observation — the first frame overrules it
 
     def canvas_sgr_body(self: RendererHost) -> str:
         """The SGR parameters that paint the canvas colours, or "" when there is no canvas."""

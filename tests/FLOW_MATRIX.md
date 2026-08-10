@@ -541,6 +541,10 @@ picks a theme inside the backend, and aGiTrack has to paint the rest of the scre
 | `agent_background` setting: force dark/light, or opt out entirely | `test_forced_dark_and_light_ignore_both_the_agent_and_the_terminal`, `test_terminal_setting_opts_out_of_the_whole_feature`, `test_agent_background_defaults_to_auto_and_rejects_nonsense`, `test_agent_background_is_offered_in_the_settings_menu` | unit |
 | A forced background is also what the backend is told (OSC 10/11) | `test_only_a_forced_background_is_reported_to_the_backend`, `test_a_forced_background_is_what_the_backend_is_told` | mock |
 | Every renderer hook the frame needs is re-exported by the runner (else the screen freezes) | `test_the_runner_exposes_every_canvas_hook_the_renderer_calls` | unit |
+| Session OPENS in the agent's scheme (remembered from last run), no flip a beat later | `test_a_remembered_theme_paints_the_first_frame_before_any_output_arrives`, `test_the_runner_starts_from_the_scheme_the_backend_used_last_time`, `test_frames_are_sampled_without_a_throttle_until_the_scheme_is_known` | unit |
+| Theme changed between sessions → the first real frame overrules the remembered one | `test_the_first_real_frame_overrules_a_remembered_theme_at_once`, `test_an_unknown_or_matching_remembered_theme_changes_nothing` | unit |
+| The scheme is recorded per backend, and a broken/missing config never blocks startup | `test_the_scheme_is_remembered_for_the_next_launch`, `test_the_runner_records_the_scheme_it_observes`, `test_a_missing_or_broken_config_never_blocks_startup`, `test_agent_theme_seen_round_trips_per_backend` | unit |
+| Startup hands stdin to the capability round trip at once (no poll-cycle wait) | `test_handing_stdin_over_does_not_wait_out_the_pumps_poll_cycle`, `test_the_pause_pipe_never_swallows_a_keystroke` | real-proc |
 
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |

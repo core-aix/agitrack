@@ -12293,3 +12293,105 @@ def test_restart_ignores_a_conversation_that_is_only_a_newer_FILE(tmp_path):
     runner._resync_pin_to_the_live_conversation()
 
     assert state.backend_session_id == "the-real-one"
+
+
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
+def test_handing_stdin_over_does_not_wait_out_the_pumps_poll_cycle(monkeypatch):
+    """The pump sits in a 0.2s select; `_pause_pump_and_wait` used to just set `_paused` and
+    wait for the pump to notice, so every hand-over cost up to a full cycle. At startup that
+    is paid right before the capability round trip — dead time on a blank screen, and the
+    reason the session took a visible beat to appear in the agent's colours. A pause pipe
+    breaks the select at once."""
+    import pty
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved_in = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+
+        class _Stdin:
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host._start_reader()
+        assert host._reader is not None and host._reader.is_alive()
+        time.sleep(0.05)  # let the pump reach its select
+
+        started = time.monotonic()
+        assert host._pause_pump_and_wait() is True
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.1  # a whole poll cycle is 0.2s; this must not wait for one
+        assert host._parked.is_set()  # and stdin really is handed over, not just flagged
+        host._paused.clear()
+    finally:
+        host._stop_reader()
+        os.dup2(saved_in, 0)
+        os.close(saved_in)
+        os.close(master)
+        os.close(slave)
+
+
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
+def test_the_pause_pipe_never_swallows_a_keystroke(monkeypatch):
+    """Waking the pump must not cost input. While it is parked the tty belongs to whoever
+    paused it (the capability round trip, a cooked-mode prompt), so bytes typed then must be
+    left ON the tty for that reader — not taken into the pump's buffer — and once the pump is
+    resumed it must go back to draining normally."""
+    import pty
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved_in = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+
+        class _Stdin:
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host._start_reader()
+        time.sleep(0.05)
+
+        host._pause_pump_and_wait()
+        os.write(master, b"typed while paused")
+        time.sleep(0.1)
+        with host._lock:
+            assert bytes(host._buffer) == b""  # the pump kept its hands off the tty…
+        assert host.read_stdin(65536) == b"typed while paused"  # …and left them for its owner
+
+        host._paused.clear()  # resume, exactly as detect_host_terminal does
+        os.write(master, b"typed after resume")
+        deadline = time.monotonic() + 2.0
+        seen = b""
+        while time.monotonic() < deadline and b"typed after resume" not in seen:
+            seen += host.read_stdin(65536)
+            time.sleep(0.02)
+        assert b"typed after resume" in seen  # draining again, through the pump
+    finally:
+        host._stop_reader()
+        os.dup2(saved_in, 0)
+        os.close(saved_in)
+        os.close(master)
+        os.close(slave)
