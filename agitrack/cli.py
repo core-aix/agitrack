@@ -99,8 +99,11 @@ def _maybe_install_tool(name: str, *, required: bool) -> bool:
         return False
     label = "git" if name == "git" else "the GitHub CLI (gh)"
     note = "" if required else " (optional)"
+    # Two leading newlines, not one: whatever ran before this may have been a subprocess
+    # (an installer, `gh auth status`) whose output does not end in a newline, so the first
+    # closes that partial line and the second leaves a blank line before the question.
     try:
-        answer = input(f"\n{label} isn't installed. Install it now{note}? [Y/n]: ").strip().lower()
+        answer = _ask(f"\n\n{label} isn't installed. Install it now{note}? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     if answer in {"n", "no"}:
@@ -132,13 +135,13 @@ def _ensure_git_identity() -> None:
     email = _git_config_global(["--get", "user.email"])
     if name and email:
         return
-    print("\ngit needs a name and email to record commits (aGiTrack commits your work each turn).")
+    print("\n\ngit needs a name and email to record commits (aGiTrack commits your work each turn).")
     if not name:
-        entered = input("  Name for git commits: ").strip()
+        entered = _ask("  Name for git commits: ").strip()
         if entered:
             _git_config_global(["user.name", entered])
     if not email:
-        entered = input("  Email for git commits: ").strip()
+        entered = _ask("  Email for git commits: ").strip()
         if entered:
             _git_config_global(["user.email", entered])
     if not (_git_config_global(["--get", "user.name"]) and _git_config_global(["--get", "user.email"])):
@@ -1192,11 +1195,10 @@ def _confirm_backend_command_mismatch(backend: str, backend_command: list[str], 
     )
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True  # can't prompt here; proceed with the warning rather than hang automation
-    # Drain any injected input first so a stray newline can't auto-confirm (same reason as
-    # the privacy acknowledgment): this must be a deliberate keypress.
-    _drain_terminal_input()
     try:
-        answer = input(f"Proceed with backend '{backend}' anyway? [y/N] ").strip().lower()
+        # _ask drains injected input first so a stray newline can't auto-confirm (same
+        # reason as the privacy acknowledgment): this must be a deliberate keypress.
+        answer = _ask(f"Proceed with backend '{backend}' anyway? [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     return answer in {"y", "yes"}
@@ -1258,7 +1260,7 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     try:
         # Default (empty Enter) is to update — that's the recommended action, so
         # make it the path of least resistance and say so in the prompt.
-        answer = input("Update aGiTrack now? [Y]es / [n]o / [never] ask again: ").strip().lower()
+        answer = _ask("Update aGiTrack now? [Y]es / [n]o / [never] ask again: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
     if answer in {"never", "no ask", "stop"}:
@@ -1336,18 +1338,26 @@ def _privacy_warning(width: int | None = None) -> str:
 
 
 def _drain_terminal_input() -> None:
-    """Discard any unread bytes in the controlling terminal's input queue (POSIX tty).
+    """Discard any unread bytes in the controlling terminal's input queue.
 
-    A no-op when stdin isn't a real tty or termios is unavailable. Used before an
-    interactive acknowledgment so input injected into the terminal by something other
-    than the user (an editor's shell integration, a venv-activation hook) can't answer
-    it. Best-effort: never raise."""
-    try:
-        import termios
+    A no-op when stdin isn't a real tty. Used before every interactive startup question so
+    input the user did NOT type at that question — a stray Enter pressed while an installer
+    ran, or a command injected by an editor's shell integration / venv-activation hook —
+    can't answer it. Best-effort: never raises."""
+    from agitrack.console import drain_terminal_input
 
-        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-    except Exception:
-        pass
+    drain_terminal_input()
+
+
+def _ask(question: str) -> str:
+    """``input()`` for a startup question, with the terminal's input queue drained first.
+
+    Every pre-TUI prompt goes through this. The startup flow interleaves questions with
+    steps that can take minutes (installing git / gh / an agent CLI, the update check), and
+    keys pressed while one of those ran would otherwise be delivered to the next question —
+    which then flashes past already answered, looking as if it had been skipped."""
+    _drain_terminal_input()
+    return input(question)
 
 
 def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) -> bool:
@@ -1365,14 +1375,13 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     print(_privacy_warning())
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
-    # Discard anything already sitting in the terminal's input queue before reading, so a
-    # stray newline can't auto-acknowledge this. Editors that host aGiTrack in a terminal
+    # _ask discards anything already sitting in the terminal's input queue before reading, so
+    # a stray newline can't auto-acknowledge this. Editors that host aGiTrack in a terminal
     # (e.g. the VSCode extension) — or their shell-integration / venv-activation hooks —
     # can inject a command whose trailing Enter would otherwise answer this prompt for the
-    # user. The acknowledgment must be a deliberate keypress, so flush first.
-    _drain_terminal_input()
+    # user. The acknowledgment must be a deliberate keypress.
     try:
-        answer = input("Press Enter to acknowledge and continue (q to quit): ").strip().lower()
+        answer = _ask("Press Enter to acknowledge and continue (q to quit): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("\naGiTrack not started.")
         return False
@@ -1404,7 +1413,7 @@ def _offer_backtrace_for_untracked_repo(repo: GitRepo, *, scripted: bool = False
     print(STARTUP_HINT)
     try:
         # Default YES: we only ask when the reconstruction is the ONLY view with history in it.
-        answer = input("Open the backtrace view now? [Y/n]: ").strip().lower()
+        answer = _ask("Open the backtrace view now? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
@@ -1450,28 +1459,31 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
             if status == "ok":
                 return (True, True)
     if status == "missing":
-        # Leading blank line so the gh question is separated from the preceding startup output.
-        print("\n" + _gh_install_hint())
+        # Two leading newlines: the first ends any partial line left by the install attempt's
+        # subprocess output, the second separates this section from it.
+        print("\n\n" + _gh_install_hint())
         prompt = "\nPress Enter to continue without it (q to quit): "
     else:  # unauthenticated
         print(
-            "\nGitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
+            "\n\nGitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
             "identities and for session sharing; without it those features are limited.\n\n"
-            "Sign in with `gh auth login` (or press 'l' below to run it now)."
+            "Signing in takes a moment and only has to be done once."
         )
-        prompt = "\nPress Enter to continue, type 'l' to log in now (q to quit): "
-    # Drain injected input first so a stray newline can't auto-answer this (same reason as
-    # the privacy acknowledgment) — the choice must be a deliberate keypress.
-    _drain_terminal_input()
+        # Signing in is the recommended action, so it is the DEFAULT (bare Enter): the
+        # features that depend on gh are the ones the user came for, and someone who
+        # deliberately wants to run without gh can still say so with 's'.
+        prompt = "\nPress Enter to run `gh auth login` now ([s] skip, q to quit): "
+    # _ask drains injected input first so a stray newline can't auto-answer this (same reason
+    # as the privacy acknowledgment) — the choice must be a deliberate keypress.
     try:
-        answer = input(prompt).strip().lower()
+        answer = _ask(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("\naGiTrack not started.")
         return (False, True)
     if answer in {"q", "quit"}:
         print("aGiTrack not started.")
         return (False, True)
-    if status == "unauthenticated" and answer in {"l", "login", "log in"}:
+    if status == "unauthenticated" and answer not in {"s", "skip", "n", "no"}:
         _run_gh_login()
     return (True, True)
 
@@ -1540,7 +1552,7 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> No
         "anytime with `agitrack --remove-hooks`."
     )
     try:
-        answer = input("Enable this auto-start hook? [Y/n]: ").strip().lower()
+        answer = _ask("Enable this auto-start hook? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
     if answer.startswith("n"):
@@ -1574,7 +1586,7 @@ def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:
     while True:
         try:
             answer = (
-                input(f"[t] test {label} now   [c] choose a different key   [Enter] keep it   [q] quit: ")
+                _ask(f"[t] test {label} now   [c] choose a different key   [Enter] keep it   [q] quit: ")
                 .strip()
                 .lower()
             )
@@ -1609,7 +1621,7 @@ def _choose_menu_key(config: GlobalConfig, current: str) -> str | None:
         print("Suggested: " + ", ".join(settings.menu_key_label_for(k) for k in suggestions))
     while True:
         try:
-            raw = input("New menu key (e.g. ctrl-o or ctrl+shift+g; blank to go back): ").strip()
+            raw = _ask("New menu key (e.g. ctrl-o or ctrl+shift+g; blank to go back): ").strip()
         except (EOFError, KeyboardInterrupt):
             return None
         if not raw:
@@ -1630,7 +1642,7 @@ def _confirm_menu_key_by_test(key: str) -> bool:
     it anyway. Returns True to accept *key*, False to pick a different one."""
     label = settings.menu_key_label_for(key)
     try:
-        if input(f"Test {label} now? [Y/n]: ").strip().lower() in {"n", "no"}:
+        if _ask(f"Test {label} now? [Y/n]: ").strip().lower() in {"n", "no"}:
             return True  # user skipped the test — accept the key as entered
     except (EOFError, KeyboardInterrupt):
         return True
@@ -1638,7 +1650,7 @@ def _confirm_menu_key_by_test(key: str) -> bool:
     if result is not False:
         return True  # worked, or the test was cancelled/unavailable
     try:
-        return input(f"{label} didn't reach aGiTrack. Use it anyway? [y/N]: ").strip().lower() in {"y", "yes"}
+        return _ask(f"{label} didn't reach aGiTrack. Use it anyway? [y/N]: ").strip().lower() in {"y", "yes"}
     except (EOFError, KeyboardInterrupt):
         return False
 
@@ -1809,7 +1821,7 @@ def _discover_or_init(path: Path) -> GitRepo | None:
     try:
         # Default YES: aGiTrack cannot track anything without a repo, so declining ends the run.
         # Enter should take the path that lets the user get started, not the one that quits.
-        answer = input(f"{path} is not a Git repository. Initialize one here with `git init`? [Y/n] ").strip().lower()
+        answer = _ask(f"{path} is not a Git repository. Initialize one here with `git init`? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         answer = "n"  # no way to answer ⇒ do NOT create a repo the user never asked for
     if answer in {"n", "no"}:

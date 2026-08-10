@@ -313,6 +313,86 @@ def _host_bg_is_dark(host) -> bool:
     return (0.299 * red + 0.587 * green + 0.114 * blue) < 128
 
 
+# ---------------------------------------------------------------------------
+# Agent-theme adaptation ("canvas")
+# ---------------------------------------------------------------------------
+#
+# aGiTrack draws every cell itself, and a cell the backend left at the terminal's DEFAULT
+# background is emitted as such — so it shows the host terminal's background. That is right
+# when the agent's colour scheme matches the terminal, and wrong when it doesn't: a Claude
+# session set to a dark theme inside a light terminal paints dark backgrounds where it draws
+# panels and leaves everything else white, which is the "mixed dark and white screen" that is
+# hard to read. The agent's theme is the one the user chose for the agent, so aGiTrack adapts
+# to IT: when the two disagree, aGiTrack fills the unpainted cells with a background matching
+# the agent's scheme (and a contrasting default foreground), making the agent's area uniform.
+#
+# The agent never announces its theme, so it is inferred from what the agent actually paints:
+# light text and/or dark fills mean it assumes a dark background, and vice versa. The decision
+# is sampled on a timer and has to repeat before it takes effect, so a transient screen (a
+# diff block, a coloured banner) can't flip the canvas.
+
+_CANVAS_DARK = ("1c1c1c", "d0d0d0")  # (background, default foreground) for a dark agent theme
+_CANVAS_LIGHT = ("ffffff", "1c1c1c")  # …and for a light one
+
+# Perceived luminance (0-255) of the named colours pyte reports. Only used to classify a
+# colour as dark or light, so the mid-range hues never decide anything on their own.
+_NAMED_LUMINANCE: dict[str, float] = {
+    "black": 0.0,
+    "red": 54.0,
+    "green": 128.0,
+    "brown": 128.0,
+    "yellow": 128.0,
+    "blue": 29.0,
+    "magenta": 74.0,
+    "cyan": 150.0,
+    "white": 192.0,
+    "grey": 192.0,
+    "gray": 192.0,
+    "brightblack": 96.0,
+    "brightred": 105.0,
+    "brightgreen": 200.0,
+    "brightbrown": 226.0,
+    "brightyellow": 226.0,
+    "brightblue": 58.0,
+    "brightmagenta": 145.0,
+    "brightcyan": 217.0,
+    "brightwhite": 255.0,
+}
+
+
+def _luminance(color: str) -> float | None:
+    """Perceived brightness (0-255) of a pyte colour, or None when it has none (``default``,
+    or a name aGiTrack doesn't know — both must not vote on the agent's theme)."""
+    if not color or color == "default":
+        return None
+    if len(color) == 6 and all(char in _HEX_DIGITS for char in color):
+        red, green, blue = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+        return 0.299 * red + 0.587 * green + 0.114 * blue
+    return _NAMED_LUMINANCE.get(color)
+
+
+def _osc_color_value(color: str) -> bytes:
+    """A hex colour as a terminal OSC 10/11 report body (``rgb:rrrr/gggg/bbbb``)."""
+    red, green, blue = color[0:2], color[2:4], color[4:6]
+    return f"rgb:{red}{red}/{green}{green}/{blue}{blue}".encode("ascii")
+
+
+def forced_canvas_osc_values(host) -> tuple[bytes, bytes] | None:
+    """``(foreground, background)`` OSC report bodies to answer the backend with when the
+    user FORCED a background ("dark"/"light"), or None to relay the host terminal's own.
+
+    Only the forced settings answer with something other than the terminal's real colours:
+    a backend that themes itself from the reported background (OpenCode) then matches the
+    canvas aGiTrack paints. Under "auto" the relay stays truthful — the canvas there is
+    inferred FROM what the backend paints, so feeding it back could make the two chase
+    each other."""
+    setting = getattr(host, "agent_background", "auto")
+    if setting not in {"dark", "light"}:
+        return None
+    background, foreground = _CANVAS_DARK if setting == "dark" else _CANVAS_LIGHT
+    return _osc_color_value(foreground), _osc_color_value(background)
+
+
 def _box_accent_sgr(host) -> str:
     """A bold SGR that colours a popup's border so the box stands out — a hue chosen to
     contrast the terminal background and encoded for its colour depth (via ``hex_color_code``).
@@ -486,8 +566,24 @@ class RendererHost(Protocol):
     # during render so the input loop knows whether PgUp/PgDn should scroll the message.
     _message_max_scroll: int
 
+    # Agent-theme adaptation (host-level): the user's setting, the canvas currently in
+    # effect, and the vote/sample state that keeps it from flipping on a transient frame.
+    agent_background: str
+    _canvas: tuple[str, str] | None
+    _canvas_votes: int
+    _canvas_sampled_at: float
+    CANVAS_SAMPLE_INTERVAL: float
+    CANVAS_VOTES_TO_SWITCH: int
+    CANVAS_MIN_BG_CELLS: int
+    CANVAS_MIN_FG_CELLS: int
+    CANVAS_MAJORITY: float
+
     # Renderer methods invoked on ``self`` from sibling methods
     def cell_sgr(self, cell) -> str: ...
+    def agent_theme_is_dark(self, body) -> bool | None: ...
+    def update_canvas(self, body, *, now: float | None = ...) -> None: ...
+    def canvas_sgr_body(self) -> str: ...
+    def reset_sgr(self) -> str: ...
     def color_code(self, color: str, *, foreground: bool) -> str | None: ...
     def hex_color_code(self, color: str, *, foreground: bool) -> str: ...
     def history_len(self) -> int: ...
@@ -570,6 +666,14 @@ class ScreenRenderer:
         self._render_pending: bool = False
         self._in_sync_update: bool = False
         self._sync_since: float = 0.0
+
+        # Agent-theme adaptation (see "canvas" above). ``agent_background`` is the user's
+        # setting ("auto" | "dark" | "light" | "terminal"); ``_canvas`` is the (bg, fg) pair
+        # currently painted under the agent, or None to use the host terminal's own colours.
+        self.agent_background: str = "auto"
+        self._canvas: tuple[str, str] | None = None
+        self._canvas_votes: int = 0  # consecutive samples agreeing on a DIFFERENT canvas
+        self._canvas_sampled_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Screen initialisation
@@ -749,10 +853,135 @@ class ScreenRenderer:
     # Cell / line rendering
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Agent-theme adaptation
+    # ------------------------------------------------------------------
+
+    CANVAS_SAMPLE_INTERVAL = 0.5  # how often the agent's colour scheme is re-sampled
+    CANVAS_VOTES_TO_SWITCH = 2  # agreeing samples before an ESTABLISHED canvas changes
+    CANVAS_MIN_BG_CELLS = 40  # painted background cells needed for the bg signal to count
+    CANVAS_MIN_FG_CELLS = 80  # coloured glyphs needed for the (weaker) foreground signal
+    CANVAS_MAJORITY = 0.6  # share of the sample that must agree
+
+    def agent_theme_is_dark(self: RendererHost, body) -> bool | None:
+        """Whether the backend is painting for a DARK background, read off the frame in
+        ``body`` — or None when the frame carries no opinion (a plain, uncoloured screen).
+
+        Two signals, strongest first: the backgrounds the agent fills (a dark theme fills
+        dark), and the colour of its text (a dark theme writes light text). Either alone is
+        enough; neither is consulted below a minimum sample, so a couple of coloured words
+        can't decide the whole screen's canvas."""
+        bg_dark = bg_light = fg_dark = fg_light = 0
+        for cells in body:
+            for cell in cells.values():
+                background = _luminance(getattr(cell, "bg", "default"))
+                if background is not None:
+                    if background < 128:
+                        bg_dark += 1
+                    else:
+                        bg_light += 1
+                if not (getattr(cell, "data", " ") or " ").strip():
+                    continue  # blank cells say nothing about the text colour
+                foreground = _luminance(getattr(cell, "fg", "default"))
+                if foreground is not None:
+                    if foreground < 128:
+                        fg_dark += 1
+                    else:
+                        fg_light += 1
+        total_bg = bg_dark + bg_light
+        if total_bg >= self.CANVAS_MIN_BG_CELLS:
+            if bg_dark / total_bg >= self.CANVAS_MAJORITY:
+                return True
+            if bg_light / total_bg >= self.CANVAS_MAJORITY:
+                return False
+        total_fg = fg_dark + fg_light
+        if total_fg >= self.CANVAS_MIN_FG_CELLS:
+            if fg_light / total_fg >= self.CANVAS_MAJORITY:
+                return True  # light text ⇒ the agent expects a dark background behind it
+            if fg_dark / total_fg >= self.CANVAS_MAJORITY:
+                return False
+        return None
+
+    def update_canvas(self: RendererHost, body, *, now: float | None = None) -> None:
+        """Re-decide the canvas from the frame about to be painted (see "canvas" above).
+
+        ``dark``/``light`` force it, ``terminal`` disables it entirely, and ``auto`` adapts:
+        a canvas is painted only while the agent's inferred scheme DISAGREES with the host
+        terminal's own background, so the usual matching setup renders exactly as before."""
+        setting = getattr(self, "agent_background", "auto")
+        if setting == "dark":
+            self._canvas = _CANVAS_DARK
+            return
+        if setting == "light":
+            self._canvas = _CANVAS_LIGHT
+            return
+        if setting != "auto":  # "terminal" (or anything unrecognised): host colours, as before
+            self._canvas = None
+            return
+        moment = time.monotonic() if now is None else now
+        if moment - self._canvas_sampled_at < self.CANVAS_SAMPLE_INTERVAL:
+            return
+        self._canvas_sampled_at = moment
+        agent_dark = self.agent_theme_is_dark(body)
+        if agent_dark is None:
+            return  # nothing to learn from this frame; keep whatever is painted now
+        host_dark = _host_bg_is_dark(self)
+        target = None if agent_dark == host_dark else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
+        if target == self._canvas:
+            self._canvas_votes = 0
+            return
+        # The FIRST canvas is adopted as soon as a frame has an opinion. Waiting for repeats
+        # would be worse than useless here: votes are only cast when something repaints, and
+        # a screen that has gone quiet doesn't — so a mismatched session could sit there,
+        # half dark and half white, until the user typed. Every LATER change (including
+        # dropping back to the terminal's own colours) does need repeated agreement, so a
+        # transient full-screen diff or a coloured banner can't flip an established canvas.
+        if self._canvas is not None:
+            self._canvas_votes += 1
+            if self._canvas_votes < self.CANVAS_VOTES_TO_SWITCH:
+                return
+        self._canvas = target
+        self._canvas_votes = 0
+        # Chrome composed before this decision (the status bar) is a frame behind, so ask for
+        # one more paint: the next frame is drawn entirely in the new scheme.
+        self._render_pending = True
+        getattr(self, "_debug", lambda message: None)(
+            f"agent theme {'dark' if agent_dark else 'light'} vs {'dark' if host_dark else 'light'} "
+            f"terminal → canvas {target[0] if target else 'off (terminal colours)'}"
+        )
+
+    def canvas_sgr_body(self: RendererHost) -> str:
+        """The SGR parameters that paint the canvas colours, or "" when there is no canvas."""
+        canvas = getattr(self, "_canvas", None)
+        if not canvas:
+            return ""
+        background, foreground = canvas
+        codes = [
+            code
+            for code in (
+                self.color_code(foreground, foreground=True),
+                self.color_code(background, foreground=False),
+            )
+            if code
+        ]
+        return ";".join(codes)
+
+    def reset_sgr(self: RendererHost) -> str:
+        """The "back to normal" sequence to emit between painted regions. With a canvas
+        active this is a reset PLUS the canvas colours, so aGiTrack's own chrome and every
+        gap between painted cells sit on the agent's background instead of the terminal's."""
+        body = self.canvas_sgr_body()
+        return f"\x1b[0;{body}m" if body else "\x1b[0m"
+
     def cell_sgr(self: RendererHost, cell) -> str:
         """Reproduce exactly what OpenCode rendered into this cell, including
         the original colour encoding, so the cell is byte-equivalent to a
-        native session on the same terminal."""
+        native session on the same terminal.
+
+        The one exception is the canvas: when the agent's colour scheme disagrees with the
+        host terminal's, a cell left at the terminal default is painted in the agent's
+        scheme instead — otherwise the agent's own dark panels would sit in a sea of the
+        terminal's white (see "Agent-theme adaptation")."""
         codes = []
         if getattr(cell, "bold", False):
             codes.append("1")
@@ -768,8 +997,17 @@ class ScreenRenderer:
             codes.append("7")
         if getattr(cell, "strikethrough", False):
             codes.append("9")
-        fg = self.color_code(getattr(cell, "fg", "default"), foreground=True)
-        bg = self.color_code(getattr(cell, "bg", "default"), foreground=False)
+        canvas = getattr(self, "_canvas", None)
+        cell_fg = getattr(cell, "fg", "default")
+        cell_bg = getattr(cell, "bg", "default")
+        if canvas:
+            canvas_bg, canvas_fg = canvas
+            if cell_fg == "default":
+                cell_fg = canvas_fg
+            if cell_bg == "default":
+                cell_bg = canvas_bg
+        fg = self.color_code(cell_fg, foreground=True)
+        bg = self.color_code(cell_bg, foreground=False)
         if fg:
             codes.append(fg)
         if bg:
@@ -786,9 +1024,12 @@ class ScreenRenderer:
         rendered = []
         current = ""  # SGR body currently applied on the host terminal ("" == default)
         sel_start, sel_end = sel if sel else (-1, -1)
+        # A column the backend never wrote to is the canvas: with an agent theme that
+        # disagrees with the terminal it must carry the canvas colours, not the terminal's.
+        empty = self.canvas_sgr_body()
         for col in range(cols):
             cell = cells.get(col)
-            base = "" if cell is None else self.cell_sgr(cell)
+            base = empty if cell is None else self.cell_sgr(cell)
             char = (cell.data or " ") if cell is not None else " "
             if sel is not None and sel_start <= col <= sel_end:
                 style = (base + ";7") if base else "7"  # reverse-video the selection
@@ -799,7 +1040,7 @@ class ScreenRenderer:
                 current = style
             rendered.append(char)
         if current:
-            rendered.append("\x1b[0m")
+            rendered.append(self.reset_sgr())
         return "".join(rendered)
 
     # ------------------------------------------------------------------
@@ -876,7 +1117,10 @@ class ScreenRenderer:
             # leaving the line's reverse-video (\x1b[7m) intact. Guarded by an `in`
             # check so a narrow-terminal truncation that cut the branch name skips it.
             line = line.replace(f"→ {base_branch}", f"→ \x1b[1m{base_branch}\x1b[22m", 1)
-        return f"\x1b[7m{line}\x1b[0m"
+        # Reverse video swaps whatever colours are in effect, so set the canvas first: on an
+        # adapted screen the bar then inverts the AGENT's scheme rather than the terminal's,
+        # which is what makes it read as part of the same UI.
+        return f"{self.reset_sgr()}\x1b[7m{line}\x1b[0m"
 
     # ------------------------------------------------------------------
     # Box / popup painting primitives
@@ -902,7 +1146,7 @@ class ScreenRenderer:
         # default colour so it stays readable. The escapes carry no visible width, so the
         # box geometry is unchanged.
         accent = _box_accent_sgr(self)
-        reset = "\x1b[0m"
+        reset = self.reset_sgr()  # canvas-aware: the box interior sits on the agent's background
         edge = f"{accent}┃{reset}"
         border_top = f"{accent}┏{'━' * inner}┓{reset}"
         border_bottom = f"{accent}┗{'━' * inner}┛{reset}"
@@ -939,7 +1183,7 @@ class ScreenRenderer:
         for offset, line in enumerate(box_lines):
             if row + offset >= rows:
                 break
-            parts.append(f"\x1b[{row + offset};{col}H\x1b[0m{line}")
+            parts.append(f"\x1b[{row + offset};{col}H{reset}{line}")
 
     def append_command_palette(
         self: RendererHost,
@@ -1039,7 +1283,6 @@ class ScreenRenderer:
         # the host terminal applies the frame atomically and never shows it
         # half-drawn. Terminals that don't support 2026 ignore the markers and
         # fall back to the previous (unwrapped) full-repaint behaviour.
-        parts = ["\x1b[?2026h\x1b[0m\x1b[?25l\x1b[H"]
         selection = self.selection_ranges(cols)
         # Address every row absolutely instead of walking down with \r\n. If `rows` is
         # momentarily LARGER than the real terminal (a shrink not yet observed via
@@ -1049,8 +1292,14 @@ class ScreenRenderer:
         # the terminal's last row instead: an over-large `rows` just overwrites the bottom
         # row and never scrolls, so a stale geometry can't smear the status bar up the screen.
         body = self.visible_lines(rows)
+        # Decide (at most a few times a second) whether the agent's colour scheme disagrees
+        # with the terminal's, before anything in this frame is painted — every reset below
+        # then carries the canvas, so the whole frame is drawn in one consistent scheme.
+        self.update_canvas(body)
+        reset = self.reset_sgr()
+        parts = [f"\x1b[?2026h{reset}\x1b[?25l\x1b[H"]
         for index, cells in enumerate(body):
-            parts.append(f"\x1b[{index + 1};1H\x1b[0m" + self.render_line(cells, selection.get(index), cols=cols))
+            parts.append(f"\x1b[{index + 1};1H{reset}" + self.render_line(cells, selection.get(index), cols=cols))
         # The status bar owns the reserved row just below the body, addressed absolutely too.
         parts.append(f"\x1b[{len(body) + 1};1H" + status_line_str)
         if input_capturing:

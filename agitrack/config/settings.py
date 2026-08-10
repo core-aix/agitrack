@@ -185,6 +185,7 @@ class GlobalConfig:
             "manual_commits": False,
             "background": False,
             "autotrack_hook": "auto",
+            "agent_background": "auto",
             "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
@@ -410,6 +411,26 @@ class GlobalConfig:
     @autotrack_hook.setter
     def autotrack_hook(self, value: str) -> None:
         self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "auto"
+        self.save()
+
+    AGENT_BACKGROUND_CHOICES = ("auto", "dark", "light", "terminal")
+
+    @property
+    def agent_background(self) -> str:
+        # How aGiTrack paints the cells the backend leaves at the terminal's default colour
+        # (see renderer.py, "Agent-theme adaptation"). "auto" (default): follow the agent's own
+        # colour scheme — inferred from the colours it paints, and re-checked continuously, so a
+        # dark agent theme inside a light terminal (or a theme switched mid-session) still shows
+        # as one consistent screen. "dark"/"light": force that scheme regardless of the agent.
+        # "terminal": never override — every unpainted cell keeps the host terminal's background,
+        # which is what aGiTrack did before this setting existed.
+        value = str(self._raw("agent_background") or "auto").lower()
+        return value if value in self.AGENT_BACKGROUND_CHOICES else "auto"
+
+    @agent_background.setter
+    def agent_background(self, value: str) -> None:
+        chosen = str(value).lower()
+        self.data["agent_background"] = chosen if chosen in self.AGENT_BACKGROUND_CHOICES else "auto"
         self.save()
 
     @property

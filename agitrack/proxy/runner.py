@@ -65,6 +65,7 @@ from agitrack.transcripts import SessionRef
 # and the agitrack.proxy shim can export them under their original names.
 from agitrack.proxy.renderer import (
     detect_color_mode,
+    forced_canvas_osc_values,
     _BackgroundColorEraseScreen,
     ScreenRenderer,
 )
@@ -730,6 +731,13 @@ class ProxyRunner:
     _stall_worst = 0.0  # worst reactor stall this run (reported in a crash report's context)
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
+    # Agent-theme adaptation, read by the renderer's canvas logic through ``self`` (see
+    # ScreenRenderer for what each one governs).
+    CANVAS_SAMPLE_INTERVAL = ScreenRenderer.CANVAS_SAMPLE_INTERVAL
+    CANVAS_VOTES_TO_SWITCH = ScreenRenderer.CANVAS_VOTES_TO_SWITCH
+    CANVAS_MIN_BG_CELLS = ScreenRenderer.CANVAS_MIN_BG_CELLS
+    CANVAS_MIN_FG_CELLS = ScreenRenderer.CANVAS_MIN_FG_CELLS
+    CANVAS_MAJORITY = ScreenRenderer.CANVAS_MAJORITY
     # How long a trailing, not-yet-complete escape sequence (including a lone ESC) may be
     # held before it is treated as final. This is the classic ESC-disambiguation timeout:
     # long enough that the rest of a split sequence has certainly arrived (the remainder of
@@ -1036,6 +1044,15 @@ class ProxyRunner:
             # near-greyscale (OpenCode's bolder colors survived 16-color, which is why only Claude
             # looked wrong). Render truecolor on Windows so the backend's colors are preserved.
             self.color_mode = "truecolor"
+        # Agent-theme adaptation (renderer.py, "Agent-theme adaptation"): with the default
+        # "auto", aGiTrack watches the colours the backend paints and fills the cells it
+        # leaves untouched to match — so a dark agent theme in a light terminal (or the
+        # reverse) is a uniform screen, and a theme switch inside the agent is followed
+        # automatically. The canvas state itself is host-level, not per session.
+        self.agent_background = getattr(self.global_config, "agent_background", "auto")
+        self._canvas: tuple[str, str] | None = None
+        self._canvas_votes = 0
+        self._canvas_sampled_at = 0.0
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
         self.management_lock = _lock if _lock is not None else RepoLock(repo.repo / ".agitrack" / "lock")
@@ -1447,6 +1464,10 @@ class ProxyRunner:
                 "host_da": None,
                 "host_kitty_keyboard": False,
                 "color_mode": "truecolor",
+                "agent_background": "auto",
+                "_canvas": None,
+                "_canvas_votes": 0,
+                "_canvas_sampled_at": 0.0,
                 "management_lock": None,
                 "base_repo": None,
                 "_repo_dir_branch": None,
@@ -9620,6 +9641,7 @@ class ProxyRunner:
         self._service_backend_update()  # surface a finished backend auto-update result
         self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
         self._service_session_notices()  # expire/refresh per-session status lines
+        self._service_agent_theme()  # follow a light/dark theme change inside the backend
         self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
     def _reactor_child_exit_phase(self) -> "str | int | None":
@@ -9972,10 +9994,16 @@ class ProxyRunner:
         if b"\x1b]" not in output and b"\x1b[6n" not in output and b"\x1b[c" not in output and b"\x1b[0c" not in output:
             return
         response = bytearray()
-        if self.host_fg_value and re.search(rb"\x1b\]10;\?(?:\x07|\x1b\\)", output):
-            response += b"\x1b]10;" + self.host_fg_value + b"\x07"
-        if self.host_bg_value and re.search(rb"\x1b\]11;\?(?:\x07|\x1b\\)", output):
-            response += b"\x1b]11;" + self.host_bg_value + b"\x07"
+        # A forced background ("dark"/"light") is reported to the backend in place of the
+        # terminal's real colours, so a backend that themes itself from them agrees with the
+        # canvas aGiTrack paints. "auto" relays the truth (see forced_canvas_osc_values).
+        forced = forced_canvas_osc_values(self)
+        fg_value = forced[0] if forced else self.host_fg_value
+        bg_value = forced[1] if forced else self.host_bg_value
+        if fg_value and re.search(rb"\x1b\]10;\?(?:\x07|\x1b\\)", output):
+            response += b"\x1b]10;" + fg_value + b"\x07"
+        if bg_value and re.search(rb"\x1b\]11;\?(?:\x07|\x1b\\)", output):
+            response += b"\x1b]11;" + bg_value + b"\x07"
         for match in re.finditer(rb"\x1b\]4;(\d+);\?(?:\x07|\x1b\\)", output):
             value = self.host_palette.get(match.group(1))
             if value:
@@ -10378,6 +10406,20 @@ class ProxyRunner:
 
     def hex_color_code(self, color: str, *, foreground: bool) -> str:
         return ScreenRenderer.hex_color_code(self, color, foreground=foreground)
+
+    # Agent-theme adaptation (renderer.py): the canvas decision and the canvas-aware
+    # "back to normal" sequence every painted region resets to.
+    def agent_theme_is_dark(self, body) -> bool | None:
+        return ScreenRenderer.agent_theme_is_dark(self, body)
+
+    def update_canvas(self, body, *, now: float | None = None) -> None:
+        ScreenRenderer.update_canvas(self, body, now=now)
+
+    def canvas_sgr_body(self) -> str:
+        return ScreenRenderer.canvas_sgr_body(self)
+
+    def reset_sgr(self) -> str:
+        return ScreenRenderer.reset_sgr(self)
 
     def history_len(self) -> int:
         return ScreenRenderer.history_len(self)
@@ -10814,6 +10856,12 @@ class ProxyRunner:
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
             {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
             # --- aGiTrack itself ---
+            {
+                "key": "agent_background",
+                "label": "Background behind the agent (auto: follow the agent's own light/dark theme)",
+                "kind": "choice",
+                "options": list(GlobalConfig.AGENT_BACKGROUND_CHOICES),
+            },
             {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
             {
                 "key": "menu_key",
@@ -11033,6 +11081,12 @@ class ProxyRunner:
         for key, (value, scope, restart) in self._settings_pending.items():
             self.global_config.set(key, value, scope=scope)
             needs_restart = needs_restart or restart
+        # The background/theme setting is read on every frame, so it applies at once — no
+        # restart. Clear the vote counter so "auto" re-decides from the next frames rather
+        # than carrying votes cast under the previous setting.
+        self.agent_background = getattr(self.global_config, "agent_background", "auto")
+        self._canvas_votes = 0
+        self._canvas_sampled_at = 0.0
         by_scope: dict[str, dict[str, float]] = {}
         for tkey, (value, scope) in self._settings_pending_timings.items():
             by_scope.setdefault(scope, {})[tkey] = value
@@ -12303,6 +12357,23 @@ class ProxyRunner:
         # finished line disappears even while another session's line lives on).
         if self._session_notices or self._notice_shown:
             self._refresh_notice_message()
+
+    def _service_agent_theme(self) -> None:
+        """Main-loop tick: re-check the backend's colour scheme (renderer.py, "Agent-theme
+        adaptation") and repaint if the canvas changed.
+
+        Sampling only inside ``render`` would miss the case that matters most: after the
+        agent falls quiet nothing repaints, so a screen left mismatched — half the agent's
+        dark theme, half the terminal's white — would stay that way until the user typed.
+        The check itself is throttled inside ``update_canvas`` (CANVAS_SAMPLE_INTERVAL), and
+        a changed canvas sets ``_render_pending``, which the loop's flush turns into a paint.
+        """
+        if self.screen is None or getattr(self, "agent_background", "auto") == "terminal":
+            return
+        try:
+            self.update_canvas(self._visible_lines())
+        except Exception as error:  # display-only: never let a colour probe end a session
+            self._debug(f"agent theme check failed: {error!r}")
 
     def _clear_sticky_message_on_input(self) -> bool:
         # The next keypress dismisses a sticky message. Returns True if one was

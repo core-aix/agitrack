@@ -345,3 +345,54 @@ def test_install_backend_no_installer_available_returns_false(monkeypatch):
 
 def test_install_backend_unknown_backend_returns_false():
     assert install_backend("nope", output_fn=lambda _: None, run=lambda *a, **k: None, which=lambda e: None) is False
+
+
+# ---------------------------------------------------------------------------
+# First-run flow ergonomics: drained prompts, separated sections, visible progress
+# ---------------------------------------------------------------------------
+
+
+def test_first_run_prompts_drain_stale_keypresses_by_default():
+    # The install steps between these questions can run for minutes. Whatever the user
+    # pressed while waiting must be discarded, or it answers the NEXT question and that
+    # question flashes past looking as if it had been skipped.
+    import inspect
+
+    from agitrack.console import ask
+
+    for func in (select_default_backend, select_default_summarizer_model, ensure_installed_backend):
+        assert inspect.signature(func).parameters["input_fn"].default is ask, func.__name__
+
+
+def test_install_backend_announces_a_slow_step_and_closes_the_installers_output(monkeypatch):
+    monkeypatch.setattr("agitrack.backends.setup.os.name", "posix")
+    lines = []
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, returncode=0, stdout="/usr/local", stderr="")
+
+    with patch("agitrack.backends.setup.backend_installed", side_effect=[True]):
+        ok = install_backend(
+            "claude",
+            output_fn=lines.append,
+            run=fake_run,
+            which=lambda exe: f"/usr/bin/{exe}" if exe in {"bash", "curl"} else None,
+        )
+    assert ok is True
+    # A "this takes a while" reassurance, because the installer itself can print nothing.
+    assert any("take several minutes" in line for line in lines)
+    # A bare newline after the installer runs, so its (possibly unterminated) output can't
+    # run into the next message or leave the following question on the same line.
+    assert "" in lines
+    # The step itself starts on a fresh line, separated from the preceding output.
+    assert any(line.startswith("\nInstalling Claude Code") for line in lines)
+
+
+def test_backend_question_starts_a_clearly_separated_block():
+    config = MagicMock()
+    lines = []
+    with patch("agitrack.backends.setup.backend_installed", return_value=True):
+        select_default_backend(config, input_fn=lambda _prompt: "", output_fn=lines.append)
+    # Two newlines: the first ends any partial line left by an installer's output, the
+    # second leaves a blank line so the question reads as a new section.
+    assert lines[0].startswith("\n\nAgent backends:")
