@@ -35,6 +35,10 @@ from agitrack.proc import INHERITED_PATH
 # duplicate export on every run.
 MARKER = "# added by aGiTrack (agent CLI install)"
 
+# The separator inside a Windows PATH value. Fixed rather than os.pathsep so the Windows
+# branch parses the same on any host — it is only ever handed real Windows PATH strings.
+_WINDOWS_PATHSEP = ";"
+
 
 def _home() -> Path:
     return Path(os.path.expanduser("~"))
@@ -110,7 +114,13 @@ def persist_path_entry(directory: str, *, profile: Path | None = None) -> tuple[
     telling the user what to do by hand."""
     if os.name == "nt":
         return _persist_windows(directory)
-    target = profile if profile is not None else shell_profile_path()
+    return _persist_profile(directory, profile if profile is not None else shell_profile_path())
+
+
+def _persist_profile(directory: str, target: Path) -> tuple[bool, str]:
+    """Append the marked PATH line to a shell profile. Split out from the dispatch above so
+    it can be exercised on any OS — a test for the POSIX branch must never be able to reach
+    the Windows one, which edits the machine's real user PATH."""
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
@@ -120,6 +130,19 @@ def persist_path_entry(directory: str, *, profile: Path | None = None) -> tuple[
     except OSError as error:
         return (False, f"could not write {target}: {error}")
     return (True, str(target))
+
+
+def _same_windows_dir(left: str, right: str) -> bool:
+    """Whether two Windows paths name the same directory (case- and separator-insensitive).
+
+    Spelled out rather than left to ``os.path.normcase``, which only folds case when the
+    process is actually running on Windows — this comparison has to behave the same wherever
+    the branch is exercised, including a POSIX test host."""
+
+    def normalise(path: str) -> str:
+        return path.replace("/", "\\").rstrip("\\").lower()
+
+    return normalise(left) == normalise(right)
 
 
 def _persist_windows(directory: str) -> tuple[bool, str]:
@@ -139,13 +162,12 @@ def _persist_windows(directory: str) -> tuple[bool, str]:
                 current, value_type = reg.QueryValueEx(key, "Path")
             except OSError:
                 current, value_type = "", reg.REG_EXPAND_SZ
-            parts = [part for part in str(current).split(os.pathsep) if part]
-            if any(
-                os.path.normcase(os.path.normpath(part)) == os.path.normcase(os.path.normpath(directory))
-                for part in parts
-            ):
+            # ";" spelled out, not os.pathsep: this value IS a Windows PATH, whatever the
+            # host running the code happens to use as its separator.
+            parts = [part for part in str(current).split(_WINDOWS_PATHSEP) if part]
+            if any(_same_windows_dir(part, directory) for part in parts):
                 return (True, "your user PATH (already listed)")
-            updated = os.pathsep.join([*parts, directory])
+            updated = _WINDOWS_PATHSEP.join([*parts, directory])
             reg.SetValueEx(key, "Path", 0, value_type or reg.REG_EXPAND_SZ, updated)
     except OSError as error:
         return (False, f"could not update your user PATH: {error}")

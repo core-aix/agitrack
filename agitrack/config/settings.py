@@ -610,6 +610,32 @@ class GlobalConfig:
             self.data.pop("pending_manual_update", None)
         self.save()
 
+    # --- remembered agent colour scheme ------------------------------------
+    # Runtime STATE, not a setting (so it is deliberately absent from _default_config): the
+    # light/dark scheme each backend was last seen painting in. It exists purely to remove
+    # the visible flip at startup — aGiTrack can paint the first frame in the right scheme
+    # instead of waiting for the backend to render something it can infer from. Per backend,
+    # because a user may run one agent dark and another light. See renderer.py,
+    # "Agent-theme adaptation".
+
+    def agent_theme_seen(self, backend: str) -> bool | None:
+        """Whether *backend* last painted a DARK scheme (None when never observed)."""
+        stored = self.data.get("agent_theme_seen")
+        value = stored.get(backend) if isinstance(stored, dict) else None
+        return {"dark": True, "light": False}.get(str(value))
+
+    def set_agent_theme_seen(self, backend: str, dark: bool) -> None:
+        """Record *backend*'s current scheme, writing only when it actually changed — this is
+        called from the render path, and the config file is shared by every aGiTrack process
+        on the machine."""
+        if self.agent_theme_seen(backend) is dark:
+            return
+        stored = self.data.get("agent_theme_seen")
+        seen = dict(stored) if isinstance(stored, dict) else {}
+        seen[backend] = "dark" if dark else "light"
+        self.data["agent_theme_seen"] = seen
+        self.save()
+
     # --- session sharing (issue #55) ---------------------------------------
     # Sharing is opt-in: nothing is ever uploaded until the user explicitly shares
     # a session and acknowledges the one-time consent notice. We remember that
