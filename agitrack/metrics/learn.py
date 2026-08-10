@@ -28,7 +28,7 @@ otherwise the latest session's backend and model from ``state.json``. The page's
 "coach engine" panel edits the repo-scope keys in place. All agent calls are ``bare``
 one-shots run from a scratch directory outside any repository (the same isolation the
 summarizer uses, so learn sessions can never be adopted or resumed as the user's
-coding conversation) and work identically on Claude and OpenCode.
+coding conversation) and work identically on every supported backend.
 """
 
 from __future__ import annotations

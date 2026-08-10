@@ -6,13 +6,42 @@ from pathlib import Path
 import pytest
 
 from agitrack.backends.claude import ClaudeBackend
-from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.config import GlobalConfig
 from agitrack.config import AgitrackState
 
 
 def test_available_backends_includes_every_registered_backend():
     assert set(available_backends()) == {"opencode", "claude", "codex"}
+
+
+def _label(name: str) -> str:
+    from agitrack.backends.proxy_agents import _AGENTS
+
+    return str(getattr(_AGENTS[name], "label"))
+
+
+def test_backend_phrase_names_every_registered_backend():
+    # The prose the user reads must list the backends that actually exist. Hardcoded lists rot
+    # silently and rot in the worst direction: before this was derived from the registry, the
+    # empty-backtrace message told Codex users "Backtrace reconstructs past Claude or OpenCode
+    # sessions", i.e. that their own sessions were unsupported, while sitting on a working
+    # Codex parser. Asserting against the registry makes a new backend fail here, loudly.
+    phrase = backend_phrase()
+    for name in available_backends():
+        assert _label(name) in phrase, f"{name} missing from {phrase!r}"
+    assert phrase.count(" or ") == 1, "only the final backend is joined by the conjunction"
+    assert backend_phrase("and").endswith("and OpenCode")
+
+
+def test_user_facing_backtrace_text_names_every_backend():
+    # The two strings a user hits when backtrace finds nothing — the place the stale list was
+    # actually reaching people.
+    from agitrack.metrics.backtrace import _empty_message
+
+    message = _empty_message(Path("/tmp/somewhere"))
+    for name in available_backends():
+        assert _label(name) in message, f"{name} missing from the empty-backtrace message"
 
 
 def test_opencode_proxy_agent_spawn_command():

@@ -2,7 +2,7 @@
 directory, from local transcripts alone — no git history, and no prior aGiTrack use.
 
 The dashboard is normally computed from ``git log`` (aGiTrack's own commit metadata).
-Backtrace instead reads the local Claude and OpenCode session transcripts for the current
+Backtrace instead reads the local session transcripts of every supported backend for the current
 directory, recovers each turn's file edits from the tool-call inputs, and maps every turn
 onto the SAME :class:`~agitrack.metrics.collect.Dashboard` / :class:`CommitStat` model the
 web dashboard already renders. So a first-time user — even in a folder that was never a git
@@ -127,7 +127,7 @@ class _Source:
 
 
 def _discover(directory: Path) -> list[_Source]:
-    """Every Claude and OpenCode session that ran in ``directory`` or beneath it, newest
+    """Every supported-backend session that ran in ``directory`` or beneath it, newest
     first — the sessions to reconstruct. Each backend's discovery is best-effort: a failure
     in one (e.g. the OpenCode CLI missing) never blocks the other."""
     sources: list[_Source] = []
@@ -1834,8 +1834,10 @@ def render_backtrace_text(directory: Path) -> str:
 
 
 def _empty_message(directory: Path) -> str:
+    from agitrack.backends.proxy_agents import backend_phrase
+
     return (
         f"No local coding-agent history found for {_abbreviate_home(str(directory))}.\n"
-        "Backtrace reconstructs past Claude or OpenCode sessions that ran in this directory "
+        f"Backtrace reconstructs past {backend_phrase()} sessions that ran in this directory "
         "(or a subdirectory) and changed files — none were found here."
     )
