@@ -50,6 +50,39 @@ pytestmark = pytest.mark.xdist_group("net")
 DAY = 86400
 
 
+@pytest.fixture(autouse=True)
+def _drain_builds():
+    """Leave ``story._BUILDS`` empty after every test, whatever the test did to it.
+
+    ``_BUILDS`` is a PROCESS-GLOBAL registry and ``start_build`` refuses a new build while ANY
+    record in it is live — deliberately, and across repositories: one story at a time per
+    machine. So a test that returns while its build thread is still running does not just leak a
+    thread, it makes the NEXT test's ``start_build`` answer ``{"busy": True}`` with no "building"
+    key, and that test fails on an assertion about its own build.
+
+    Several tests here deliberately start builds that block inside a faked backend call, and they
+    released them with a bare ``release.set()`` or a fixed ``time.sleep(0.2)`` — fine on an idle
+    machine, not fine under `-n auto`, which is why this only ever failed for some `-p randomly`
+    orderings. Sleeping longer would just move the threshold; joining the threads removes it.
+    """
+    yield
+    with story._BUILDS_LOCK:
+        records = list(story._BUILDS.values())
+        story._BUILDS.clear()
+    # Cleared first so a slow unwinding worker can never refuse the next test, then joined so its
+    # writes land before the next test's assertions rather than during them. Every blocking
+    # backend in this file waits with a timeout, so these threads always terminate.
+    for record in records:
+        record["abandoned"] = True
+        stop = record.get("stop")
+        if stop is not None:
+            stop.set()
+        thread = record.get("thread")
+        if thread is not None:
+            thread.join(60)
+            assert not thread.is_alive(), "a story build thread outlived its test by over a minute"
+
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -1014,7 +1047,6 @@ def test_the_page_does_not_promise_to_stop_later(tmp_path):
     cancel = cancel[: cancel.index("});")]
     for step in ("stopPolling();", "hideOverlay();", 'notice("Stopped. The moments already written are kept.")'):
         assert step in cancel, step
-        time.sleep(0.3)
 
 
 def test_a_stopped_build_throws_away_the_answer_it_was_waiting_for(tmp_path, monkeypatch):
@@ -1053,8 +1085,9 @@ def test_only_one_story_is_written_at_a_time(tmp_path, monkeypatch):
         second = story.start_build(tmp_path, stats, sha_paths, branch="other", mode="rewrite")
         assert second["busy"] is True and second["error"]
     finally:
+        # No sleep here: the autouse `_drain_builds` fixture joins the thread. A fixed sleep only
+        # moved the race, it never closed it.
         release.set()
-        time.sleep(0.2)
 
 
 def test_a_build_runs_in_the_background_and_reports_progress(tmp_path, monkeypatch):
