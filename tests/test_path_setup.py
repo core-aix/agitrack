@@ -63,9 +63,14 @@ def test_the_written_line_matches_the_shell_it_is_written_for(home):
 # ---------------------------------------------------------------------------
 
 
+# These call the profile writer directly rather than persist_path_entry: on Windows the
+# dispatch goes to the registry branch, and a test must never edit the machine's real user
+# PATH (on CI it did exactly that before this split). The dispatch itself is covered below.
+
+
 def test_persist_appends_a_marked_line_and_creates_a_missing_profile(home):
     profile = home / ".zshrc"
-    ok, detail = ps.persist_path_entry(str(home / ".local" / "bin"), profile=profile)
+    ok, detail = ps._persist_profile(str(home / ".local" / "bin"), profile)
     assert ok is True and detail == str(profile)
     written = profile.read_text(encoding="utf-8")
     assert ps.MARKER in written  # the user can see who wrote it, and so can the next install
@@ -75,24 +80,99 @@ def test_persist_appends_a_marked_line_and_creates_a_missing_profile(home):
 def test_persist_does_not_disturb_what_was_already_in_the_profile(home):
     profile = home / ".zshrc"
     profile.write_text("alias ll='ls -l'", encoding="utf-8")  # note: no trailing newline
-    ps.persist_path_entry(str(home / ".local" / "bin"), profile=profile)
+    ps._persist_profile(str(home / ".local" / "bin"), profile)
     written = profile.read_text(encoding="utf-8")
     assert written.startswith("alias ll='ls -l'\n")  # the user's last line stays its own line
     assert written.endswith("\n")
 
 
 def test_persist_reports_a_failure_instead_of_raising(home):
-    # A read-only (or otherwise unwritable) profile must come back as a reported failure —
-    # the caller turns that into instructions the user acknowledges.
-    unwritable = home / "nope" / ".zshrc"
-    unwritable.parent.mkdir()
-    unwritable.parent.chmod(0o500)
-    try:
-        ok, detail = ps.persist_path_entry(str(home / ".local" / "bin"), profile=unwritable)
-    finally:
-        unwritable.parent.chmod(0o700)
+    # An unwritable profile must come back as a reported failure — the caller turns that into
+    # instructions the user acknowledges. The path is blocked by a FILE where a directory
+    # would have to be, which fails the same way on every OS (permissions do not).
+    (home / "blocked").write_text("not a directory", encoding="utf-8")
+    ok, detail = ps._persist_profile(str(home / ".local" / "bin"), home / "blocked" / ".zshrc")
     assert ok is False
     assert "could not write" in detail
+
+
+def test_persist_writes_the_profile_on_posix_and_the_registry_on_windows(monkeypatch, home):
+    calls: list[str] = []
+    monkeypatch.setattr(ps, "_persist_profile", lambda directory, target: calls.append("profile") or (True, "p"))
+    monkeypatch.setattr(ps, "_persist_windows", lambda directory: calls.append("registry") or (True, "r"))
+
+    monkeypatch.setattr(ps.os, "name", "posix")
+    ps.persist_path_entry(str(home / "bin"), profile=home / ".zshrc")
+    monkeypatch.setattr(ps.os, "name", "nt")
+    ps.persist_path_entry(str(home / "bin"))
+    assert calls == ["profile", "registry"]
+
+
+def _fake_winreg(existing: str | None):
+    """Stand-in for the winreg module, so the Windows branch is testable on any OS — and so a
+    test can never touch a real HKCU\\Environment."""
+
+    class Key:
+        def __init__(self, store):
+            self.store = store
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    store: dict[str, tuple] = {}
+    if existing is not None:
+        store["Path"] = (existing, 2)
+
+    class FakeWinreg:
+        HKEY_CURRENT_USER = object()
+        KEY_READ = 1
+        KEY_SET_VALUE = 2
+        REG_EXPAND_SZ = 2
+
+        @staticmethod
+        def CreateKeyEx(root, path, reserved, access):
+            return Key(store)
+
+        @staticmethod
+        def QueryValueEx(key, name):
+            if name not in key.store:
+                raise OSError("no such value")
+            return key.store[name]
+
+        @staticmethod
+        def SetValueEx(key, name, reserved, value_type, value):
+            key.store[name] = (value, value_type)
+
+    return FakeWinreg, store
+
+
+def test_windows_appends_to_the_user_path_without_rewriting_what_is_there(monkeypatch):
+    import sys as _sys
+
+    fake, store = _fake_winreg(r"C:\Windows;C:\Windows\System32")
+    monkeypatch.setitem(_sys.modules, "winreg", fake)
+    monkeypatch.setattr(ps.os, "name", "nt")
+
+    ok, detail = ps._persist_windows(r"C:\Users\u\AppData\Roaming\npm")
+    assert ok is True and "user PATH" in detail
+    value = store["Path"][0]
+    assert value.startswith(r"C:\Windows;C:\Windows\System32")  # the existing PATH is preserved
+    assert value.endswith(r"C:\Users\u\AppData\Roaming\npm")
+
+
+def test_windows_does_not_add_a_directory_that_is_already_listed(monkeypatch):
+    import sys as _sys
+
+    fake, store = _fake_winreg(r"C:\Windows;C:\Users\u\AppData\Roaming\npm")
+    monkeypatch.setitem(_sys.modules, "winreg", fake)
+    monkeypatch.setattr(ps.os, "name", "nt")
+
+    ok, detail = ps._persist_windows(r"C:\Users\u\AppData\Roaming\NPM")  # same dir, different case
+    assert ok is True and "already listed" in detail
+    assert store["Path"][0] == r"C:\Windows;C:\Users\u\AppData\Roaming\npm"  # untouched
 
 
 def test_already_in_profile_recognises_both_spellings(home):
