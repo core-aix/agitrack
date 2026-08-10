@@ -21,10 +21,12 @@ exists for.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 # ~1s of waiting in all: doubling from 10ms, then capped, so the common case (another
 # writer's replace, which lasts microseconds) is waited out almost instantly while a slower
@@ -46,6 +48,51 @@ def _replace_when_allowed(tmp: str, path: Path) -> None:
             if attempt == _REPLACE_ATTEMPTS - 1:
                 raise
             time.sleep(min(_REPLACE_BACKOFF_SECONDS * 2**attempt, _REPLACE_BACKOFF_CAP_SECONDS))
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    """The JSON object at *path*, or ``{}`` when it is missing, unreadable or not an object."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def merge_json_for_save(path: Path, current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    """The document to write for a whole-file JSON store, merged against the file on disk.
+
+    Atomicity is NOT isolation. ``atomic_write_text`` guarantees no reader sees a torn file,
+    but a store that serializes its entire in-memory dict still performs a LOST UPDATE: two
+    live objects over one path — a second instance in the same process, or a second aGiTrack
+    process (background tracker, dashboard daemon, ``--json`` run) on the same repo — each
+    hold a private copy taken when they loaded, and whichever saves last silently discards
+    every key the other wrote. That is not theoretical: a session name written through a
+    second ``AgitrackState`` vanished on the session state's next property setter, leaving
+    the conversation unnamed and the name unrecoverable.
+
+    So instead of writing ``current`` blind, re-read the file and apply only what THIS
+    instance actually changed since it loaded (*baseline*):
+
+    * a key this instance changed  -> ours wins (a genuine update),
+    * a key this instance deleted  -> deleted here too (deletions must propagate),
+    * a key this instance never touched -> whatever is on disk wins, so a concurrent
+      writer's key survives even when our copy is hours stale,
+    * a key we hold that the file has never had -> contributed (first save / new defaults).
+
+    Merging is per top-level key. Two writers updating the SAME key still resolve
+    last-writer-wins — that is unavoidable without locking, and it is the narrow case;
+    the damage in practice came from unrelated keys being dropped wholesale.
+    """
+    merged = read_json_object(path)
+    for key, value in current.items():
+        if key not in baseline or baseline[key] != value or key not in merged:
+            merged[key] = value
+    for key in baseline:
+        if key not in current:
+            merged.pop(key, None)
+    return merged
 
 
 def atomic_write_text(path: Path, text: str) -> None:

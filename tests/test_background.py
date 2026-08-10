@@ -1744,7 +1744,8 @@ def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
 
 # --- a repo that TRACKS the agent scaffolding dirs ---------------------------
 #
-# `snapshot_worktree_tree()` strips `.agitrack/` / `.claude/` / `.opencode/`; a raw `^{tree}` does
+# `snapshot_worktree_tree()` strips every agent-config prefix (`.agitrack/`, `.claude/`, `.codex/`,
+# `.opencode/` — see git/repo.py `_NEVER_STAGE_PREFIXES`); a raw `^{tree}` does
 # not. So in a repo that COMMITS its `.claude/` config — ordinary practice, a team shares its
 # agent setup like an editorconfig — "is the working tree clean?" answered "dirty" forever, and
 # `_agent_committed_own_work` bails on a dirty tree. The daemon therefore covered NO agent

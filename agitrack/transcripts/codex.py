@@ -80,6 +80,38 @@ def _sessions_root() -> Path:
     return _codex_home() / "sessions"
 
 
+def watch_roots() -> list[Path]:
+    """Directories whose mtime changes when a NEW Codex conversation appears.
+
+    The backtrace daemon decides a fresh discovery pass is owed by stat-ing directories
+    (``metrics.backtrace._watch_signature``). Watching only the sessions root is not enough
+    here, because Codex files rollouts under ``sessions/YYYY/MM/DD/`` — so the root's own mtime
+    never changes for a new conversation, and the daemon never noticed one until something else
+    forced a rediscovery.
+
+    Four cases have to be covered, and the chain from the root down to the NEWEST existing day
+    directory covers all of them: a new rollout today changes the day dir; the first rollout of
+    a new day changes the month dir; a new month changes the year dir; a new year changes the
+    root. That is a handful of stats per poll, rather than the ``rglob`` over every rollout ever
+    written that a "newest file" signature would need.
+
+    Names are zero-padded numerals, so lexicographic order IS chronological.
+    """
+    root = _sessions_root()
+    roots = [root]
+    current = root
+    for _ in range(3):  # YYYY / MM / DD
+        try:
+            children = sorted(child for child in current.iterdir() if child.is_dir())
+        except OSError:
+            break
+        if not children:
+            break
+        current = children[-1]
+        roots.append(current)
+    return roots
+
+
 def _schema_version(path: Path) -> int:
     """The migration number in ``state_<n>.sqlite``; -1 when it has none."""
     digits = path.stem.rpartition("_")[2]

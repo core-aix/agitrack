@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from agitrack.fileio import atomic_write_text
+from agitrack.fileio import atomic_write_text, merge_json_for_save
 from agitrack.proc import console_isolation_kwargs
 
 # The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
@@ -23,6 +26,12 @@ class AgitrackState:
         self._default_backend = default_backend
         self.data = self._load()
         self.config = self._load_config()
+        # What this instance believes was on disk when it loaded. save() writes only the
+        # difference against it, so a concurrent writer's keys are not dropped — see
+        # fileio.merge_json_for_save.
+        self._baseline = copy.deepcopy(self.data)
+        self._config_baseline = copy.deepcopy(self.config)
+        self._saves_suspended = 0
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -104,14 +113,39 @@ class AgitrackState:
         default.update(data if isinstance(data, dict) else {})
         return default
 
+    @contextmanager
+    def suspend_saves(self) -> Iterator[None]:
+        """Keep mutations in memory instead of writing them, for a block that must not touch
+        the file yet. Used where state is prepared BEFORE the repo lock is held: writing there
+        rewrites a live tracker's state file even when the run is then refused, and the
+        tracker's own next save reverts it — a lost update in both directions."""
+        self._saves_suspended += 1
+        try:
+            yield
+        finally:
+            self._saves_suspended -= 1
+
     def save(self) -> None:
+        if self._saves_suspended:
+            return
         self._ensure_repo_local_ignore()
         # Atomic write (unique tmp, see fileio): save() runs on every property setter, so
         # an in-place rewrite interrupted by a crash/SIGKILL/full disk would leave exactly
         # the truncated file that bricks the next startup — and a FIXED tmp name crashed
         # whenever a second aGiTrack process (dashboard, export, tracker) saved this same
         # repo's state concurrently.
-        atomic_write_text(self.path, json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+        #
+        # Merge against the file rather than overwriting it: atomicity is not isolation, and
+        # a whole-document write silently discards whatever another live instance (a second
+        # AgitrackState in this process, or another aGiTrack process on this repo) wrote in
+        # the meantime. See fileio.merge_json_for_save.
+        merged = merge_json_for_save(self.path, self.data, self._baseline)
+        atomic_write_text(self.path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        # Adopt the merged document (in place, so anything holding ``state.data`` keeps
+        # seeing the live dict) and re-baseline: this instance is now in sync with disk.
+        self.data.clear()
+        self.data.update(merged)
+        self._baseline = copy.deepcopy(merged)
 
     def ensure_local_ignore(self) -> None:
         """Make sure ``.agitrack/`` is git-ignored for this repo (idempotent). Call this before
@@ -632,7 +666,15 @@ class AgitrackState:
         self._save_config()
 
     def _save_config(self) -> None:
-        atomic_write_text(self.config_path, json.dumps(self.config, indent=2, sort_keys=True) + "\n")
+        # ``<repo>/.agitrack/config.json`` is written by TWO classes with disjoint key sets —
+        # this one and GlobalConfig.save_repo (the repo settings overlay, which the dashboard
+        # daemon also writes) — so an unmerged whole-file write here drops every setting the
+        # other one owns. Merge, exactly as save() does.
+        merged = merge_json_for_save(self.config_path, self.config, self._config_baseline)
+        atomic_write_text(self.config_path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.config.clear()
+        self.config.update(merged)
+        self._config_baseline = copy.deepcopy(merged)
 
     def append_trace(self, role: str, content: str) -> None:
         trace = self.pending_trace()

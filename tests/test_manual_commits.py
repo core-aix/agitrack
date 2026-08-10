@@ -2418,7 +2418,7 @@ def test_nothing_is_reported_when_no_chain_is_dropped(tmp_path):
 
 # --- a repo that TRACKS the agent scaffolding dirs ---------------------------
 #
-# Committing `.claude/settings.json`, a `.claude/commands/` dir or an `.opencode/` config is
+# Committing `.claude/settings.json`, a `.claude/commands/` dir, a `.codex/` or an `.opencode/` config is
 # ordinary practice — a team shares its agent setup the same way it shares an editorconfig. But
 # EVERY "has the working tree changed?" question in manual / no-worktree / background mode is a
 # comparison between `snapshot_worktree_tree()` and some commit's tree, and the snapshot

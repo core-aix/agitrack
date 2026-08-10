@@ -109,9 +109,9 @@ def merge_transcripts(new: str, existing: str) -> str:
     already contains the other's rows changes nothing).
 
     Only line-oriented JSONL with per-row ids can be merged this way. When lineage
-    can't be established — the first rows have no id or differ (a different
-    conversation, or OpenCode's single-object export) — it falls back to ``new``
-    (last-write-wins), the prior behaviour."""
+    can't be established — the first rows have no id or differ — it falls back to ``new``
+    (last-write-wins), the prior behaviour. That is the case for OpenCode (a single export
+    object, not lines at all) and for Codex, whose rollout rows carry no per-row id."""
     new_rows = [line for line in new.splitlines() if line.strip()]
     old_rows = [line for line in existing.splitlines() if line.strip()]
     if not old_rows:
@@ -147,7 +147,7 @@ def _transcript_is_readable(text: str, backend: str | None) -> bool:
     Used to guard a union merge before it's uploaded: a merge that combined two
     diverged copies must not produce a transcript the backend can no longer load.
     True only when the backend's OWN parser yields at least one turn; False on a
-    parse failure or an empty result. Supported for both backends — Claude
+    parse failure or an empty result. Every backend has a parser here — Claude and Codex
     (line-oriented JSONL via ``parse_rows``) and OpenCode (a single export object via
     ``parse_exported_session``). An unknown/unspecified backend has no parser to
     check, so it is treated as readable (the merge logic only runs for line-mergeable

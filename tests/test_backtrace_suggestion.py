@@ -8,6 +8,7 @@ worst answer available, so the dashboard defers to the reconstruction.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -16,6 +17,15 @@ import pytest
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
 from agitrack.metrics import suggest
+
+
+@pytest.fixture(autouse=True)
+def codex_home(tmp_path, monkeypatch):
+    """Redirect Codex's store, as tests/test_codex_session.py does: the session probe walks every
+    backend, and an unredirected one reads the developer's real ``~/.codex``."""
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home
 
 
 def _repo(path: Path, *, tracked: bool, tokens: int = 0) -> GitRepo:
@@ -51,6 +61,48 @@ def test_an_untracked_repo_with_local_sessions_is_diverted(tmp_path, monkeypatch
     monkeypatch.setattr(suggest, "has_backtrace_history", lambda _d: True)
 
     assert suggest.has_tracked_history(repo) is False
+    assert suggest.should_show_backtrace(repo) is True
+
+
+def test_an_untracked_repo_whose_only_sessions_are_codex_is_diverted(tmp_path, monkeypatch, codex_home):
+    # The probe is per-backend, and missing one of them is invisible from the outside: a Codex
+    # user who has not adopted aGiTrack would be shown the empty dashboard while their entire
+    # history sits in ~/.codex — exactly the situation the diversion exists for. Driven through
+    # a real rollout rather than a stubbed probe, because what is at stake is discovery itself.
+    monkeypatch.setattr("agitrack.transcripts.opencode.sessions_under", lambda directory: [])
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    root = tmp_path / "proj"
+    repo = _repo(root, tracked=False)
+    rows = [
+        {
+            "timestamp": "2026-08-06T09:00:00.000Z",
+            "type": "session_meta",
+            # Codex links a conversation to a directory ONLY through this recorded cwd.
+            "payload": {
+                "session_id": "019fe8dc-ca6c-7951-9225-73513aadf083",
+                "cwd": str(root.resolve()),
+                "source": "cli",
+                "thread_source": "user",
+            },
+        },
+        {
+            "timestamp": "2026-08-06T09:00:01.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1"},
+        },
+        {
+            "timestamp": "2026-08-06T09:00:02.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1", "last_agent_message": "done"},
+        },
+    ]
+    sessions = codex_home / "sessions" / "2026" / "08" / "06"
+    sessions.mkdir(parents=True)
+    (sessions / "rollout-2026-08-06T09-00-00-019fe8dc-ca6c-7951-9225-73513aadf083.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    assert suggest.has_backtrace_history(root) is True
     assert suggest.should_show_backtrace(repo) is True
 
 

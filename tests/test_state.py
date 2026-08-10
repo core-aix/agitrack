@@ -1,3 +1,4 @@
+import json
 import subprocess
 
 from agitrack.backends.base import TokenUsage
@@ -283,3 +284,122 @@ def test_session_origin_event_roundtrip_and_one_shot(tmp_path):
     state.clear_session_origin_event()
     assert state.session_origin_event() is None
     assert AgitrackState(tmp_path).session_origin_event() is None
+
+
+# --- lost updates: two live objects over ONE state file -------------------------------
+# AgitrackState.save() used to serialize its whole in-memory dict over the file. Atomicity
+# is not isolation: a second instance on the same path — a second object in this process
+# (without a worktree the session state and the repo-root state ARE the same file), or
+# another aGiTrack process on the repo (background tracker, dashboard, a --json run) —
+# held its own copy and whichever saved last silently discarded the other's keys. A session
+# name written through a second instance vanished on the session state's next setter.
+
+
+def test_a_second_instances_write_is_not_clobbered_by_the_first(tmp_path):
+    session = AgitrackState(tmp_path)
+    session.backend = "claude"
+
+    # a second live object over the SAME file records a name…
+    other = AgitrackState(tmp_path)
+    other.name_session("sid-1", "jubilee")
+
+    # …and the first instance's next save must not erase it.
+    session.backend_session_id = "sid-1"
+
+    assert AgitrackState(tmp_path).session_name_for("sid-1") == "jubilee"
+    assert AgitrackState(tmp_path).backend_session_id == "sid-1"
+
+
+def test_the_first_instance_also_survives_the_second(tmp_path):
+    first = AgitrackState(tmp_path)
+    first.name_session("sid-1", "jubilee")
+
+    second = AgitrackState(tmp_path)  # loads the name, then writes something else
+    second.backend = "codex"
+
+    reloaded = AgitrackState(tmp_path)
+    assert reloaded.session_name_for("sid-1") == "jubilee"
+    assert reloaded.data["backend"] == "codex"
+
+
+def test_a_key_this_instance_deleted_is_still_deleted(tmp_path):
+    # Merging must not resurrect a removed key: clearing a pending name has to stick even
+    # though the on-disk file still carries it.
+    state = AgitrackState(tmp_path)
+    state.remember_pending_session_name("jubilee")
+    AgitrackState(tmp_path).backend = "codex"  # someone else rewrites the file meanwhile
+
+    state.remember_pending_session_name(None)
+
+    assert AgitrackState(tmp_path).pending_session_name is None
+    assert AgitrackState(tmp_path).data["backend"] == "codex"
+
+
+def test_a_stale_instance_does_not_revert_a_key_it_never_touched(tmp_path):
+    # The long-lived case: an instance loaded minutes ago writes ONE key. Everything it did
+    # not touch must keep the value the other writer left, not the value it remembers.
+    stale = AgitrackState(tmp_path)
+    stale.backend = "claude"
+
+    AgitrackState(tmp_path).backend_session_id = "sid-new"
+
+    stale.name_session("sid-new", "aurora")
+
+    reloaded = AgitrackState(tmp_path)
+    assert reloaded.backend_session_id == "sid-new"  # not reverted to None
+    assert reloaded.session_name_for("sid-new") == "aurora"
+
+
+def test_the_repo_config_file_is_merged_too(tmp_path):
+    # <repo>/.agitrack/config.json is written by TWO classes with disjoint key sets:
+    # AgitrackState._save_config and GlobalConfig.save_repo (which the dashboard daemon also
+    # writes). An unmerged write here dropped every setting the other one owns.
+    from agitrack.config.settings import GlobalConfig
+
+    state = AgitrackState(tmp_path)
+    state.merge_branch = "main"
+
+    overlay = GlobalConfig(path=tmp_path / "global.json")
+    overlay.load_repo_overlay(tmp_path)
+    overlay.set("learning_model", "gpt-5.4-mini", scope="repo")
+
+    state.summarization_enabled = False
+
+    written = json.loads((tmp_path / ".agitrack" / "config.json").read_text(encoding="utf-8"))
+    assert written["merge_branch"] == "main"
+    assert written["learning_model"] == "gpt-5.4-mini"
+    assert written["summarization_enabled"] is False
+
+
+def test_suspended_saves_keep_mutations_in_memory(tmp_path):
+    state = AgitrackState(tmp_path)
+    state.backend = "claude"
+
+    with state.suspend_saves():
+        state.backend = "codex"
+        state.backend_session_id = "sid-x"
+        assert state.backend == "codex"  # visible in memory
+        assert AgitrackState(tmp_path).data["backend"] == "claude"  # nothing written
+
+    state.save()
+    assert AgitrackState(tmp_path).data["backend"] == "codex"
+    assert AgitrackState(tmp_path).backend_session_id == "sid-x"
+
+
+def test_a_second_state_on_the_active_sessions_config_does_not_drop_its_settings(tmp_path):
+    # The env-copy flow opens a SECOND AgitrackState on a worktree path to stamp
+    # `copy_full_env` — and for the ACTIVE session that path is the one `self.state` already
+    # holds, so the stamp and the session's own settings were two copies of one config.json.
+    session = AgitrackState(tmp_path)
+    session.merge_branch = "main"
+    session.summarization_model = "gpt-5.4-mini"
+
+    AgitrackState(tmp_path).copy_full_env = True
+
+    session.summarization_enabled = False
+
+    reloaded = AgitrackState(tmp_path)
+    assert reloaded.copy_full_env is True
+    assert reloaded.merge_branch == "main"
+    assert reloaded.summarization_model == "gpt-5.4-mini"
+    assert reloaded.summarization_enabled is False
