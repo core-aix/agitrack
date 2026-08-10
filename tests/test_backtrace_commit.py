@@ -209,6 +209,21 @@ def test_backtrace_commit_declined_makes_no_changes(repo_with_history, capsys):
     assert before == after  # no branch created
 
 
+def test_backtrace_commit_with_no_stdin_cancels_instead_of_crashing(repo_with_history, capsys):
+    # Run from a script or CI (`agitrack --backtrace commit --branch x < /dev/null`) the
+    # confirmation `input()` raises EOFError. It escaped as a raw Python traceback instead of a
+    # message; and since the "yes" answer REWRITES history, no answer must mean no.
+    def _eof(_prompt):
+        raise EOFError
+
+    before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+    rc = backtrace_commit(repo_with_history, "unattended", _input=_eof)
+
+    assert rc == 0
+    assert "Aborted" in capsys.readouterr().out
+    assert _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split() == before
+
+
 def test_backtrace_commit_no_ai_history(tmp_path, monkeypatch, capsys):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)

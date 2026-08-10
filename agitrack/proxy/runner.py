@@ -3807,6 +3807,10 @@ class ProxyRunner:
             self.backend = make_proxy_agent(name)
             self.state.backend_session_id = self.state.stored_backend_session(name)
             self.state.last_backend_message_id = None
+            # A model belongs to its backend. Worktree sessions each load their own state file,
+            # so only this shared-state branch can carry the previous backend's model id into the
+            # new backend's commits (and into the model aGiTrack asks that CLI to run).
+            self.state.model = (self.state.recall_session(name) or {}).get("model")
             self.state.clear_trace()
             self._restart_agent(f"Backend set to {name}")
             return

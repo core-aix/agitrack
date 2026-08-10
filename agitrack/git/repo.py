@@ -1065,11 +1065,23 @@ class GitRepo:
         # the env var reliably keeps the walk to local objects. The config is set too, as a
         # harmless second line of defence on git builds where it does take effect.
         extra_env: dict[str, str] = dict(env) if env else {}
+        flags: list[str] = []
+        if command and command[0] == "git":
+            # PATHS MUST COME BACK VERBATIM. With git's default ``core.quotePath=true`` every
+            # listing command (``ls-files``, ``status --short``, ``diff --name-only``) prints a
+            # path containing non-ASCII characters C-QUOTED — `"my file \303\251\344\270\255.txt"`,
+            # complete with the surrounding double quotes. aGiTrack feeds those names straight
+            # back to ``git add --``, which then fails ("pathspec ... did not match any files")
+            # and, because staging fails, the whole agent turn is LOST: no commit, no trace, no
+            # tokens. Any agent that creates a file with an accented or CJK name hit this. Turning
+            # quoting off makes git emit the real UTF-8 bytes, which round-trip.
+            flags += ["-c", "core.quotePath=false"]
         if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
-            flags = ["-c", "core.commitGraph=false"]
+            flags += ["-c", "core.commitGraph=false"]
             if not allow_lazy_fetch or not _git_read_needs_blobs(command):
                 flags += ["-c", "fetch.disableLazyFetch=true"]
                 extra_env["GIT_NO_LAZY_FETCH"] = "1"
+        if flags:
             command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a

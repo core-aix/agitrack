@@ -1060,7 +1060,10 @@ def main(argv: list[str] | None = None) -> int:
                 management_lock.release()
                 return 1
             management_lock.release()  # json/scripted mode runs via AgitrackShell, which takes its own lock
-            AgitrackShell(
+            # Propagate the shell's exit code: a scripted run that could not start (no backend
+            # installed, another aGiTrack on the repo) otherwise exited 0 and was indistinguishable
+            # from a successful turn to whatever script invoked it.
+            return AgitrackShell(
                 repo,
                 verbose=args.verbose,
                 backend=args.backend,

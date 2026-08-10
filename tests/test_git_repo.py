@@ -78,6 +78,36 @@ def test_untracked_entries_reports_untracked_files_in_a_partially_tracked_dir(tm
     assert repo.untracked_entries() == ["pkg/new.py"]
 
 
+# --- non-ASCII path names ---------------------------------------------------------------------
+
+
+def test_a_non_ascii_filename_round_trips_from_listing_back_into_the_index(tmp_path):
+    # git's DEFAULT core.quotePath=true prints a path holding non-ASCII characters C-quoted —
+    # `"caf\303\251 \344\270\255.txt"`, surrounding double quotes included. aGiTrack feeds the
+    # names it lists straight back to `git add --`, which rejects the quoted form ("pathspec ...
+    # did not match any files"); staging then fails and the ENTIRE agent turn is lost — no
+    # commit, no interaction trace, no token accounting. Any agent creating an accented or CJK
+    # filename hit this, so the listing must come back verbatim.
+    repo = _init_repo(tmp_path)
+    name = "café 中 file.txt"
+    (tmp_path / name).write_text("hello\n", encoding="utf-8")
+
+    listed = repo.untracked_files()
+
+    assert listed == [name]
+    repo.stage_paths(listed)
+    assert repo.staged_paths() == [name]
+
+
+def test_a_non_ascii_filename_is_not_quoted_in_the_short_status(tmp_path):
+    # The same quoting reaches `status --short`, which aGiTrack shows to the user and parses.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "ünïcödé.txt").write_text("x\n", encoding="utf-8")
+
+    assert "ünïcödé.txt" in repo.status_short()
+    assert "\\303" not in repo.status_short()
+
+
 # --- git's comment char vs. aGiTrack's "#" section headings -----------------------------------
 
 

@@ -42,6 +42,15 @@ _BARE_DISABLED_FEATURES = (
 # rather than a setting that makes every summary fail on some configurations.
 _SUMMARIZER_REASONING_EFFORT = "low"
 
+# The one plain (non-JSON) line ``codex exec`` prints on EVERY run, success or failure. It is a
+# start-up banner, not a diagnostic, so it must never be reported as the reason a turn failed.
+_STDIN_BANNER = "Reading additional input from stdin..."
+
+# How many plain diagnostic lines to keep as a fallback failure reason. Enough for Codex's
+# multi-line messages (a config parse error is five lines, ending in a bare caret), small enough
+# that a backend printing without limit can't turn a user-facing message into a wall of text.
+_MAX_DIAGNOSTIC_LINES = 12
+
 
 class CodexBackend:
     name = "codex"
@@ -77,7 +86,8 @@ class CodexBackend:
     ) -> AgentResult:
         head = list(self.launch_command or ["codex"])
         command = [*head, "exec", "--json", "--skip-git-repo-check", "-C", str(self.repo)]
-        if model:
+        pinned_model = _pinned_model(self.backend_args)
+        if model and pinned_model is None:
             command.extend(["-m", model])
         if bare:
             # ``--ephemeral`` writes NO session file at all. The other two backends can only
@@ -147,7 +157,9 @@ class CodexBackend:
             # agent text to aGiTrack's own stdout, which is the host terminal — otherwise the
             # summary leaks onto the screen next to the user's input box while a session is live.
             # A non-bare run is foreground shell mode, where streaming the progress is the point.
-            final_response, parsed_session_id, tokens = self._read_events(process.stdout, stream_console=not bare)
+            final_response, parsed_session_id, tokens, error = self._read_events(
+                process.stdout, stream_console=not bare
+            )
             exit_code = process.wait()
         finally:
             if watchdog is not None:
@@ -157,11 +169,22 @@ class CodexBackend:
         # thread.started, item.completed nor turn.completed carries one — so ask the session
         # store when the caller didn't pin one, exactly as the OpenCode backend has to.
         # Best-effort: None simply records no model, as before.
-        resolved_model = model
+        # A model the USER pinned is the one that actually ran, so it — not aGiTrack's
+        # remembered value, which was suppressed above — is what the commit must record.
+        resolved_model = pinned_model or model
         if not resolved_model and (parsed_session_id or session_id):
             from agitrack.transcripts.codex import session_model
 
             resolved_model = session_model(parsed_session_id or session_id or "")
+
+        # A FAILED run with nothing to say reports WHY. Codex puts the reason ("The 'gpt-x' model
+        # is not supported when using Codex with a ChatGPT account", a 429, an expired login) only
+        # in its error events, which used to be dropped — so the caller had an exit code and an
+        # empty string, and the user was shown nothing at all. Only on a non-zero exit, and only
+        # when the agent produced no answer of its own, so an error can never displace a real
+        # reply or become a commit summary.
+        if exit_code != 0 and not final_response.strip() and error:
+            final_response = error
 
         return AgentResult(
             backend=self.name,
@@ -174,7 +197,7 @@ class CodexBackend:
 
     def _read_events(
         self, output: IO[str] | None, *, stream_console: bool = True
-    ) -> tuple[str, str | None, TokenUsage]:
+    ) -> tuple[str, str | None, TokenUsage, str]:
         """Consume ``codex exec --json``'s JSONL event stream.
 
         Only the LAST ``agent_message`` is the answer: Codex narrates its work in earlier
@@ -182,11 +205,17 @@ class CodexBackend:
         the narration into the commit summary. Non-JSON lines (Codex prints a plain
         "Reading additional input from stdin..." banner and any panic text) are ignored rather
         than parsed, so a diagnostic line can't become the final response.
+
+        Returns ``(final_response, session_id, tokens, error)``. The error is reported SEPARATELY
+        from the response so the caller decides whether it is worth surfacing — it never silently
+        becomes the agent's answer.
         """
         if output is None:
-            return "", None, TokenUsage()
+            return "", None, TokenUsage(), ""
 
         messages: list[str] = []
+        errors: list[str] = []
+        diagnostics: list[str] = []
         session_id: str | None = None
         tokens = TokenUsage()
         for line in output:
@@ -194,6 +223,16 @@ class CodexBackend:
             if not line:
                 continue
             if not line.startswith("{"):
+                # Some failures never reach the event stream at all: a resume whose rollout file
+                # was deleted or moved dies with a PLAIN line ("Error: thread/resume ... file does
+                # not exist"), leaving zero JSON events. Dropping those left the user with a bare
+                # exit code and no way to tell a missing session from a network failure. The
+                # start-up banner is the one line that is not a diagnostic. Bounded, because a
+                # panicking backend could print without limit and this text ends up in a message
+                # shown to the user.
+                if line != _STDIN_BANNER:
+                    diagnostics.append(line)
+                    del diagnostics[:-_MAX_DIAGNOSTIC_LINES]
                 if self.verbose:
                     print(line)
                 continue
@@ -213,6 +252,14 @@ class CodexBackend:
                 tokens.add(self._usage(event.get("usage")))
                 continue
             if kind in ("turn.failed", "error"):
+                # Codex reports WHY a run died only here — "The 'gpt-x' model is not supported
+                # when using Codex with a ChatGPT account", a 429, an auth failure. These events
+                # used to be dropped, so a failed turn came back with an empty response and the
+                # user was told nothing at all (the caller can only report an exit code). Kept
+                # separate from `messages` so an error can never be mistaken for the answer.
+                detail = _error_text(event)
+                if detail:
+                    errors.append(detail)
                 if self.verbose:
                     print(line)
                 continue
@@ -231,7 +278,12 @@ class CodexBackend:
                 command = item.get("command")
                 if isinstance(command, str) and command:
                     print(f"[{command}]")
-        return (messages[-1] if messages else ""), session_id, tokens
+        # A structured error beats a printed line: the events carry the provider's own message,
+        # the plain lines are the last resort for a failure that produced no events at all. Those
+        # are kept WHOLE rather than last-line-only — a config parse error is a five-line block
+        # whose last line is the caret ("|      ^"), useless on its own.
+        reason = errors[-1] if errors else "\n".join(diagnostics)
+        return (messages[-1] if messages else ""), session_id, tokens, reason.strip()
 
     def _usage(self, usage: object) -> TokenUsage:
         """A ``turn.completed`` usage block in aGiTrack's token categories.
@@ -263,6 +315,56 @@ class CodexBackend:
 
 def _int(value: object) -> int:
     return value if isinstance(value, int) else 0
+
+
+def _error_text(event: dict) -> str:
+    """The human-readable reason out of a Codex ``error`` / ``turn.failed`` event.
+
+    The two shapes differ (``{"type":"error","message":…}`` vs
+    ``{"type":"turn.failed","error":{"message":…}}``), and the message is frequently a JSON
+    document rather than prose — the API's own error body, re-encoded as a string. Unwrapping it
+    to ``error.message`` turns an unreadable
+    ``{"type":"error","status":400,"error":{...,"message":"The 'x' model is not supported…"}}``
+    into the one sentence that tells the user what to change.
+    """
+    raw = event.get("message")
+    if not isinstance(raw, str) or not raw.strip():
+        nested = event.get("error")
+        raw = nested.get("message") if isinstance(nested, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            decoded = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return text
+        for candidate in (decoded.get("error") if isinstance(decoded, dict) else None, decoded):
+            if isinstance(candidate, dict):
+                message = candidate.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+    return text
+
+
+def _pinned_model(backend_args: list[str]) -> str | None:
+    """The model the user's passthrough arguments choose, or None if they choose none.
+
+    aGiTrack has no ``--model`` flag of its own, so ``agitrack --backend codex --model X`` is
+    the documented way to pick one: the unrecognised flag is forwarded verbatim (#32). But
+    aGiTrack also REMEMBERS the model a session ran under and re-pins it with ``-m`` on every
+    later turn — and Codex's clap parser rejects a repeated option outright ("the argument
+    '--model <MODEL>' cannot be used multiple times", exit 2). The result was that the first
+    turn of a session worked and every turn after it silently did nothing. When the user has
+    pinned a model, theirs wins, aGiTrack adds none — and the commit records THEIRS, since that
+    is the model the turn actually ran under.
+    """
+    for index, arg in enumerate(backend_args):
+        if arg in ("-m", "--model") and index + 1 < len(backend_args):
+            return backend_args[index + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1] or None
+    return None
 
 
 def _write_instructions(system_prompt: str) -> Path | None:

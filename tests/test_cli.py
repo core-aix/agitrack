@@ -1352,7 +1352,7 @@ def test_prompt_flag_implies_json_mode_and_passes_prompts(monkeypatch):
             captured.update(kw)
 
         def run(self):
-            return None
+            return 0  # the real shell returns a process exit code, which main() propagates
 
     monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     monkeypatch.setattr(
@@ -1385,7 +1385,7 @@ def test_prompt_flag_never_blocks_on_input_even_with_a_tty(monkeypatch):
             captured.update(kw)
 
         def run(self):
-            return None
+            return 0  # the real shell returns a process exit code, which main() propagates
 
     monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     _stub_repo_and_free_lock(monkeypatch)
