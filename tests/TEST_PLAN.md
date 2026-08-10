@@ -76,10 +76,10 @@ aGiTrack ships two backends. The suite tests one.
   (`test_manual_commits.py:387,432,940`; `test_background.py:260,304,1300`).
 - `ProxyRunner.for_testing()` seeds `state_data["backend"] = "claude"` (`runner.py:1524`). Every one of
   those 263 `make_runner()` tests therefore runs on Claude, silently.
-- **Zero** tests invoke a real `claude` or `opencode` binary. The only `shutil.which`-gated tests are
+- **Zero** tests invoke a real `claude`, `codex` or `opencode` binary. The only `shutil.which`-gated tests are
   for `node`, `sandbox-exec` and `bwrap`.
 
-That contradicts the project's own standing rule (*"every feature must work on Claude AND OpenCode,
+That contradicts the project's own standing rule (*"every feature must work on Claude AND Codex AND OpenCode,
 verified by actually invoking each backend"*) — the rule exists but nothing enforces it.
 
 ### 2a. The concrete bug this hides — OpenCode turn-end detection

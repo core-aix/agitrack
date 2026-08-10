@@ -43,7 +43,7 @@ uv run mypy | uv run mypy-baseline sync
 
 ## What a good change looks like
 
-**Both backends, really.** Every feature must work identically on Claude Code and OpenCode, and
+**All backends, really.** Every feature must work identically on Claude Code, Codex and OpenCode, and
 "identically" means you ran it on both, not that the mocked unit tests pass. Their transcript
 shapes, session ids, resume semantics and summary behaviour all differ, and the differences are
 where the bugs are.
@@ -77,7 +77,7 @@ same commit. Likewise `docs/user-flow.md` when the interactive flow changes.
 | Path | What lives there |
 | --- | --- |
 | `agitrack/proxy/` | The interactive TUI: the reactor, the terminal/ConPTY layer, the commit pipeline |
-| `agitrack/backends/` | Claude and OpenCode, behind one interface |
+| `agitrack/backends/` | Claude, Codex and OpenCode, behind one interface |
 | `agitrack/transcripts/` | Reading each backend's session files into turns and file edits |
 | `agitrack/commits/` | Commit messages, the interaction trace, manual/latent commit modes |
 | `agitrack/metrics/` | The dashboard, the learn page, the storyline, the backtrace, the static export |
@@ -98,7 +98,7 @@ goes THERE, and `tests/test_web_ui.py` is the contract that keeps them from drif
 3. Keep the change and its tests and its docs in one coherent set of commits.
 4. Run `make check`.
 5. Open the PR against `dev` and say what you verified by hand, on which backends and which
-   platforms. "Tested on Claude and OpenCode, macOS" is a useful sentence; its absence is a
+   platforms. "Tested on Claude, Codex and OpenCode, macOS" is a useful sentence; its absence is a
    question the reviewer has to ask.
 
 ## Reporting a bug

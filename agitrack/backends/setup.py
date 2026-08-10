@@ -19,6 +19,12 @@ _BACKEND_INSTALL = {
         "unix": "curl -fsSL https://claude.ai/install.sh | bash",
         "npm": "@anthropic-ai/claude-code",
     },
+    "codex": {
+        "label": "Codex CLI",
+        "url": "https://developers.openai.com/codex/cli",
+        "unix": "curl -fsSL https://chatgpt.com/backend-api/codex/install | bash",
+        "npm": "@openai/codex",
+    },
     "opencode": {
         "label": "OpenCode",
         "url": "https://opencode.ai",
@@ -151,8 +157,9 @@ def _candidate_bin_dirs(npm: str | None, run: Callable[..., subprocess.Completed
                 dirs.append(os.path.join(base, "nodejs"))
     else:
         dirs += [
-            os.path.join(home, ".local", "bin"),  # claude's official installer target
+            os.path.join(home, ".local", "bin"),  # claude's AND codex's official installer target
             os.path.join(home, ".opencode", "bin"),  # opencode's installer target
+            os.path.join(home, ".codex", "bin"),  # codex's standalone package tree
             os.path.join(home, "bin"),
             "/usr/local/bin",
             "/opt/homebrew/bin",
@@ -288,7 +295,7 @@ def _explain_default_backend_switching(default: str, *, output_fn: Callable[[str
     a single run, or persistently for this repo or globally via the in-app settings menu."""
     output_fn(f"\nDefault coding agent set to {default}.")
     output_fn("You can change it later:")
-    output_fn("  - for a single run:           agitrack --backend <claude|opencode>")
+    output_fn("  - for a single run:           agitrack --backend <" + "|".join(available_backends()) + ">")
     output_fn("  - for this repo or globally:  open the aGiTrack menu (Ctrl-G by default) -> Settings ->")
     output_fn('                                "Default coding agent", choosing repo or global scope when saving.')
 

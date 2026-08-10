@@ -95,7 +95,7 @@ def discover_local_sessions(directory: Path) -> list[SessionCandidate]:
     is kept ONCE, at its largest — the most complete copy — matching how the backtrace
     reconstructs the same sessions.
     """
-    from agitrack.transcripts import claude, opencode
+    from agitrack.transcripts import claude, codex, opencode
 
     state = AgitrackState(directory)
     candidates: dict[str, SessionCandidate] = {}
@@ -126,6 +126,28 @@ def discover_local_sessions(directory: Path) -> list[SessionCandidate]:
             )
     except Exception:
         pass  # one backend's discovery failing must never block the other
+
+    try:
+        # `rollout` (not `path`): the Claude loop above binds `path` as a Path, and codex's
+        # sessions_under yields the rollout location as a str — reusing the name is a type clash.
+        for ref, rollout in codex.sessions_under(directory):
+            if ref.id in candidates:
+                continue
+            try:
+                raw = Path(rollout).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not raw.strip():
+                continue
+            candidates[ref.id] = SessionCandidate(
+                backend="codex",
+                session_id=ref.id,
+                name=_session_name(state, ref),
+                updated=float(getattr(ref, "updated", 0.0) or 0.0),
+                raw=raw,
+            )
+    except Exception:
+        pass  # one backend's discovery failing must never block the others
 
     try:
         for ref, sdir in opencode.sessions_under(directory):
@@ -265,10 +287,18 @@ def _redact_and_cap(candidate: SessionCandidate, max_bytes: int) -> str:
     OpenCode's export), and each module knows how to drop whole middle turns while leaving a
     resumable recent tail.
     """
-    from agitrack.transcripts import claude, opencode
+    from agitrack.transcripts import claude, codex, opencode
 
     redacted = redact_transcript(candidate.raw)
-    cap = claude.cap_shared_transcript if candidate.backend == "claude" else opencode.cap_shared_transcript
+    # Keyed by name rather than a two-way ternary: with three backends the ternary silently
+    # handed Codex's JSONL to OpenCode's single-JSON-object capper, which would have truncated
+    # every shared Codex session to nothing.
+    cappers = {
+        "claude": claude.cap_shared_transcript,
+        "codex": codex.cap_shared_transcript,
+        "opencode": opencode.cap_shared_transcript,
+    }
+    cap = cappers.get(candidate.backend, claude.cap_shared_transcript)
     try:
         return cap(redacted, max_bytes)
     except Exception:

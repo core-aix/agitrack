@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agitrack.backends.base import AgentBackend
+from agitrack.backends.proxy_agents import available_backends
 from agitrack.env import getenv_compat
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat
@@ -185,14 +186,12 @@ class LearningBackendChoice:
     model_source: str
 
     def build(self) -> AgentBackend:
-        from agitrack.backends.claude import ClaudeBackend
-        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.backends import backend_class
         from agitrack.config.settings import GlobalConfig
 
         config = GlobalConfig()
         launch = config.backend_command(self.backend_name)
-        backend_class = OpenCodeBackend if self.backend_name == "opencode" else ClaudeBackend
-        return backend_class(learning_scratch_dir(), launch_command=launch)
+        return backend_class(self.backend_name)(learning_scratch_dir(), launch_command=launch)
 
 
 def resolve_learning_backend(repo_root: Path) -> LearningBackendChoice:
@@ -212,7 +211,7 @@ def resolve_learning_backend(repo_root: Path) -> LearningBackendChoice:
     config.load_repo_overlay(repo_root)
     state = AgitrackState(repo_root)
 
-    known = {"claude", "opencode"}
+    known = set(available_backends())
     backend_name, backend_source = config.learning_backend, "config"
     if backend_name not in known:
         backend_name, backend_source = state.data.get("backend"), "session"
@@ -928,7 +927,7 @@ def model_options(backend_name: str) -> dict[str, Any]:
     """Models the learn page's engine picker can offer for ``backend_name`` (queried from
     the backend CLI, same as the summarizer's model menu). Empty when unqueryable; the
     picker then falls back to "auto"."""
-    if backend_name not in {"claude", "opencode"}:
+    if backend_name not in available_backends():
         return {"backend": backend_name, "models": []}
     from agitrack.summaries.model_select import list_available_models
 
@@ -941,7 +940,7 @@ def set_learning_config(repo_root: Path, *, backend: str, model: str) -> dict[st
     user can set by hand, so the page and the config file are two views of one setting.
     Empty values unset the key (back to "auto": the latest session's backend/model)."""
     backend, model = backend.strip(), model.strip()
-    if backend not in {"", "claude", "opencode"}:
+    if backend and backend not in available_backends():
         return {"error": f"Unknown backend '{backend}'."}
     from agitrack.config.settings import GlobalConfig
 
@@ -1788,6 +1787,7 @@ __BACKTRACE_BANNER__
         <select id="e-backend">
           <option value="">auto (latest session)</option>
           <option value="claude">claude</option>
+          <option value="codex">codex</option>
           <option value="opencode">opencode</option>
         </select>
         <label style="min-width:auto">model</label>

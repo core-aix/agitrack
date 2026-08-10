@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - only when the proxy platform layer is 
 
 _BACKEND_COMMANDS = {
     "claude": "claude",
+    "codex": "codex",
     "opencode": "opencode",
 }
 
@@ -955,7 +956,7 @@ def main(argv: list[str] | None = None) -> int:
     if not effective_backend:
         print(
             "No coding agent backend is configured. Run aGiTrack in an interactive "
-            "terminal to choose a default, or pass --backend <claude|opencode>."
+            "terminal to choose a default, or pass --backend <" + "|".join(available_backends()) + ">."
         )
         return 1
     # Resolve the backend launch wrapper (--backend-command, else config) for the backend
@@ -1120,6 +1121,11 @@ def main(argv: list[str] | None = None) -> int:
 # silently swallows the user's intent.
 _RESERVED_PASSTHROUGH = {
     "claude": {"--session-id", "--resume", "-r", "--continue", "-c"},
+    # codex resumes via a `resume <id>` SUBCOMMAND rather than a flag, so the reserved
+    # entries are the subcommand plus the flags aGiTrack sets on the launch line: `-C`
+    # (working root) and `-c` (config override, which `--backend-args` could otherwise
+    # use to re-pin the model or sandbox aGiTrack just chose).
+    "codex": {"resume", "-C", "--cd", "-c", "--config", "--last"},
     "opencode": {"--session", "-s", "--continue", "-c"},
 }
 

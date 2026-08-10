@@ -32,8 +32,11 @@ from agitrack.git.worktree import WorktreeManager
 from agitrack.proxy.session import Session
 from agitrack.transcripts.types import SessionRef
 from proxy_helpers import make_runner
+from agitrack.backends.proxy_agents import available_backends
 
-BACKENDS = ["claude", "opencode"]
+# Every registered backend, so a newly added one is covered the moment it is registered
+# (the pattern test_backend_parity.py already uses).
+BACKENDS = available_backends()
 
 SWITCHED = [
     SessionRef(id="old-session", updated=100.0, label="old"),

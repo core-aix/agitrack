@@ -13,7 +13,7 @@ That's it — a session opens in a VSCode terminal.
 
 This extension is a thin **launcher**: it runs the real aGiTrack CLI in a VSCode
 integrated terminal, so you get the **complete aGiTrack experience** — the coding
-agent's native interface (Claude Code / OpenCode), the `Ctrl-G` command menu, sessions,
+agent's native interface (Claude Code / Codex / OpenCode), the `Ctrl-G` command menu, sessions,
 sharing, worktrees, and auto-commits with full provenance on every turn. Everything
 aGiTrack does in a terminal, started from VSCode.
 
@@ -21,7 +21,7 @@ aGiTrack does in a terminal, started from VSCode.
 
 - **Python 3.10+** to install the aGiTrack CLI via pipx/pip — **or**, on Windows, nothing
   at all: the extension can install the self-contained MSI (which bundles its own Python).
-- A backend installed (Claude Code or OpenCode), the same as using aGiTrack in a terminal.
+- A backend installed (Claude Code, Codex or OpenCode), the same as using aGiTrack in a terminal.
 - The workspace is a git repository.
 
 The aGiTrack CLI itself does **not** need to be installed first — if it's missing, the
@@ -80,7 +80,7 @@ opens on **your** machine; over plain SSH, forward it yourself (e.g.
 | Setting | Default | Description |
 | --- | --- | --- |
 | `agitrack.path` | `agitrack` | Path to the aGiTrack executable. |
-| `agitrack.backend` | (aGiTrack default) | `claude` or `opencode`. |
+| `agitrack.backend` | (aGiTrack default) | `claude`, `codex` or `opencode`. |
 | `agitrack.args` | `[]` | Extra CLI arguments (e.g. `["--no-worktree"]`). |
 | `agitrack.openOnStartup` | `false` | Start a session automatically when a workspace opens. |
 | `agitrack.terminalLocation` | `beside` | Where the terminal opens: `beside` (right of the editor), `editor` (new editor tab), or `panel` (bottom). |

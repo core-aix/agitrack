@@ -172,6 +172,17 @@ def _transcript_is_readable(text: str, backend: str | None) -> bool:
             from agitrack.transcripts.opencode import parse_exported_session
 
             return bool(parse_exported_session(json.loads(text)).turns)
+        if backend == "codex":
+            # Codex's rollout is JSONL, but its rows carry no ``uuid`` — the per-row id
+            # ``_row_id`` needs — so it does NOT line-union merge; ``merge_transcripts`` takes its
+            # documented last-write-wins fallback, as it does for OpenCode. Keying on the raw line
+            # instead was considered and rejected: a redacted shared copy and a raw local copy
+            # differ textually row for row, so every row would read as new and the "merge" would
+            # emit the conversation twice — worse than one side winning. The parser still takes
+            # the raw text (it skips damaged lines itself) so the readability guard applies.
+            from agitrack.transcripts.codex import parse_exported_session as parse_codex
+
+            return bool(parse_codex(text).turns)
     except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
         return False
     return True

@@ -197,7 +197,7 @@ session in the background — the interactive-UI-agnostic tracker of
 [issue #143](https://github.com/core-aix/agitrack/issues/143). Especially handy if you'd rather stay
 in a GUI than a terminal. aGiTrack does **not** launch or relay the agent; it watches the agent's
 on-disk session transcript for the repo (**only** this repo's — Claude by its cwd-encoded transcript
-dir, OpenCode by each session's recorded directory), records each completed turn, summarizes it, and
+dir, Codex and OpenCode by each session's recorded directory), records each completed turn, summarizes it, and
 installs the fold hooks. It **always runs without a worktree** (implies `--no-worktree`), with either
 commit style (auto — default — or `--manual-commits`).
 
@@ -460,7 +460,7 @@ flowchart TD
   snew --> mode3["See Worktrees vs no-worktree"]
   sswitch --> scopy["See After the turn: copy worktree-only files"]
 
-  backend -->|No arg, picker| bpick[/"Pick claude or opencode"/]
+  backend -->|No arg, picker| bpick[/"Pick claude, codex or opencode"/]
   bpick --> bswitch[["Save current backend's session, relaunch target backend, restore its last session, update global default"]]
 
   summ --> smm[/"Summarizer menu: Toggle (ON/OFF) / Set model"/]
@@ -568,7 +568,7 @@ flowchart TD
 > (the apply + restart finish) — closing the terminal or quitting VS Code mid-upgrade can no
 > longer strand the package half-removed.
 
-> Distinct from the **backend agent** (Claude / OpenCode) updating itself: that runs
+> Distinct from the **backend agent** (Claude / Codex / OpenCode) updating itself: that runs
 > inside the agent TUI, and the sandbox is built to keep the agent's own install dirs
 > writable so it always works. See `agitrack/proxy/sandbox.py`.
 
@@ -757,7 +757,7 @@ what my past coding-agent sessions did here."
 
 ```mermaid
 flowchart TD
-  bt["agitrack --backtrace [text|html|stop|status|commit]"] --> disc[["Discover every Claude/OpenCode session whose recorded cwd is this directory (or a subdirectory)"]]
+  bt["agitrack --backtrace [text|html|stop|status|commit]"] --> disc[["Discover every Claude/Codex/OpenCode session whose recorded cwd is this directory (or a subdirectory)"]]
   disc --> exp[["Export each session; recover every turn's file edits from the tool calls (Edit/Write/MultiEdit)"]]
   exp --> map[["Map each turn → a virtual commit: model, tokens, timings, per-file diff, and the user↔agent trace (final response only, exactly as a real aGiTrack commit)"]]
   map --> mode{mode}

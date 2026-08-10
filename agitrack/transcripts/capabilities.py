@@ -73,7 +73,11 @@ def split_mcp_names(names, *, servers=()) -> tuple[list[str], list[str]]:
         if parsed is None:
             # Longest server name first, so a "lore" and a "lore_extra" server can coexist.
             for server in known:
-                for separator in ("_", "."):
+                # Longest SEPARATOR first for the same reason: Codex namespaces an MCP tool
+                # ``<server>__<tool>`` (a double underscore, like Claude but with no ``mcp__``
+                # prefix to key off). Trying "_" first consumed one underscore and left the
+                # tool named "_lucky_number".
+                for separator in ("__", "_", "."):
                     prefix = server + separator
                     if text.startswith(prefix) and len(text) > len(prefix):
                         parsed = (server, text[len(prefix) :])

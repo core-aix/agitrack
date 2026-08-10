@@ -15,10 +15,10 @@ class GitError(RuntimeError):
 
 
 # Machine-managed scaffolding directories aGiTrack must never surface as untracked changes to
-# stage: its own state (.agitrack) and the backends' local config/state (.claude, .opencode).
-# These belong to the tooling, not the user's source, so they must never appear in the
-# "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
-_NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".opencode/")
+# stage: its own state (.agitrack) and the backends' local config/state (.claude, .codex,
+# .opencode). These belong to the tooling, not the user's source, so they must never appear in
+# the "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
+_NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".codex/", ".opencode/")
 
 
 def _is_scaffolding(path: str) -> bool:

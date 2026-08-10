@@ -144,7 +144,7 @@ because it is trusted.
 | Both hooks install and remove together; a project's own hook is chained, receives its stdin, can still veto, and survives removal | `test_both_hooks_are_installed_and_removed_together`, `test_an_existing_project_reference_transaction_hook_is_chained_not_destroyed`, `test_a_chained_project_hook_still_runs_and_receives_its_stdin`, `test_a_chained_hook_can_still_veto`, `test_installing_twice_does_not_clobber_the_backup`, `test_removal_leaves_a_foreign_hook_untouched` | real-git |
 | Neither hook names git's bypass flag (the refusal is only ever shown to the agent) | `test_the_guard_never_names_gits_bypass_flag` | mock |
 
-## 6c. Repos that TRACK the agent scaffolding dirs (`.claude/`, `.opencode/`, `.agitrack/`)
+## 6c. Repos that TRACK the agent scaffolding dirs (`.claude/`, `.codex/`, `.opencode/`, `.agitrack/`)
 Committing `.claude/settings.json` or a `.claude/commands/` dir is ordinary practice — a team
 shares its agent setup like an editorconfig. But every "has the working tree changed?" question
 in manual / no-worktree / background mode is a comparison between `snapshot_worktree_tree()` and
@@ -317,9 +317,10 @@ correct and only the order or the wiring is wrong. The recorded precedent is a f
 
 ## 11c. Backend parity (`tests/test_backend_parity.py`, `tests/test_turn_end_detection.py`)
 Structural checks that every registered backend implements the same contract, so "works on Claude"
-can no longer silently mean "does nothing on OpenCode". The runner reaches most backend methods via
+can no longer silently mean "does nothing on Codex or OpenCode". The runner reaches most backend methods via
 `getattr(..., None)`, which turns a missing one into a SILENT degradation. Parameterized over
-`available_backends()`, so a third backend is covered the moment it is registered.
+`available_backends()`, so a new backend is covered the moment it is registered — which is exactly how
+Codex arrived with no edit to this file's parity rows.
 
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -329,17 +330,23 @@ can no longer silently mean "does nothing on OpenCode". The runner reaches most 
 | Liveness lookups answer None (never raise) for an empty/unknown session — they are polled from the reactor | `test_liveness_signals_are_safe_on_an_unknown_session` | mock |
 | Unknown backend name raises rather than substituting one | `test_unknown_backend_raises_rather_than_substituting_one` | mock |
 | Spawn command starts with the backend binary and honours a launch wrapper | `test_spawn_command_starts_with_the_backend_binary`, `test_spawn_command_honours_a_launch_wrapper` | mock |
-| **Turn end: a quiet sub-agent must not read as the turn ending** (else a half-finished turn is committed) — both backends | `test_a_quiet_subagent_does_not_read_as_the_turn_ending` | mock |
-| **Turn end: a chattering idle heartbeat must not prevent it** (else NOTHING is ever committed) — both backends | `test_a_chattering_idle_heartbeat_does_not_prevent_the_turn_from_ending` | mock |
+| **Turn end: a quiet sub-agent must not read as the turn ending** (else a half-finished turn is committed) — every backend | `test_a_quiet_subagent_does_not_read_as_the_turn_ending` | mock |
+| **Turn end: a chattering idle heartbeat must not prevent it** (else NOTHING is ever committed) — every backend | `test_a_chattering_idle_heartbeat_does_not_prevent_the_turn_from_ending` | mock |
 | OpenCode's signal is session-scoped, read-only, and degrades to None on any store problem | `test_opencode_reports_activity_from_its_session_store`, `test_opencode_activity_is_none_when_the_store_is_unusable`, `test_opencode_never_writes_to_the_users_database` | mock |
 | OpenCode's model comes from its session store (its event stream names none) | `test_opencode_resolves_the_model_from_its_session_store`, `test_opencode_model_lookup_tolerates_an_unexpected_store_shape` | mock |
+| Codex: the interactive TUI's record shape (role messages, not the `exec` events) yields the prompt, reply and edits | `test_a_tui_turn_recovers_the_prompt_from_role_messages`, `test_the_tui_records_file_edits_as_item_completed_filechange` | mock |
+| Codex: harness context blocks injected as `role: user` are not the user's prompt | `test_concatenated_context_blocks_are_not_the_users_prompt`, `test_prose_that_merely_contains_a_tag_is_still_a_prompt` | mock |
+| Codex: cached input and reasoning are split out of the totals they are nested inside | `test_usage_splits_cached_input_and_reasoning_out_of_their_totals`, `test_a_turn_sums_its_token_counts_and_keeps_the_last_context` | mock |
+| Codex: a spawned sub-agent's own thread is counted but never listed as a resumable session | `test_a_spawned_subagent_is_recorded_and_its_tokens_folded_in`, `test_a_subagent_thread_is_never_listed_as_a_resumable_session` | mock |
+| Codex: worktree trust is propagated only from an already-trusted base repo | `test_trust_is_only_propagated_from_an_already_trusted_base_repo` | mock |
 
 ## 11d. Live backend smoke (`tests/test_live_backends.py`, `-m live`)
 The only tests that call the REAL backend CLIs, and therefore the only ones that can catch a CLI
 changing its output format under us — mocks assert the shape we believed was true when we wrote
 them. Excluded from the default run and from CI (they need the backend installed and
 authenticated and cost real tokens); each skips itself when its binary is absent. Run `pytest -m
-live`. They found OpenCode reporting no model on the very first run.
+live`. They found OpenCode reporting no model on the very first run, and cover Claude, Codex and
+OpenCode (each pinned to its cheapest model tier so a smoke test never bills a frontier model).
 
 | Sequence | Test(s) | Kind |
 |---|---|---|

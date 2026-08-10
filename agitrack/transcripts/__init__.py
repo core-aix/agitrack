@@ -1,6 +1,6 @@
 """Backend session transcript parsing and the shared turn/session types.
-``claude`` and ``opencode`` are the per-backend parsers; ``types`` holds the
-backend-agnostic dataclasses they produce."""
+``claude``, ``codex`` and ``opencode`` are the per-backend parsers; ``types``
+holds the backend-agnostic dataclasses they produce."""
 
 from agitrack.transcripts.types import (
     ExportedSession,

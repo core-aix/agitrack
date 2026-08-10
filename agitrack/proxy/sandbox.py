@@ -112,7 +112,7 @@ def is_available() -> bool:
 # The coding-agent CLIs aGiTrack drives. Their self-update writes land under a small
 # set of well-known per-user trees, plus wherever the executable itself resolves
 # (covers npm-global / Homebrew / custom prefixes the static list can't predict).
-_BACKEND_EXES = ("claude", "opencode")
+_BACKEND_EXES = ("claude", "codex", "opencode")
 
 
 def _xdg_dir(var: str, *default: str) -> str:
@@ -126,7 +126,7 @@ def agent_writable_dirs() -> list[str]:
     Returned paths are realpath-resolved (so a symlinked ``~/.claude`` matches the
     real path the kernel checks writes against) and de-duplicated. The sandbox keeps
     these writable so a backend self-update is never blocked by worktree confinement.
-    Covers Claude Code and OpenCode across native, npm-global, and Homebrew installs:
+    Covers Claude Code, Codex and OpenCode across native, npm-global, and Homebrew installs:
     the static XDG/HOME roots they use, plus the resolved location of each CLI on PATH.
     """
     home = os.path.expanduser("~")
@@ -139,6 +139,10 @@ def agent_writable_dirs() -> list[str]:
         os.path.join(home, ".local", "bin"),  # native launcher symlink (claude)
         os.path.join(home, ".claude"),  # claude config + ~/.claude/downloads staging
         os.path.join(home, ".opencode"),  # opencode install root (bin + node_modules)
+        # codex keeps BOTH its config and its versioned standalone install here
+        # (~/.codex/packages/standalone/releases/<version>/), so `codex update` writes
+        # under this root; the ~/.local/bin launcher it repoints is already covered above.
+        os.path.join(home, ".codex"),
     ]
     for tool in _BACKEND_EXES:
         candidates += [os.path.join(root, tool) for root in (data, state, config, cache)]
@@ -268,6 +272,22 @@ def build_bwrap_command(base: str, worktree: str, allowed_paths: list[str] | Non
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
+
+
+def will_confine(*, base: str, worktree: str) -> bool:
+    """Whether :func:`wrap_command` will actually confine a command for this base/worktree pair.
+
+    Callers need to know this BEFORE building the command, because confinement changes what the
+    command itself should say: a backend that runs its own OS sandbox (Codex's seatbelt) has to
+    be told to stand down, since sandboxes don't nest — see
+    ``ProxyRunner._relax_nested_backend_sandbox``. Asking after the fact means comparing command
+    lists, which is exactly the kind of check that breaks the moment a wrapper changes shape.
+    """
+    if not is_enabled():
+        return False
+    if os.path.realpath(worktree) == os.path.realpath(base):
+        return False  # legacy in-place session: nothing to isolate
+    return _have_sandbox_exec() or _have_bwrap()
 
 
 def wrap_command(command: list[str], *, base: str, worktree: str, allowed_paths: list[str] | None = None) -> list[str]:
