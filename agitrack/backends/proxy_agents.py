@@ -125,6 +125,13 @@ class ProxyAgent(Protocol):
     """
 
     name: str
+    # How this backend is written in prose the user reads ("Claude Code", not "claude").
+    # Registered here so a sentence naming the backends can be BUILT from the registry
+    # instead of hand-written: every hardcoded "Claude or OpenCode" in a user-facing string
+    # silently became a lie the day Codex landed, and one of them ("Backtrace reconstructs
+    # past Claude or OpenCode sessions...") was still telling Codex users their own sessions
+    # were unsupported. See `backend_phrase`.
+    label: str
     # Whether this backend has a portable transcript that can be shared and
     # resumed across machines (issue #55). Both Claude (per-session .jsonl) and
     # OpenCode (export/import CLI) do.
@@ -281,6 +288,7 @@ class ProxyAgent(Protocol):
 
 class OpenCodeProxyAgent:
     name = "opencode"
+    label = "OpenCode"
     # OpenCode's `export`/`import` CLI serialises a whole session to JSON (id
     # preserved, directory retargeted to the import cwd), so its sessions are
     # portable and shareable like Claude's (issue #55).
@@ -389,6 +397,7 @@ class OpenCodeProxyAgent:
 
 class ClaudeProxyAgent:
     name = "claude"
+    label = "Claude Code"
     supports_session_sharing = True
 
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
@@ -499,6 +508,7 @@ class ClaudeProxyAgent:
 
 class CodexProxyAgent:
     name = "codex"
+    label = "Codex"
     # Codex keeps one append-only rollout JSONL per conversation, so a session is portable and
     # shareable across machines exactly like Claude's per-session transcript (issue #55).
     supports_session_sharing = True
@@ -617,6 +627,21 @@ _AGENTS: dict[str, type] = {
 
 def available_backends() -> list[str]:
     return sorted(_AGENTS)
+
+
+def backend_phrase(conjunction: str = "or") -> str:
+    """The supported backends written for a human: ``"Claude Code, Codex or OpenCode"``.
+
+    For prose in help text, prompts and error messages. Hand-written lists of backend names
+    are a maintenance trap — they read as authoritative, nothing fails when one goes stale,
+    and a user of the missing backend is actively told their sessions are unsupported.
+    """
+    # getattr, not `.label`: the registry is `dict[str, type]` (not `type[ProxyAgent]`) because
+    # mypy refuses to instantiate a Protocol type, so the class objects carry no declared attrs.
+    labels = [str(getattr(_AGENTS[name], "label")) for name in available_backends()]
+    if len(labels) == 1:
+        return labels[0]
+    return f"{', '.join(labels[:-1])} {conjunction} {labels[-1]}"
 
 
 def make_proxy_agent(name: str) -> ProxyAgent:

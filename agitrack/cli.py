@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
-from agitrack.backends.proxy_agents import available_backends
+from agitrack.backends.proxy_agents import available_backends, backend_phrase
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.proc import console_isolation_kwargs
 from agitrack.config import GlobalConfig, settings
@@ -214,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["text", "html", "stop", "status", "commit"],
         default=None,
         help="reconstruct how PAST coding-agent conversations changed THIS directory, from local "
-        "Claude/OpenCode transcripts alone — even if you have never used aGiTrack here, and even if "
+        f"{backend_phrase()} transcripts alone — even if you have never used aGiTrack here, and even if "
         "the directory is not a git repo. It reads the sessions that ran in this directory (or a "
         "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
         "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
@@ -1083,7 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
-            # Nothing tracked here yet, but their own Claude/OpenCode transcripts hold history
+            # Nothing tracked here yet, but their own agent transcripts hold history
             # aGiTrack can reconstruct — say so while there is still a shell to run it from.
             _offer_backtrace_for_untracked_repo(repo, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support

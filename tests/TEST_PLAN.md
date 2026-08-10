@@ -165,9 +165,9 @@ them up. Delete them.
 
 # Current status (2026-08-03) — plan complete
 
-**`2801 passed, 10 skipped`. Ruff, ruff format and mypy clean. Coverage 81.45% against a 78%
-floor. ~1m40s under `-n auto`, down from 6m12s. Three consecutive full parallel runs green,
-plus 6 live tests against the real Claude and OpenCode CLIs.**
+**`3222 passed, 10 skipped`. Ruff, ruff format and mypy clean. Coverage 81.65% against a 78%
+floor. ~2m10s under `-n auto`, down from 6m12s. Three consecutive full parallel runs green,
+plus 9 live tests against the real Claude Code, Codex and OpenCode CLIs.**
 
 Every item in the plan below is now implemented. The five that were still outstanding at the
 first pass — and were found by re-auditing rather than by remembering — are done:

@@ -267,7 +267,7 @@ class SharedSessionStore:
 
     def _would_regress(self, gid: str, nm: str, transcript: str) -> bool:
         """Whether writing ``transcript`` would REPLACE a longer shared copy with a
-        shorter one — i.e. this machine is behind. Claude/OpenCode transcripts are
+        shorter one — i.e. this machine is behind. Backend transcripts are
         append-only, so fewer rows means an older conversation. Refusing this is what
         stops a stale machine (or its auto-share, which fires on every commit) from
         rewinding everyone's shared copy to an earlier state."""

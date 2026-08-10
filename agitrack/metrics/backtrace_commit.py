@@ -126,8 +126,10 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
     # 4) Reconstruct the agent turns (with the files each changed) from local transcripts.
     turns = [t for t in _gather_turns(root) if t.files]
     if not turns:
+        from agitrack.backends.proxy_agents import backend_phrase
+
         print(
-            f"No AI-made file changes were found in local Claude/OpenCode transcripts for "
+            f"No AI-made file changes were found in local {backend_phrase()} transcripts for "
             f"{_abbreviate_home(str(root))}.\nThere is nothing to reconstruct — this command annotates "
             "commits whose changes an agent produced."
         )
