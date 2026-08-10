@@ -175,7 +175,14 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         "This REWRITES history: every commit gets a new hash, so the new branch is NOT a "
         "fast-forward of your current branch. Your current branch is left untouched."
     )
-    answer = _input(f"Create branch '{new_branch}' with the reconstructed history? [y/N] ")
+    # Guarded exactly like the branch-name prompt above: run from a script, a CI job or any
+    # pipeline (`agitrack --backtrace commit --branch x < /dev/null`) `input()` raises EOFError,
+    # which escaped as a raw traceback. No answer means NO — the safe reading for a prompt whose
+    # "yes" rewrites history.
+    try:
+        answer = _input(f"Create branch '{new_branch}' with the reconstructed history? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
     if answer.strip().lower() not in ("y", "yes"):
         print("Aborted — no changes made.")
         return 0

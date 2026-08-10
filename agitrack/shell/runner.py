@@ -77,6 +77,13 @@ class AgitrackShell:
             self.global_config.default_backend = backend
             self.state.backend_session_id = self.state.stored_backend_session(backend)
             self.state.last_backend_message_id = None
+            # A MODEL BELONGS TO ITS BACKEND. `state.model` is the model the last turn ran under;
+            # carried across a switch it made the new backend's commits claim the old backend's
+            # model ("backend: codex, model: claude-haiku-4-5-…"), which the dashboard then
+            # groups under that model. Worse, it is also what aGiTrack re-pins on the command
+            # line, so the switched-to CLI is asked to run a model id it does not have. Restore
+            # whatever this backend last ran under, or nothing — the backend reports its own.
+            self.state.model = (self.state.recall_session(backend) or {}).get("model")
         if new_session:
             self.state.backend_session_id = None
             self.state.last_backend_message_id = None
@@ -86,7 +93,13 @@ class AgitrackShell:
         self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui)
         self.management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
 
-    def run(self) -> None:
+    def run(self) -> int:
+        """Run the shell, returning a PROCESS EXIT CODE (0 = ran, 1 = could not start).
+
+        The code matters because this is the scripted entry point (`agitrack --json --prompt`):
+        a run that never started — no backend installed, another aGiTrack holding the repo —
+        exited 0 and looked to any calling script exactly like a successful turn.
+        """
         try:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=self.interactive)
         except BackendUnavailable as error:
@@ -94,7 +107,7 @@ class AgitrackShell:
             if self._bridge is not None:
                 self._bridge.emit({"type": "error", "message": str(error)})
                 self._bridge.emit({"type": "bye"})
-            return
+            return 1
         if resolved != self.state.backend:
             self.state.backend = resolved
         if not self.management_lock.acquire():
@@ -105,7 +118,7 @@ class AgitrackShell:
             if self._bridge is not None:
                 self._bridge.emit({"type": "error", "message": message})
                 self._bridge.emit({"type": "bye"})
-            return
+            return 1
         self.state.save()
         if self.verbose:
             print(f"aGiTrack session {self.state.session_id}")
@@ -115,21 +128,21 @@ class AgitrackShell:
         try:
             if self._bridge is not None:
                 self._run_bridge()
-                return
+                return 0
             if self.prompts is not None:
                 self._run_scripted(self.prompts)
-                return
+                return 0
             while True:
                 try:
                     text = self.prompt.prompt().strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
-                    return
+                    return 0
                 if not text:
                     continue
                 if text.startswith(AGITRACK_PREFIX):
                     if self._handle_command(text):
-                        return
+                        return 0
                 else:
                     self._handle_agent_prompt(text)
         finally:
@@ -370,17 +383,18 @@ class AgitrackShell:
         if result.model and result.model != self.state.model:
             self.state.model = result.model
         if result.exit_code != 0:
-            self.state.append_trace("agent", result.final_response or f"Backend exited with code {result.exit_code}")
+            failure = f"Backend exited with code {result.exit_code}"
+            message = result.final_response or failure
+            self.state.append_trace("agent", message)
             self.state.add_token_usage(result.tokens)
-            self._emit(
-                {
-                    "type": "error",
-                    "message": result.final_response or f"Backend exited with code {result.exit_code}",
-                    "exit_code": result.exit_code,
-                }
-            )
-            if self.verbose:
-                print(f"Backend exited with code {result.exit_code}; no automatic agent commit was made.")
+            self._emit({"type": "error", "message": message, "exit_code": result.exit_code})
+            # ALWAYS say something. This used to print only under --verbose, so a failed turn in
+            # the default json/scripted mode was completely invisible: the prompt echoed, nothing
+            # came back, no commit was made, and the process still exited 0. Whatever the backend
+            # said about the failure (a quota message, a rejected model id) is the useful part, so
+            # lead with it and let the exit code follow.
+            lead = "" if message == failure else f"{message}\n"
+            self._say(f"{lead}{failure}; no automatic agent commit was made.", level="warn")
             return
 
         self.state.append_trace("agent", result.final_response)

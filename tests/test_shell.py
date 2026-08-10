@@ -5,6 +5,7 @@ from pathlib import Path
 
 import agitrack.shell.runner as shell_mod
 from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.backends.setup import BackendUnavailable
 from agitrack.commits import AgitrackActions
 from agitrack.git import GitRepo
 from agitrack.git import RepoLock
@@ -185,3 +186,78 @@ def test_non_interactive_user_commit_uses_default_message(tmp_path, monkeypatch)
         ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], capture_output=True, text=True
     ).stdout
     assert log.startswith("Save user changes")
+
+
+# --- switching backends must not carry the old backend's model over ------------------------
+
+
+def test_switching_backends_drops_the_previous_backends_model(tmp_path, monkeypatch):
+    # `state.model` is the model the LAST turn ran under. Carried across a `--backend` switch it
+    # made the new backend's commits claim the old backend's model — a live run produced
+    # `backend: codex, model: claude-haiku-4-5-20251001`, and the dashboard grouped the Codex
+    # commit under a Claude model. It is also what aGiTrack re-pins on the command line, so the
+    # switched-to CLI is asked for a model id it does not have.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    state = AgitrackState(repo.repo)
+    state.backend = "claude"
+    state.model = "claude-haiku-4-5-20251001"
+
+    shell = AgitrackShell(repo, backend="codex")
+
+    assert shell.state.backend == "codex"
+    assert shell.state.model is None
+
+
+def test_switching_back_restores_the_model_that_backend_last_ran(tmp_path, monkeypatch):
+    # Dropping is the fallback, not the goal: when aGiTrack recorded what this backend last ran
+    # under, switching back must restore it rather than forget it.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    state = AgitrackState(repo.repo)
+    state.backend = "claude"
+    state.model = "claude-haiku-4-5-20251001"
+    state.remember_session("codex", session_id="019f-abc", worktree="", model="gpt-5.4-mini")
+
+    shell = AgitrackShell(repo, backend="codex")
+
+    assert shell.state.model == "gpt-5.4-mini"
+
+
+# --- exit codes: a scripted run must be able to tell "did not start" from "ran" -------------
+
+
+def test_a_missing_backend_exits_non_zero(tmp_path, monkeypatch, capsys):
+    # `agitrack --json --prompt ...` is the scripted entry point. With the backend CLI absent it
+    # printed an install hint and exited 0 — indistinguishable, to the calling script, from a
+    # turn that ran and committed.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+
+    def _unavailable(*_a, **_k):
+        raise BackendUnavailable("Backend 'codex' is not installed.")
+
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", _unavailable)
+    repo = GitRepo.init(tmp_path / "demo")
+
+    assert AgitrackShell(repo, backend="codex", prompts=["do a thing"]).run() == 1
+    assert "not installed" in capsys.readouterr().out
+
+
+def test_a_repo_already_being_tracked_exits_non_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert holder.acquire() is True
+    try:
+        assert AgitrackShell(repo, backend="claude", prompts=["do a thing"]).run() == 1
+    finally:
+        holder.release()
+
+
+def test_a_scripted_run_that_worked_exits_zero(tmp_path, monkeypatch):
+    shell, _repo = _scripted_shell(tmp_path, monkeypatch, ["write hello.py"])
+
+    assert shell.run() == 0
