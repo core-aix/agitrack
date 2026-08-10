@@ -106,10 +106,22 @@ def test_gh_check_non_interactive_does_not_prompt(monkeypatch):
     assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
 
 
-def test_gh_check_unauthenticated_continue(monkeypatch):
+def test_gh_check_unauthenticated_defaults_to_login(monkeypatch):
+    # Signing in is the recommended action, so a bare Enter runs `gh auth login`.
     _force_tty(monkeypatch, stdin=True)
     _stub_gh(monkeypatch, status="unauthenticated")
     monkeypatch.setattr("builtins.input", lambda *a: "")
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == [True]
+
+
+def test_gh_check_unauthenticated_skip_continues_without_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "s")
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: (_ for _ in ()).throw(AssertionError("skipped")))
     assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
 
 

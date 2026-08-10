@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.console import ask, progress_ticker
 from agitrack.proc import resolve_subprocess_command, which_executable
 
 # Per-backend facts used to build a single install hint that covers macOS, Linux, AND
@@ -107,25 +108,28 @@ def _install_node_with_winget(
     winget = which("winget")
     if not winget:
         return None
-    output_fn("Node.js (needed to install the agent CLI) was not found; installing it with winget…\n")
+    output_fn("\nNode.js (needed to install the agent CLI) was not found; installing it with winget…")
+    output_fn("This can take a few minutes and installs silently. Please wait…\n")
     try:
-        run(
-            resolve_subprocess_command(
-                [
-                    winget,
-                    "install",
-                    "-e",
-                    "--id",
-                    "OpenJS.NodeJS",
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ]
-            ),
-            timeout=900,
-        )
+        with progress_ticker("still installing Node.js", output_fn=output_fn):
+            run(
+                resolve_subprocess_command(
+                    [
+                        winget,
+                        "install",
+                        "-e",
+                        "--id",
+                        "OpenJS.NodeJS",
+                        "--silent",
+                        "--accept-package-agreements",
+                        "--accept-source-agreements",
+                    ]
+                ),
+                timeout=900,
+            )
     except (OSError, subprocess.SubprocessError):
         return None
+    output_fn("")  # close any partial line winget left behind
     return _npm_command(which)
 
 
@@ -222,12 +226,20 @@ def install_backend(
         output_fn(install_hint(name))
         return False
     for description, command in plan:
-        output_fn(f"\nInstalling {info['label']} — {description}\n")
+        # A leading blank line separates this step from whatever ran before it, and the
+        # "may take a while" note plus the ticker keep the terminal from looking frozen:
+        # these installers download hundreds of megabytes and can print NOTHING for minutes.
+        output_fn(f"\nInstalling {info['label']} — {description}")
+        output_fn("This can take several minutes and may show no output while it downloads. Please wait…\n")
         try:
-            result = run(command, timeout=900)
+            with progress_ticker(f"still installing {info['label']}", output_fn=output_fn):
+                result = run(command, timeout=900)
         except (OSError, subprocess.SubprocessError) as error:
-            output_fn(f"  that attempt failed: {error}\n")
+            output_fn(f"\n  that attempt failed: {error}\n")
             continue
+        # The installer's own output may end mid-line; close it so the next message (and the
+        # next question) starts on a line of its own.
+        output_fn("")
         if getattr(result, "returncode", 1) != 0:
             output_fn("  that attempt did not complete successfully.\n")
             continue
@@ -249,7 +261,7 @@ def install_backend(
 def select_default_backend(
     config,
     *,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
     install_fn: Callable[..., bool] = install_backend,
 ) -> str:
@@ -263,9 +275,10 @@ def select_default_backend(
     names = available_backends()
     while True:
         installed = [name for name in names if backend_installed(name)]
-        # Leading blank line so this question is visually separated from the preceding startup
-        # output (the update prompt / git-identity setup).
-        output_fn("\nAgent backends:")
+        # Two leading newlines so this section is visually separated from the preceding startup
+        # output (the update prompt / git-identity setup): the first ends any partial line a
+        # subprocess left behind, the second leaves a blank line before the list.
+        output_fn("\n\nAgent backends:")
         for index, name in enumerate(names, start=1):
             output_fn(f"  {index}. {name} ({'installed' if name in installed else 'not installed'})")
         default_index = (names.index(installed[0]) + 1) if installed else 1
@@ -304,7 +317,7 @@ def select_default_summarizer_model(
     config,
     backend_name: str,
     *,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
 ) -> None:
     """First-run setup (after the backend is chosen) for the model aGiTrack uses to summarize
@@ -339,13 +352,13 @@ def select_default_summarizer_model(
         )
         return
     ordered = [smallest, *(m for m in models if m != smallest)]
-    output_fn("\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
+    output_fn("\n\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
     for index, model in enumerate(ordered, start=1):
         tag = "  (smallest — recommended)" if model == smallest else ""
         output_fn(f"  {index}. {model}{tag}")
     same_index = len(ordered) + 1
     output_fn(f"  {same_index}. Same as the agent's session model")
-    raw = input_fn(f"Enter a number [1-{same_index}] (default 1): ").strip()
+    raw = input_fn(f"\nEnter a number [1-{same_index}] (default 1): ").strip()
     choice = raw or "1"
     if not choice.isdigit() or not 1 <= int(choice) <= same_index:
         config.summarization_model = ordered[0]  # invalid input → the recommended default
@@ -359,7 +372,7 @@ def ensure_installed_backend(
     config,
     *,
     interactive: bool,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
 ) -> str:
     """Make sure the backend that is about to run is installed before launching it. This is a
@@ -377,7 +390,7 @@ def ensure_installed_backend(
     while True:
         if backend_installed(name):
             return name
-        output_fn(f"\nThe selected backend '{name}' is not installed.\n")
+        output_fn(f"\n\nThe selected backend '{name}' is not installed.\n")
         output_fn(install_hint(name))
         installed = [other for other in names if backend_installed(other)]
         prompt = "\nPress Enter after installing it to retry"
