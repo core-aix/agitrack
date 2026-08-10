@@ -1119,8 +1119,10 @@ class ScreenRenderer:
             line = line.replace(f"→ {base_branch}", f"→ \x1b[1m{base_branch}\x1b[22m", 1)
         # Reverse video swaps whatever colours are in effect, so set the canvas first: on an
         # adapted screen the bar then inverts the AGENT's scheme rather than the terminal's,
-        # which is what makes it read as part of the same UI.
-        return f"{self.reset_sgr()}\x1b[7m{line}\x1b[0m"
+        # which is what makes it read as part of the same UI. Read through getattr so this
+        # method keeps composing a bar from its keyword args alone, with no host at all.
+        reset = getattr(self, "reset_sgr", lambda: "\x1b[0m")()
+        return f"{reset}\x1b[7m{line}\x1b[0m"
 
     # ------------------------------------------------------------------
     # Box / popup painting primitives
