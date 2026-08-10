@@ -261,3 +261,72 @@ def test_a_scripted_run_that_worked_exits_zero(tmp_path, monkeypatch):
     shell, _repo = _scripted_shell(tmp_path, monkeypatch, ["write hello.py"])
 
     assert shell.run() == 0
+
+
+# --- a refused run must leave the owner's state alone --------------------------------------
+# AgitrackShell prepared its startup state (backend switch, --new-session, the conversation
+# pointer and the committed watermark) in __init__ — BEFORE run() takes the repo lock. On a
+# repo already owned by a background tracker or a live TUI, `agitrack --json --prompt …`
+# therefore rewrote that process's state.json and minted a fresh agitrack session id, printed
+# "already running", and exited: a lost update from a run that never started.
+
+
+def test_a_refused_shell_run_does_not_touch_the_owners_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    owner = AgitrackState(repo.repo)
+    owner.backend = "claude"
+    owner.backend_session_id = "live-conversation"
+    owner.last_backend_message_id = "msg-42"
+    owner.name_session("live-conversation", "aurora")
+    before = (repo.repo / ".agitrack" / "state.json").read_text(encoding="utf-8")
+
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert holder.acquire() is True
+    try:
+        assert AgitrackShell(repo, backend="codex", new_session=True, prompts=["do a thing"]).run() == 1
+    finally:
+        holder.release()
+
+    assert (repo.repo / ".agitrack" / "state.json").read_text(encoding="utf-8") == before
+    reloaded = AgitrackState(repo.repo)
+    assert reloaded.backend == "claude"
+    assert reloaded.backend_session_id == "live-conversation"
+    assert reloaded.last_backend_message_id == "msg-42"
+    assert reloaded.session_name_for("live-conversation") == "aurora"
+
+
+def test_a_refused_shell_run_does_not_change_the_global_default_backend(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    AgitrackState(repo.repo).backend = "claude"
+    from agitrack.config import GlobalConfig
+
+    GlobalConfig().default_backend = "claude"
+
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert holder.acquire() is True
+    try:
+        assert AgitrackShell(repo, backend="codex", prompts=["do a thing"]).run() == 1
+    finally:
+        holder.release()
+
+    assert GlobalConfig().default_backend == "claude"
+
+
+def test_a_shell_run_that_starts_does_persist_the_switch(tmp_path, monkeypatch):
+    # The other half of the contract: once the lock IS held, everything __init__ decided
+    # must land on disk exactly as before.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    repo = GitRepo.init(tmp_path / "demo")
+    AgitrackState(repo.repo).backend = "claude"
+
+    assert AgitrackShell(repo, backend="codex", prompts=[]).run() == 0
+
+    from agitrack.config import GlobalConfig
+
+    assert AgitrackState(repo.repo).backend == "codex"
+    assert GlobalConfig().default_backend == "codex"

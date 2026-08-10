@@ -1633,6 +1633,9 @@ def story_html(root: Path, *, banner_html: str = "") -> str:
         .replace("__PREBOOT_CSS__", PREBOOT_CSS)
         .replace("__PREBOOT_HTML__", PREBOOT_HTML.replace("the aGiTrack dashboard", "the storyline"))
         .replace("__FONT_LINKS__", FONT_LINKS)
+        # Built from the backend registry, never hand-written: a literal option list simply
+        # could not offer a newly added backend, and nothing failed to say so.
+        .replace("__BACKEND_OPTIONS__", learn_page._backend_option_html())
     )
 
 
@@ -2068,9 +2071,7 @@ __BACKTRACE_BANNER__
       <div class="row"><label>backend</label>
         <select id="e-backend">
           <option value="">auto (latest session)</option>
-          <option value="claude">claude</option>
-          <option value="codex">codex</option>
-          <option value="opencode">opencode</option>
+__BACKEND_OPTIONS__
         </select>
         <label style="min-width:auto">model</label>
         <select id="e-model"><option value="">auto (latest session)</option></select>

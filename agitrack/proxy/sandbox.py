@@ -109,10 +109,17 @@ def is_available() -> bool:
 # Backend agent self-update carve-out
 # ----------------------------------------------------------------------------
 
+
 # The coding-agent CLIs aGiTrack drives. Their self-update writes land under a small
 # set of well-known per-user trees, plus wherever the executable itself resolves
 # (covers npm-global / Homebrew / custom prefixes the static list can't predict).
-_BACKEND_EXES = ("claude", "codex", "opencode")
+def _backend_exes() -> tuple[str, ...]:
+    """The backend CLI executables, from the backend registry — not a hand-written tuple,
+    which silently omits a newly added agent and denies it its self-update carve-out."""
+    from agitrack.backends.proxy_agents import available_backends
+    from agitrack.backends.setup import _executable
+
+    return tuple(_executable(name) for name in available_backends())
 
 
 def _xdg_dir(var: str, *default: str) -> str:
@@ -144,11 +151,12 @@ def agent_writable_dirs() -> list[str]:
         # under this root; the ~/.local/bin launcher it repoints is already covered above.
         os.path.join(home, ".codex"),
     ]
-    for tool in _BACKEND_EXES:
+    backend_exes = _backend_exes()
+    for tool in backend_exes:
         candidates += [os.path.join(root, tool) for root in (data, state, config, cache)]
     # Wherever the CLIs actually resolve — the launcher dir and the install dir the
     # launcher points at (e.g. claude's versioned native install, an npm-global bin).
-    for exe in _BACKEND_EXES:
+    for exe in backend_exes:
         found = shutil.which(exe)
         if not found:
             continue

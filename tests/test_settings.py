@@ -411,3 +411,71 @@ def test_settings_menu_esc_on_list_with_pending_prompts_save(tmp_path):
     runner._settings_menu()
     assert runner.global_config.sandbox is False
     assert runner.global_config.source("sandbox") == "global"
+
+
+# --- lost updates: ONE global file, every aGiTrack process on the machine ---------------
+# ~/.agitrack/config.json is shared by every aGiTrack process (a TUI in one repo, a tracker
+# in another, the dashboard daemon, the self-updater) and NO repo lock excludes them from
+# each other. GlobalConfig.save() used to dump its whole in-memory copy — minutes to hours
+# stale in a long-lived TUI — and revert whatever the others had recorded since.
+
+
+def test_a_concurrent_writers_global_key_survives_a_stale_save(tmp_path):
+    path = tmp_path / "global" / "config.json"
+    stale = GlobalConfig(path=path)
+    stale.default_backend = "claude"
+
+    other = GlobalConfig(path=path)  # another aGiTrack process
+    other.pending_manual_update = "0.9.9"
+
+    stale.default_backend = "codex"  # the stale instance writes an unrelated key
+
+    reloaded = GlobalConfig(path=path)
+    assert reloaded.pending_manual_update == "0.9.9"
+    assert reloaded.default_backend == "codex"
+
+
+def test_unsetting_a_global_key_still_removes_it(tmp_path):
+    # Merging must not resurrect a key this instance deliberately dropped.
+    path = tmp_path / "global" / "config.json"
+    config = GlobalConfig(path=path)
+    config.pending_manual_update = "0.9.9"
+    GlobalConfig(path=path).default_backend = "codex"  # someone else rewrites the file
+
+    config.pending_manual_update = None
+
+    reloaded = GlobalConfig(path=path)
+    assert reloaded.pending_manual_update is None
+    assert reloaded.default_backend == "codex"
+
+
+def test_the_global_file_is_written_atomically(tmp_path):
+    # A non-atomic rewrite let a concurrent reader (AgitrackState._load_config, another
+    # process' GlobalConfig) observe a truncated file and silently fall back to defaults.
+    path = tmp_path / "global" / "config.json"
+    config = GlobalConfig(path=path)
+    config.default_backend = "codex"
+
+    assert json.loads(path.read_text(encoding="utf-8"))["default_backend"] == "codex"
+    assert list(path.parent.glob("*.tmp")) == []  # nothing left behind
+
+
+def test_save_repo_really_preserves_keys_it_does_not_own(tmp_path):
+    # save_repo()'s contract is "preserving any other keys the file already holds (e.g.
+    # AgitrackState's)". That held only for keys present when load_repo_overlay ran: anything
+    # written since — by AgitrackState._save_config here, or by the dashboard daemon's
+    # set_learning_config in another process — was dropped on the next repo-scope write.
+    from agitrack.config import AgitrackState
+
+    repo = tmp_path / "repo"
+    overlay = GlobalConfig(path=tmp_path / "global" / "config.json")
+    overlay.load_repo_overlay(repo)
+    overlay.set("log_file", "agitrack.log", scope="repo")
+
+    AgitrackState(repo).merge_branch = "main"  # a different class, same file
+    overlay.set("sandbox", False, scope="repo")
+
+    written = json.loads((repo / ".agitrack" / "config.json").read_text(encoding="utf-8"))
+    assert written["merge_branch"] == "main"
+    assert written["log_file"] == "agitrack.log"
+    assert written["sandbox"] is False

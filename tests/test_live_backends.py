@@ -27,13 +27,14 @@ import shutil
 
 import pytest
 
-from agitrack.backends.claude import ClaudeBackend
-from agitrack.backends.codex import CodexBackend
-from agitrack.backends.opencode import OpenCodeBackend
+from agitrack.backends import headless_backends
+from agitrack.backends.setup import _executable
 
 pytestmark = pytest.mark.live
 
-_BACKENDS = {"claude": ClaudeBackend, "codex": CodexBackend, "opencode": OpenCodeBackend}
+# Straight from the registry: a hand-written map means a newly added backend gets no live
+# smoke test at all — exactly the backend whose CLI contract nobody has verified yet.
+_BACKENDS = headless_backends()
 
 # Cheapest tier per backend, so a smoke test never bills a frontier model. None = the CLI's own
 # default (OpenCode fronts arbitrary providers, so there is no id that is valid everywhere).
@@ -41,7 +42,9 @@ _SMOKE_MODELS = {"claude": "claude-haiku-4-5-20251001", "codex": "gpt-5.4-mini",
 
 
 def _backend_or_skip(name, tmp_path):
-    if shutil.which(name) is None:
+    # The backend's own executable, not its registry key: they coincide today but the key is
+    # aGiTrack's name for the agent, not a promise about the binary on PATH.
+    if shutil.which(_executable(name)) is None:
         pytest.skip(f"{name} is not installed on this machine")
     return _BACKENDS[name](tmp_path)
 

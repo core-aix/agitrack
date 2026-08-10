@@ -25,11 +25,18 @@ except ImportError:  # pragma: no cover - only when the proxy platform layer is 
     ProxyRunner = None  # type: ignore[assignment,misc]
     BackgroundRunner = None  # type: ignore[assignment,misc]
 
-_BACKEND_COMMANDS = {
-    "claude": "claude",
-    "codex": "codex",
-    "opencode": "opencode",
-}
+
+def _backend_command(name: str) -> str | None:
+    """The executable that launches *name*'s CLI, or None when *name* is not a backend.
+
+    Derived from the backend's own spawn command rather than a hand-written map: a literal
+    table is one more list to forget when a backend is added, and `agitrack -- --help`
+    would then reject a backend the rest of aGiTrack happily runs."""
+    from agitrack.backends.setup import _executable
+
+    if name not in available_backends():
+        return None
+    return _executable(name)
 
 
 def _git_install_hint() -> str:
@@ -483,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.epilog = (
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
-        "(claude / opencode), e.g. `agitrack --backend opencode --port 12345`. Use "
+        f"({' / '.join(available_backends())}), e.g. `agitrack --backend opencode --port 12345`. Use "
         "`--` to forward arguments that aGiTrack also defines or a bare prompt, e.g. "
         '`agitrack -- --verbose "fix the bug"`. To see the backend CLI\'s own help, run '
         "`agitrack -- --help` (or invoke the backend directly)."
@@ -820,7 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         if not backend:
             print("Error: No backend selected. Use --backend to specify one.")
             return 1
-        backend_cmd = _BACKEND_COMMANDS.get(backend)
+        backend_cmd = _backend_command(backend)
         if not backend_cmd:
             print(f"Error: Unknown backend '{backend}'.")
             return 1

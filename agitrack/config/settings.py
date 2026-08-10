@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agitrack.env import getenv_compat
+from agitrack.fileio import atomic_write_text, merge_json_for_save
 
 # The key that opens aGiTrack's command menu in proxy mode. Configurable as
 # "menu_key" in config.json. Supports:
@@ -146,11 +148,15 @@ class GlobalConfig:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or _default_path()
         self.data = self._load()
+        # What was on disk when this instance loaded. save() writes only the difference
+        # against it, so another process's keys survive (see fileio.merge_json_for_save).
+        self._baseline = copy.deepcopy(self.data)
         # Repo-local overlay: settings written for THIS repository (in its
         # ``.agitrack/config.json``) take precedence over the global file. Loaded via
         # ``load_repo_overlay`` once aGiTrack knows which repo it's running in.
         self.repo_path: Path | None = None
         self.repo_data: dict[str, Any] = {}
+        self._repo_baseline: dict[str, Any] = {}
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -209,10 +215,18 @@ class GlobalConfig:
         return added
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        # ONE global file is shared by every aGiTrack process on the machine — a TUI in one
+        # repo, a background tracker in another, a dashboard daemon, the self-updater — and
+        # no repo lock excludes them from each other. A long-lived instance's copy is minutes
+        # to hours stale, so writing it wholesale reverted whatever the others had recorded
+        # since (a pending manual update, a github login, a changed default backend). Write
+        # only this instance's own changes, merged onto the current file, and do it atomically
+        # so a concurrent reader can never see a half-written file. See fileio.
+        merged = merge_json_for_save(self.path, self.data, self._baseline)
+        atomic_write_text(self.path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.data.clear()
+        self.data.update(merged)
+        self._baseline = copy.deepcopy(merged)
 
     # --- repo-local overlay -------------------------------------------------
 
@@ -222,6 +236,7 @@ class GlobalConfig:
         self.repo_path = Path(repo_root) / ".agitrack" / "config.json"
         if not self.repo_path.exists():
             self.repo_data = {}
+            self._repo_baseline = {}
             return
         try:
             with self.repo_path.open("r", encoding="utf-8") as handle:
@@ -229,16 +244,23 @@ class GlobalConfig:
             self.repo_data = data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
             self.repo_data = {}
+        self._repo_baseline = copy.deepcopy(self.repo_data)
 
     def save_repo(self) -> None:
         """Write the repo-local overlay back to ``<repo>/.agitrack/config.json``,
-        preserving any other keys the file already holds (e.g. AgitrackState's)."""
+        preserving any other keys the file already holds (e.g. AgitrackState's).
+
+        That promise used to hold only for keys present when ``load_repo_overlay`` ran: the
+        write dumped ``repo_data`` over the file, so anything written since — by
+        ``AgitrackState._save_config`` in this very process, or by the dashboard daemon's
+        ``set_learning_config`` in another — was dropped. Merge on save instead."""
         if self.repo_path is None:
             return
-        self.repo_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.repo_path.open("w", encoding="utf-8") as handle:
-            json.dump(self.repo_data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        merged = merge_json_for_save(self.repo_path, self.repo_data, self._repo_baseline)
+        atomic_write_text(self.repo_path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.repo_data.clear()
+        self.repo_data.update(merged)
+        self._repo_baseline = copy.deepcopy(merged)
 
     def _raw(self, key: str) -> Any:
         """The stored value for *key*: the repo-local overlay wins over the global file."""

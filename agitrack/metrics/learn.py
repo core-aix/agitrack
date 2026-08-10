@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agitrack.backends.base import AgentBackend
-from agitrack.backends.proxy_agents import available_backends
+from agitrack.backends.proxy_agents import available_backends, backend_phrase
 from agitrack.env import getenv_compat
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat
@@ -118,7 +118,7 @@ def _no_trace_message(turns: int) -> str:
     found = f"only {turns} aGiTrack-tracked agent turn(s)" if turns else "no aGiTrack-tracked agent turns"
     return (
         f"I found {found} in this selection, not enough to personalize lessons from. "
-        "If this code was written with a supported agent (Claude Code or OpenCode) outside aGiTrack, "
+        "If this code was written with a supported agent (" + backend_phrase() + ") outside aGiTrack, "
         "run 'agitrack --backtrace' to reconstruct that history from the transcripts on your machine, "
         "preferably 'agitrack --backtrace commit' so it becomes part of a branch I can read. "
         "Otherwise, simply launch your next coding session with 'agitrack': every turn is captured "
@@ -1408,6 +1408,18 @@ def handle_learn_post(
 # ------------------------------------------------------------------------- the page
 
 
+def _backend_option_html() -> str:
+    """The engine picker's backend ``<option>`` rows, built from the backend registry.
+
+    Hand-written rows in the page template silently went stale whenever a backend was
+    added — the picker simply could not offer it, with nothing failing to say so."""
+    from agitrack.metrics.web import _escape
+
+    return "\n".join(
+        f'          <option value="{_escape(name)}">{_escape(name)}</option>' for name in available_backends()
+    )
+
+
 def learn_html(root: Path, *, banner_html: str = "") -> str:
     """The /learn page chrome. Data (profile, committers, backend info) is fetched from
     ``/learn/state`` after paint, so this stays instant like the dashboard shell.
@@ -1432,6 +1444,10 @@ def learn_html(root: Path, *, banner_html: str = "") -> str:
         .replace("__PREBOOT_CSS__", PREBOOT_CSS)
         .replace("__PREBOOT_HTML__", PREBOOT_HTML.replace("the aGiTrack dashboard", "the learn page"))
         .replace("__FONT_LINKS__", FONT_LINKS)
+        .replace("__BACKEND_OPTIONS__", _backend_option_html())
+        # Same reason as the option rows: a hand-written prose list tells a user of the
+        # missing backend that their sessions are unsupported.
+        .replace("__BACKEND_PHRASE__", backend_phrase())
     )
 
 
@@ -1786,9 +1802,7 @@ __BACKTRACE_BANNER__
       <div class="row"><label>backend</label>
         <select id="e-backend">
           <option value="">auto (latest session)</option>
-          <option value="claude">claude</option>
-          <option value="codex">codex</option>
-          <option value="opencode">opencode</option>
+__BACKEND_OPTIONS__
         </select>
         <label style="min-width:auto">model</label>
         <select id="e-model"><option value="">auto (latest session)</option></select>
@@ -2489,7 +2503,7 @@ async function refreshState() {
     if (typeof d.trace_turns === "number" && d.trace_turns < 3) {
       $("trace-notice").innerHTML =
         `&#128269; ${d.trace_turns ? "only " + d.trace_turns : "no"} tracked agent turn${d.trace_turns === 1 ? "" : "s"} captured here yet, so I can't personalize lessons. ` +
-        "If this code was written with Claude Code or OpenCode outside aGiTrack, run " +
+        "If this code was written with __BACKEND_PHRASE__ outside aGiTrack, run " +
         "<code>agitrack --backtrace</code> to reconstruct that history (ideally <code>agitrack --backtrace commit</code> " +
         "so it becomes part of the branch). Or simply start your next session with <code>agitrack</code> and the " +
         "trace builds itself. Either way, check in below and I'll offer some starter topics.";

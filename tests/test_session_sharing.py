@@ -6,6 +6,7 @@ through a local bare remote.
 """
 
 import json
+import os
 import random
 import string
 import subprocess
@@ -28,6 +29,64 @@ _posix_git_gc = pytest.mark.skipif(
     sys.platform == "win32",
     reason="git object reclamation via loose-file removal behaves differently on Windows (objects may be packed)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _codex_home(tmp_path_factory, monkeypatch):
+    """Redirect CODEX_HOME for every test in this module.
+
+    Codex resolves a session from a GLOBAL store rather than a per-repo directory, and importing
+    a shared session WRITES a rollout file into it. Without this, the Codex sharing tests would
+    install fixture conversations into the developer's real ``~/.codex`` — and read the real
+    sessions when looking one up.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex-home")))
+
+
+# --- Codex rollout fixtures --------------------------------------------------
+#
+# Record shapes captured from real codex-cli rollouts (see tests/test_codex_session.py): every
+# row is ``{timestamp, type, payload}`` and the payload carries its own ``type``.
+
+CODEX_SESSION = "019fe8dc-ca6c-7951-9225-73513aadf083"
+
+
+def _codex_row(kind, payload, stamp="2026-08-09T23:30:12.005Z"):
+    return {"timestamp": stamp, "type": kind, "payload": payload}
+
+
+def _codex_meta(cwd="/repo", session_id=CODEX_SESSION):
+    return _codex_row(
+        "session_meta",
+        {"session_id": session_id, "id": session_id, "cwd": cwd, "source": "cli", "workspace_roots": [cwd]},
+    )
+
+
+def _codex_turn(turn_id, prompt, reply, *, pad=""):
+    return [
+        _codex_row("event_msg", {"type": "task_started", "turn_id": turn_id}),
+        _codex_row("turn_context", {"turn_id": turn_id, "model": "gpt-5.4-mini", "cwd": "/repo"}),
+        _codex_row("event_msg", {"type": "user_message", "message": prompt + pad}),
+        _codex_row("event_msg", {"type": "agent_message", "message": reply, "phase": "final"}),
+        _codex_row("event_msg", {"type": "task_complete", "turn_id": turn_id, "last_agent_message": reply}),
+    ]
+
+
+def _codex_rollout(rows):
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def _write_codex_rollout(rows, *, session_id=CODEX_SESSION):
+    """Install a rollout in the (redirected) Codex store, the way Codex files one: partitioned
+    by date, with the session id in the file name — which is what actually resolves it."""
+    from agitrack.transcripts import codex
+
+    directory = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "08" / "10"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"rollout-2026-08-10T00-30-11-{session_id}.jsonl"
+    path.write_text(_codex_rollout(rows), encoding="utf-8")
+    assert codex.session_transcript_path(session_id) == path  # the store resolves it by id
+    return path
 
 
 def _fake_token(prefix: str, n: int, *, charset: str = string.ascii_letters + string.digits) -> str:
@@ -182,6 +241,33 @@ def test_transcript_is_readable_opencode():
     assert _transcript_is_readable(good, "opencode") is True
     assert _transcript_is_readable("{bad json", "opencode") is False
     assert _transcript_is_readable(json.dumps({"info": {}, "messages": []}), "opencode") is False
+
+
+def test_transcript_is_readable_codex():
+    from agitrack.sessions.store import _transcript_is_readable
+
+    good = _codex_rollout([_codex_meta(), *_codex_turn("t1", "fix it", "fixed")])
+    assert _transcript_is_readable(good, "codex") is True
+    assert _transcript_is_readable("{bad json", "codex") is False
+    assert _transcript_is_readable("", "codex") is False
+    # A header with no turns is a session that has not started: nothing to share, not readable.
+    assert _transcript_is_readable(_codex_rollout([_codex_meta()]), "codex") is False
+
+
+def test_a_codex_transcript_falls_back_to_last_write_wins_instead_of_merging():
+    # Deliberate, and the reason this backend is NOT line-union merged: Codex rows carry no
+    # per-row uuid, so `_row_id` cannot establish lineage. Keying the union on the raw line
+    # instead was rejected — a redacted shared copy and a raw local copy differ textually row
+    # for row, so every row would read as new and the "merge" would emit the whole conversation
+    # TWICE. One side winning is the lesser loss.
+    from agitrack.sessions.store import merge_transcripts
+
+    mine = _codex_rollout([_codex_meta(), *_codex_turn("t1", "shared start", "ok"), *_codex_turn("t2", "mine", "ok")])
+    theirs = _codex_rollout(
+        [_codex_meta(), *_codex_turn("t1", "shared start", "ok"), *_codex_turn("t3", "theirs", "ok")]
+    )
+
+    assert merge_transcripts(mine, theirs) == mine  # last-write-wins, not a doubled conversation
 
 
 # --- redaction --------------------------------------------------------------
@@ -351,6 +437,32 @@ def test_opencode_cap_keeps_info_and_recent_messages():
     assert parsed["messages"][0]["info"]["role"] == "user"  # tail starts at a user turn boundary
     assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it fits
     assert cap_shared_transcript("not json{", 1) == "not json{"  # unparseable → left as-is
+
+
+def test_codex_cap_keeps_the_session_meta_header_and_a_resumable_tail():
+    from agitrack.sessions.store import _transcript_is_readable
+    from agitrack.transcripts.codex import cap_shared_transcript
+
+    rows = [_codex_meta()]
+    for i in range(150):
+        rows.extend(_codex_turn(f"t{i}", f"prompt {i}", "ok", pad="P" * 300))
+    raw = _codex_rollout(rows)
+    max_bytes = 30 * 1024
+
+    out = cap_shared_transcript(raw, max_bytes)
+
+    assert len(out.encode("utf-8")) <= max_bytes  # under the file-size limit
+    kept = [json.loads(line) for line in out.splitlines() if line.strip()]
+    # The header is ALWAYS re-attached on top of the tail: without session_meta the shared copy
+    # imports as a conversation Codex cannot rebuild, which is the whole point of sharing it.
+    assert kept[0]["type"] == "session_meta"
+    # The tail begins at a turn boundary, so it never starts mid-turn (half a turn parses as a
+    # prompt with no reply, or a reply with no prompt).
+    assert kept[1]["payload"]["type"] == "task_started"
+    assert kept[-1]["payload"].get("last_agent_message") == "ok"  # most recent turn preserved
+    assert len(kept) < len(rows)  # older turns dropped (it IS trimmed)
+    assert _transcript_is_readable(out, "codex") is True  # …and what survives still parses
+    assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it already fits
 
 
 def test_redact_and_cap_trims_oversized_and_flags_truncation():
@@ -1759,6 +1871,107 @@ def test_opencode_transcript_size_is_unavailable(tmp_path):
     assert opencode.session_transcript_size(tmp_path, "ses_1") is None
 
 
+# --- Codex transcript export / import ---------------------------------------
+#
+# Codex is the third backend with a portable transcript, and the only one whose sessions live
+# in a GLOBAL store keyed by id rather than under the repo: an import must therefore rewrite
+# both the id (for "keep both") and the recorded cwd, or the shared conversation resumes
+# pointing at a directory that exists only on the machine it came from.
+
+
+def test_codex_export_reads_the_rollout_and_import_retargets_id_and_cwd(tmp_path):
+    from agitrack.transcripts import codex
+
+    src = tmp_path / "srcrepo"
+    src.mkdir()
+    _write_codex_rollout([_codex_meta(cwd="/Users/alice/old"), *_codex_turn("t1", "add subtract", "Added subtract.")])
+
+    raw = codex.export_session_raw(src, CODEX_SESSION)
+    assert raw is not None and "/Users/alice/old" in raw
+
+    # …import it as if it had arrived from another machine, under a new id ("keep both").
+    dst = tmp_path / "dstrepo"
+    dst.mkdir()
+    new_id = codex.new_import_id()
+    assert codex.import_shared_session(dst, CODEX_SESSION, raw, as_id=new_id) is True
+
+    imported = codex.session_transcript_path(new_id)
+    assert imported is not None
+    rows = [json.loads(line) for line in imported.read_text(encoding="utf-8").splitlines() if line.strip()]
+    meta = next(row["payload"] for row in rows if row["type"] == "session_meta")
+    assert meta["session_id"] == new_id and meta["id"] == new_id  # re-id'd, so both copies resolve
+    # Compare as paths, not text: the raw JSON has escaped backslashes on Windows.
+    assert Path(meta["cwd"]) == dst.resolve() and meta["workspace_roots"] == [str(dst.resolve())]
+    assert "/Users/alice/old" not in imported.read_text(encoding="utf-8")
+    assert codex.session_belongs_to_repo(dst, new_id) is True
+    # Both copies survive: the original id still resolves to its own file.
+    assert codex.session_transcript_path(CODEX_SESSION) != imported
+
+
+def test_codex_import_keeps_the_local_copy_unless_overwrite_is_asked_for(tmp_path):
+    # The "pull latest?" fork: declining must leave the local conversation byte for byte, and
+    # accepting must replace the SAME file rather than filing a second rollout under the same
+    # id — two files with one id is a session Codex resolves by whichever it scans first.
+    from agitrack.transcripts import codex
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    local = _write_codex_rollout([_codex_meta(), *_codex_turn("t1", "my local work", "ok")])
+    shared = _codex_rollout([_codex_meta(cwd="/other/machine"), *_codex_turn("t1", "their work", "ok")])
+
+    assert codex.import_shared_session(repo, CODEX_SESSION, shared) is False
+    assert "my local work" in local.read_text(encoding="utf-8")
+
+    assert codex.import_shared_session(repo, CODEX_SESSION, shared, overwrite=True) is True
+    assert codex.session_transcript_path(CODEX_SESSION) == local  # same file, not a second one
+    assert "their work" in local.read_text(encoding="utf-8")
+
+
+def test_codex_import_refuses_a_transcript_with_no_usable_rows(tmp_path):
+    # A share that arrived empty or shredded must not create a rollout file at all: an empty
+    # session in the store is one `codex resume` opens onto nothing, with no error to explain it.
+    from agitrack.transcripts import codex
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert codex.import_shared_session(repo, CODEX_SESSION, "") is False
+    assert codex.import_shared_session(repo, CODEX_SESSION, "not json\nstill not\n") is False
+    assert codex.has_imported_session(repo, CODEX_SESSION) is False
+
+
+def test_codex_has_imported_session_and_transcript_size_read_the_global_store(tmp_path):
+    # Both drive user-facing decisions: "you already have this session locally" (the pull
+    # prompt) and "the shared copy has newer turns" (the size-based status in the manage menu).
+    from agitrack.transcripts import codex
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert codex.has_imported_session(repo, CODEX_SESSION) is False
+    assert codex.session_transcript_size(repo, CODEX_SESSION) is None
+    assert codex.has_imported_session(repo, "") is False
+
+    path = _write_codex_rollout([_codex_meta(), *_codex_turn("t1", "hello", "hi")])
+
+    assert codex.has_imported_session(repo, CODEX_SESSION) is True
+    assert codex.session_transcript_size(repo, CODEX_SESSION) == path.stat().st_size
+
+
+def test_codex_new_import_ids_are_fresh_uuids_codex_can_resolve(tmp_path):
+    # The id goes into the rollout FILE NAME, which is what resolves a session — so it has to
+    # match Codex's uuid shape or the re-imported copy is invisible to `codex resume`.
+    import re
+    import uuid as uuid_module
+
+    from agitrack.transcripts import codex
+
+    first, second = codex.new_import_id(), codex.new_import_id()
+
+    assert first != second
+    assert uuid_module.UUID(first)  # a real uuid, not an opaque token
+    assert re.match(codex._ROLLOUT_RE, f"rollout-2026-08-10T00-30-11-{first}.jsonl")
+
+
 # --- runner glue: share + resume-shared through the session menu ------------
 
 
@@ -2031,26 +2244,40 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     assert AgitrackState(repo.repo).shared_origin_name("bob-sid") == "cool-fix"
 
 
-def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
-    # Active backend is Claude, but the shared entry is an OpenCode session: it
-    # must be imported and resumed by a freshly-built OpenCode agent, not Claude.
+@pytest.mark.parametrize(
+    "shared_backend,shared_id,shared_transcript",
+    [
+        ("opencode", "ses_bob", '{"info":{"id":"ses_bob"}}'),
+        ("codex", CODEX_SESSION, '{"type":"session_meta","payload":{"session_id":"' + CODEX_SESSION + '"}}\n'),
+    ],
+)
+def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch, shared_backend, shared_id, shared_transcript):
+    # Active backend is Claude, but the shared entry belongs to another backend: it must be
+    # imported and resumed by a freshly-built agent of THAT backend, not by Claude. Handing a
+    # foreign transcript to the active agent imports nothing and resumes an empty session.
     from agitrack.proxy import runner as runner_module
 
     active = _StubBackend()  # name == "claude"
     runner, repo = _runner_with_store(tmp_path, monkeypatch, active)
     SharedSessionStore(repo).publish(
         github_id="bob",
-        name="oc-fix",
-        transcript='{"info":{"id":"ses_bob"}}',
-        manifest={"github_id": "bob", "name": "oc-fix", "backend": "opencode", "session_id": "ses_bob", "updated": 7},
+        name="their-fix",
+        transcript=shared_transcript,
+        manifest={
+            "github_id": "bob",
+            "name": "their-fix",
+            "backend": shared_backend,
+            "session_id": shared_id,
+            "updated": 7,
+        },
     )
-    oc_agent = _StubBackend(transcript="oc")
-    oc_agent.name = "opencode"
+    other_agent = _StubBackend(transcript="theirs")
+    other_agent.name = shared_backend
     built: list[str] = []
 
     def fake_make(name):
         built.append(name)
-        return oc_agent
+        return other_agent
 
     monkeypatch.setattr(runner_module, "make_proxy_agent", fake_make)
     resumed: list = []
@@ -2061,10 +2288,11 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     runner._resume_shared_session_menu()
     _drain_shared_resume(runner)
 
-    assert built == ["opencode"]  # a fresh OpenCode agent was constructed
-    assert oc_agent.imported == ("ses_bob", '{"info":{"id":"ses_bob"}}', False)  # OpenCode did the import
+    assert built == [shared_backend]  # a fresh agent of the entry's backend was constructed
+    assert other_agent.imported == (shared_id, shared_transcript, False)  # …and IT did the import
     assert active.imported is None  # the active Claude agent was NOT used
-    assert resumed == [("oc-fix", "ses_bob", "opencode")]  # resumed under the share name, pinned to opencode
+    # Resumed under the share name, pinned to the entry's backend.
+    assert resumed == [("their-fix", shared_id, shared_backend)]
 
 
 def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
@@ -2536,19 +2764,28 @@ def test_shared_entry_status_is_size_based(tmp_path, monkeypatch):
     assert runner._shared_entry_status(unknown, "sid-123") == "shared"
 
 
-def test_both_backends_flag_sharing_support():
+def test_every_backend_with_a_portable_transcript_flags_sharing_support():
+    from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+
+    # Claude (per-session .jsonl), OpenCode (export/import CLI) and Codex (one append-only
+    # rollout per conversation) all have a portable transcript, so all three advertise session
+    # sharing (issue #55). Checked against the REGISTRY so a backend added later cannot quietly
+    # default to "unsupported" here — the share menu would just tell its users no.
+    for name in available_backends():
+        assert make_proxy_agent(name).supports_session_sharing is True, name
+    assert set(available_backends()) == {"claude", "codex", "opencode"}
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+def test_the_proxy_agent_delegates_sharing_to_its_transcript_module(tmp_path, monkeypatch, backend):
+    # Every backend's agent is a thin forwarder onto its transcript module. The forwarding is
+    # what the whole share/resume flow calls, and a method left off a newly added agent shows up
+    # only as an AttributeError deep inside a background share thread.
+    import importlib
+
     from agitrack.backends.proxy_agents import make_proxy_agent
 
-    # Claude (per-session .jsonl) and OpenCode (export/import CLI) both have a
-    # portable transcript, so both advertise session sharing (issue #55).
-    assert make_proxy_agent("claude").supports_session_sharing is True
-    assert make_proxy_agent("opencode").supports_session_sharing is True
-
-
-def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeypatch):
-    from agitrack.backends.proxy_agents import make_proxy_agent
-    from agitrack.transcripts import opencode as opencode_session
-
+    module = importlib.import_module(f"agitrack.transcripts.{backend}")
     calls: dict[str, object] = {}
 
     def record(key, value):
@@ -2558,22 +2795,77 @@ def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeyp
 
         return fn
 
-    monkeypatch.setattr(opencode_session, "export_session_raw", record("export", "{}"))
-    monkeypatch.setattr(opencode_session, "session_transcript_size", record("size", None))
-    monkeypatch.setattr(opencode_session, "has_imported_session", record("has", True))
+    monkeypatch.setattr(module, "export_session_raw", record("export", "{}"))
+    monkeypatch.setattr(module, "session_transcript_size", record("size", None))
+    monkeypatch.setattr(module, "has_imported_session", record("has", True))
 
     def fake_import(repo, sid, text, *, overwrite=False, as_id=None):
-        calls["import"] = (repo, sid, text, overwrite)
+        calls["import"] = (repo, sid, text, overwrite, as_id)
         return True
 
-    monkeypatch.setattr(opencode_session, "import_shared_session", fake_import)
-    agent = make_proxy_agent("opencode")
-    assert agent.export_session_raw(tmp_path, "ses_1") == "{}"
-    assert agent.transcript_size(tmp_path, "ses_1") is None
-    assert agent.has_local_session(tmp_path, "ses_1") is True
-    assert agent.import_shared_session(tmp_path, "ses_1", "{}", overwrite=True) is True
-    assert calls["export"] == (tmp_path, "ses_1")
-    assert calls["import"] == (tmp_path, "ses_1", "{}", True)
+    monkeypatch.setattr(module, "import_shared_session", fake_import)
+    agent = make_proxy_agent(backend)
+    assert agent.export_session_raw(tmp_path, "sid_1") == "{}"
+    assert agent.transcript_size(tmp_path, "sid_1") is None
+    assert agent.has_local_session(tmp_path, "sid_1") is True
+    assert agent.import_shared_session(tmp_path, "sid_1", "{}", overwrite=True) is True
+    assert calls["export"] == (tmp_path, "sid_1")
+    assert calls["import"] == (tmp_path, "sid_1", "{}", True, None)
+    # "Keep both" needs a fresh id per backend — a None here silently reverts the choice to
+    # "overwrite my local copy", losing the local conversation.
+    assert agent.new_import_id()
+    assert agent.import_shared_session(tmp_path, "sid_1", "{}", as_id="sid_2") is True
+    assert calls["import"][4] == "sid_2"
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+def test_a_cap_never_grows_a_transcript_or_makes_it_unreadable(tmp_path, backend):
+    # The cap runs on EVERY share (git rejects an oversized blob outright), so it is on the
+    # common path for all three backends. Two properties it must never violate, whatever the
+    # transcript shape: the result fits, and what survives still parses into real turns — a
+    # capped copy the backend can't load is a share that silently can't be resumed.
+    from agitrack.backends.proxy_agents import make_proxy_agent
+    from agitrack.sessions.store import _transcript_is_readable
+
+    if backend == "claude":
+        rows = []
+        for i in range(300):
+            role = "user" if i % 2 == 0 else "assistant"
+            content = "hello" if role == "user" else [{"type": "text", "text": "ok"}]
+            rows.append(
+                json.dumps(
+                    {
+                        "type": role,
+                        "uuid": f"u{i}",
+                        "parentUuid": (f"u{i - 1}" if i else None),
+                        "pad": "P" * 300,
+                        "message": {"role": role, "content": content},
+                    }
+                )
+            )
+        raw = "\n".join(rows) + "\n"
+    elif backend == "codex":
+        codex_rows = [_codex_meta()]
+        for i in range(150):
+            codex_rows.extend(_codex_turn(f"t{i}", f"prompt {i}", "ok", pad="P" * 300))
+        raw = _codex_rollout(codex_rows)
+    else:
+        messages = []
+        for i in range(300):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append(
+                {
+                    "info": {"id": f"m{i}", "role": role, "finish": "stop"},
+                    "parts": [{"type": "text", "text": "T" * 300}],
+                }
+            )
+        raw = json.dumps({"info": {"id": "ses_x"}, "messages": messages})
+
+    capped = make_proxy_agent(backend).cap_shared_transcript(raw, 30 * 1024)
+
+    assert len(capped.encode("utf-8")) <= 30 * 1024
+    assert len(capped) < len(raw)  # it really did trim
+    assert _transcript_is_readable(capped, backend) is True
 
 
 def test_live_session_for_lineage_matches_by_origin_not_backend_id():

@@ -71,23 +71,33 @@ class AgitrackShell:
         # backend) resolves to it rather than to the configured default, which may be unset
         # (there is no hardcoded fallback).
         self.state = AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
-        if backend and backend in BACKENDS and backend != self.state.backend:
-            self.state.remember_backend_session()
-            self.state.backend = backend
-            self.global_config.default_backend = backend
-            self.state.backend_session_id = self.state.stored_backend_session(backend)
-            self.state.last_backend_message_id = None
-            # A MODEL BELONGS TO ITS BACKEND. `state.model` is the model the last turn ran under;
-            # carried across a switch it made the new backend's commits claim the old backend's
-            # model ("backend: codex, model: claude-haiku-4-5-…"), which the dashboard then
-            # groups under that model. Worse, it is also what aGiTrack re-pins on the command
-            # line, so the switched-to CLI is asked to run a model id it does not have. Restore
-            # whatever this backend last ran under, or nothing — the backend reports its own.
-            self.state.model = (self.state.recall_session(backend) or {}).get("model")
-        if new_session:
-            self.state.backend_session_id = None
-            self.state.last_backend_message_id = None
-            self.state.new_agitrack_session_id()
+        # NOTHING BELOW MAY REACH DISK YET. The repo lock is only taken in run(), and this
+        # constructor runs even when the run is about to be refused because another aGiTrack
+        # (a background tracker, a live TUI) already holds the repo. Writing here rewrote that
+        # process's state.json — a new agitrack session id, a different conversation pointer,
+        # a cleared watermark — and its own long-lived copy then reverted ours a poll later:
+        # a lost update in both directions from a run that never started. Kept in memory and
+        # flushed by run()'s save(), after the lock is held.
+        self._switch_to_backend: str | None = None
+        with self.state.suspend_saves():
+            if backend and backend in BACKENDS and backend != self.state.backend:
+                self._switch_to_backend = backend
+                self.state.remember_backend_session()
+                self.state.backend = backend
+                self.state.backend_session_id = self.state.stored_backend_session(backend)
+                self.state.last_backend_message_id = None
+                # A MODEL BELONGS TO ITS BACKEND. `state.model` is the model the last turn ran
+                # under; carried across a switch it made the new backend's commits claim the old
+                # backend's model ("backend: codex, model: claude-haiku-4-5-…"), which the
+                # dashboard then groups under that model. Worse, it is also what aGiTrack
+                # re-pins on the command line, so the switched-to CLI is asked to run a model id
+                # it does not have. Restore whatever this backend last ran under, or nothing —
+                # the backend reports its own.
+                self.state.model = (self.state.recall_session(backend) or {}).get("model")
+            if new_session:
+                self.state.backend_session_id = None
+                self.state.last_backend_message_id = None
+                self.state.new_agitrack_session_id()
         self.verbose = verbose
         self.prompt = AgitrackPrompt(self._prompt_state)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui)
@@ -108,8 +118,6 @@ class AgitrackShell:
                 self._bridge.emit({"type": "error", "message": str(error)})
                 self._bridge.emit({"type": "bye"})
             return 1
-        if resolved != self.state.backend:
-            self.state.backend = resolved
         if not self.management_lock.acquire():
             message = already_running_message(
                 self.management_lock.owner_pid(), repo_root=getattr(self.repo, "repo", None)
@@ -119,6 +127,12 @@ class AgitrackShell:
                 self._bridge.emit({"type": "error", "message": message})
                 self._bridge.emit({"type": "bye"})
             return 1
+        # Only now — with the lock held, so no other aGiTrack owns this repo's state — do the
+        # startup decisions made in __init__ become durable (see the note there).
+        if resolved != self.state.backend:
+            self.state.backend = resolved
+        if self._switch_to_backend:
+            self.global_config.default_backend = self._switch_to_backend
         self.state.save()
         if self.verbose:
             print(f"aGiTrack session {self.state.session_id}")

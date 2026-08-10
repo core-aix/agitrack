@@ -283,6 +283,27 @@ def _shared_cache_dir(directory: Path) -> Path:
     return path
 
 
+def _shared_cache_name(backend: str, github_id: str, session_id: str) -> str:
+    """The file name a fetched shared transcript is cached under.
+
+    The SUFFIX names what the bytes actually are: Claude's and Codex's shared transcripts are
+    their on-disk JSONL transcripts, and only OpenCode shares a ``{info, messages}`` JSON export.
+
+    Codex additionally needs a ``rollout-…-<uuid>.jsonl`` NAME, because the rollout file name is
+    where Codex records a conversation's id: ``export_session_at`` reads the id off the path and
+    only falls back to the ``session_meta`` header. Under any other name that fallback was the
+    only thing supplying the id — and a share whose header did not survive the transport cap
+    (see ``codex.cap_shared_transcript``) then exports with an EMPTY session id. Every such
+    session's turns would collide on the same virtual shas (a sha is
+    ``backend:session:index:message``) and lose ``backend_session_id`` from their metadata.
+    """
+    if backend == "opencode":
+        return f"{github_id}--{session_id}.json"
+    if backend == "codex":
+        return f"rollout-{github_id}--{session_id}.jsonl"
+    return f"{github_id}--{session_id}.jsonl"
+
+
 def _materialize_shared(store, entry, cache: Path, backend: str, session_id: str) -> Path | None:
     """Write a shared transcript to the cache and return its path (None when unreadable).
 
@@ -293,8 +314,7 @@ def _materialize_shared(store, entry, cache: Path, backend: str, session_id: str
     text = store.read_transcript(entry)
     if not text:
         return None
-    suffix = ".jsonl" if backend == "claude" else ".json"
-    path = cache / f"{entry.github_id}--{session_id}{suffix}"
+    path = cache / _shared_cache_name(backend, entry.github_id, session_id)
     try:
         if path.exists() and path.read_text(encoding="utf-8", errors="replace") == text:
             return path
@@ -395,8 +415,17 @@ def _watch_signature(sources: list[_Source]) -> tuple[dict[str, tuple], dict[str
     files: dict[str, tuple] = {}
     dirs: dict[str, tuple] = {}
     watched_dirs: set[Path] = set()
+    # EVERY backend's root, not just Claude's. Only discovered sessions contribute their own
+    # parent below, so a backend whose root is missing here is invisible until something else
+    # forces a rediscovery — the FIRST conversation in a directory is exactly the case that
+    # needs one. Codex additionally nests rollouts under `sessions/YYYY/MM/DD/`, so it supplies
+    # a chain of dirs rather than a single root (see `codex.watch_roots`).
     try:
         watched_dirs.add(claude._projects_root())
+    except Exception:
+        pass
+    try:
+        watched_dirs.update(codex.watch_roots())
     except Exception:
         pass
     for source in sources:

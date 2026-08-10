@@ -1,9 +1,9 @@
 """Tests for ``agitrack --backtrace``: reconstructing past agent conversations (and the
-file changes they made) from local Claude/OpenCode transcripts, with no git history.
+file changes they made) from local Claude/Codex/OpenCode transcripts, with no git history.
 
-The collector merges both backends, so most tests drive it through monkeypatched discovery
-(no real filesystem/CLI); one end-to-end test plants a real Claude transcript in a plain,
-non-git temp directory to prove the git-independence the feature promises.
+The collector merges every backend, so most tests drive it through monkeypatched discovery
+(no real filesystem/CLI); two end-to-end tests plant a real Claude transcript and a real Codex
+rollout in a plain, non-git temp directory to prove the git-independence the feature promises.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 from agitrack.backends.base import TokenUsage
 from agitrack.metrics import backtrace as bt
 from agitrack.metrics.web import aggregates_payload, format_html, log_page
-from agitrack.transcripts import claude, opencode
+from agitrack.transcripts import claude, codex, opencode
 from agitrack.transcripts.edits import make_edit
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn
 
@@ -28,6 +28,20 @@ from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn
 # worker can falsify between choosing the base and binding it. Unlike a slow test this cannot
 # be fixed by waiting longer; the contention has to be removed.
 pytestmark = pytest.mark.xdist_group("net")
+
+
+@pytest.fixture(autouse=True)
+def codex_home(tmp_path, monkeypatch):
+    """Redirect Codex's store for EVERY test in this file, as tests/test_codex_session.py does.
+
+    Discovery walks all three backends, and the Codex pass reads ``$CODEX_HOME`` (defaulting to
+    ``~/.codex``) — so any test that built a backtrace without stubbing Codex was reconstructing
+    from whatever conversations the developer's or the CI runner's own machine happened to hold.
+    That is both non-hermetic and unbounded work: the pass scans the whole Codex history.
+    """
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home
 
 
 # --------------------------------------------------------------------------- edits math
@@ -452,11 +466,17 @@ def _turn(
     )
 
 
-def _patch_discovery(monkeypatch, *, claude_sessions=None, opencode_sessions=None):
+def _patch_discovery(monkeypatch, *, claude_sessions=None, opencode_sessions=None, codex_sessions=None):
     """Make build_backtrace read from in-memory synthetic sessions instead of the real
-    filesystem/OpenCode CLI. ``*_sessions`` map session id -> ExportedSession."""
+    filesystem/OpenCode CLI. ``*_sessions`` map session id -> ExportedSession.
+
+    EVERY backend is stubbed, including the ones a caller passes nothing for: an unstubbed
+    backend does not go quiet, it goes to the machine's own transcript store, so a test that
+    named only its own sessions was silently reconstructing the developer's real history too.
+    """
     claude_sessions = claude_sessions or {}
     opencode_sessions = opencode_sessions or {}
+    codex_sessions = codex_sessions or {}
 
     monkeypatch.setattr(
         claude,
@@ -469,6 +489,18 @@ def _patch_discovery(monkeypatch, *, claude_sessions=None, opencode_sessions=Non
     monkeypatch.setattr(
         claude, "export_session_at", lambda path, collect_edits=False: claude_sessions.get(Path(path).stem)
     )
+    # Codex yields its rollout path as a str (not a Path) and records the session's working
+    # directory inside the rollout itself, so discovery asks `recorded_cwd` for the base dir
+    # rather than looking at the file's own location under ~/.codex/sessions/.
+    monkeypatch.setattr(
+        codex,
+        "sessions_under",
+        lambda d: [
+            (SessionRef(id=sid, updated=float(i)), f"/fake/codex/{sid}.jsonl") for i, sid in enumerate(codex_sessions)
+        ],
+    )
+    monkeypatch.setattr(codex, "recorded_cwd", lambda p: "/repo")
+    monkeypatch.setattr(codex, "export_session_at", lambda path, **kwargs: codex_sessions.get(Path(path).stem))
     monkeypatch.setattr(
         opencode,
         "sessions_under",
@@ -495,6 +527,7 @@ def test_discover_dedupes_session_recorded_under_repo_and_worktree(monkeypatch, 
     )
     monkeypatch.setattr(claude, "_first_cwd", lambda p: "/repo")
     monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+    monkeypatch.setattr(bt.codex, "sessions_under", lambda d: [])
 
     sources = bt._discover(tmp_path)
     assert len(sources) == 1
@@ -502,22 +535,35 @@ def test_discover_dedupes_session_recorded_under_repo_and_worktree(monkeypatch, 
     assert sources[0].export.args[0] == big
 
 
-def test_build_backtrace_merges_both_backends(monkeypatch, tmp_path):
+def test_build_backtrace_merges_every_backend(monkeypatch, tmp_path):
+    # The expected set comes from the REGISTRY, not a hand-written list: a backtrace that quietly
+    # stops merging a backend still passes a test that only names the backends it knows about,
+    # and a fourth backend must fail here rather than be forgotten.
+    from agitrack.backends.proxy_agents import available_backends
+
     edit = make_edit("/repo/a.py", "", "x\ny\n", status="added")
     claude_es = ExportedSession(
         session_id="c1", model="claude-opus-4-8", updated=2000, turns=[_turn("do a claude thing", edits=[edit])]
     )
+    codex_es = ExportedSession(
+        session_id="x1", model="gpt-5.4-codex", updated=2000, turns=[_turn("do a codex thing", model="gpt-5.4-codex")]
+    )
     oc_es = ExportedSession(
         session_id="o1", model="gpt-5.5", updated=2000, turns=[_turn("do an opencode thing", model="gpt-5.5")]
     )
-    _patch_discovery(monkeypatch, claude_sessions={"c1": claude_es}, opencode_sessions={"o1": oc_es})
+    _patch_discovery(
+        monkeypatch,
+        claude_sessions={"c1": claude_es},
+        codex_sessions={"x1": codex_es},
+        opencode_sessions={"o1": oc_es},
+    )
 
     view = bt.build_backtrace(tmp_path)
     assert not view.is_empty
-    assert view.session_count == 2 and view.edited_sessions == 1
-    assert view.backends == ["claude", "opencode"]
-    assert view.dashboard.total_commits == 2
-    assert set(view.dashboard.by_backend) == {"claude", "opencode"}
+    assert view.session_count == 3 and view.edited_sessions == 1
+    assert view.backends == available_backends()
+    assert view.dashboard.total_commits == 3
+    assert set(view.dashboard.by_backend) == set(available_backends())
     # the claude turn's edit shows up as tracked-AI lines and a diff entry
     assert view.dashboard.ai_lines == (2, 0)
     edited = next(s for s in view.dashboard.stats if s.insertions)
@@ -1024,6 +1070,183 @@ def test_backtrace_end_to_end_non_git_claude(monkeypatch, tmp_path):
     assert "Create hello.py" in stat.message and "## Agent" in stat.message
 
 
+# --------------------------------------------------------------------------- codex discovery
+#
+# Codex files its rollouts by DATE under $CODEX_HOME/sessions, not by working directory, so the
+# only link between a conversation and the directory it ran in is the ``cwd`` its header records.
+# Everything below plants real rollout files (the record shapes are the ones captured from
+# codex-cli 0.147.0 in tests/test_codex_session.py) and drives discovery through them.
+
+CODEX_SESSION = "019fe8dc-ca6c-7951-9225-73513aadf083"
+
+
+def _codex_row(kind, payload, stamp="2026-07-08T10:00:00.000Z"):
+    return {"timestamp": stamp, "type": kind, "payload": payload}
+
+
+def _codex_rollout_rows(cwd: str, *, file_path: str, content: str, prompt: str, reply: str) -> list[dict]:
+    """One complete Codex turn: the header that records the cwd, the turn's model, the prompt,
+    an applied patch and the token counts, closed by task_complete."""
+    return [
+        _codex_row(
+            "session_meta",
+            {"session_id": CODEX_SESSION, "cwd": cwd, "source": "cli", "thread_source": "user"},
+        ),
+        _codex_row("event_msg", {"type": "task_started", "turn_id": "t1"}),
+        _codex_row("turn_context", {"turn_id": "t1", "model": "gpt-5.4-codex", "cwd": cwd}),
+        _codex_row("event_msg", {"type": "user_message", "message": prompt}),
+        _codex_row(
+            "event_msg",
+            {"type": "patch_apply_end", "success": True, "changes": {file_path: {"type": "add", "content": content}}},
+        ),
+        _codex_row(
+            "event_msg",
+            {
+                "type": "token_count",
+                "info": {"last_token_usage": {"input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 60}},
+            },
+        ),
+        _codex_row(
+            "event_msg",
+            {"type": "task_complete", "turn_id": "t1", "last_agent_message": reply},
+            stamp="2026-07-08T10:00:05.000Z",
+        ),
+    ]
+
+
+def _write_codex_rollout(home: Path, rows: list[dict], *, session_id: str = CODEX_SESSION, day: str = "10") -> Path:
+    directory = home / "sessions" / "2026" / "07" / day
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"rollout-2026-07-{day}T10-00-00-{session_id}.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def test_backtrace_end_to_end_non_git_codex(monkeypatch, tmp_path, codex_home):
+    """The Codex branch of discovery, end to end: a rollout planted under $CODEX_HOME is found by
+    the cwd it RECORDED, and its applied patch reconstructs into a turn with a relativized diff."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setattr(opencode, "sessions_under", lambda d: [])  # would shell out to its CLI
+
+    workdir = tmp_path / "myproject"  # NOT a git repo
+    workdir.mkdir()
+    _write_codex_rollout(
+        codex_home,
+        _codex_rollout_rows(
+            str(workdir),
+            file_path=str(workdir / "hello.py"),
+            content='print("hi")\n',
+            prompt="Create hello.py",
+            reply="Created hello.py.",
+        ),
+    )
+
+    view = bt.build_backtrace(workdir)
+
+    assert view.session_count == 1 and view.edited_sessions == 1
+    assert view.backends == ["codex"]
+    stat = view.dashboard.stats[0]
+    assert stat.backend == "codex" and stat.model == "gpt-5.4-codex"
+    assert stat.insertions == 1 and stat.deletions == 0
+    assert stat.tokens.get("input") == 120 and stat.tokens.get("output") == 60
+    # The edit path is relativized against the RECORDED cwd — the rollout's own location under
+    # $CODEX_HOME relativizes nothing, and using it dropped every reconstructed edit.
+    assert view.diffs[stat.sha].startswith("diff --git a/hello.py b/hello.py")
+    assert "Create hello.py" in stat.message and "Created hello.py." in stat.message
+    assert f"backend_session_id: {CODEX_SESSION}" in stat.message
+
+
+def test_discover_scopes_codex_sessions_to_the_directory(monkeypatch, tmp_path, codex_home):
+    # Every rollout on the machine sits in the same date directory, so scoping is entirely a
+    # question of the recorded cwd: a conversation from another project must not be reconstructed
+    # into this one's history.
+    monkeypatch.setattr(opencode, "sessions_under", lambda d: [])
+    here, elsewhere = tmp_path / "here", tmp_path / "elsewhere"
+    here.mkdir()
+    elsewhere.mkdir()
+    rows_here = _codex_rollout_rows(str(here), file_path=str(here / "a.py"), content="x\n", prompt="mine", reply="ok")
+    other_id = "019fe900-1111-7000-8000-aaaaaaaaaaaa"
+    rows_there = [
+        {**row, "payload": {**row["payload"], "session_id": other_id}} if row["type"] == "session_meta" else row
+        for row in _codex_rollout_rows(
+            str(elsewhere), file_path=str(elsewhere / "b.py"), content="y\n", prompt="theirs", reply="ok"
+        )
+    ]
+    path_here = _write_codex_rollout(codex_home, rows_here)
+    _write_codex_rollout(codex_home, rows_there, session_id=other_id, day="11")
+
+    sources = bt._discover(here)
+
+    assert [(s.backend, s.ref_id) for s in sources] == [("codex", CODEX_SESSION)]
+    assert sources[0].base_dir == str(here)  # the recorded cwd, not the rollout's own directory
+    assert sources[0].watch == (path_here,)  # what the daemon stats to notice new turns
+    assert [s.subject for s in bt.build_backtrace(here).dashboard.stats] == ["mine"]
+
+
+def test_discover_keeps_one_source_per_codex_session_id(monkeypatch, tmp_path, codex_home):
+    # A re-imported conversation is filed under TODAY's date directory while the copy it was
+    # imported from keeps its own, so discovery sees the same session id twice. Both copies would
+    # emit the same virtual shas, doubling every turn in the reconstruction.
+    monkeypatch.setattr(opencode, "sessions_under", lambda d: [])
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    rows = _codex_rollout_rows(
+        str(workdir), file_path=str(workdir / "a.py"), content="x\n", prompt="do it", reply="done"
+    )
+    _write_codex_rollout(codex_home, rows, day="10")
+    _write_codex_rollout(codex_home, rows, day="11")
+
+    assert len(bt._discover(workdir)) == 1
+    assert bt.build_backtrace(workdir).dashboard.total_commits == 1
+
+
+def test_a_codex_subagents_files_are_attributed_to_the_turn_that_delegated_them(monkeypatch, tmp_path, codex_home):
+    # A Codex sub-agent runs as its own thread with its own rollout, and that thread is
+    # deliberately excluded from discovery (it is not a resumable conversation) — so unless its
+    # work is folded into the parent turn, the files it wrote vanish from the reconstruction.
+    monkeypatch.setattr(opencode, "sessions_under", lambda d: [])
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    child = "019fe8e3-7a9d-7d12-8e2b-da1425a793ce"
+    rows = _codex_rollout_rows(
+        str(workdir), file_path=str(workdir / "a.py"), content="x\n", prompt="delegate it", reply="delegated"
+    )
+    rows.insert(
+        -1,
+        _codex_row(
+            "response_item",
+            {"type": "function_call", "name": "wait_agent", "arguments": json.dumps({"targets": [child]})},
+        ),
+    )
+    _write_codex_rollout(codex_home, rows)
+    _write_codex_rollout(
+        codex_home,
+        [
+            _codex_row(
+                "session_meta",
+                {"session_id": child, "cwd": str(workdir), "source": "cli", "thread_source": "subagent"},
+            ),
+            _codex_row(
+                "event_msg",
+                {
+                    "type": "patch_apply_end",
+                    "success": True,
+                    "changes": {str(workdir / "haiku.txt"): {"type": "add", "content": "one\ntwo\nthree\n"}},
+                },
+            ),
+        ],
+        session_id=child,
+        day="11",
+    )
+
+    view = bt.build_backtrace(workdir)
+
+    assert view.session_count == 1  # the sub-agent's thread is not a session of its own
+    stat = view.dashboard.stats[0]
+    assert (stat.insertions, stat.deletions) == (4, 0)  # its own a.py plus the delegated haiku.txt
+    assert "haiku.txt" in view.diffs[stat.sha]
+
+
 def test_backtrace_start_restarts_a_running_daemon_on_the_same_port(monkeypatch, tmp_path, capsys):
     # Re-running `agitrack --backtrace` must behave like `agitrack -d`: STOP the old daemon
     # and start a fresh one reusing the previous port, not just print "already running".
@@ -1285,3 +1508,41 @@ def test_an_interrupted_turn_that_did_work_is_still_its_own_entry(monkeypatch, t
 
     assert view.dashboard.total_commits == 2
     assert [s.subject for s in view.dashboard.stats] == ["Do the thing.", "Carry on."]
+
+
+def test_the_daemon_watches_the_codex_day_directory_a_new_rollout_lands_in(codex_home):
+    """Codex files rollouts under ``sessions/YYYY/MM/DD/``, so watching only the sessions root
+    never sees a new conversation: the root's mtime does not change when a rollout is written
+    three levels down. The daemon then reported no work owed and the backtrace view went stale
+    until something else forced a rediscovery — the FIRST Codex conversation in a directory (and
+    the first of every new day) was the case that needed one most.
+
+    The chain root -> year -> month -> day covers all four ways a rollout can be new.
+    """
+    day = codex_home / "sessions" / "2026" / "08" / "10"
+    day.mkdir(parents=True)
+    (day / "rollout-2026-08-10T00-00-00-019f.jsonl").write_text("{}\n", encoding="utf-8")
+
+    roots = bt.codex.watch_roots()
+
+    assert day in roots, "the day directory a new rollout lands in must be watched"
+    assert day.parent in roots, "the month directory changes on the first rollout of a new day"
+    assert day.parent.parent in roots, "the year directory changes on a new month"
+    assert codex_home / "sessions" in roots, "the root changes on a new year"
+
+
+def test_codex_watch_roots_survive_an_absent_or_empty_store(codex_home, tmp_path):
+    # A machine that has never run Codex, and one mid-first-run with the tree half-created.
+    assert bt.codex.watch_roots() == [codex_home / "sessions"]
+    (codex_home / "sessions" / "2026").mkdir(parents=True)
+    assert bt.codex.watch_roots() == [codex_home / "sessions", codex_home / "sessions" / "2026"]
+
+
+def test_every_backend_root_is_watched_for_newly_appeared_sessions(codex_home, monkeypatch):
+    # The regression itself: `_watch_signature` seeded Claude's projects root alone, so a
+    # backend whose sessions all post-date the last discovery pass stayed invisible.
+    (codex_home / "sessions" / "2026" / "08" / "10").mkdir(parents=True)
+    _files, dirs = bt._watch_signature([])
+
+    assert str(codex_home / "sessions") in dirs, dirs
+    assert str(codex_home / "sessions" / "2026" / "08" / "10") in dirs, dirs

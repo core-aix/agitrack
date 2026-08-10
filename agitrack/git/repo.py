@@ -183,7 +183,8 @@ class GitRepo:
         ``dir/`` is kept only when it actually contains a genuinely-untracked file — cross-checked
         against the accurate per-file list (which descends and honours every nested ``.gitignore``).
 
-        Agent/tooling scaffolding (``.agitrack/``, ``.claude/``, ``.opencode/``) is filtered out
+        Agent/tooling scaffolding (``_NEVER_STAGE_PREFIXES``: ``.agitrack/``, ``.claude/``,
+        ``.codex/``, ``.opencode/``) is filtered out
         so the user is never asked to stage an agent's own folder."""
         output = self._run(["git", "ls-files", "--others", "--exclude-standard", "--directory"]).stdout
         entries = [line for line in output.splitlines() if line and not _is_scaffolding(line)]
@@ -281,7 +282,7 @@ class GitRepo:
         index or working tree, and return its SHA. Uses a throwaway index seeded from
         HEAD, so ``git add -A`` records the full working-tree delta the agent produced
         this turn — tracked edits, new untracked files, and deletions — minus the agent
-        scaffolding dirs (``.agitrack/`` / ``.claude/`` / ``.opencode/``). This is how
+        scaffolding dirs (``_NEVER_STAGE_PREFIXES``). This is how
         manual-commit mode captures a turn as a hidden latent commit while HEAD never
         moves and the user's own index/staging is left completely untouched."""
         scaffolding = [prefix.rstrip("/") for prefix in _NEVER_STAGE_PREFIXES]
@@ -310,7 +311,7 @@ class GitRepo:
 
         Every "has the working tree changed?" test in manual/no-worktree/background mode is a
         comparison between a snapshot and some commit's tree. The snapshot deliberately drops
-        ``.agitrack/`` / ``.claude/`` / ``.opencode/``; a raw ``rev^{tree}`` does not. So in a repo
+        every ``_NEVER_STAGE_PREFIXES`` entry; a raw ``rev^{tree}`` does not. So in a repo
         that TRACKS any of those — committing ``.claude/settings.json`` or a ``.claude/commands/``
         dir is ordinary practice — the two could never be equal and every one of those tests
         answered "dirty" forever: the daemon stopped covering the agent's own commits, stale and

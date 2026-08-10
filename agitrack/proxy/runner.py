@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - exercised only without optional depend
 
 from agitrack.commits import AgitrackActions
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
-from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.commits import (
     apply_summary_to_message,
     build_auto_fold_message,
@@ -10748,7 +10748,10 @@ class ProxyRunner:
         return [
             {
                 "key": "default_backend",
-                "label": "Default coding agent (Claude Code or OpenCode)",
+                # Never hand-write the list: the options right below come from the registry, so a
+                # literal label went stale the moment a backend was added — this one offered Codex
+                # under a heading that said the choice was Claude-or-OpenCode.
+                "label": f"Default coding agent ({backend_phrase()})",
                 "kind": "choice",
                 "options": available_backends(),
                 "restart": True,
