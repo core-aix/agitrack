@@ -9956,6 +9956,20 @@ class ProxyRunner:
             self._host.detect_host_terminal(debug_fn=debug_fn)
         else:
             TerminalHost.detect_host_terminal(self, debug_fn=debug_fn)
+        # SOME TERMINALS NEVER ANSWER. macOS Terminal.app is the common one: it draws true
+        # colour perfectly well but implements no colour REPORT, so the query above times out
+        # every launch. With nothing to relay, the backend fell back to its own default — dark —
+        # and painted a dark UI in a white terminal, and aGiTrack could not tell that was wrong
+        # because it had no background to compare the agent against either. Ask the platform
+        # instead; `detect_host_background` is read-only and never prompts. Only a terminal that
+        # stayed silent is asked, so a real answer is never second-guessed.
+        if not self.host_bg_value:
+            from agitrack.proxy.host_background import detect_host_background
+
+            derived = detect_host_background()
+            if derived:
+                self.host_bg_value = derived
+                self._debug(f"host background derived from the platform: {derived!r}")
         # If the menu key requires shift modifier, enable the kitty keyboard protocol
         # so the terminal sends distinguishable escape sequences.
         if self.global_config.is_shift_modified:
