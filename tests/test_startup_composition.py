@@ -13,7 +13,6 @@ makes the test a coin toss (it passed on macOS and failed on Linux for exactly t
 from __future__ import annotations
 
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -22,10 +21,12 @@ import pytest
 from agitrack.proxy.platform.base import ChildProcess, HostTerminal
 from harness import FakeChildProcess, FakeHostTerminal, init_repo, launch
 
-# The harness drives a POSIX reactor (select on pipe fds, os.pipe stdin). Native Windows
-# bridges those through sockets in platform/nt.py and is covered by the dedicated Windows
-# job; running this here would test the fakes, not the product.
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX reactor (select on pipe fds) only")
+# These run on Windows too. They used to be skipped there because the harness fakes were
+# built on `os.pipe()`, which Windows `select` rejects — so the ONE suite that drives the real
+# run()/reactor covered every platform except the one whose host I/O is most unusual, and the
+# Windows job's "full test suite" quietly meant "minus the composition layer". The fakes now
+# bridge through a socketpair exactly as platform/nt.py does, so the sequence under test is the
+# product's on both platforms. See harness._channel.
 
 
 def test_fakes_satisfy_the_platform_protocols():
@@ -465,3 +466,77 @@ def test_reactor_does_not_commit_a_turn_that_is_still_running(tmp_path):
     ).stdout
     assert "half.txt" not in log
     assert h.runner.base_repo.rev_parse("HEAD") == head_before
+
+
+def _subcommand(command: tuple) -> str:
+    """The git subcommand in an argv, skipping the ``-c key=value`` pairs GitRepo injects.
+
+    Every command goes out as ``git -c core.quotePath=false <subcommand> …`` (and history
+    reads add two more), so ``command[1]`` is ``-c``, never the subcommand. Reading it
+    naively made an earlier version of the test below classify NOTHING as a read and pass
+    unconditionally — which is why it is verified against the unfixed code, not just written.
+    """
+    index = 1
+    while index < len(command) and command[index] == "-c":
+        index += 2
+    return command[index] if index < len(command) else ""
+
+
+def test_pressing_enter_does_not_ask_git_the_same_question_twice(tmp_path):
+    """The submit path must not re-run a read-only git command it has already run.
+
+    WHY THIS IS A COMPOSITION TEST AND WHY IT COUNTS SPAWNS. Pressing Enter was measured at
+    740 ms on native Windows against an empty repo with a clean tree — and 100% of it was git:
+    19 subprocesses for one keystroke, five of them the same `rev-parse --abbrev-ref HEAD`,
+    three the same `diff --quiet`, three the same `ls-files --others`. Nothing was slow; a
+    process spawn just costs ~38 ms on Windows against ~5 ms on macOS/Linux, which is why
+    "Enter takes a long time" only ever arrived as a Windows report while every POSIX
+    measurement said the path was fine.
+
+    The duplication is invisible to a unit test because no single method does it twice: it
+    emerges from half a dozen collaborating helpers each asking independently, which is
+    exactly what a composition test is for. And it asserts on a COUNT, never on elapsed time,
+    so it is deterministic in CI on any machine (see AGENTS.md, "Timing-dependent tests").
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    repo = init_repo(tmp_path)
+
+    import agitrack.git.repo as repo_module
+
+    submitting = {"on": False}
+    spawned: list[tuple[str, tuple]] = []
+    real_run = repo_module.subprocess.run
+
+    def _recording_run(command, **kwargs):
+        if submitting["on"]:
+            spawned.append((str(kwargs.get("cwd")), tuple(command)))
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(repo_module.subprocess, "run", _recording_run)
+
+    typed = {"enter": False}
+
+    def _script(harness):
+        harness.host.type(b"hello")
+
+    def _tick(harness):
+        written = bytes(harness.child.written)
+        if b"hello" in written and not typed["enter"]:
+            typed["enter"] = True
+            submitting["on"] = True
+            harness.host.type(b"\r")
+        elif typed["enter"] and (b"\r" in written or b"\n" in written):
+            submitting["on"] = False
+            harness.runner.running = False
+
+    launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=600, script=_script, on_tick=_tick)
+
+    assert typed["enter"], "the prompt was never typed; the harness did not reach the submit"
+    # Only READ-ONLY commands: a repeated write is a different bug and would be a real change
+    # in behaviour, so it is deliberately not swept up here.
+    reads = [entry for entry in spawned if _subcommand(entry[1]) in repo_module._CACHEABLE_SUBCOMMANDS]
+    assert reads, f"no read-only git commands were seen during the submit; got {spawned}"
+    repeated = {entry for entry in reads if reads.count(entry) > 1}
+    assert not repeated, "the submit path re-ran read-only git commands:\n  " + "\n  ".join(
+        f"{count}x {cmd}" for cmd, count in ((e, reads.count(e)) for e in repeated)
+    )

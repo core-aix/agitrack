@@ -3,7 +3,7 @@ worktrees/branches, and the single-writer lock. Public names are re-exported
 here so call sites import ``from agitrack.git import GitRepo`` etc."""
 
 from agitrack.git.lock import RepoLock, already_running_message
-from agitrack.git.repo import GitError, GitRepo
+from agitrack.git.repo import GitError, GitRepo, read_cache
 from agitrack.git.worktree import (
     BRANCH_PREFIX,
     WORKTREES_DIRNAME,
@@ -24,4 +24,5 @@ __all__ = [
     "_sanitize_name",
     "RepoLock",
     "already_running_message",
+    "read_cache",
 ]
