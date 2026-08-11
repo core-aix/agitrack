@@ -8212,7 +8212,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             },
             {
                 "key": "autotrack_hook",
-                "label": "Auto-start tracking on commit when aGiTrack isn't running (auto/off; `agitrack --remove-hooks` also turns it off)",
+                "label": "Auto-start tracking when aGiTrack isn't running — on a commit, or when an agent turn leaves changes (auto/off; `agitrack --remove-hooks` also turns it off)",
                 "kind": "text",
             },
             {
