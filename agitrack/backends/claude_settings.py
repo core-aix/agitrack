@@ -34,6 +34,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agitrack.fileio import atomic_write_text
+
 # The flags whose presence identifies OUR hook entries. Matching on the command string rather
 # than on a marker key of our own keeps each entry to the shape Claude Code documents — an
 # unknown key risks being rejected by its settings validation, which would take the user's
@@ -52,6 +54,57 @@ SESSION_NOTE_HOOK = ("SessionStart", HOOK_FLAG)
 AUTOSTART_HOOK = ("Stop", AUTOSTART_FLAG)
 
 SETTINGS_RELPATH = Path(".claude") / "settings.local.json"
+
+# The user's settings file EXACTLY as aGiTrack first found it, kept for the length of the
+# install so removal can put it back byte-for-byte. See _snapshot_original.
+ORIGINAL_RELPATH = Path(".agitrack") / "claude-settings.original"
+
+
+def _snapshot_original(path: Path) -> None:
+    """Remember the settings file verbatim, once, before aGiTrack's first hook goes in.
+
+    Re-serializing with ``json.dumps(indent=2)`` preserves the user's settings in MEANING but
+    not in bytes, and for the repos that TRACK ``settings.local.json`` — the `.local` says most
+    do not, but some do — meaning is not enough: `agitrack -b` followed by `agitrack -b stop`
+    correctly removed the hooks and still left a whole-file reformatting diff in `git status`,
+    for a file aGiTrack does not own and was only ever a guest in. Snapshotting the original
+    lets removal restore it instead of re-printing it. Same idea as the `core.commentChar` and
+    partial-clone config snapshots: put the repo back as it was found.
+
+    Best-effort throughout, and only for a file that already exists — one aGiTrack creates
+    itself has nothing to restore and is deleted outright on removal."""
+    if not path.exists():
+        return
+    original = path.parent.parent / ORIGINAL_RELPATH
+    if original.exists():  # an earlier install already captured the true original
+        return
+    try:
+        atomic_write_text(original, path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+
+
+def _restore_original(path: Path, data: dict[str, Any]) -> bool:
+    """Put the snapshot back when ``data`` — the settings with our hooks taken out — says
+    nothing else has changed since. False means there is no usable snapshot, or the user has
+    edited the file meanwhile and their version is the one to keep."""
+    original = path.parent.parent / ORIGINAL_RELPATH
+    try:
+        text = original.read_text(encoding="utf-8")
+        if json.loads(text) != data:
+            return False
+        path.write_text(text, encoding="utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    _discard_original(path)
+    return True
+
+
+def _discard_original(path: Path) -> None:
+    try:
+        (path.parent.parent / ORIGINAL_RELPATH).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def hook_command(flag: str = HOOK_FLAG) -> str:
@@ -135,6 +188,7 @@ def install_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
     kept = [item for item in _entries(data, event) if not _is_ours(item, flag)]
     hooks[event] = [*kept, entry]
     try:
+        _snapshot_original(path)  # before the first write: what removal has to restore
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
@@ -167,7 +221,13 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
     if not hooks:
         data.pop("hooks", None)
     try:
-        if data:
+        # The snapshot first: our hooks are out, so if what remains is what the user had, give
+        # them their own bytes back rather than aGiTrack's reformatting of them. While our OTHER
+        # hook is still installed the two differ and this falls through — the restore happens
+        # when the last one goes.
+        if _restore_original(path, data):
+            pass
+        elif data:
             path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         elif _is_tracked_by_git(path):
             # Emptied but COMMITTED: some repos do track this file. Deleting it would show up
@@ -178,6 +238,7 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
             # The file existed only to carry our hook: remove it, and the directory too when
             # it was ours alone. Claude Code recreates either on demand.
             path.unlink()
+            _discard_original(path)
             try:
                 path.parent.rmdir()
             except OSError:

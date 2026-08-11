@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, fs_path
 
 
 class GitError(RuntimeError):
@@ -153,7 +153,9 @@ class GitRepo:
             raise GitError(f"Cannot read the Git repository at {path}: {error}") from error
         if process.returncode != 0:
             raise GitError(f"Not a Git repository: {path}")
-        return cls(Path(process.stdout.strip()))
+        # fs_path, not Path: git printed UTF-8, and this string is about to be `resolve()`d and
+        # handed to the OS as `cwd`. See proc.fs_path.
+        return cls(fs_path(process.stdout.strip()))
 
     @classmethod
     def init(cls, path: Path) -> "GitRepo":
@@ -1195,7 +1197,7 @@ class GitRepo:
         raw = self._run(["git", "rev-parse", "--git-path", "objects"], check=False).stdout.strip()
         if not raw:
             return 0
-        objects = Path(raw) if os.path.isabs(raw) else (self.repo / raw)
+        objects = fs_path(raw) if os.path.isabs(raw) else (self.repo / raw)
         removed = 0
         for sha in orphaned:
             if len(sha) < 4 or any(ch not in "0123456789abcdef" for ch in sha):
