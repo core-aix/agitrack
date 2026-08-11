@@ -290,10 +290,25 @@ _OSC_RGB_RE = re.compile(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)")
 _HEX6_RE = re.compile(r"#?([0-9a-fA-F]{6})\b")
 
 
+def _host_bg_known(host) -> bool:
+    """Whether the terminal actually TOLD us its background, as opposed to us assuming one.
+
+    ``_host_bg_is_dark`` has to return a bool for accent contrast, so it guesses dark when the
+    answer is missing. A guess is fine for picking a highlight colour and wrong for deciding
+    whether to repaint the user's whole screen — see the abstain branch in ``update_canvas``.
+    """
+    raw = getattr(host, "host_bg_value", None)
+    if not raw:
+        return False
+    text = raw.decode("ascii", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return bool(_OSC_RGB_RE.search(text) or _HEX6_RE.search(text))
+
+
 def _host_bg_is_dark(host) -> bool:
     """Whether the terminal background is dark, read from its OSC-11 colour (``host_bg_value``).
     Defaults to dark when unknown/unparseable — the common terminal default — so a popup's
-    accent colour can be chosen to contrast the background."""
+    accent colour can be chosen to contrast the background. Callers that must not act on a
+    GUESS check ``_host_bg_known`` first."""
     raw = getattr(host, "host_bg_value", None)
     if not raw:
         return True
@@ -945,6 +960,25 @@ class ScreenRenderer:
         agent_dark = self.agent_theme_is_dark(body)
         if agent_dark is None:
             return  # nothing to learn from this frame; keep whatever is painted now
+        if not _host_bg_known(self):
+            # THE TERMINAL HAS NOT SAID WHAT IT IS DRAWING ON — no OSC 11 support, or an answer
+            # still in flight (tmux, ssh and forwarded sessions routinely reply after detection's
+            # bounded wait). Leave its colours alone: an unknown background must never be turned
+            # into a repaint of the user's whole screen.
+            #
+            # Guessing here is what broke it. `_host_bg_is_dark` answers "dark" when it does not
+            # know, so a dark agent "matched" a WHITE terminal, no canvas was painted — and the
+            # decision LATCHED, because the code below sets `_canvas_decided`. Every later change
+            # then needs CANVAS_VOTES_TO_SWITCH agreeing samples, so the terminal's real answer,
+            # arriving moments later on stdin, could not simply take effect: the session sat with
+            # the agent's dark panels floating in a white screen until enough repaints happened
+            # to out-vote the guess — which is why it came right only once the user SCROLLED.
+            #
+            # Staying undecided is the whole point: the first sample after the answer lands is
+            # then a FIRST decision, adopted outright, and the throttle above does not apply
+            # while undecided, so it is sampled on the very next reactor tick.
+            self._canvas = None
+            return
         host_dark = _host_bg_is_dark(self)
         target = None if agent_dark == host_dark else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
         decided = self._canvas_decided
@@ -996,6 +1030,13 @@ class ScreenRenderer:
             self._canvas_decided = True  # settled by the setting; no frame can overrule it
             return
         if agent_dark is None or setting != "auto":
+            return
+        if not _host_bg_known(self):
+            # Same rule as `update_canvas`: with no answer from the terminal there is nothing to
+            # disagree WITH, so the session opens in the terminal's own colours. Applying a
+            # remembered scheme against an assumed background would repaint the whole screen on
+            # the strength of two guesses stacked on each other.
+            self._canvas = None
             return
         self._canvas = None if agent_dark == _host_bg_is_dark(self) else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
         self._canvas_votes = 0
