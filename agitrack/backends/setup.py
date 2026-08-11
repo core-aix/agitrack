@@ -24,7 +24,10 @@ _BACKEND_INSTALL = {
     "codex": {
         "label": "Codex CLI",
         "url": "https://developers.openai.com/codex/cli",
-        "unix": "curl -fsSL https://chatgpt.com/backend-api/codex/install | bash",
+        # The chatgpt.com installer endpoint returns HTTP 403 from some networks (confirmed by
+        # two independent live-test runs), so npm — which the same hint already offers and which
+        # works everywhere Node does — is the primary suggestion for Codex.
+        "unix": "npm install -g @openai/codex",
         "npm": "@openai/codex",
     },
     "opencode": {
@@ -49,7 +52,33 @@ def backend_installed(name: str) -> bool:
     # which_executable (not shutil.which) so a Windows backend is "installed" only when a
     # real runnable shim (.exe/.cmd/.bat) exists — not a half-installed npm package that left
     # only an extensionless shell script or a .ps1, which aGiTrack can't actually launch.
-    return which_executable(_executable(name)) is not None
+    return backend_executable(name) is not None
+
+
+def backend_executable(name: str) -> str | None:
+    """The path to ``name``'s CLI, searching PATH and then the directories the installers use.
+
+    Detection used to be PATH-only, so a working `claude` sitting at ``%APPDATA%\\npm`` or
+    ``~/.local/bin`` was reported "not installed" — with a reinstall recipe whose official
+    installer drops it in that same directory, so a naive user could loop forever. The damning
+    part is that ``_candidate_bin_dirs()`` already hardcodes exactly those paths, with the
+    comment "claude.cmd lands here" — but its only call site was INSIDE the install routine,
+    after a successful install. It was never consulted when deciding whether one was missing.
+
+    Found-off-PATH also adds the directory to this process's PATH, so the launch that follows
+    works rather than reporting success and then failing to spawn."""
+    executable = _executable(name)
+    found = which_executable(executable)
+    if found is not None:
+        return found
+    for directory in _candidate_bin_dirs(which_executable("npm"), subprocess.run):
+        if not directory or not os.path.isdir(directory):
+            continue
+        candidate = which_executable(os.path.join(directory, executable))
+        if candidate is not None:
+            _add_dirs_to_path([directory])
+            return candidate
+    return None
 
 
 def install_hint(name: str) -> str:
@@ -341,10 +370,25 @@ def select_default_backend(
         if answer.isdigit() and 1 <= int(answer) <= len(names):
             chosen = names[int(answer) - 1]
             if chosen not in installed:
-                # Explicit pick of an uninstalled one → install now. The same input_fn is
-                # handed down so the installer's own questions (notably the PATH offer that
-                # follows it) are drained and answerable exactly like this one.
-                install_fn(chosen, input_fn=input_fn, output_fn=output_fn)
+                # CONFIRM FIRST. Typing a number used to run `curl … | bash` immediately — no
+                # y/N, no abort, the only disclosure a trailing clause on the question above —
+                # so a user picking the agent they PLANNED to use later got an unannounced
+                # ~291 MB download piped from the network into a shell. Declining is not a
+                # dead end: the choice is still saved, and the launch-time gate offers to
+                # install it when they actually start a session.
+                hint = install_hint(chosen)
+                output_fn(f"\n{chosen} is not installed yet.\n\n{hint}\n")
+                consent = input_fn(f"Install {chosen} now? [y/N]: ").strip().lower()
+                if consent.startswith("y"):
+                    # The same input_fn is handed down so the installer's own questions (notably
+                    # the PATH offer that follows it) are drained and answerable exactly like this.
+                    install_fn(chosen, input_fn=input_fn, output_fn=output_fn)
+                else:
+                    output_fn(
+                        f"Not installing. {chosen} stays your default — aGiTrack offers to "
+                        "install it again when you start a session, or install it yourself with "
+                        "the command above."
+                    )
             break
         output_fn("Please enter a valid number, or press Enter for the default.")
     config.default_backend = chosen

@@ -26,6 +26,7 @@ from agitrack.commits.message import apply_summary_to_message, build_manual_squa
 from agitrack.config import AgitrackState
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
+from agitrack.fileio import ensure_state_dir
 
 
 def write_lf(path: Path, text: str) -> None:
@@ -45,7 +46,7 @@ def write_lf(path: Path, text: str) -> None:
     message. Same guarantee ``state.save()`` already relies on.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
@@ -256,7 +257,7 @@ class ManualCommitTracker:
         AI work) is left untouched."""
         try:
             agit_dir = self.agit_dir()
-            agit_dir.mkdir(parents=True, exist_ok=True)
+            ensure_state_dir(agit_dir)
             # EVERY ref whose turns this commit will fold, one per line — the post-commit hook
             # advances each. Writing only the current session's ref left an earlier session's
             # already-folded turns pending, so the next commit folded them a second time.

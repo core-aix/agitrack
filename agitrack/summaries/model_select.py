@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, resolve_subprocess_command
 
 
 def list_available_models(backend_name: str) -> list[str]:
@@ -84,7 +84,7 @@ def _list_opencode_models() -> list[str]:
     try:
         result = subprocess.run(
             resolve_subprocess_command(["opencode", "models"]),
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -148,7 +148,7 @@ def _list_claude_models() -> list[str]:
     try:
         result = subprocess.run(
             resolve_subprocess_command(["claude", "--help"]),
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,

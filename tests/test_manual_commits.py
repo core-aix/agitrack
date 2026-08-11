@@ -2588,3 +2588,52 @@ def test_the_proxys_own_manual_copy_agrees_with_the_tracker_in_a_scaffolded_repo
     assert runner._manual_record(_agent_body("work", 10)) is not None
     _git(repo, "checkout", "--", "a.txt")
     assert runner._reset_stale_manual_ref() is True
+
+
+def test_the_project_post_commit_hook_runs_on_an_ORDINARY_commit(tmp_path):
+    """B6 / C36: the `exit 0` guard fired on every commit WITHOUT aGiTrack metadata — i.e. every
+    ordinary human commit — and returned before the chain block at the bottom of the script. A
+    project's own post-commit hook (a CI trigger, a notification, a ctags rebuild) went silently
+    dead from `agitrack -b` onward, and `-b stop` did not bring it back; only `--remove-hooks`
+    did. `prepare-commit-msg` got this right all along with its `_agitrack_chain()` helper."""
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    ran = tmp_path / "project-hook-ran.txt"
+    existing = hooks_dir / "post-commit"
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran}\n", encoding="utf-8")
+    existing.chmod(0o755)
+
+    assert git_hooks.install_manual_commit_hooks(hooks_dir)
+
+    # A purely human commit: no aGiTrack turn pending, so no metadata lands in the message.
+    (tmp_path / "b.txt").write_text("mine\n", encoding="utf-8")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "an ordinary human commit")
+
+    assert "# aGiTrack Metadata" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert ran.exists(), "the project's own post-commit hook never ran"
+
+
+def test_the_project_post_commit_hook_still_runs_on_a_folded_commit(tmp_path):
+    """The other branch: a commit that DOES carry aGiTrack metadata advances the latent refs and
+    must still hand off to the project's hook."""
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    ran = tmp_path / "project-hook-ran.txt"
+    existing = hooks_dir / "post-commit"
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran}\n", encoding="utf-8")
+    existing.chmod(0o755)
+
+    assert git_hooks.install_manual_commit_hooks(hooks_dir)
+    trailer = build_manual_squash_trailer(agitrack_session_id="s", latent_bodies=[_agent_body("do x", 10)])
+    _setup_manual_ref_and_trailer(repo, trailer)
+
+    (tmp_path / "a.txt").write_text("one\nedit\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My change")
+
+    assert "# aGiTrack Metadata" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert repo.rev_parse("refs/agitrack/manual/s") == repo.rev_parse("HEAD")  # the fold still happened
+    assert ran.exists()

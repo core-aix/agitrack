@@ -254,3 +254,51 @@ def test_bridge_lock_conflict_reports_error(tmp_path, monkeypatch):
     types = {event["type"] for event in _events(out)}
     assert "error" in types and "bye" in types
     holder.release()
+
+
+def test_an_ask_after_stdin_closes_does_not_deadlock():
+    """C39: `wait_answer` was an unbounded `queue.get()`, so an `ask` raised after stdin had
+    already closed — a driver that piped one prompt and exited, a harness whose stdin was
+    /dev/null — waited on an answer that could never arrive. The session deadlocked forever
+    (killed after 7 minutes at {"type":"ask","id":"ask-1",…}) while the reader thread had
+    already queued its exit."""
+    import io
+    import time
+
+    from agitrack.shell.bridge import BridgeServer, BridgeUI
+
+    out = io.StringIO()
+    server = BridgeServer(out=out, inp=io.StringIO(""))  # stdin closed immediately
+    server.start()
+    for _ in range(200):  # let the reader observe EOF
+        if server._closed.is_set():
+            break
+        time.sleep(0.01)
+
+    started = time.monotonic()
+    answer = BridgeUI(server).select("Which one?", ["a", "b"])
+
+    assert answer is None
+    assert time.monotonic() - started < 5.0
+
+
+def test_an_unknown_message_type_is_reported_not_silently_dropped():
+    """`--help` called this protocol JSON-RPC, so developers wrote JSON-RPC 2.0 clients — and got
+    complete silence, with no way to tell a protocol mismatch from a hang."""
+    import io
+    import json
+    import time
+
+    from agitrack.shell.bridge import BridgeServer
+
+    out = io.StringIO()
+    server = BridgeServer(out=out, inp=io.StringIO('{"jsonrpc": "2.0", "method": "prompt", "id": 1}\n'))
+    server.start()
+    for _ in range(200):
+        if server._closed.is_set():
+            break
+        time.sleep(0.01)
+
+    notices = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert any(n.get("type") == "notice" and "unknown type" in n.get("message", "") for n in notices)
+    assert any("JSON-RPC" in n.get("message", "") for n in notices)

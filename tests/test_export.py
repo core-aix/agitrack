@@ -379,3 +379,65 @@ def test_cli_export_writes_the_site(tmp_path, monkeypatch, capsys):
     assert code == 0
     assert (out / "index.html").exists()
     assert "Static demo dashboard written to" in capsys.readouterr().out
+
+
+def test_export_refuses_a_directory_it_did_not_write(tmp_path, monkeypatch, capsys):
+    """A mistyped `--export-dir ~/Documents` must not be an unrecoverable rmtree.
+
+    The export REPLACES its output directory, so it may only delete a directory it can prove
+    is its own: empty, absent, or carrying the export marker."""
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    precious = tmp_path / "documents"
+    (precious / "taxes").mkdir(parents=True)
+    (precious / "README.txt").write_text("do not delete", encoding="utf-8")
+    (precious / "taxes" / "2025.txt").write_text("keep", encoding="utf-8")
+
+    code = cli.main(["-d", "export", "--repo", str(repo.repo), "--export-dir", str(precious)])
+
+    assert code == 1
+    assert (precious / "README.txt").read_text(encoding="utf-8") == "do not delete"
+    assert (precious / "taxes" / "2025.txt").exists()
+    out = capsys.readouterr().out
+    assert "Refusing to replace" in out
+    assert "--force" in out
+
+
+def test_export_replaces_its_own_previous_output(tmp_path, monkeypatch):
+    """Re-exporting into a previous export is the normal case and must keep working —
+    including cleaning up files the new export no longer produces."""
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    out = tmp_path / "site"
+    export_static_demo(repo, out)
+    from agitrack.metrics.export import EXPORT_MARKER
+
+    assert (out / EXPORT_MARKER).exists()
+    (out / "stale.json").write_text("{}", encoding="utf-8")
+
+    export_static_demo(repo, out)
+
+    assert not (out / "stale.json").exists()
+    assert (out / "index.html").exists()
+
+
+def test_export_force_overrides_the_refusal(tmp_path, monkeypatch):
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    out = tmp_path / "site"
+    out.mkdir()
+    (out / "someone-elses.txt").write_text("bye", encoding="utf-8")
+
+    export_static_demo(repo, out, force=True)
+
+    assert not (out / "someone-elses.txt").exists()
+    assert (out / "index.html").exists()
+
+
+def test_export_accepts_an_empty_directory(tmp_path, monkeypatch):
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    out = tmp_path / "site"
+    out.mkdir()
+    export_static_demo(repo, out)
+    assert (out / "index.html").exists()

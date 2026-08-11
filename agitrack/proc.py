@@ -14,6 +14,27 @@ import shutil
 import signal
 import subprocess
 import sys
+from typing import Any
+
+
+# The ONLY correct way to ask subprocess for text I/O in this codebase. Spread it instead of
+# writing ``text=True``:
+#
+#     subprocess.run(cmd, **UTF8_TEXT, stdout=subprocess.PIPE, ...)
+#
+# Bare ``text=True`` decodes with ``locale.getencoding()`` — cp1252 on a Western Windows box,
+# ASCII under ``LC_ALL=C`` or ``PYTHONUTF8=0`` on Linux. Every tool aGiTrack shells out to (git
+# above all) speaks UTF-8, so the locale codec is simply the wrong one, and the failure is not
+# cosmetic: ``git rev-parse --show-toplevel`` in ``C:\Users\Müller\repo`` came back as mojibake,
+# which was then passed as ``cwd`` to the next git call and surfaced as ``[WinError 267] The
+# directory name is invalid`` — aGiTrack was unusable for anyone whose profile directory is not
+# pure ASCII. On Linux the same call raised ``UnicodeDecodeError`` outright.
+#
+# ``errors="replace"`` is deliberate: a stray undecodable byte in a tool's OUTPUT must degrade
+# one character, never crash a command.
+# Annotated ``dict[str, Any]``: inferred as ``dict[str, object]`` it cannot satisfy any
+# ``subprocess.run`` overload when spread, and every call site fails to type-check.
+UTF8_TEXT: dict[str, Any] = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
 def agitrack_invocation() -> list[str]:

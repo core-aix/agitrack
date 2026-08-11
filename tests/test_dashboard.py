@@ -2126,3 +2126,38 @@ def test_a_block_without_a_conversation_anchor_is_never_suppressed(tmp_path):
     ]
     _suppress_copied_turns(stats)
     assert [s.tokens for s in stats] == [{"output": 10}, {"output": 10}]
+
+
+def test_dashboard_on_a_repo_with_no_commits(tmp_path, capsys):
+    """A fresh `git init` is the very first state a new user can be in, and `-d text` answered it
+    with a raw traceback and exit 1: `git rev-parse --abbrev-ref HEAD` fails outright on an unborn
+    branch, and `current_branch()` ran it with check=True. `-d html` was worse — it reported
+    success and served a page that spun forever while every /data request crashed server-side."""
+    import subprocess
+
+    from agitrack import cli
+
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    assert cli.main(["-d", "text", "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert "Traceback" not in out
+    assert "0 commits" in out
+    # ...and the empty case explains itself rather than just printing zeroes, the way `-d html`
+    # already did when it diverted to the backtrace view.
+    assert "--backtrace" in out
+
+
+def test_dashboard_names_the_unborn_branch(tmp_path):
+    import subprocess
+
+    from agitrack.git import GitRepo
+
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "trunk"], cwd=repo, check=True)
+
+    assert GitRepo.discover(repo).current_branch() == "trunk"

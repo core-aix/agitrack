@@ -182,7 +182,15 @@ def manual_path_instructions(directory: str, *, profile: Path | None = None) -> 
         [
             f"To use the agent CLI outside aGiTrack, add this directory to your PATH:\n  {directory}",
             f"  macOS / Linux:  echo '{profile_line(directory, profile=target)}' >> {target}",
-            f'  Windows (PowerShell):  setx PATH "$env:PATH;{directory}"',
+            # NOT `setx PATH "$env:PATH;<dir>"`, which this file's own _persist_windows docstring
+            # documents as the thing to avoid: setx truncates the value at 1024 characters and
+            # silently destroys a long PATH. It is also wrong in SCOPE — in PowerShell $env:PATH
+            # is the combined machine+user value while setx writes the USER value, so every
+            # machine entry gets permanently copied into the user PATH (measured: 224 → ~440
+            # chars on one box). This reads only the user value, appends, and writes it back.
+            "  Windows (PowerShell):\n"
+            "      $user = [Environment]::GetEnvironmentVariable('Path', 'User')\n"
+            f"      [Environment]::SetEnvironmentVariable('Path', \"$user;{directory}\", 'User')",
             "Then open a NEW terminal so the updated PATH is picked up.",
         ]
     )

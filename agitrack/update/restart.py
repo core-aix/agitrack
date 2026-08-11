@@ -62,13 +62,13 @@ def _git_head(root: Path) -> str | None:
     (``index.lock`` present: a pull/checkout is mid-flight, nothing is settled yet)."""
     import subprocess
 
-    from agitrack.proc import console_isolation_kwargs
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--git-path", "index.lock", "HEAD"],
             cwd=root,
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,

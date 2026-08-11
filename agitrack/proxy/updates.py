@@ -410,12 +410,12 @@ class UpdatesMixin(RunnerHost):
         """The backend CLI's reported version string, used to detect whether an update actually
         landed. Empty when it can't be read."""
         try:
-            from agitrack.proc import console_isolation_kwargs
+            from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 
             proc = subprocess.run(
                 [self.backend.name, "--version"],
                 capture_output=True,
-                text=True,
+                **UTF8_TEXT,
                 timeout=20,
                 **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
             )
@@ -468,10 +468,10 @@ class UpdatesMixin(RunnerHost):
         cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
         result: dict = {"name": name, "before": before}
         try:
-            from agitrack.proc import console_isolation_kwargs
+            from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 
             proc = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True, timeout=600, **console_isolation_kwargs()
+                cmd, cwd=cwd, capture_output=True, **UTF8_TEXT, timeout=600, **console_isolation_kwargs()
             )
             result["code"] = proc.returncode
             result["output"] = (proc.stdout or "") + (proc.stderr or "")

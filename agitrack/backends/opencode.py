@@ -9,6 +9,7 @@ from typing import IO
 from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.proc import (  # _IS_WINDOWS: see proc.py
     _IS_WINDOWS,
+    UTF8_TEXT,
     console_isolation_kwargs,
     resolve_subprocess_command,
 )
@@ -101,8 +102,15 @@ class OpenCodeBackend:
         process = subprocess.Popen(
             resolve_subprocess_command(command),  # find/launch opencode(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
-            text=True,
-            stdin=subprocess.PIPE if to_stdin else None,
+            **UTF8_TEXT,
+            # DEVNULL, never None. `None` means "inherit", and on POSIX `to_stdin` is False, so
+            # the opencode child inherited whatever aGiTrack's own stdin was. Under `--ui-bridge`
+            # that is the editor's protocol pipe: the child held it open, it never reached EOF,
+            # and the bridge hung forever — zero frames for 720 s after `ready`, reproduced twice.
+            # `lsof` showed aGiTrack and the child sharing fd 0. codex already used DEVNULL and
+            # claude passes detach_stdin=not to_stdin; opencode was the only backend that
+            # inherited stdin. Nothing here ever wants the user's terminal.
+            stdin=subprocess.PIPE if to_stdin else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
             # Keep the opencode CLI off a console on Windows: the background daemon runs the
@@ -166,6 +174,16 @@ class OpenCodeBackend:
             from agitrack.transcripts.opencode import session_model
 
             resolved_model = session_model(parsed_session_id or session_id or "")
+
+        if bare and parsed_session_id:
+            # A bare run is aGiTrack's own machinery (the summarizer), not a conversation.
+            # OpenCode's `session list` carries no programmatic marker — Claude has
+            # `promptSource: sdk` and Codex has `source == "exec"` — so without recording it
+            # here, the very next session listing offered this to the user as their chat, and
+            # `latest_session_id` would resume into it.
+            from agitrack.transcripts.opencode import mark_programmatic
+
+            mark_programmatic(parsed_session_id)
 
         return AgentResult(
             backend=self.name,
