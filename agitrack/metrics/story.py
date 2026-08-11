@@ -208,7 +208,6 @@ class StoryStore:
         return data
 
     def save(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         try:  # keep .agitrack/ git-ignored even in a repo that never ran aGiTrack
             from agitrack.config.state import AgitrackState
 

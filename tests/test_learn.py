@@ -957,3 +957,19 @@ def test_norm_lesson_falls_back_to_single_step_for_a_blob():
     lesson = learn._norm_lesson(raw, {"minutes": 5})
     assert lesson["steps"] == [{"title": "", "content_md": "### A\nbody text"}]
     assert lesson["content_md"] == "### A\nbody text"
+
+
+def test_the_learn_page_names_the_config_file_actually_in_use(tmp_path, monkeypatch):
+    """The page hardcoded `~/.agitrack/config.json`, which is simply the wrong file whenever
+    AGITRACK_CONFIG_DIR is set — the user is told to edit something that has no effect on
+    them."""
+    from agitrack.metrics.learn import global_config_display_path
+
+    monkeypatch.delenv("AGITRACK_CONFIG_DIR", raising=False)
+    assert global_config_display_path() == "~/.agitrack/config.json"
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    shown = global_config_display_path()
+    assert shown.endswith("config.json")
+    assert "elsewhere" in shown
+    assert "~/.agitrack" not in shown

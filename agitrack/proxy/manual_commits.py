@@ -27,6 +27,7 @@ from agitrack.commits import (
 from agitrack.git import hooks as git_hooks
 
 from agitrack.proxy.runner_host import RunnerHost
+from agitrack.fileio import ensure_state_dir
 
 
 class ManualCommitsMixin(RunnerHost):
@@ -247,7 +248,7 @@ class ManualCommitsMixin(RunnerHost):
             return
         try:
             agit_dir = self._manual_agit_dir()
-            agit_dir.mkdir(parents=True, exist_ok=True)
+            ensure_state_dir(agit_dir)
             # Every ref this commit will fold, one per line, LF-terminated (see commits.write_lf:
             # a CRLF name makes `git update-ref` refuse and the refs never advance on Windows).
             refs = self._manual_pending_refs()

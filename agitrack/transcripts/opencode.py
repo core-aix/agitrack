@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.fileio import safe_is_dir
 
 # Bind the transcript dataclasses (and the git-free edit reconstruction that depends only on
 # them) BEFORE importing ``agitrack.sessions`` below: that package pulls in
@@ -18,8 +19,13 @@ from agitrack.backends.base import TokenUsage
 # names must already exist here or that cycle fails when opencode is the first module imported.
 from agitrack.transcripts import capabilities
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
-from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
-from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
+from agitrack.transcripts.edits import (
+    content_from_read_output,
+    edits_from_apply_patch,
+    seed_file_state,
+    tracked_edit,
+)
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, resolve_subprocess_command
 from agitrack.sessions.share_cap import select_kept_indices
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
@@ -67,7 +73,7 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
                 ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)]
             ),
             cwd=cwd,
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -115,21 +121,67 @@ def _to_seconds(value: object) -> float:
     return number / 1000.0 if number > 1e12 else number
 
 
+def _programmatic_registry() -> Path:
+    """Where the ids of PROGRAMMATIC OpenCode sessions are recorded.
+
+    Claude marks these itself (``promptSource: sdk``) and Codex does too (``source == "exec"``),
+    so both are filtered out of the resume/switch lists. OpenCode's `session list` exposes no
+    such field, so a scripted `opencode run` was adopted as the user's conversation — aGiTrack
+    resumed it, attributed commits to it, and the person's real chat was displaced by a script's.
+
+    aGiTrack cannot see into someone else's script, but it can always account for its OWN: every
+    bare run it makes (the summarizer above all) is recorded here and never offered as a
+    conversation. Honoured per config dir, so an isolated run keeps its own list."""
+    config_dir = getenv_compat("CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".agitrack"
+    return base / "opencode-programmatic.json"
+
+
+def mark_programmatic(session_id: str) -> None:
+    """Record ``session_id`` as machine-driven, not a conversation. Best-effort."""
+    if not session_id:
+        return
+    try:
+        known = programmatic_session_ids()
+        if session_id in known:
+            return
+        from agitrack.fileio import atomic_write_text
+
+        # Bounded: this is a filter list, not an archive, and it is read on every session listing.
+        kept = [*sorted(known), session_id][-500:]
+        atomic_write_text(_programmatic_registry(), json.dumps(sorted(kept)))
+    except OSError:
+        pass
+
+
+def programmatic_session_ids() -> set[str]:
+    try:
+        data = json.loads(_programmatic_registry().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return {str(item) for item in data} if isinstance(data, list) else set()
+
+
 def list_sessions(repo: Path) -> list[SessionRef]:
     refs = []
+    machine_driven = programmatic_session_ids()
     for session in _fetch_sessions(repo, 50):
         updated = session.get("updated") or session.get("created") or 0
         title = session.get("title")
         refs.append(
             SessionRef(
-                id=str(session["id"]), updated=_to_seconds(updated), label=title if isinstance(title, str) else None
+                id=str(session["id"]),
+                updated=_to_seconds(updated),
+                label=title if isinstance(title, str) else None,
+                programmatic=str(session["id"]) in machine_driven,
             )
         )
     return refs
 
 
 def latest_session_id(repo: Path) -> str | None:
-    refs = list_sessions(repo)
+    # Only real conversations. Resuming a machine-driven one silently replaces the user's chat.
+    refs = [ref for ref in list_sessions(repo) if not ref.programmatic]
     if not refs:
         return None
     return max(refs, key=lambda ref: ref.updated).id
@@ -141,7 +193,7 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
     records each session's ``directory``, so conversations whose worktree has
     since been removed are still listed (and stay resumable)."""
     root = worktrees_root.resolve()
-    cwd = next((p for p in [root, *root.parents] if p.is_dir()), Path.home())
+    cwd = next((p for p in [root, *root.parents] if safe_is_dir(p)), Path.home())
     sessions = _opencode_session_list(cwd, 200)
     out: list[tuple[str, SessionRef]] = []
     for session in sessions:
@@ -169,7 +221,7 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
     Uses ``opencode session list`` (the sanctioned export path) and filters by directory,
     so it needs no git and catches sessions run in subdirectories or worktrees."""
     directory = directory.resolve()
-    cwd = next((p for p in [directory, *directory.parents] if p.is_dir()), Path.home())
+    cwd = next((p for p in [directory, *directory.parents] if safe_is_dir(p)), Path.home())
     out: list[tuple[SessionRef, str]] = []
     for session in _opencode_session_list(cwd, 500):
         sid = session.get("id")
@@ -465,7 +517,7 @@ def _debug(repo: Path, message: str) -> None:
         return
     try:
         path = repo / ".agitrack" / "proxy-debug.log"
-        if not path.parent.is_dir():
+        if not safe_is_dir(path.parent):
             # Never CREATE the directory: this is called with whatever cwd the caller had, and
             # `list_worktree_sessions` passes the worktrees ROOT — which made debug runs grow a
             # phantom `.agitrack/worktrees/.agitrack/`, a directory that reads as a session
@@ -713,7 +765,11 @@ def _build_turn(
     last_assistant = assistants[-1] if assistants else None
     for assistant in assistants:
         assistant_info = _as_dict(assistant.get("info"))
-        tokens.add(_tokens(assistant_info, assistant.get("parts")))
+        message_tokens = _tokens(assistant_info, assistant.get("parts"))
+        tokens.add(message_tokens)
+        # Same reason as in `_tokens`: across a turn's assistant messages the context grows, and
+        # `add` would let the last (smallest) one win.
+        tokens.context = max(tokens.context or 0, message_tokens.context or 0) or None
         model = _model_name(assistant_info) or model
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
@@ -837,6 +893,17 @@ def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdi
                 if isinstance(output, str):
                     seed_file_state(file_state, path, content_from_read_output(output))
             continue
+        if tool in ("apply_patch", "applypatch"):
+            # The whole patch arrives as one string under `patchText`, naming its own files —
+            # which is why the `path` lookup above finds nothing for it. Matching only
+            # write/edit/patch made every OpenAI-family session under OpenCode report +0/-0
+            # lines, and `--backtrace commit` then exited 128 claiming there were no agent-made
+            # edits to attribute.
+            patch = inp.get("patchText") or inp.get("patch_text") or inp.get("patch") or ""
+            out.extend(edits_from_apply_patch(file_state, str(patch)))
+            continue
+        if not path:
+            continue
         if tool == "write":
             edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))
         elif tool in ("edit", "patch"):
@@ -935,12 +1002,26 @@ def _final_text_from_event_blob(text: str) -> str:
 
 
 def _tokens(info: dict, parts: object) -> TokenUsage:
+    """This message's token usage: summed across its steps, with ``context`` the LARGEST step
+    rather than the last.
+
+    OpenCode records usage per STEP, and each step's ``input`` is the context that step ran with.
+    ``TokenUsage.add`` overwrites ``context`` with whatever came last (correct where a single
+    growing figure is reported), so the final — often tiny — step's count replaced the real
+    total: 349 / 357 / 187 reported against an actual ~6.5 K. Context grows within a turn, so its
+    peak is the honest answer and matches what the other backends report."""
     usage = TokenUsage()
+    peak = 0
     if isinstance(parts, list):
         for part in parts:
             if isinstance(part, dict):
-                usage.add(_token_usage(part.get("tokens")))
-    return usage if usage.total else _token_usage(info.get("tokens"))
+                step = _token_usage(part.get("tokens"))
+                peak = max(peak, step.context or 0)
+                usage.add(step)
+    if not usage.total:
+        return _token_usage(info.get("tokens"))
+    usage.context = peak or usage.context
+    return usage
 
 
 def _token_usage(tokens: object) -> TokenUsage:

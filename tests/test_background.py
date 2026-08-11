@@ -2008,3 +2008,113 @@ def test_stop_does_not_revoke_the_users_standing_auto_start_choice(tmp_path):
     config = GlobalConfig()
     config.load_repo_overlay(tmp_path)
     assert config.autotrack_hook == "auto"
+
+
+def test_autostart_status_is_read_from_the_hooks_not_the_preference(tmp_path, monkeypatch):
+    """B7 / C32: `Auto-start: on` was derived from the config VALUE and never from the hook file,
+    so it lied in four separate ways, all confirmed live:
+
+    * a virgin repo reported `on` before any hook existed — the first commit after agent work
+      was silently lost and no tracker ever started;
+    * `-b stop` printed "Auto-start is off for this repo", really did remove the hooks, and `-s`
+      a second later still said `on`;
+    * with core.hooksPath set aGiTrack installs nothing at all, and `-s` asserted the opposite —
+      anyone on Husky / pre-commit / lefthook was told their commits were tracked when nothing
+      was, disproved by a real commit;
+    * every backend was told "…or when an agent turn leaves changes", which only Claude Code
+      does.
+    """
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "virgin")
+
+    line = autostart_status_line(repo)
+    assert "not armed" in line
+    assert "on (" not in line
+
+    # core.hooksPath: aGiTrack installs nothing and must say so, naming the setting.
+    other = _init_repo(tmp_path / "hookspath")
+    subprocess.run(["git", "-C", str(other.repo), "config", "core.hooksPath", "myhooks"], check=True)
+    line = autostart_status_line(other)
+    assert "core.hooksPath" in line
+    assert "NOT tracked" in line
+
+
+def test_autostart_status_says_on_once_the_hook_is_really_installed(tmp_path, monkeypatch):
+    from agitrack import __version__
+    from agitrack.git import hooks as git_hooks
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "armed")
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=["python", "-m", "agitrack"], repo_root=str(repo.repo), version=__version__
+    )
+
+    line = autostart_status_line(repo)
+    assert line.startswith("Auto-start: on (")
+    assert "on a commit" in line
+    # No Claude turn-end hook here, so the clause that only Claude Code honours must be absent.
+    assert "agent turn leaves changes" not in line
+    assert "last-run" not in line  # the placeholder that used to leak onto a fresh repo
+
+
+def test_autostart_status_reports_the_opt_out(tmp_path, monkeypatch):
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "optout")
+    config = GlobalConfig()
+    config.load_repo_overlay(repo.repo)
+    config.set("autotrack_hook", "off", scope="repo")
+
+    assert autostart_status_line(repo).startswith("Auto-start: off")
+
+
+def test_status_names_the_repository(tmp_path, monkeypatch, capsys):
+    """`-s`, `-b status` and the `-b` banner never named the repo — exactly wrong in a submodule
+    or a multi-repo terminal, which is the one place the answer needs disambiguating."""
+    from agitrack.proxy.background import background_status, repo_status
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "named-repo")
+
+    repo_status(repo)
+    background_status(repo)
+
+    out = capsys.readouterr().out
+    assert out.count("named-repo") >= 2
+
+
+def test_core_hookspath_is_announced_not_only_debug_logged(tmp_path, monkeypatch, capsys):
+    """B7: with core.hooksPath set, aGiTrack installs nothing and the string `core.hooksPath`
+    never reached the user — both skip messages were `_debug`-only, invisible even with
+    --verbose (those diagnostics go to a log file whose path is never printed). The spec says it
+    must SAY it cannot install hooks and continue."""
+    from agitrack.proxy.background import BackgroundRunner
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "husky")
+    subprocess.run(["git", "-C", str(repo.repo), "config", "core.hooksPath", "myhooks"], check=True)
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+
+    runner = BackgroundRunner(repo, backend="claude")
+    capsys.readouterr()  # drop construction output
+    runner._install_autotrack_hook()
+
+    out = capsys.readouterr().out
+    assert "core.hooksPath" in out
+    assert "myhooks" in out
+    assert "NOT tracked" in out

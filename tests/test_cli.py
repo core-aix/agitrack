@@ -335,7 +335,7 @@ def _stub_repo_and_free_lock(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return True  # nobody else holds it — we take it
 
         def release(self):
@@ -399,7 +399,7 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return False  # another instance holds it — refuse
 
         def owner_pid(self):
@@ -449,7 +449,7 @@ def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return False  # another instance already holds the repo
 
         def owner_pid(self):
@@ -503,7 +503,7 @@ def test_background_rerun_replaces_a_running_background_tracker(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             type(self).calls += 1
             return type(self).calls > 1  # held by the old daemon; free once it stops
 
@@ -562,7 +562,7 @@ def _bg_rerun_over_live_tracker(monkeypatch, argv: list[str]):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             type(self).calls += 1
             return type(self).calls > 1
 
@@ -1595,3 +1595,231 @@ def test_main_stops_when_privacy_warning_declined(monkeypatch):
 
     assert rc == 1
     assert captured == {}  # the shell was not launched
+
+
+def test_auto_commit_overrides_manual_in_interactive_mode(monkeypatch):
+    """C4: the --auto-commit override sat INSIDE the `if background:` block, so it could never
+    fire for a TUI run. The flag was accepted, printed nothing, and did nothing: the turn stayed
+    latent on refs/agitrack/manual/…, the branch never advanced (+0 commits after 420 s), and
+    --help did not say it was background-only."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+
+    assert cli.main(["--manual-commits", "--auto-commit"]) == 0
+
+    assert captured["manual_commits"] is False
+
+
+def test_manual_commits_alone_still_means_manual(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+
+    assert cli.main(["--manual-commits"]) == 0
+
+    assert captured["manual_commits"] is True
+
+
+def test_overwrite_shared_alone_is_an_error_not_an_agent_session(monkeypatch, capsys):
+    """C34: `--overwrite-shared` is a MODIFIER and was read nowhere except next to
+    --share-sessions, so on its own it fell straight through to launching a full agent session.
+    On a machine with a configured backend, someone who typed it meaning to fix a rejected share
+    got a live agent instead."""
+    monkeypatch.setattr(
+        cli, "ProxyRunner", lambda *a, **k: pytest.fail("--overwrite-shared alone must not start a session")
+    )
+
+    assert cli.main(["--overwrite-shared"]) == 2
+
+    out = capsys.readouterr().out
+    assert "--share-sessions" in out
+
+
+def test_flag_prefixes_are_not_accepted(monkeypatch, capsys):
+    """The refusal message named `--overwrite`, a flag that does not exist in --help. It only
+    ever resolved because argparse prefix-matches, and it would have broken silently the moment
+    a second `--overwrite*` option was added. With allow_abbrev off, `--overwrite` is an unknown
+    flag — it is passed through to the backend like any other, not silently promoted to
+    `--overwrite-shared`."""
+    monkeypatch.setattr(
+        cli, "_run_share_sessions", lambda *a, **k: pytest.fail("a flag PREFIX must not trigger a share")
+    )
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("--overwrite must not start a session either"))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    _stub_launch(monkeypatch)
+
+    # Reaching the launcher at all (rather than the share path or the overwrite-shared error)
+    # is the proof: the prefix was not resolved to the real flag.
+    assert cli.main(["--overwrite", "-s"]) == 0
+
+
+def test_the_usage_line_does_not_leak_the_interpreter_path(capsys):
+    """`--help`'s usage line was `usage: python.exe C:\\Users\\dev\\AppData\\Local\\...\\agitrack`
+    — Python 3.14 on Windows derives prog from sys.argv[0] — leaking the user's home layout into
+    any pasted help output, and the only line over 80 columns."""
+    assert cli.main(["--help"]) == 0
+    out = capsys.readouterr().out
+    assert "usage: agitrack" in out
+
+
+def _no_configured_backend(monkeypatch):
+    """A machine that has never chosen a default — the state the backend gate is written for."""
+
+    class Config:
+        default_backend = None
+        use_worktrees = False
+        commit_guidance = True
+
+        def has_default_backend(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+
+def test_the_only_installed_backend_is_used_without_a_tty(monkeypatch, capsys):
+    """Windows/no-TTY: bare `agitrack` and `agitrack -b` both stopped at the backend gate
+    IDENTICALLY whether one or two backends were installed, so an explicitly headless mode
+    required a terminal for its first run and the entire documented prompt chain was
+    unreachable. Five separate live-test scenarios dead-ended here."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name == "claude")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 0
+
+    assert captured["backend"] == "claude"
+    out = capsys.readouterr().out
+    assert "only coding agent backend installed" in out
+
+
+def test_the_gate_offers_only_backends_that_are_actually_installed(monkeypatch, capsys):
+    """The no-backend message offered `--backend <claude|codex|opencode>` unconditionally, so on
+    a box where codex is not installed two of its three suggestions would have failed."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name in {"claude", "opencode"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 1
+
+    out = capsys.readouterr().out
+    assert "claude|opencode" in out
+    assert "codex" not in out
+
+
+def test_the_gate_says_so_when_nothing_is_installed(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 1
+    assert "None of the supported backends are installed" in capsys.readouterr().out
+
+
+def test_help_does_not_promise_things_that_do_not_exist(capsys):
+    """A message naming a flag, file, or command that does not exist is filed as a bug in its own
+    right by this project's own live-test plan. These four were found live."""
+    assert cli.main(["--help"]) == 0
+    # argparse hard-wraps help text, so compare on a whitespace-normalised copy.
+    out = " ".join(capsys.readouterr().out.split())
+
+    # `--skip-privacy-ack` is the only way to get a clean machine-readable stream, and a driver
+    # author cannot find a flag that is not in --help (it was argparse.SUPPRESS'd).
+    assert "--skip-privacy-ack" in out
+    # `--ui-bridge` is newline-delimited JSON, not JSON-RPC 2.0; developers who believed the help
+    # wrote JSON-RPC clients and got silence.
+    assert "JSON-RPC 2.0" in out and "NEWLINE-DELIMITED JSON" in out
+    # `--log-file` claimed a "merge integrated" event that no code ever emits.
+    assert "merge integrated" not in out
+    # Confinement protects the REPOSITORY, not the rest of the disk — true on both platforms by
+    # construction (`--dev-bind / /` on Linux, `(allow default)` on macOS).
+    assert "protects the REPOSITORY, not the rest of the disk" in out
+    # `--auto-commit` is not background-only.
+    assert "in EVERY mode" in out
+
+
+def test_a_failed_takeover_does_not_name_the_pid_it_just_killed(monkeypatch, capsys):
+    """The `-b -m` zero-writer bug's user-facing half: on losing the lock race it printed
+    "already running (PID N)" naming the PID it had just terminated, and told the user to
+    `agitrack -b stop` a process that no longer existed."""
+    import pathlib
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_refuse_during_merge_conflict", lambda repo: False)
+    monkeypatch.setattr("agitrack.config.migrate.migrate_repo_state", lambda repo: None)
+
+    class _Lock:
+        def __init__(self, _path):
+            pass
+
+        def acquire(self, **kw):
+            return False  # never obtainable, even with the retry
+
+        def owner_pid(self):
+            return 4242
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _Lock)
+    monkeypatch.setattr("agitrack.proxy.background._running_tracker_is_current", lambda *a, **k: False)
+    monkeypatch.setattr("agitrack.proxy.background.replace_running_tracker", lambda *a, **k: True)
+
+    class Config:
+        default_backend = "claude"
+        use_worktrees = False
+        commit_guidance = True
+
+        def has_default_backend(self):
+            return True
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    assert cli.main(["-b", "-m"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Nothing is tracking it now" in out
+    assert "4242" not in out  # never name the process we just stopped
+
+
+def test_an_optional_tool_install_does_not_default_to_yes(monkeypatch):
+    """`gh` is explicitly OPTIONAL — aGiTrack degrades to git author names without it — yet a
+    bare Enter shelled straight into `brew install gh`: a package install nobody asked for, on
+    the most reflexive keypress there is. `git` is genuinely required, so it keeps its Y
+    default."""
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("agitrack.system_tools.can_install_tool", lambda name: True)
+    monkeypatch.setattr(
+        "agitrack.system_tools.install_system_tool", lambda name: pytest.fail(f"must not install {name}")
+    )
+
+    prompts: list[str] = []
+
+    def _bare_enter(prompt: str) -> str:
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr(cli, "_ask", _bare_enter)
+
+    assert cli._maybe_install_tool("gh", required=False) is False
+    assert "[y/N]" in prompts[0]
+
+
+def test_a_required_tool_install_still_defaults_to_yes(monkeypatch):
+    installed: list[str] = []
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("agitrack.system_tools.can_install_tool", lambda name: True)
+    monkeypatch.setattr("agitrack.system_tools.install_system_tool", lambda name: installed.append(name) or True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt: "")
+
+    assert cli._maybe_install_tool("git", required=True) is True
+    assert installed == ["git"]

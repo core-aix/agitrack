@@ -312,3 +312,36 @@ def wrap_command(command: list[str], *, base: str, worktree: str, allowed_paths:
     if _have_bwrap():
         return [*build_bwrap_command(base, worktree, allowed_paths), *command]
     return command
+
+
+def status_line() -> str:
+    """One line describing what confinement is ACTUALLY in effect right now.
+
+    C11: on stock Ubuntu 24.04 (``kernel.apparmor_restrict_unprivileged_userns=1``) bwrap cannot
+    create a sandbox, aGiTrack silently falls back to the advisory path, and nothing in the TUI,
+    in ``-s``, or in the status bar said which mode was in effect — so a whole run looked
+    confined while a ``!``-bash write into the base checkout succeeded. What looked like
+    enforcement was the agent choosing to comply. The fallback is a reasonable degradation; being
+    unable to find out which one you are in is not.
+    """
+    if not is_enabled():
+        return "Confinement: off (AGITRACK_SANDBOX)."
+    if is_available():
+        mechanism = "sandbox-exec" if _have_sandbox_exec() else "bubblewrap"
+        return f"Confinement: enforced by the OS sandbox ({mechanism}) — the agent can only write its own worktree."
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        why = (
+            "bubblewrap is installed but cannot create a sandbox here (unprivileged user "
+            "namespaces are denied — e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+        )
+    elif sys.platform.startswith("linux"):
+        why = "bubblewrap (bwrap) is not installed"
+    elif os.name == "nt":
+        why = "Windows has no equivalent sandbox"
+    else:
+        why = "no sandbox is available on this platform"
+    return (
+        f"Confinement: ADVISORY only — {why}.\n"
+        "  A commit-time guard still stops the agent committing into the base repo, but nothing "
+        "prevents it WRITING there."
+    )

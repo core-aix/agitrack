@@ -174,9 +174,11 @@ def spawn_dashboard_daemon(
 
 
 def _open_log(repo: GitRepo) -> Any:
+    from agitrack.fileio import ensure_state_dir
+
     try:
         path = log_path(repo)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(path.parent)
         return path.open("ab")
     except OSError:
         return subprocess.DEVNULL

@@ -405,3 +405,22 @@ def test_a_piped_run_prints_instructions_instead_of_prompting(monkeypatch, tmp_p
             which=lambda exe: f"/usr/bin/{exe}" if exe in {"bash", "curl"} else None,
         )
     assert seen == [False]
+
+
+def test_the_windows_fallback_never_hands_the_user_setx():
+    """A7: the fallback printed `setx PATH "$env:PATH;<dir>"` — on the non-TTY path, on decline,
+    and on write failure, i.e. the "press Enter to acknowledge" path aGiTrack deliberately makes
+    unmissable. This file's OWN docstring documents setx as the thing to avoid ("it truncates the
+    value at 1024 characters, which silently destroys a long PATH"), and it is wrong in scope
+    too: in PowerShell `$env:PATH` is the combined machine+user value but setx writes the USER
+    value, so every machine entry is permanently copied into the user PATH."""
+    from agitrack.path_setup import manual_path_instructions
+
+    text = manual_path_instructions(r"C:\Users\dev\AppData\Roaming\npm")
+
+    assert "setx" not in text
+    assert "$env:PATH" not in text  # the combined machine+user value must never be written back
+    assert "GetEnvironmentVariable('Path', 'User')" in text
+    assert "SetEnvironmentVariable('Path'" in text
+    assert "'User'" in text
+    assert r"C:\Users\dev\AppData\Roaming\npm" in text

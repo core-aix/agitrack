@@ -11,11 +11,26 @@ from pathlib import Path
 from typing import Any
 
 from agitrack.fileio import atomic_write_text, merge_json_for_save
-from agitrack.proc import console_isolation_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 
 # The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
 # (see AgitrackState._exclude_path) instead of spawning `git rev-parse` on every save/ensure.
 _EXCLUDE_PATH_CACHE: dict[Path, Path] = {}
+
+# What aGiTrack adds to the repo's `.git/info/exclude` — every path IT writes inside the user's
+# working tree, so none of them ever appears in `git status` as the user's change.
+#
+# `.claude/settings.local.json` is on this list because aGiTrack WRITES it (the Stop /
+# SessionStart hooks that make auto-start work). Only `.agitrack/` was ever excluded, so a new
+# user saw `?? .claude/` the moment they ran `agitrack -b` — and in a submodule that surfaced in
+# the parent as ` M vendor/sub`. It went unnoticed for so long because the developers' own
+# machines happened to carry a personal `**/.claude/settings.local.json` in
+# ~/.config/git/ignore, which aGiTrack did not create and no new user has.
+#
+# An exclude entry has no effect on a file the repo already TRACKS, which is the correct
+# behaviour here: a team that deliberately commits that file keeps deciding for themselves.
+# What protects THEM is `add_tracked()`'s scaffolding filter (git/repo.py).
+_EXCLUDE_LINES = (".agitrack/", ".claude/settings.local.json")
 
 
 class AgitrackState:
@@ -37,7 +52,10 @@ class AgitrackState:
         if not self.path.exists():
             return self._default()
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # utf-8-SIG: a BOM (a Windows editor, `Out-File -Encoding utf8`) otherwise made
+            # json.load raise and the file was quarantined as corrupt. Identical to utf-8
+            # when there is no BOM.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             # A truncated or invalid state file must not brick startup. Keep the
@@ -106,7 +124,7 @@ class AgitrackState:
         if not self.config_path.exists():
             return default
         try:
-            with self.config_path.open("r", encoding="utf-8") as handle:
+            with self.config_path.open("r", encoding="utf-8-sig") as handle:  # tolerate a BOM
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return default  # user-edited file; don't crash, just use defaults
@@ -148,35 +166,47 @@ class AgitrackState:
         self._baseline = copy.deepcopy(merged)
 
     def ensure_local_ignore(self) -> None:
-        """Make sure ``.agitrack/`` is git-ignored for this repo (idempotent). Call this before
-        writing any ``.agitrack/`` file (the manual trailer/ref, handshake, …) so aGiTrack's
-        internal state can never leak into a ``git add -A`` / user commit — ``save()`` also does
-        it, but state isn't always saved before those files are written (e.g. an idle daemon)."""
+        """Make sure everything aGiTrack writes into the repo is git-ignored (idempotent). Call
+        this before writing any ``.agitrack/`` file (the manual trailer/ref, handshake, …) so
+        aGiTrack's internal state can never leak into a ``git add -A`` / user commit — ``save()``
+        also does it, but state isn't always saved before those files are written (e.g. an idle
+        daemon)."""
         self._ensure_repo_local_ignore()
 
-    def _ensure_repo_local_ignore(self) -> None:
+    def add_local_ignore(self, line: str) -> None:
+        """Add one extra pattern to this repo's ``.git/info/exclude`` (idempotent).
+
+        For paths aGiTrack writes whose location the USER chose, so they cannot live in the
+        fixed ``_EXCLUDE_LINES`` list — today that is the ``--log-file`` event log."""
+        self._ensure_repo_local_ignore(extra=(line,))
+
+    def _ensure_repo_local_ignore(self, *, extra: tuple[str, ...] = ()) -> None:
+        wanted = (*_EXCLUDE_LINES, *extra)
         exclude = self._exclude_path()
         if exclude is None:
             return
         if not exclude.exists():
             # Repos created without the default template have no info/exclude;
-            # create it (only in an actual git repo) so .agitrack/ stays unignored
+            # create it (only in an actual git repo) so aGiTrack's files stay unignored
             # nowhere. The worktree case resolves to the shared git dir via git.
             if not (self.repo / ".git").exists():
                 return
             try:
                 exclude.parent.mkdir(parents=True, exist_ok=True)
-                exclude.write_text(".agitrack/\n", encoding="utf-8")
+                exclude.write_text("".join(f"{line}\n" for line in wanted), encoding="utf-8")
             except OSError:
                 pass
             return
         content = exclude.read_text(encoding="utf-8")
-        if ".agitrack/" in content.splitlines():
+        present = set(content.splitlines())
+        missing = [line for line in wanted if line not in present]
+        if not missing:
             return
         with exclude.open("a", encoding="utf-8") as handle:
             if content and not content.endswith("\n"):
                 handle.write("\n")
-            handle.write(".agitrack/\n")
+            for line in missing:
+                handle.write(f"{line}\n")
 
     def _exclude_path(self) -> Path | None:
         # The info/exclude location is invariant for a repo, but ensure_local_ignore() /
@@ -203,7 +233,7 @@ class AgitrackState:
             process = subprocess.run(
                 ["git", "rev-parse", "--git-path", "info/exclude"],
                 cwd=self.repo,
-                text=True,
+                **UTF8_TEXT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,

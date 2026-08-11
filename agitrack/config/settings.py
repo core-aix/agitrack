@@ -172,7 +172,12 @@ class GlobalConfig:
         if not self.path.exists():
             return {}
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # utf-8-SIG, not utf-8: a BOM makes json.load raise, and the whole config was then
+            # silently discarded and replaced with defaults — with no warning, so a user who
+            # edited it in a Windows editor (or wrote it with `Out-File -Encoding utf8`, which
+            # adds a BOM) simply found their settings had stopped applying. utf-8-sig is
+            # byte-identical to utf-8 on a file with no BOM.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return {}
@@ -259,7 +264,7 @@ class GlobalConfig:
             self._repo_baseline = {}
             return
         try:
-            with self.repo_path.open("r", encoding="utf-8") as handle:
+            with self.repo_path.open("r", encoding="utf-8-sig") as handle:  # tolerate a BOM (see _load)
                 data = json.load(handle)
             self.repo_data = data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):

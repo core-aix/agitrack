@@ -166,21 +166,23 @@ def test_ensure_comment_char_is_idempotent_and_repo_local(tmp_path):
     local = subprocess.run(
         ["git", "config", "--local", "--get", "core.commentChar"], cwd=tmp_path, capture_output=True, text=True
     ).stdout.strip()
-    assert local == "auto"
+    # NOT "auto": git 2.54 deprecates it and warns on every commit forever (see
+    # ensure_comment_char_preserves_headings).
+    assert local not in ("auto", "#") and local
     # A second call is a no-op (already set) rather than rewriting it.
     assert repo.ensure_comment_char_preserves_headings() is False
 
 
 def test_ensure_comment_char_never_overrides_a_value_the_user_chose(tmp_path):
     repo = _init_repo(tmp_path)
-    subprocess.run(["git", "config", "--local", "core.commentChar", ";"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "--local", "core.commentChar", "%"], cwd=tmp_path, check=True)
 
     assert repo.ensure_comment_char_preserves_headings() is False
 
     kept = subprocess.run(
         ["git", "config", "--local", "--get", "core.commentChar"], cwd=tmp_path, capture_output=True, text=True
     ).stdout.strip()
-    assert kept == ";"  # the user's choice stands (and it already protects "#" headings)
+    assert kept == "%"  # the user's choice stands (and it already protects "#" headings)
 
 
 # --- the short-lived read cache (repo.read_cache) ----------------------------------------
@@ -299,3 +301,193 @@ def test_nested_scopes_share_one_cache_and_survive_to_the_outermost(tmp_path, mo
         repo.status_short()
 
     assert sum(1 for cmd in spawned if "status" in cmd) == 1
+
+
+def test_discover_reads_a_non_ascii_repo_path(tmp_path):
+    """aGiTrack was completely unusable on any repo whose path contains a non-ASCII character.
+
+    `GitRepo.discover()` ran git with a bare `text=True`, so git's UTF-8 output was decoded with
+    the platform locale — cp1252 on a Western Windows box, ASCII under `PYTHONUTF8=0` on Linux.
+    The mojibake path was then handed to the NEXT git call as `cwd`, which failed with
+    `[WinError 267] The directory name is invalid` (or raised UnicodeDecodeError outright). Every
+    user whose profile directory is `C:\\Users\\Müller` — or any CJK/Cyrillic/Greek username — hit
+    this on their first command."""
+    nested = tmp_path / "ünïcode dir" / "repo"
+    nested.mkdir(parents=True)
+    repo = _init_repo(nested)
+
+    assert repo.repo == nested.resolve()
+    # ...and the handle keeps working: the discovered path is used as `cwd` for every later call.
+    assert repo.current_branch()
+
+
+def test_discover_names_the_path_instead_of_leaking_an_oserror(tmp_path):
+    """`--repo <missing>` and `--repo <a file>` both surfaced as raw OSErrors — a
+    `PosixPath('…')` repr on POSIX, a bare `[WinError 267]` with no path at all on Windows, and
+    no way to tell the two cases apart. The good sibling message already existed for the
+    not-a-repo case."""
+    from agitrack.git import GitError
+    import pytest
+
+    with pytest.raises(GitError) as missing:
+        GitRepo.discover(tmp_path / "nope")
+    assert "no such directory" in str(missing.value) and "nope" in str(missing.value)
+
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("x")
+    with pytest.raises(GitError) as not_a_dir:
+        GitRepo.discover(a_file)
+    assert "not a directory" in str(not_a_dir.value)
+
+
+def test_utf8_text_is_used_everywhere_git_output_is_decoded():
+    """Belt-and-braces guard for the whole class of defect: a bare `text=True` anywhere in the
+    package decodes with the platform locale, which is never what aGiTrack wants."""
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in pathlib.Path("agitrack").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = getattr(node.func, "attr", None)
+            if target not in {"run", "Popen", "check_output"}:
+                continue
+            names = {kw.arg for kw in node.keywords}
+            if "text" in names and "encoding" not in names and None not in names:
+                offenders.append(f"{path}:{node.lineno}")
+    assert offenders == [], f"use **UTF8_TEXT (agitrack/proc.py) instead of text=True: {offenders}"
+
+
+def test_comment_char_is_explicit_not_the_deprecated_auto(tmp_path):
+    """git 2.54 deprecates `core.commentChar=auto`: every subsequent commit prints a deprecation
+    warning plus 8-9 hint lines, FOREVER — including long after the user has removed aGiTrack —
+    and the hint tells them to unset the very setting that protects aGiTrack's `#` headings. It
+    breaks outright in Git 3.0. Six independent live-test scenarios found it."""
+    repo = _init_repo(tmp_path)
+
+    assert repo.ensure_comment_char_preserves_headings() is True
+
+    value = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert value and value != "auto" and value != "#"
+
+
+def test_comment_char_is_restored_on_teardown(tmp_path):
+    """It was written into every tracked repo's local config and never unset — not by `-b stop`,
+    not by `--remove-hooks` — so it outlived a full uninstall."""
+    repo = _init_repo(tmp_path)
+    repo.ensure_comment_char_preserves_headings()
+
+    assert repo.restore_comment_char() is True
+
+    got = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert got.returncode != 0  # unset
+    assert repo.restore_comment_char() is False  # idempotent
+
+
+def test_a_comment_char_the_user_chose_is_never_touched(tmp_path):
+    repo = _init_repo(tmp_path)
+    subprocess.run(["git", "config", "--local", "core.commentChar", "%"], cwd=repo.repo, check=True)
+
+    assert repo.ensure_comment_char_preserves_headings() is False
+    assert repo.restore_comment_char() is False
+
+    value = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert value == "%"
+
+
+def test_a_previously_written_auto_is_migrated(tmp_path):
+    """Repos aGiTrack already touched carry the deprecated value; upgrading must fix them."""
+    repo = _init_repo(tmp_path)
+    subprocess.run(["git", "config", "--local", "core.commentChar", "auto"], cwd=repo.repo, check=True)
+    subprocess.run(["git", "config", "--local", "agitrack.commentchar", "auto"], cwd=repo.repo, check=True)
+
+    repo.ensure_comment_char_preserves_headings()
+
+    value = subprocess.run(
+        ["git", "config", "--local", "--get", "core.commentChar"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert value != "auto"
+
+
+def test_a_filtered_fetch_leaves_the_repos_config_exactly_as_it_found_it(tmp_path):
+    """B12: `--backtrace text`, a documented READ-ONLY report, permanently mutated git config.
+    A `--filter` fetch does not just set `partialclonefilter` — git also writes
+    `remote.<r>.promisor=true` and bumps `core.repositoryformatversion` to 1, WITHOUT the
+    matching `extensions.partialClone`, leaving a state git itself would not produce. Only the
+    filter was ever undone. Reproduced from pristine; in a submodule setup it edited the
+    vendored dependency's own config."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    repo = _init_repo(work)
+    subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=repo.repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:refs/heads/main"], cwd=repo.repo, check=True)
+
+    def local_config() -> dict:
+        raw = subprocess.run(
+            ["git", "config", "--local", "--list"], cwd=repo.repo, capture_output=True, text=True, check=True
+        ).stdout
+        return dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+
+    before = local_config()
+    assert repo.fetch_ref("+refs/heads/main:refs/agitrack/probe", filter_blobs="blob:limit=16k") is True
+
+    after = local_config()
+    for key in ("remote.origin.partialclonefilter", "remote.origin.promisor"):
+        assert key not in after, f"{key} was left behind"
+    assert after.get("core.repositoryformatversion") == before.get("core.repositoryformatversion")
+    # ...and the fetch still did its job.
+    assert repo.rev_parse("refs/agitrack/probe")
+
+
+def test_a_repo_that_really_is_a_partial_clone_keeps_its_settings(tmp_path):
+    """The restore must put values BACK, not blanket-unset them: a user whose repo genuinely is
+    a partial clone must not have their setup dismantled by a session listing."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    repo = _init_repo(work)
+    subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=repo.repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD:refs/heads/main"], cwd=repo.repo, check=True)
+    subprocess.run(
+        ["git", "config", "--local", "remote.origin.partialclonefilter", "blob:none"], cwd=repo.repo, check=True
+    )
+    subprocess.run(["git", "config", "--local", "remote.origin.promisor", "true"], cwd=repo.repo, check=True)
+
+    repo.fetch_ref("+refs/heads/main:refs/agitrack/probe", filter_blobs="blob:limit=16k")
+
+    kept = subprocess.run(
+        ["git", "config", "--local", "--get", "remote.origin.partialclonefilter"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert kept == "blob:none"  # the user's own value, restored
