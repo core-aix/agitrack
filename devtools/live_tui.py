@@ -62,6 +62,43 @@ from pathlib import Path
 
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\([AB0]")
 
+# --- staging the HOST terminal's colours ---------------------------------------------------
+# aGiTrack asks the terminal it runs in for its own foreground/background (OSC 10/11), its
+# palette (OSC 4) and its device attributes, and adapts to the answers — most visibly for the
+# agent-theme adaptation, which only paints a canvas when the AGENT's scheme disagrees with the
+# TERMINAL's. Answering those queries here is what makes "a light terminal" or "a dark terminal"
+# real for the child: the developer's own terminal is never involved, so a scenario can stage
+# either one. Detection waits a bounded 0.5 s for the replies, so they are written the moment
+# the query is seen, from inside the read loop.
+HOST_THEMES = {
+    #        background                 foreground
+    "dark": (b"rgb:1c1c/1c1c/1c1c", b"rgb:d0d0/d0d0/d0d0"),
+    "light": (b"rgb:ffff/ffff/ffff", b"rgb:1c1c/1c1c/1c1c"),
+}
+_XTERM_16 = (
+    "000000", "cd0000", "00cd00", "cdcd00", "0000ee", "cd00cd", "00cdcd", "e5e5e5",
+    "7f7f7f", "ff0000", "00ff00", "ffff00", "5c5cff", "ff00ff", "00ffff", "ffffff",
+)
+
+
+def host_terminal_reply(data: bytes, theme: str) -> bytes:
+    """The answers a terminal themed *theme* would send to the capability queries in *data*."""
+    background, foreground = HOST_THEMES[theme]
+    out = bytearray()
+    if re.search(rb"\x1b\]10;\?(?:\x07|\x1b\\)", data):
+        out += b"\x1b]10;" + foreground + b"\x07"
+    if re.search(rb"\x1b\]11;\?(?:\x07|\x1b\\)", data):
+        out += b"\x1b]11;" + background + b"\x07"
+    for match in re.finditer(rb"\x1b\]4;(\d+);\?(?:\x07|\x1b\\)", data):
+        index = int(match.group(1))
+        if index < len(_XTERM_16):
+            value = _XTERM_16[index]
+            pairs = "/".join(value[at : at + 2] * 2 for at in (0, 2, 4))
+            out += b"\x1b]4;%d;rgb:%s\x07" % (index, pairs.encode())
+    if re.search(rb"\x1b\[(?:0)?c", data):
+        out += b"\x1b[?62;1;6;9;15;22c"  # device attributes — also detection's stop sentinel
+    return bytes(out)
+
 AGITRACK = os.environ.get("AGITRACK_BIN", "agitrack")
 WORKDIR = Path(os.environ.get("AGITRACK_LIVE_WORKDIR", "/tmp/agitrack-live"))
 BACKEND = "codex"
@@ -219,11 +256,26 @@ class Tui:
     # A backend's own "may I write this file?" dialog; Enter takes the permissive default.
     PERMISSION_PROMPTS = ("Do you want to", "1. Yes", "Allow this", "y/n")
 
-    def __init__(self, repo: Path, command: list[str], *, log: Path | None = None):
+    def __init__(
+        self,
+        repo: Path,
+        command: list[str],
+        *,
+        log: Path | None = None,
+        env: dict[str, str] | None = None,
+        host_theme: str | None = None,
+    ):
         self.repo = Path(repo)
         self.log = log or WORKDIR / f"{self.repo.name}.pty.log"
         self.log.parent.mkdir(parents=True, exist_ok=True)
         self._logf = self.log.open("wb")
+        # ``host_theme`` stages what the TERMINAL reports about itself (see host_terminal_reply);
+        # ``raw`` keeps every byte the child wrote, because a colour assertion has to look at the
+        # SGR/OSC sequences themselves — stripping them, as `clean` does for text matching,
+        # removes exactly the thing under test.
+        self.host_theme = host_theme
+        self.raw = bytearray()
+        self.started = time.monotonic()
         self.master, slave = pty.openpty()
         # BEFORE the spawn, and on the SLAVE fd: sizing the master (or the child) instead
         # leaves the child rendering into a 0-row screen with nothing visible ever.
@@ -231,7 +283,7 @@ class Tui:
         self.proc = subprocess.Popen(
             command,
             cwd=str(self.repo),
-            env=child_env(),
+            env=child_env(env),
             stdin=slave,
             stdout=slave,
             stderr=slave,
@@ -254,6 +306,17 @@ class Tui:
             if not chunk:
                 break
             raw += chunk
+            self.raw += chunk
+            if self.host_theme:
+                # Answer the capability queries in this chunk immediately: detection gives the
+                # terminal only 0.5 s, and a reply that misses that window leaves the child with
+                # no idea what colours it is drawing on.
+                answer = host_terminal_reply(chunk, self.host_theme)
+                if answer:
+                    try:
+                        os.write(self.master, answer)
+                    except OSError:
+                        pass
             deadline = time.time() + quiet
         if raw:
             self._logf.write(raw)
