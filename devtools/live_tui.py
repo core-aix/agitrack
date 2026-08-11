@@ -70,10 +70,23 @@ ANSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)
 # real for the child: the developer's own terminal is never involved, so a scenario can stage
 # either one. Detection waits a bounded 0.5 s for the replies, so they are written the moment
 # the query is seen, from inside the read loop.
+#
+# The named entries are the generic light/dark pair; the rest are REAL macOS Terminal.app
+# profiles, decoded from a user's own preferences. They are here because mid-tone backgrounds
+# are where a luminance comparison stops being a decision and becomes a coin toss: `novel` is
+# cream and `silver-aerogel` is exactly the 50% grey the comparison used to be against. A
+# scenario that only ever stages pure white and pure black cannot see that class of bug.
+# ``host_theme=None`` stages the other important case: a terminal that answers NOTHING, which
+# is what Terminal.app really does (it implements no colour report at all).
 HOST_THEMES = {
-    #        background                 foreground
+    #                  background            foreground
     "dark": (b"rgb:1c1c/1c1c/1c1c", b"rgb:d0d0/d0d0/d0d0"),
     "light": (b"rgb:ffff/ffff/ffff", b"rgb:1c1c/1c1c/1c1c"),
+    "basic": (b"rgb:ffff/ffff/ffff", b"rgb:0000/0000/0000"),  # Terminal.app default: white
+    "novel": (b"rgb:dfdf/dbdb/c3c3", b"rgb:3b3b/2323/2222"),  # cream - mid-tone
+    "silver-aerogel": (b"rgb:8080/8080/8080", b"rgb:0000/0000/0000"),  # exactly 50% grey
+    "homebrew": (b"rgb:0000/0000/0000", b"rgb:0000/ffff/0000"),  # black
+    "ocean": (b"rgb:2222/4f4f/bcbc", b"rgb:ffff/ffff/ffff"),  # deep blue
 }
 _XTERM_16 = (
     "000000", "cd0000", "00cd00", "cdcd00", "0000ee", "cd00cd", "00cdcd", "e5e5e5",

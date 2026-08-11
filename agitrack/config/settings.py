@@ -185,7 +185,7 @@ class GlobalConfig:
             "manual_commits": False,
             "background": False,
             "autotrack_hook": "auto",
-            "agent_background": "auto",
+            "agent_background": "terminal",
             "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
@@ -413,24 +413,28 @@ class GlobalConfig:
         self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "auto"
         self.save()
 
-    AGENT_BACKGROUND_CHOICES = ("auto", "dark", "light", "terminal")
+    AGENT_BACKGROUND_CHOICES = ("terminal", "dark", "light")
 
     @property
     def agent_background(self) -> str:
         # How aGiTrack paints the cells the backend leaves at the terminal's default colour
-        # (see renderer.py, "Agent-theme adaptation"). "auto" (default): follow the agent's own
-        # colour scheme — inferred from the colours it paints, and re-checked continuously, so a
-        # dark agent theme inside a light terminal (or a theme switched mid-session) still shows
-        # as one consistent screen. "dark"/"light": force that scheme regardless of the agent.
-        # "terminal": never override — every unpainted cell keeps the host terminal's background,
-        # which is what aGiTrack did before this setting existed.
-        value = str(self._raw("agent_background") or "auto").lower()
-        return value if value in self.AGENT_BACKGROUND_CHOICES else "auto"
+        # (see renderer.py, "Agent background"). "terminal" (default): never override — every
+        # unpainted cell keeps the HOST TERMINAL's background, so the session looks like the
+        # terminal profile the user chose. "dark"/"light": fill them with that background
+        # instead, and report it to the backend so a self-theming agent paints to match.
+        #
+        # A fourth choice, "auto", used to infer the agent's own light/dark scheme from the
+        # colours on screen. It is gone: the inference read the screen's CONTENT, so a turn
+        # that printed a code block voted one way and the prose after it the other, and the
+        # background flipped every few seconds. Configs still holding it read as "terminal" —
+        # when in doubt, the terminal's own colours.
+        value = str(self._raw("agent_background") or "terminal").lower()
+        return value if value in self.AGENT_BACKGROUND_CHOICES else "terminal"
 
     @agent_background.setter
     def agent_background(self, value: str) -> None:
         chosen = str(value).lower()
-        self.data["agent_background"] = chosen if chosen in self.AGENT_BACKGROUND_CHOICES else "auto"
+        self.data["agent_background"] = chosen if chosen in self.AGENT_BACKGROUND_CHOICES else "terminal"
         self.save()
 
     @property
@@ -608,36 +612,6 @@ class GlobalConfig:
             self.data["pending_manual_update"] = str(value)
         else:
             self.data.pop("pending_manual_update", None)
-        self.save()
-
-    # --- remembered agent colour scheme ------------------------------------
-    # Runtime STATE, not a setting (so it is deliberately absent from _default_config): the
-    # light/dark scheme each backend was last seen painting in. It exists purely to remove
-    # the visible flip at startup — aGiTrack can paint the first frame in the right scheme
-    # instead of waiting for the backend to render something it can infer from. Per backend,
-    # because a user may run one agent dark and another light. See renderer.py,
-    # "Agent-theme adaptation".
-
-    def agent_theme_seen(self, backend: str) -> bool | None:
-        """Whether *backend* last painted a DARK scheme (None when never observed)."""
-        stored = self.data.get("agent_theme_seen")
-        value = stored.get(backend) if isinstance(stored, dict) else None
-        return {"dark": True, "light": False}.get(str(value))
-
-    def set_agent_theme_seen(self, backend: str, dark: bool) -> None:
-        """Record *backend*'s current scheme, writing only when it actually changed — this is
-        called from the render path, and the config file is shared by every aGiTrack process
-        on the machine."""
-        if self.agent_theme_seen(backend) is dark:
-            return
-        stored = self.data.get("agent_theme_seen")
-        seen = dict(stored) if isinstance(stored, dict) else {}
-        # Drop entries an earlier aGiTrack filed under a repr of the backend OBJECT (address
-        # included, so a new key every launch). They can never match a backend name again, and
-        # without this the file keeps every one it accumulated, forever.
-        seen = {key: value for key, value in seen.items() if " object at 0x" not in str(key)}
-        seen[backend] = "dark" if dark else "light"
-        self.data["agent_theme_seen"] = seen
         self.save()
 
     # --- session sharing (issue #55) ---------------------------------------

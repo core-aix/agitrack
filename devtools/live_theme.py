@@ -51,12 +51,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from collections import Counter
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -67,7 +65,6 @@ import live_tui as lt  # noqa: E402
 from agitrack.proxy.renderer import (  # noqa: E402
     _CANVAS_DARK,
     _CANVAS_LIGHT,
-    ScreenRenderer,
     _BackgroundColorEraseScreen,
 )
 from agitrack.proxy.runner import _PYTE_HOSTILE_CSI_RE  # noqa: E402
@@ -167,8 +164,7 @@ def canvas_verdict(screen) -> str:
 
 
 def theme_home(tag: str, **settings) -> Path:
-    """A private aGiTrack config dir, so ``agent_background`` and the remembered per-backend
-    scheme are this scenario's alone."""
+    """A private aGiTrack config dir, so ``agent_background`` is this scenario's alone."""
     home = lt.WORKDIR / f"home-{tag}"
     home.mkdir(parents=True, exist_ok=True)
     data = {"default_backend": lt.BACKEND, "check_for_updates": False, "use_worktrees": False}
@@ -191,8 +187,15 @@ def claude_home(tag: str, theme: str | None) -> Path:
     source = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
     identity = {
         key: source[key]
-        for key in ("oauthAccount", "userID", "hasCompletedOnboarding", "lastOnboardingVersion",
-                    "installMethod", "autoUpdates", "firstStartTime")
+        for key in (
+            "oauthAccount",
+            "userID",
+            "hasCompletedOnboarding",
+            "lastOnboardingVersion",
+            "installMethod",
+            "autoUpdates",
+            "firstStartTime",
+        )
         if key in source
     }
     identity["projects"] = {}
@@ -226,27 +229,17 @@ def themed_from_config(backend: str) -> bool:
 
     Only claude can (``theme`` in settings.json). codex has no light/dark setting at all, and
     opencode's themes are adaptive — every one of them (nord, gruvbox, …) renders its light
-    variant when the terminal reports a light background, verified against the bare CLI. For
-    those two the only way to make agent and terminal disagree is a forced
-    ``agent_background``, which is also the setting whose OSC relay makes them disagree
-    deliberately."""
+    variant when the terminal reports a light background, verified against the bare CLI. Which
+    is the point: those two follow whatever background aGiTrack reports, and aGiTrack reports
+    the truth, so they match the terminal without anything having to adapt."""
     return backend == "claude"
 
 
-def switchable_in_agent(backend: str) -> bool:
-    """Whether the RUNNING agent can be switched between light and dark from inside it."""
-    return backend in {"claude", "opencode"}
-
-
-def stage(tag: str, agent_theme: str | None, host: str, *, background: str = "auto",
-          remembered: dict | None = None) -> tuple[Path, Path, dict]:
+def stage(tag: str, agent_theme: str | None, host: str, *, background: str = "terminal") -> tuple[Path, Path, dict]:
     """A throwaway repo plus the environment that puts *agent_theme* in front of a *host*
     terminal. Returns (repo, aGiTrack config home, child env)."""
     repo = lt.make_repo(f"th_{tag}")
-    settings: dict = {"agent_background": background}
-    if remembered is not None:
-        settings["agent_theme_seen"] = remembered
-    home = theme_home(tag, **settings)
+    home = theme_home(tag, agent_background=background)
     env = {
         "AGITRACK_CONFIG_DIR": str(home),
         # Truecolor makes the evidence readable: the canvas arrives as 48;2;28;28;28 rather
@@ -287,59 +280,54 @@ def settle(handle: lt.Tui, seconds: float = 3.0) -> None:
 # ---------------------------------------------------------------------------
 
 
-def s_mismatch() -> None:
-    """The original complaint, both ways round: an agent themed against the terminal must not
-    leave "a combination of dark and white backgrounds"."""
-    for agent, host in (("dark", "light"), ("light", "dark")):
-        tag = f"{lt.BACKEND[:2]}_{agent}_in_{host}"
-        title = f"{lt.BACKEND}: {agent} agent in a {host} terminal"
-        if themed_from_config(lt.BACKEND):
-            repo, home, env = stage(tag, agent, host)
+def canvas_markers(raw: bytes, since: int = 0) -> list[tuple[int, str]]:
+    """Every point in the byte stream where aGiTrack switched a canvas ON, in order.
+
+    ``reset_sgr`` is emitted with EVERY painted region, so a canvas that is in force leaves its
+    exact sequence all over the stream and one that is not leaves none at all. Those two
+    sequences are written by nothing else, which makes this the direct measurement of the bug:
+    a session that oscillated necessarily emits both, and the ORDER says when it flipped.
+    """
+    found: list[tuple[int, str]] = []
+    for scheme, marker in CANVAS_RESET.items():
+        at = raw.find(marker, since)
+        while at >= 0:
+            found.append((at, scheme))
+            at = raw.find(marker, at + 1)
+    return sorted(found)
+
+
+def canvas_transitions(raw: bytes, since: int = 0) -> list[str]:
+    """The sequence of DISTINCT canvases the session used, oldest first — ``["dark"]`` for a
+    forced dark session, ``[]`` for one that kept the terminal's colours, and anything longer
+    is a background the user watched change under them."""
+    out: list[str] = []
+    for _, scheme in canvas_markers(raw, since):
+        if not out or out[-1] != scheme:
+            out.append(scheme)
+    return out
+
+
+def backend_is_dark(screen, canvas: str | None) -> bool | None:
+    """Whether the BACKEND painted for a dark background, by the backgrounds it filled.
+
+    This lives in the harness, not in aGiTrack: reading a scheme off the screen is exactly the
+    thing that oscillated, and it is only sound here because it is applied ONCE, to a settled
+    screen, to check what the backend was TOLD — it never decides what anything is painted in.
+    Cells wearing exactly the canvas colours are aGiTrack's own fill and are excluded.
+    """
+    canvas_bg = CANVAS[canvas][0] if canvas else None
+    dark = light = 0
+    for colour, count in backgrounds(screen).items():
+        if colour in {"default", canvas_bg} or len(colour) != 6:
+            continue
+        if _is_dark(colour):
+            dark += count
         else:
-            # No theme of its own; forcing the background is what makes it paint against the
-            # terminal, and the forced value is what aGiTrack reports to it over OSC 11.
-            repo, home, env = stage(tag, None, host, background=agent)
-        handle = launch(repo, env, host, tag)
-        try:
-            handle.boot(f"{tag}")
-            settle(handle)
-            screen = emulate(handle.raw)
-            verdict = canvas_verdict(screen)
-            check(f"{title}: the canvas is {agent}", verdict == agent, f"got {verdict}; {describe(screen)}")
-            counts = backgrounds(screen)
-            check(f"{title}: NO cell is left at the terminal's own background",
-                  counts.get("default", 0) == 0, f"default×{counts.get('default', 0)}")
-            check(f"{title}: the status bar sits on the agent's background",
-                  set(status_backgrounds(screen)) == {CANVAS[agent][0]},
-                  f"{sorted(status_backgrounds(screen))} | {row_text(screen, ROWS - 1)[:70]!r}")
-            check(f"{title}: the canvas reset sequence is on the wire",
-                  CANVAS_RESET[agent] in handle.raw, f"{CANVAS_RESET[agent]!r}")
-            # The popup chrome is aGiTrack's own, drawn with reset_sgr — the piece the user saw
-            # in the wrong colour.
-            handle.press(b"\x07", "Ctrl-G", 2.0)
-            settle(handle, 1.5)
-            screen = emulate(handle.raw)
-            palette = rows_matching(screen, "agent-backend")
-            # Only the columns INSIDE the popup's own border: the rest of that row is still the
-            # backend's screen, and a backend that paints every cell (opencode) has its own
-            # colour there — which says nothing about aGiTrack's chrome.
-            inside = box_columns(screen, palette[0]) if palette else []
-            ok = bool(inside) and all(
-                screen.buffer[row][col].bg == CANVAS[agent][0] for row in palette for col in inside
-            )
-            check(f"{title}: the command palette is drawn on the agent's background", ok,
-                  f"rows={palette} cols={inside[:1]}..{inside[-1:]} "
-                  f"{sorted({screen.buffer[palette[0]][col].bg for col in inside}) if inside else ''}")
-            handle.press(b"\x1b", "close the palette", 1.5)
-            if not themed_from_config(lt.BACKEND):
-                # The forced background is relayed over OSC 11, so the BACKEND itself must have
-                # themed to match — otherwise the canvas would be papering over a mismatch.
-                painted = {colour for colour in backgrounds(screen) if colour not in {"default", CANVAS[agent][0]}}
-                check(f"{title}: the backend itself painted for a {agent} background",
-                      bool(painted) and all(_is_dark(colour) == (agent == "dark") for colour in painted),
-                      f"backend fills {sorted(painted)}")
-        finally:
-            handle.kill()
+            light += count
+    if dark + light < 40:  # too few filled cells to mean anything
+        return None
+    return dark > light
 
 
 def _is_dark(colour: str) -> bool:
@@ -347,275 +335,102 @@ def _is_dark(colour: str) -> bool:
     return (0.299 * red + 0.587 * green + 0.114 * blue) < 128
 
 
-def s_match() -> None:
-    """Terminal and agent agree: NO canvas, so the output is what aGiTrack always produced."""
-    for scheme in ("dark", "light"):
-        tag = f"{lt.BACKEND[:2]}_match_{scheme}"
-        title = f"{lt.BACKEND}: {scheme} agent in a {scheme} terminal"
-        agent = scheme if themed_from_config(lt.BACKEND) else None
-        repo, home, env = stage(tag, agent, scheme)
-        handle = launch(repo, env, scheme, tag)
+# The real Terminal.app profiles staged by live_tui.HOST_THEMES, plus the case that has no
+# answer at all — which is what Terminal.app actually is, and the user's own setup.
+PROFILES = ("basic", "novel", "silver-aerogel", "homebrew", "ocean", None)
+
+
+def s_profiles() -> None:
+    """Every terminal profile keeps its own colours, whatever the agent paints.
+
+    `novel` (cream) and `silver-aerogel` (exactly 50% grey) are the ones that used to decide
+    nothing reliably; `None` stages a terminal that answers no colour query at all, which is
+    what macOS Terminal.app really does.
+    """
+    for profile in PROFILES:
+        name = profile or "silent (answers nothing, like Terminal.app)"
+        tag = f"{lt.BACKEND[:2]}_prof_{profile or 'silent'}"
+        title = f"{lt.BACKEND}: {name} terminal"
+        repo, home, env = stage(tag, None, profile or "light")
+        handle = launch(repo, env, profile, tag)
         try:
             handle.boot(tag)
             settle(handle)
             screen = emulate(handle.raw)
             verdict = canvas_verdict(screen)
-            check(f"{title}: no canvas is applied", verdict == "none", f"got {verdict}; {describe(screen)}")
-            check(f"{title}: aGiTrack's chrome keeps the terminal's own background",
-                  set(status_backgrounds(screen)) == {"default"},
-                  f"{sorted(status_backgrounds(screen))}")
-            check(f"{title}: no canvas reset sequence is ever emitted",
-                  CANVAS_RESET["dark"] not in handle.raw and CANVAS_RESET["light"] not in handle.raw)
+            check(
+                f"{title}: no canvas — the terminal's own colours stand",
+                verdict == "none",
+                f"got {verdict}; {describe(screen)}",
+            )
+            check(
+                f"{title}: no canvas sequence is EVER on the wire",
+                canvas_transitions(handle.raw) == [],
+                str(canvas_transitions(handle.raw)),
+            )
+            check(
+                f"{title}: aGiTrack's own chrome keeps the terminal's background",
+                set(status_backgrounds(screen)) == {"default"},
+                str(sorted(status_backgrounds(screen))),
+            )
             check(f"{title}: chrome resets with a plain SGR reset", PLAIN_RESET in handle.raw)
         finally:
             handle.kill()
 
 
-def s_switch() -> None:
-    """A theme changed INSIDE the agent, with aGiTrack idle, is followed within about a second.
-
-    The DIRECTION is per backend, for a reason worth writing down: opencode dims the whole
-    screen behind its command palette, and a dimmed light theme (``696969``) reads as dark, so
-    a light→dark switch driven from that palette cannot be told apart from the dimming. Driving
-    it dark→light instead makes the dimming harmless — it can only ever argue for the scheme
-    that is already there — so the light canvas at the end is unambiguously the switch."""
-    if not switchable_in_agent(lt.BACKEND):
-        check(f"{lt.BACKEND}: in-agent light/dark switch", True,
-              "SKIPPED - this backend has no light/dark theme of its own (see module docstring)")
-        return
-    start = "light" if lt.BACKEND == "claude" else "dark"
-    target = "dark" if start == "light" else "light"
-    tag = f"{lt.BACKEND[:2]}_switch"
-    title = f"{lt.BACKEND}: in-agent switch to {target} while idle"
-    repo, home, env = stage(tag, start, start)
-    handle = launch(repo, env, start, tag)
-    try:
-        handle.boot(tag)
-        settle(handle)
-        screen = emulate(handle.raw)
-        check(f"{title}: starts with no canvas (agent and terminal agree)",
-              canvas_verdict(screen) == "none", describe(screen))
-        mark = len(handle.raw)
-        # Timed from the KEYSTROKE that switched the theme, not from when the harness stopped
-        # reading afterwards — the reply to that keystroke is exactly where the canvas shows up.
-        switched = switch_theme(handle, target)
-        # Nobody types from here on: the canvas must be picked up by the reactor tick.
-        deadline = time.time() + 10.0
-        while time.time() < deadline and CANVAS_RESET[target] not in handle.raw[mark:]:
-            handle.read(0.2, cap=0.4)
-        found = handle.raw.find(CANVAS_RESET[target], mark)
-        took = None
-        if found >= 0:
-            arrived = handle.when(found)
-            took = None if arrived is None else arrived + handle.started - switched
-        check(f"{title}: the canvas follows the agent", found >= 0,
-              f"after {took:.2f}s" if took is not None else "never")
-        if found >= 0:
-            # This clock includes the AGENT's own repaint, which is the larger and more
-            # variable part: claude re-themes in one frame (measured 2.1 s end to end), while
-            # opencode regenerates its palette asynchronously and took 2.2 s once and 8.0 s
-            # another time. aGiTrack's own share is bounded and small — the
-            # CANVAS_VOTES_TO_SWITCH agreeing samples a change to an ESTABLISHED canvas needs,
-            # CANVAS_SAMPLE_INTERVAL apart — and in the 8.0 s run its canvas landed 6 KB and
-            # zero full repaints after the agent's first light frame. So the bound here is
-            # generous on purpose: what must not happen is "never".
-            check(f"{title}: followed, and not only after the user touched something",
-                  took is not None and 0 <= took <= 12.0, f"{took:.2f}s")
-            settle(handle)
-            screen = emulate(handle.raw)
-            check(f"{title}: aGiTrack's chrome ends up {target}", canvas_verdict(screen) == target,
-                  describe(screen))
-            check(f"{title}: and the agent really is painting {target} now",
-                  backend_scheme(screen, target) is (target == "dark"),
-                  f"backend painted for dark={backend_scheme(screen, target)}")
-    finally:
-        release_theme_lock(handle)
-        handle.kill()
+TURN_PROMPT = (
+    "Reply with exactly three short paragraphs and nothing else. First a sentence of plain "
+    "prose. Then a fenced python code block containing 'def f():' and 'return 1'. Then another "
+    "sentence of plain prose. Do not use any tools."
+)
 
 
-def release_theme_lock(handle: lt.Tui) -> None:
-    """Put the agent back to following the terminal.
+def s_stable() -> None:
+    """THE REGRESSION: a session long enough for the content to change must never repaint.
 
-    opencode's runtime switch LOCKS the mode, and the lock is global and persistent: every
-    later opencode session — this harness's and the developer's own — then ignores the
-    reported background. Verified the hard way; a scenario that changes a machine-wide
-    preference has to change it back."""
-    if lt.BACKEND != "opencode" or handle.proc.poll() is not None:
-        return
-    try:
-        handle.press(b"\x10", "opencode command palette (ctrl+p)", 2.0)
-        handle.press(b"lock", "search for the theme-mode lock", 2.0)
-        if rows_matching(emulate(handle.raw), "Unlock theme mode"):
-            handle.press(b"\r", "unlock the theme mode", 2.5)
-            check("opencode: the theme-mode lock the switch set is released again",
-                  not rows_matching(emulate(handle.raw), "Unlock theme mode"))
-        else:
-            handle.press(b"\x1b", "close the palette", 1.0)
-    except AssertionError as error:  # teardown must not mask the scenario's own result
-        print(f"    could not release opencode's theme lock: {error}", flush=True)
-
-
-def switch_theme(handle: lt.Tui, target: str) -> float:
-    """Switch the running agent to its *target* scheme, the way a user would.
-
-    Returns the monotonic time of the keystroke that did it, which is where the clock for
-    "followed within about a second" starts."""
-    if lt.BACKEND == "claude":
-        # type_prompt retries until the composer echoes: a slash command typed into a composer
-        # that repaints a beat later is simply lost, with nothing on screen to say so.
-        handle.type_prompt("/theme")
-        handle.press(b"\r", "open claude's /theme menu", 3.0)
-        # The entries are NUMBERED ("2. Dark mode"), and the number is the shortcut. Pressing
-        # it beats walking the list with arrows: the menu shares the screen with a composer
-        # that has its own "❯", so "which row is selected" is not reliably readable.
-        wanted = re.compile(rf"(\d+)\.\s+{target.capitalize()} mode\s*$")
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            screen = emulate(handle.raw)
-            entry = next(
-                (match for row in range(ROWS) if (match := wanted.search(row_text(screen, row)))),
-                None,
-            )
-            if entry is None:
-                handle.read(0.5, cap=1.0)
-                continue
-            stamp = time.monotonic()
-            handle.press(entry.group(1).encode(), f"choose {entry.group(0).strip()!r}", 2.5)
-            if wanted.search("\n".join(row_text(emulate(handle.raw), r) for r in range(ROWS))):
-                stamp = time.monotonic()
-                handle.press(b"\r", "confirm the theme choice", 2.5)
-            return stamp
-        raise AssertionError(f"never found '{target} mode' in claude's /theme menu:\n{handle.buffer[-2500:]}")
-    if lt.BACKEND == "opencode":
-        handle.press(b"\x10", "opencode command palette (ctrl+p)", 2.5)
-        deadline = time.time() + 12
-        while time.time() < deadline:
-            if rows_matching(emulate(handle.raw), "Commands"):
-                break
-            handle.read(0.5, cap=1.0)
-        else:
-            raise AssertionError(f"opencode's command palette never opened:\n{handle.buffer[-1500:]}")
-        # The entry is titled for what it WILL do ("Switch to light mode"), and the palette
-        # matches on that title — "theme mode" finds only the lock command.
-        handle.press(f"{target} mode".encode(), f"search for '{target} mode'", 2.5)
-        hit = rows_matching(emulate(handle.raw), f"Switch to {target} mode")
-        if not hit:
-            raise AssertionError(f"'Switch to {target} mode' is not in the palette:\n{handle.buffer[-1500:]}")
-        stamp = time.monotonic()
-        handle.press(b"\r", f"switch opencode to {target} mode", 3.0)
-        return stamp
-    raise AssertionError(f"no in-agent theme switch known for {lt.BACKEND}")
-
-
-def s_startup() -> None:
-    """No flip a beat after launch, and no blank white/black gap while the backend starts.
-
-    codex cannot disagree with the terminal on its own, so its mismatch — and therefore its
-    startup case — is the forced ``agent_background``; there the canvas is known from the
-    setting rather than remembered, which is asserted instead of the memory."""
-    tag = f"{lt.BACKEND[:2]}_start"
-    agent = "dark" if themed_from_config(lt.BACKEND) else None
-    background = "auto" if agent else "dark"
-    for run, remembered in (("cold", {}), ("warm", {lt.BACKEND: "dark"})):
-        title = f"{lt.BACKEND}: {run} start, dark agent in a light terminal"
-        repo, home, env = stage(f"{tag}_{run}", agent, "light", background=background,
-                                remembered=remembered)
-        handle = launch(repo, env, "light", f"{tag}_{run}")
+    The user's own diagnosis was that the background followed the CONTENT — "it shows dark if
+    the view doesn't have a code snippet, and it switches back to bright when there is". So this
+    runs a real turn that prints prose, then a fenced code block (whose own fill is what flipped
+    the vote), then prose again, and asserts the canvas never moved across the whole session.
+    Staged on `novel`, the profile the user reported flickering on, and on a silent terminal.
+    """
+    for profile in ("novel", None):
+        name = profile or "silent"
+        tag = f"{lt.BACKEND[:2]}_stable_{name}"
+        title = f"{lt.BACKEND}: a full turn in a {name} terminal"
+        repo, home, env = stage(tag, None, profile or "light")
+        handle = launch(repo, env, profile, tag)
         try:
-            handle.boot(f"{tag}-{run}")
+            handle.boot(tag)
             settle(handle)
-            alt = handle.raw.find(b"\x1b[?1049h")
-            first = handle.raw.find(CANVAS_RESET["dark"])
-            wrong = handle.raw.find(CANVAS_RESET["light"])
-            check(f"{title}: the session ends up on the dark canvas", first >= 0)
-            check(f"{title}: the WRONG canvas is never painted", wrong < 0,
-                  f"light canvas at byte {wrong}")
-            if first >= 0 and alt >= 0:
-                from_alt = (handle.when(first) or 0) - (handle.when(alt) or 0)
-                print(f"    [{run}] TUI took the screen at {handle.when(alt):.2f}s, "
-                      f"dark canvas at {handle.when(first):.2f}s (Δ {from_alt:.2f}s)", flush=True)
-                check(f"{title}: the canvas is up within a second of the TUI taking the screen",
-                      from_alt <= 1.0, f"Δ {from_alt:.2f}s")
-                if run == "warm" or background != "auto":
-                    check(f"{title}: the canvas is up with the very first clear",
-                          from_alt <= 0.05, f"Δ {from_alt:.2f}s")
-                    # The alternate screen is filled with the canvas the moment it is cleared —
-                    # otherwise a white (or black) flash shows until the backend paints. That
-                    # exact pair of sequences is written by nothing else, and it must be the
-                    # FIRST canvas on the wire or something painted the wrong colours first.
-                    fill = handle.raw.find(CANVAS_RESET["dark"] + b"\x1b[2J\x1b[H")
-                    check(f"{title}: the just-cleared screen is filled with the canvas",
-                          fill >= 0 and fill == first, f"fill={fill} first canvas={first}")
-            if background == "auto":
-                check(f"{title}: the remembered scheme is recorded for this backend",
-                      home_config(home).get("agent_theme_seen", {}).get(lt.BACKEND) == "dark",
-                      str(home_config(home).get("agent_theme_seen")))
-            else:
-                # A forced background never consults or updates the memory: what the config
-                # went in with is what it comes out with.
-                check(f"{title}: a forced background leaves the remembered scheme alone",
-                      home_config(home).get("agent_theme_seen", {}) == remembered,
-                      f"{home_config(home).get('agent_theme_seen')} vs {remembered}")
+            before = canvas_transitions(handle.raw)
+            handle.type_prompt(TURN_PROMPT)
+            handle.press(b"\r", "submit the turn", 4.0, cap=180.0)
+            deadline = time.time() + 180.0
+            while time.time() < deadline and "return 1" not in handle.buffer[-20000:]:
+                handle.read(1.0, cap=20.0)
+            check(f"{title}: the agent really printed a code block", "return 1" in handle.buffer, handle.buffer[-400:])
+            settle(handle, 5.0)  # and keep watching after it falls quiet
+            after = canvas_transitions(handle.raw)
+            check(
+                f"{title}: the background never changed, start to finish",
+                after == [] and before == [],
+                f"canvases used, in order: {after}",
+            )
+            screen = emulate(handle.raw)
+            check(
+                f"{title}: it ends on the terminal's own colours",
+                canvas_verdict(screen) == "none",
+                f"{canvas_verdict(screen)}; {describe(screen)}",
+            )
         finally:
             handle.kill()
 
 
-def s_memory() -> None:
-    """The remembered scheme is per backend: one backend's must never be applied to another.
-
-    Under ``auto`` every backend records what it paints — a themed one records its theme, and
-    codex (which follows the terminal) records the terminal's. The OTHER backend's entry is
-    seeded with the opposite value, so carrying it across would be unmistakable."""
-    tag = f"{lt.BACKEND[:2]}_mem"
-    other = "codex" if lt.BACKEND != "codex" else "claude"
-    themed = themed_from_config(lt.BACKEND)
-    agent = "dark" if themed else None
-    mine, theirs = ("dark", "light") if themed else ("light", "dark")
-    repo, home, env = stage(tag, agent, "light", remembered={other: theirs})
-    handle = launch(repo, env, "light", tag)
-    try:
-        handle.boot(tag)
-        settle(handle)
-        seen = home_config(home).get("agent_theme_seen", {})
-        check(f"{lt.BACKEND}: its own scheme is remembered under its own key",
-              seen.get(lt.BACKEND) == mine, str(seen))
-        check(f"{lt.BACKEND}: the other backend's remembered scheme is untouched",
-              seen.get(other) == theirs, str(seen))
-        check(f"{lt.BACKEND}: the other backend's scheme was NOT applied to this session",
-              CANVAS_RESET[theirs] not in handle.raw)
-    finally:
-        handle.kill()
-
-
-def backend_scheme(screen, canvas: str | None) -> bool | None:
-    """What the BACKEND painted for, read with aGiTrack's OWN rule (``agent_theme_is_dark``)
-    after undoing the canvas — every cell wearing exactly the canvas colours is one aGiTrack
-    filled in, so it goes back to "default" before the vote. True = the backend is drawing for
-    a dark background. This is how "the backend was told the forced colour" is checked without
-    guessing at each CLI's palette: claude paints almost no backgrounds at all (14 accent
-    cells), so a background histogram cannot answer it."""
-    canvas_bg, canvas_fg = CANVAS[canvas] if canvas else (None, None)
-    body = []
-    for row in range(ROWS - 1):  # the last row is aGiTrack's status bar, not the backend's
-        cells = {}
-        for col in range(COLS):
-            cell = screen.buffer[row][col]
-            cells[col] = SimpleNamespace(
-                fg="default" if cell.fg == canvas_fg else cell.fg,
-                bg="default" if cell.bg == canvas_bg else cell.bg,
-                data=cell.data,
-            )
-        body.append(cells)
-    return ScreenRenderer.agent_theme_is_dark(ScreenRenderer(ROWS, COLS), body)
-
-
 def s_overrides() -> None:
-    """``agent_background``: dark / light force it, terminal opts out, auto adapts. The forced
-    value is also what the backend is told over OSC 11, so a self-theming backend agrees.
-
-    The agent is left on its own default here (claude's ``auto``; codex and opencode have no
-    choice), so what it paints reports what it was TOLD — that is the end-to-end proof of the
-    relay, and it works the same on all three."""
+    """``agent_background``: dark/light force it for the WHOLE session; anything else keeps the
+    terminal's. The forced value is also what the backend is told over OSC 11, so a self-theming
+    backend paints to match rather than fighting the canvas."""
     for setting in ("dark", "light"):
         tag = f"{lt.BACKEND[:2]}_ov_{setting}"
         title = f"{lt.BACKEND}: agent_background={setting} in a light terminal"
@@ -627,63 +442,61 @@ def s_overrides() -> None:
             screen = emulate(handle.raw)
             verdict = canvas_verdict(screen)
             check(f"{title}: canvas is {setting}", verdict == setting, f"got {verdict}; {describe(screen)}")
-            painted = backend_scheme(screen, setting)
-            check(f"{title}: the backend was told the forced colour (it painted to match)",
-                  painted is (setting == "dark"), f"backend painted for dark={painted}; {describe(screen)}")
+            check(
+                f"{title}: and it is the ONLY canvas the session ever used",
+                canvas_transitions(handle.raw) == [setting],
+                str(canvas_transitions(handle.raw)),
+            )
+            painted = backend_is_dark(screen, setting)
+            check(
+                f"{title}: the backend was told the forced colour (it painted to match)",
+                painted is (setting == "dark"),
+                f"backend painted for dark={painted}; {describe(screen)}",
+            )
+            # The canvas goes on with the very first clear: the setting IS the answer, so there
+            # is nothing to wait for and no white/black flash before it.
+            alt = handle.raw.find(b"\x1b[?1049h")
+            fill = handle.raw.find(CANVAS_RESET[setting] + b"\x1b[2J\x1b[H")
+            first = handle.raw.find(CANVAS_RESET[setting])
+            check(
+                f"{title}: the just-cleared screen is filled with the canvas",
+                fill >= 0 and fill == first,
+                f"fill={fill} first={first}",
+            )
+            if first >= 0 and alt >= 0:
+                delta = (handle.when(first) or 0) - (handle.when(alt) or 0)
+                check(f"{title}: in place the moment the TUI takes the screen", delta <= 0.05, f"delta {delta:.2f}s")
         finally:
             handle.kill()
 
-    # Opting out needs a REAL disagreement to ignore, which only a backend with a theme of its
-    # own can produce: the other two follow whatever aGiTrack reports, and under "terminal"
-    # that is the truth.
+    # And the default relays the truth, which is the whole reason nothing has to adapt.
     tag = f"{lt.BACKEND[:2]}_ov_terminal"
-    title = f"{lt.BACKEND}: agent_background=terminal in a light terminal"
-    if themed_from_config(lt.BACKEND):
-        repo, home, env = stage(tag, "dark", "light", background="terminal")
-        handle = launch(repo, env, "light", tag)
-        try:
-            handle.boot(tag)
-            settle(handle)
-            screen = emulate(handle.raw)
-            check(f"{title}: a DARK agent is left alone — no canvas", canvas_verdict(screen) == "none",
-                  f"got {canvas_verdict(screen)}; {describe(screen)}")
-            check(f"{title}: the agent really was dark (so the opt-out had something to ignore)",
-                  backend_scheme(screen, None) is True, str(backend_scheme(screen, None)))
-            check(f"{title}: no canvas sequence is ever emitted",
-                  CANVAS_RESET["dark"] not in handle.raw and CANVAS_RESET["light"] not in handle.raw)
-        finally:
-            handle.kill()
-    else:
-        check(f"{title}: the opt-out is exercised", True,
-              "SKIPPED - this backend cannot disagree with the terminal on its own, and under "
-              "'terminal' the relay is truthful, so there is no mismatch to ignore")
-
-    # auto stays truthful: the backend must see the REAL terminal colour.
-    tag = f"{lt.BACKEND[:2]}_ov_auto"
-    title = f"{lt.BACKEND}: agent_background=auto relays the real terminal colour"
-    repo, home, env = stage(tag, None, "light", background="auto")
+    title = f"{lt.BACKEND}: the default relays the real terminal colour"
+    repo, home, env = stage(tag, None, "light", background="terminal")
     handle = launch(repo, env, "light", tag)
     try:
         handle.boot(tag)
         settle(handle)
         log = debug_log(repo)
-        check(f"{title}: aGiTrack detected the staged light terminal",
-              "bg=b'rgb:ffff/ffff/ffff'" in log, log[:200])
+        check(f"{title}: aGiTrack detected the staged light terminal", "bg=b'rgb:ffff/ffff/ffff'" in log, log[:200])
         screen = emulate(handle.raw)
-        check(f"{title}: the backend painted for a light background",
-              backend_scheme(screen, None) is False, str(backend_scheme(screen, None)))
-        check(f"{title}: agent and terminal agree, so no canvas is applied",
-              canvas_verdict(screen) == "none", f"{canvas_verdict(screen)}; {describe(screen)}")
+        check(
+            f"{title}: the backend painted for a light background",
+            backend_is_dark(screen, None) is False,
+            str(backend_is_dark(screen, None)),
+        )
+        check(
+            f"{title}: so no canvas is needed, and none is applied",
+            canvas_verdict(screen) == "none",
+            f"{canvas_verdict(screen)}; {describe(screen)}",
+        )
     finally:
         handle.kill()
 
 
 SCENARIOS = {
-    "mismatch": s_mismatch,
-    "match": s_match,
-    "switch": s_switch,
-    "startup": s_startup,
-    "memory": s_memory,
+    "profiles": s_profiles,
+    "stable": s_stable,
     "overrides": s_overrides,
 }
 
