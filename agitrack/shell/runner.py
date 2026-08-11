@@ -35,6 +35,7 @@ class AgitrackShell:
         commit_guidance: bool = True,
         json_events: bool = False,
         ui_bridge: bool = False,
+        log_file: str | None = None,
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
@@ -56,6 +57,13 @@ class AgitrackShell:
         # VSCode chat extension (see editors/vscode) — can render the conversation.
         # Bridge mode always emits them; otherwise it follows the --json-events flag.
         self._json_events = json_events or ui_bridge
+        # WHERE HUMAN TEXT GOES. With --json-events (and no bridge), stdout is a machine stream:
+        # one JSON object per line, nothing else. It was not — the privacy banner, the `> `
+        # prompt echo, "Staged untracked files:" and "aGiTrack is summarizing…" were all
+        # interleaved into it, and the `> ` marker (written with no newline) glued itself onto
+        # the very event carrying the agent's answer, making it unparseable. Prose goes to
+        # stderr in that mode, where a driver can still show or ignore it.
+        self._human = sys.stderr if (json_events and not ui_bridge) else sys.stdout
         # Tell the coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance turns it off). Appended where the backend supports it.
         self._commit_guidance = commit_guidance
@@ -99,9 +107,17 @@ class AgitrackShell:
                 self.state.last_backend_message_id = None
                 self.state.new_agitrack_session_id()
         self.verbose = verbose
-        self.prompt = AgitrackPrompt(self._prompt_state)
+        self.prompt = AgitrackPrompt(self._prompt_state, human_stream=self._human)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui)
         self.management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
+        # --log-file used to be parsed, passed to the background tracker and the proxy runner,
+        # and then simply DROPPED here: this constructor took no log_file argument at all, so
+        # `--prompt`/`--json` runs — including ones that made real commits — created no log file
+        # anywhere, no warning, exit 0, while `--help` said verbatim "Works in every mode".
+        from agitrack.events import EventLog, exclude_log_file, resolve_log_path
+
+        self.events = EventLog(resolve_log_path(log_file, repo.repo))
+        exclude_log_file(repo.repo, self.events.path)
 
     def run(self) -> int:
         """Run the shell, returning a PROCESS EXIT CODE (0 = ran, 1 = could not start).
@@ -113,7 +129,7 @@ class AgitrackShell:
         try:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=self.interactive)
         except BackendUnavailable as error:
-            print(error)
+            print(error, file=self._human)
             if self._bridge is not None:
                 self._bridge.emit({"type": "error", "message": str(error)})
                 self._bridge.emit({"type": "bye"})
@@ -122,7 +138,7 @@ class AgitrackShell:
             message = already_running_message(
                 self.management_lock.owner_pid(), repo_root=getattr(self.repo, "repo", None)
             )
-            print(message)
+            print(message, file=self._human)
             if self._bridge is not None:
                 self._bridge.emit({"type": "error", "message": message})
                 self._bridge.emit({"type": "bye"})
@@ -135,10 +151,10 @@ class AgitrackShell:
             self.global_config.default_backend = self._switch_to_backend
         self.state.save()
         if self.verbose:
-            print(f"aGiTrack session {self.state.session_id}")
-            print(f"Repository: {self.repo.repo}")
-            print(f"Backend: {self.state.backend}")
-            print("Type :help for aGiTrack commands. Backend / commands are passed through.")
+            print(f"aGiTrack session {self.state.session_id}", file=self._human)
+            print(f"Repository: {self.repo.repo}", file=self._human)
+            print(f"Backend: {self.state.backend}", file=self._human)
+            print("Type :help for aGiTrack commands. Backend / commands are passed through.", file=self._human)
         try:
             if self._bridge is not None:
                 self._run_bridge()
@@ -150,7 +166,7 @@ class AgitrackShell:
                 try:
                     text = self.prompt.prompt().strip()
                 except (EOFError, KeyboardInterrupt):
-                    print()
+                    print(file=self._human)
                     return 0
                 if not text:
                     continue
@@ -170,7 +186,7 @@ class AgitrackShell:
             text = text.strip()
             if not text:
                 continue
-            print(f"> {text}")
+            print(f"> {text}", file=self._human)
             if text.startswith(AGITRACK_PREFIX):
                 if self._handle_command(text):
                     return
@@ -280,37 +296,39 @@ class AgitrackShell:
         if command == ":help":
             self._print_help()
         elif command == ":status":
-            print(self.repo.status_short() or "Working tree clean")
+            print(self.repo.status_short() or "Working tree clean", file=self._human)
         elif command == ":agent-backend":
             agent = arg.strip()
             if agent not in BACKENDS:
-                print(f"Unknown backend: {agent or '(none)'}. Available: {', '.join(sorted(BACKENDS))}")
+                print(
+                    f"Unknown backend: {agent or '(none)'}. Available: {', '.join(sorted(BACKENDS))}", file=self._human
+                )
             elif not backend_installed(agent):
-                print(f"'{agent}' is not installed.")
-                print(install_hint(agent))
+                print(f"'{agent}' is not installed.", file=self._human)
+                print(install_hint(agent), file=self._human)
             else:
                 self.state.remember_backend_session()
                 self.state.backend = agent
                 self.global_config.default_backend = agent
                 self.state.backend_session_id = self.state.stored_backend_session(agent)
                 self.state.last_backend_message_id = None
-                print(f"Backend set to {agent}")
+                print(f"Backend set to {agent}", file=self._human)
         elif command == ":user-commit":
             self.actions.create_user_commit()
         elif command == ":unstaged":
             declined = self.state.declined_untracked()
             if declined:
-                print("Intentionally unstaged files:")
+                print("Intentionally unstaged files:", file=self._human)
                 for path in declined:
-                    print(f"  {path}")
+                    print(f"  {path}", file=self._human)
             else:
-                print("No intentionally unstaged files.")
+                print("No intentionally unstaged files.", file=self._human)
         elif command == ":stage":
             self.actions.review_untracked(include_declined=True)
         elif command == ":summarizer":
             self._handle_summarizer_command(arg.strip())
         else:
-            print(f"Unknown command: {command}")
+            print(f"Unknown command: {command}", file=self._human)
         return False
 
     def _handle_summarizer_command(self, arg: str) -> None:
@@ -331,7 +349,7 @@ class AgitrackShell:
                     return  # cancelled — leave the model unchanged
                 new_model = entered.strip()
             else:
-                print(f"Current summarizer model: {current}")
+                print(f"Current summarizer model: {current}", file=self._human)
                 new_model = input("Enter model (empty to clear): ").strip()
             # Persist globally (survives restarts and applies across the repo); clear the
             # per-session override so the global value takes effect.
@@ -351,7 +369,7 @@ class AgitrackShell:
         if self.ui is not None:
             self.ui.info(message, level=level)
         else:
-            print(message)
+            print(message, file=self._human, flush=True)
 
     def _summarization_enabled(self) -> bool:
         # The GLOBAL config is the durable source of truth (survives restarts), so it wins
@@ -381,7 +399,7 @@ class AgitrackShell:
             if self.ui is not None:
                 self.ui.info("User changes detected before the agent runs.")
             else:
-                print("User changes detected before agent runs.")
+                print("User changes detected before agent runs.", file=self._human)
             self.actions.create_user_commit()
 
         backend = self._backend()
@@ -421,6 +439,13 @@ class AgitrackShell:
                 "model": self.state.model,
             }
         )
+        # PRINT THE REPLY. `_emit` is a no-op without --json-events, so a plain
+        # `agitrack --prompt "…"` showed the privacy banner and the echoed prompt and then
+        # nothing at all — the agent's answer appeared nowhere on screen (it went only into
+        # state.json and the commit trace). On claude that meant a turn whose entire content was
+        # "I need permission to create the file" looked like a silent success.
+        if result.final_response and self.ui is None and not self._json_events:
+            print(result.final_response, file=self._human)
         self.repo.add_tracked()
         self.actions.review_untracked(include_declined=False)
         if self.repo.has_staged_changes():
@@ -437,7 +462,7 @@ class AgitrackShell:
             if self._summarization_enabled():
                 # Shell mode is synchronous per prompt, so summarizing inline is
                 # fine — but say so, since the LLM call can take a while.
-                print("aGiTrack is summarizing the changes before committing...")
+                print("aGiTrack is summarizing the changes before committing...", file=self._human)
                 if self.ui is not None:
                     self.ui.info("Summarizing the changes before committing…")
                 try:
@@ -451,7 +476,7 @@ class AgitrackShell:
                     )
                 except Exception as error:
                     if self.verbose:
-                        print(f"Summarization failed: {error}")
+                        print(f"Summarization failed: {error}", file=self._human)
 
             origin_event = self.state.session_origin_event()
             commit_sha = self.repo.commit(
@@ -473,6 +498,9 @@ class AgitrackShell:
             if origin_event is not None:
                 self.state.clear_session_origin_event()  # one-shot: surfaced once, then cleared
             self.state.clear_trace()
+            self.events.emit(
+                "commit", sha=(commit_sha or "")[:12], type="agent", backend=result.backend, subject=commit_summary
+            )
 
             if commit_summary and commit_sha:
                 try:
@@ -487,14 +515,20 @@ class AgitrackShell:
                     self.repo.notes_add(commit_sha, new_session_summary, namespace="agitrack/session-summary")
                 except Exception as error:
                     if self.verbose:
-                        print(f"Session summary update failed: {error}")
+                        print(f"Session summary update failed: {error}", file=self._human)
 
-            print("Created <aGiTrack> commit.")
+            print("Created <aGiTrack> commit.", file=self._human)
             self._emit({"type": "commit", "sha": commit_sha, "session": self.state.session_id})
         else:
             self._emit({"type": "no_changes"})
-            if self.verbose:
-                print("No code changes detected; interaction trace remains pending.")
+            # ALWAYS say it, not only under --verbose. A turn that produced no file change is
+            # exactly the case a scripted caller must be able to see: it is indistinguishable
+            # from a successful one otherwise, and it is what a declined permission, a refusal,
+            # or a pure question all look like from the outside. The exit code stays 0: the turn
+            # genuinely ran and the agent genuinely answered — "changed nothing" is a legitimate
+            # outcome for a question, and the `no_changes` event plus this line are what make it
+            # visible. A turn that FAILED still returns non-zero, above.
+            print("No code changes were made; the interaction trace remains pending.", file=self._human)
 
     def _launch_command(self) -> list[str]:
         # Command that launches the current backend, replacing its executable with a user
@@ -530,7 +564,7 @@ class AgitrackShell:
 
     def _handle_pre_compaction(self) -> None:
         if self.verbose:
-            print("aGiTrack: Capturing session summary before compaction...")
+            print("aGiTrack: Capturing session summary before compaction...", file=self._human)
         try:
             from agitrack.summaries import Summarizer
 
@@ -555,23 +589,23 @@ class AgitrackShell:
                 self.state.session_summary_commit = head_sha
                 self.repo.notes_add(head_sha, summary, namespace="agitrack/session-summary")
             if self.verbose:
-                print("aGiTrack: Session summary captured.")
+                print("aGiTrack: Session summary captured.", file=self._human)
         except Exception as error:
             if self.verbose:
-                print(f"aGiTrack: Pre-compaction summary failed: {error}")
+                print(f"aGiTrack: Pre-compaction summary failed: {error}", file=self._human)
 
     def _print_help(self) -> None:
-        print("Commands:")
-        print("  :help              show this help")
-        print("  :status            show git status")
-        print("  :user-commit       create a user commit")
-        print("  :stage             review and stage untracked files")
-        print("  :unstaged          show intentionally unstaged files")
-        print(f"  :agent-backend <{'|'.join(BACKENDS)}> select the agent backend")
-        print("  :summarizer [on|off|model|status]")
-        print("                     manage summarization (on/off, set model, show status)")
-        print("  :exit              exit")
-        print("Backend / commands are not reserved by aGiTrack and are sent to the backend.")
+        print("Commands:", file=self._human)
+        print("  :help              show this help", file=self._human)
+        print("  :status            show git status", file=self._human)
+        print("  :user-commit       create a user commit", file=self._human)
+        print("  :stage             review and stage untracked files", file=self._human)
+        print("  :unstaged          show intentionally unstaged files", file=self._human)
+        print(f"  :agent-backend <{'|'.join(BACKENDS)}> select the agent backend", file=self._human)
+        print("  :summarizer [on|off|model|status]", file=self._human)
+        print("                     manage summarization (on/off, set model, show status)", file=self._human)
+        print("  :exit              exit", file=self._human)
+        print("Backend / commands are not reserved by aGiTrack and are sent to the backend.", file=self._human)
 
     def _prompt_state(self) -> PromptState:
         existing = [path for path in self.state.declined_untracked() if (self.repo.repo / path).exists()]

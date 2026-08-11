@@ -67,6 +67,11 @@ def test_restart_all_terminates_and_respawns(monkeypatch, tmp_path):
             sleeper.wait()
 
     monkeypatch.setattr(daemons, "terminate_pid", fake_terminate)
+    # restart_all now requires proof each target really is an aGiTrack daemon before signalling
+    # it (a registry pid can be a REUSED pid after a reboot), so the stand-in must look like one.
+    monkeypatch.setattr(
+        daemons, "_process_command_lines", lambda: [f"{sleeper.pid} python -m agitrack --dashboard-serve"]
+    )
 
     restarted = daemons.restart_all(exclude_pid=os.getpid())
     assert restarted == 1
@@ -89,6 +94,7 @@ def test_restart_all_skips_current_process(monkeypatch, tmp_path):
 
 
 def test_scan_daemon_processes_parses_ps(monkeypatch):
+    monkeypatch.setattr(daemons, "_custom_config_dir", lambda: "")  # exercise the scan itself
     canned = (
         "  501 /usr/bin/python3 -m agitrack --repo /home/me/proj --dashboard-serve --dashboard-owner-pid 42\n"
         "  777 /usr/bin/python3 -m agitrack --repo /home/me/other --backtrace-serve --dashboard-owner-pid 9\n"
@@ -119,6 +125,7 @@ def test_list_running_finds_unregistered_daemon_via_ps(monkeypatch, tmp_path):
     # This test exercises the REAL scan (parsing a mocked `_process_command_lines`), so restore it
     # over the conftest guard that stubs it out for every other test.
     monkeypatch.setattr(daemons, "_scan_daemon_processes", _real_scan)
+    monkeypatch.setattr(daemons, "_custom_config_dir", lambda: "")  # exercise the scan itself
     monkeypatch.setattr(daemons, "_process_command_lines", lambda: _R().stdout.splitlines())
     infos = daemons.list_running()
     assert any(i.pid == 501 and i.kind == "dashboard" and i.repo == "/r/one" for i in infos)

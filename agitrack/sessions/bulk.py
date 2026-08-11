@@ -265,7 +265,10 @@ def share_all(
                     candidate.backend,
                     candidate.name,
                     "behind",
-                    "the shared copy already has newer turns; resume it first, or re-run with --overwrite",
+                    # NAME THE REAL FLAG. `--overwrite` does not exist; it only ever resolved because
+                    # argparse prefix-matches, and it would break the moment any other
+                    # --overwrite* option is added.
+                    "the shared copy already has newer turns; resume it first, or re-run with --overwrite-shared",
                 )
             )
         elif published.remote and not published.pushed:

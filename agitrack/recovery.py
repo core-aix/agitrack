@@ -57,10 +57,32 @@ class RecoveryReport:
     def did_work(self) -> bool:
         return bool(self.recovered or self.integrated or self.flagged)
 
+    # Set when the repo's only uncommitted work is in the BASE tree (a --no-worktree session).
+    # Recovery deliberately does not touch that, and saying "Nothing to recover" there is a lie
+    # by omission — see `summary`.
+    uncommitted_outside_worktrees: bool = False
+
     def summary(self) -> str:
         if self.skipped_busy:
             return "aGiTrack is already running on this repo; recovery skipped."
         if not self.did_work():
+            if self.uncommitted_outside_worktrees:
+                # C35: after a --no-worktree crash this printed "Nothing to recover." —
+                # BYTE-IDENTICAL to the never-tracked case — and the agent's work stayed
+                # uncommitted forever, while `--help` promised recovery unconditionally. The
+                # behaviour is deliberate (those edits sit in the base tree intermixed with the
+                # user's own, so auto-committing them would be unsafe); the silence was not.
+                return (
+                    "Nothing to recover automatically.\n"
+                    "This repo has uncommitted changes in its working tree, but they are NOT in a "
+                    "session worktree.\n"
+                    "`--recover` only finalizes worktree sessions: a --no-worktree run leaves the "
+                    "agent's edits in your\n"
+                    "own working tree, intermixed with your changes, so committing them for you "
+                    "would be unsafe.\n"
+                    "Review them with `git status` and commit what you want — `agitrack -b` folds "
+                    "the AI trace into that commit."
+                )
             return "Nothing to recover."
         parts: list[str] = []
         if self.recovered:
@@ -139,6 +161,14 @@ class RecoveryService:
             integration.delete_orphan_merged_branches()
         except Exception as error:
             self._debug(f"recover: orphan-branch cleanup failed: {error!r}")
+        if not report.did_work():
+            # Distinguish "there is nothing anywhere" from "there IS uncommitted work, but not
+            # somewhere `--recover` may touch" — the two printed the same sentence, so a
+            # --no-worktree crash looked like a never-tracked repo. See RecoveryReport.summary.
+            try:
+                report.uncommitted_outside_worktrees = self.base_repo.has_changes()
+            except Exception as error:
+                self._debug(f"recover: base working-tree check failed: {error!r}")
         return report
 
     def _recover_one(

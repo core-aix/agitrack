@@ -85,7 +85,13 @@ def _never_touch_real_daemons(monkeypatch):
     above) with an OS PROCESS-TABLE SCAN — so a test that reaches ``restart_all()``
     (e.g. through ``restart_agitrack``) would SIGTERM the developer's live dashboards
     on every run, exactly as it silently did before this guard. Tests of the scan
-    itself bind the real function at import time (see test_daemons.py)."""
+    itself bind the real function at import time (see test_daemons.py).
+
+    Belt and braces since the scan itself now stands down under a custom
+    AGITRACK_CONFIG_DIR — which is the real fix, because this fixture only ever
+    protected the SUITE. Users running under an isolated config dir (a CI job, one
+    slot of a parallel test run) had no such guard, and `--daemons stop` reached
+    across the whole machine for them."""
     from agitrack import daemons
 
     monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])

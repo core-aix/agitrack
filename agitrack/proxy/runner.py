@@ -38,7 +38,7 @@ from agitrack.commits import (
     build_user_commit_message,
     summary_metadata_lines,
 )
-from agitrack.events import EventLog, resolve_log_path
+from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import read_cache as git_read_cache
 from agitrack.git import hooks as git_hooks
@@ -798,8 +798,15 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # User-facing event log (an AI change detected, a commit made, an update available).
         # Keyed on the base repo root so a relative --log-file resolves the same everywhere.
         self.events = EventLog(resolve_log_path(log_file, repo.repo))
+        # Keep the log out of the user's tree. Under -b the tracker's own `git add` swept an
+        # in-repo events.log into the AGENT'S commit — aGiTrack telemetry about a turn ending
+        # up inside the turn, attributed to the AI, in permanent history.
+        exclude_log_file(repo.repo, self.events.path)
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
+        # One-shot: the hook install path runs again on every worktree-guard restore, and the
+        # core.hooksPath notice must not repeat down the session.
+        self._hooks_path_notice_shown = False
         self._skip_privacy_ack = skip_privacy_ack
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
@@ -1655,7 +1662,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             self.actions.create_user_commit(allow_skip=not self._use_worktrees)
         # Base-merge-only: run even the first session in a worktree so the base
         # branch is only advanced by integration, never edited by a live agent.
+        self._announce_diagnostics()
         self._base_branch = self.base_repo.current_branch()
+        self._warn_if_base_is_detached()
         self._integration.base_branch = self._base_branch
         # Cached branch checked out in the repo directory, refreshed by the drift
         # poll. The status bar bolds a session's integration branch when it differs
@@ -2148,7 +2157,20 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         repo's ``autotrack_hook`` opt-out. Shared by no-worktree startup and the worktree
         guard's restore path."""
         try:
-            if self.base_repo.core_hooks_path():
+            hooks_path = self.base_repo.core_hooks_path()
+            if hooks_path:
+                # Say it once, on the pre-TUI console. The skip was `_debug`-only, so the string
+                # "core.hooksPath" never reached the user — and the status line then asserted
+                # the opposite. See BackgroundRunner._install_autotrack_hook.
+                if not self._hooks_path_notice_shown:
+                    self._hooks_path_notice_shown = True
+                    print(
+                        f"aGiTrack: this repo sets core.hooksPath ({hooks_path}), so git ignores "
+                        "the hooks directory aGiTrack installs into.\n"
+                        "  Tracking works normally while aGiTrack runs; commits made after it "
+                        "exits are NOT tracked.\n"
+                        "  Your own hooks are left exactly as they are."
+                    )
                 return
             hooks_dir = self.base_repo.hooks_dir()
             if getattr(self.global_config, "autotrack_hook", "auto") == "off":
@@ -2338,6 +2360,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # Re-arm the automatic self-update check so it re-evaluates for the backend being
         # switched to (a sandbox-blocked update is then applied on switch too).
         self._backend_update_checked_for = None
+        self._drop_model_pin_on_switch(name)
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
@@ -2421,6 +2444,46 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             return
         self._remember_repo_backend(name)
         self._new_session(session_name, backend=name)
+
+    def _drop_model_pin_on_switch(self, name: str) -> None:
+        """Remove a ``--model`` passthrough before switching to ``name``, and say so.
+
+        Backend args are forwarded VERBATIM to whatever backend is spawned, including after a
+        Ctrl-G switch. So launching with `--backend codex --model gpt-5.4-mini` and switching to
+        claude handed claude a model id it does not have: the next turn died instantly, with the
+        error buried inside the backend's own pane and no aGiTrack-level warning anywhere. The
+        repo's own harness command hits this — 8 of 9 checks pass and the turn fails.
+
+        Dropping it means the switched-to backend uses its own default, which is the only model
+        that is certain to exist there. Stated out loud, because a pin the user typed on the
+        command line silently disappearing would be its own surprise."""
+        args = getattr(self, "_backend_args", [])
+        if not args:
+            return
+        kept: list[str] = []
+        dropped: list[str] = []
+        skip_next = False
+        for index, arg in enumerate(args):
+            if skip_next:
+                skip_next = False
+                dropped.append(arg)
+                continue
+            if arg in ("--model", "-m"):
+                dropped.append(arg)
+                skip_next = index + 1 < len(args)
+                continue
+            if arg.startswith("--model="):
+                dropped.append(arg)
+                continue
+            kept.append(arg)
+        if not dropped:
+            return
+        self._backend_args = kept
+        self._set_message(
+            f"Dropped {' '.join(dropped)} — a model belongs to one backend, and {name} would "
+            "reject it. Using its own default model.",
+            seconds=8.0,
+        )
 
     def _remember_repo_backend(self, name: str) -> None:
         """Record the switch for THIS repo only (repo-scoped), not globally.
@@ -2597,19 +2660,76 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             return state
         return AgitrackState(root, default_backend=getattr(self.global_config, "default_backend", None))
 
-    def _persist_session_name(self, session_id: str | None) -> None:
+    def _announce_diagnostics(self) -> None:
+        """Print WHERE the diagnostics go, before the TUI takes the screen.
+
+        C13: `--verbose` produced ZERO extra on-screen output — the verbose and non-verbose
+        transcripts differed only in the session name, and the status bar carried no marker.
+        Everything went to `.agitrack/proxy-debug-<stamp>.log`, whose path was never printed
+        anywhere, so the flag read as broken and the file it wrote was undiscoverable. It also
+        records every keystroke and grows ~10 KB/min while idle, which is worth knowing before
+        leaving it on."""
+        if not self.debug_proxy:
+            return
+        try:
+            path = self._diag_path("proxy-debug")
+        except Exception:
+            return
+        print(f"aGiTrack: verbose diagnostics → {path}")
+        if self.raw_capture:
+            print(f"aGiTrack: raw I/O capture   → {self._diag_path('proxy-raw')}")
+        print("  It records your keystrokes and grows steadily; delete it when you are done.")
+
+    def _warn_if_base_is_detached(self) -> None:
+        """Say so — loudly, once, before the agent starts — when the repo is on a detached HEAD.
+
+        B8: a detached HEAD was never detected and never mentioned; the only trace anywhere in
+        the UI was the status bar rendering "→ HEAD". Integration then FAST-FORWARDED the
+        detached HEAD onto the aGiTrack commit without asking, leaving `main` untouched and the
+        turn branch deleted — so the agent's work was reflog-only from the next
+        `git checkout main` onward, and looked to the user like it had simply vanished.
+
+        aGiTrack still works here (the commits are real, and `git switch -c` keeps them), so this
+        warns rather than refuses: refusing would strand the legitimate detached-HEAD workflows
+        (bisect, an inspected tag) that people do run agents inside."""
+        try:
+            if not self.base_repo.is_detached():
+                return
+            head = self.base_repo.rev_parse("HEAD")[:12]
+        except Exception as error:
+            self._debug(f"detached-HEAD check failed: {error!r}")
+            return
+        print(
+            f"aGiTrack: this repository is on a DETACHED HEAD ({head}) — no branch is checked out.\n"
+            "  Commits aGiTrack makes will be integrated onto that detached HEAD, so they belong\n"
+            "  to no branch: the next `git checkout <branch>` leaves them reachable only from the\n"
+            "  reflog, and `git gc` will eventually discard them.\n"
+            f"  To keep this work: `git switch -c <name>` now, or `git branch <name> {head}` later."
+        )
+
+    def _persist_session_name(self, session_id: str | None, *, overwrite: bool = False) -> None:
         # Link this session's user-given name to its backend conversation id in
         # the durable repo-root record as soon as the id is known — and again
         # whenever the backend forks a new id — not only on clean exit. Waiting
         # for exit strands the name under a stale id (or never records it) when
         # the worktree is kept, aGiTrack crashes, or the conversation id drifts
         # across resumes, leaving the session unnamed in the resume list.
+        #
+        # FILL-ONLY unless ``overwrite``. This wrote self.name — the name of the session doing
+        # the resuming — onto whatever conversation was now active, so RESUMING a past
+        # conversation renamed it: alpha → hill → gamma → delta, and the list then showed two
+        # unrelated conversations both called "hill" with the original names unrecoverable.
+        # A rename is a deliberate act with its own command (`_rename_session`), and that is the
+        # only caller that passes overwrite=True.
         name = self.name
         if not session_id or not name or self._AUTO_NAME_RE.match(name):
             return
         try:
             root = self._root_state()
-            if root.session_name_for(session_id) != name:
+            existing = root.session_name_for(session_id)
+            if existing and not overwrite:
+                return  # this conversation already has a name of its own; it is not ours to change
+            if existing != name:
                 root.name_session(session_id, name)
             if root.pending_session_name:
                 root.remember_pending_session_name(None)  # now durably linked to the conversation
@@ -5194,7 +5314,8 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         shared_before_rename = bool(sid and self._user_state().shared_origin(sid))
         if sid:
             self._stage_backend_resume(sid)  # re-link the transcript under the new path
-            self._persist_session_name(sid)
+            # The one place a stored name SHOULD be replaced: the user just asked for it.
+            self._persist_session_name(sid, overwrite=True)
             self._fork_lineage_on_rename(sid)
         self._reset_agent_tracking()
         self._sanitize_state_trace()

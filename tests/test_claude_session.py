@@ -1804,3 +1804,17 @@ def test_session_last_activity_falls_back_to_a_full_read(monkeypatch, tmp_path):
 
     assert stamp is not None
     assert time.strftime("%Y-%m-%dT%H:%M", time.gmtime(stamp)) == "2026-08-04T20:04"
+
+
+def test_overlong_project_dir_does_not_raise(tmp_path, monkeypatch):
+    """Claude keys transcripts by flattening the repo's cwd into ONE filename, so a repo nested
+    ~225 characters deep produces a path component past Linux's 255-byte limit. `Path.is_dir()`
+    swallows "not found" but NOT ENAMETOOLONG, so the probe raised `OSError: [Errno 36] File name
+    too long` — a raw traceback, exit 1, TUI never started, from a call whose only job was to ask
+    whether a directory exists."""
+    from agitrack.transcripts import claude as claude_transcripts
+
+    deep = tmp_path / ("d" * 200 + "/" + "e" * 200)
+    # Never created on disk: the point is that merely LOOKING at it must not raise.
+    assert claude_transcripts._refs_in_project_dir(deep) == []
+    assert claude_transcripts.list_sessions(deep) == []

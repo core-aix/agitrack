@@ -97,7 +97,9 @@ def merge_json_for_save(path: Path, current: dict[str, Any], baseline: dict[str,
 
 def atomic_write_text(path: Path, text: str) -> None:
     """Atomically replace ``path`` with ``text`` (UTF-8); safe under concurrent writers."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Writing into `.agitrack/` is what CREATES it, so the self-ignore has to be established
+    # here rather than left to whichever caller happens to be first (see ensure_state_dir).
+    ensure_state_dir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -110,3 +112,65 @@ def atomic_write_text(path: Path, text: str) -> None:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def safe_is_dir(path: Path) -> bool:
+    """``path.is_dir()`` that answers False instead of raising on a path the OS will not even
+    look at.
+
+    ``Path.is_dir()`` swallows "not found" but NOT ``ENAMETOOLONG``. The coding-agent backends key
+    their transcripts by flattening the repo's cwd into ONE filename, so a repo nested ~225
+    characters deep produces a component past Linux's 255-byte limit and the probe raised
+    ``OSError: [Errno 36] File name too long`` — a raw traceback, exit 1, TUI never starts, from a
+    call whose only job was to ask whether a directory exists. A path we cannot stat holds no
+    transcripts by definition, which is exactly what False means here."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+# aGiTrack's per-repo state directory. Everything it writes about a repository lives here.
+STATE_DIRNAME = ".agitrack"
+
+_SELF_IGNORE = (
+    "# aGiTrack's own working state for this repository. Never part of your project,\n"
+    "# and never something you should be asked to commit. Written by aGiTrack itself.\n"
+    "*\n"
+)
+
+
+def ensure_state_dir(directory: Path) -> Path:
+    """Create ``directory`` and, if it is (or is inside) a repo's ``.agitrack/``, make that
+    directory ignore itself. Returns ``directory``.
+
+    ``.git/info/exclude`` was the only thing keeping ``.agitrack/`` out of the user's tree, and
+    it is written by a DIFFERENT code path — so every run that created a lock, a config, a
+    dashboard log or an export before tracking started, and then exited (no TTY, `-d html`,
+    `--remove-hooks`, `--recover`, an abort), left the user staring at ``?? .agitrack/`` in a
+    repository aGiTrack had just told them it had never touched. Even the happy path had a race
+    where the files landed before the exclude line did.
+
+    A ``.gitignore`` holding ``*`` inside the directory needs no second code path and no ordering:
+    the moment the directory exists it is ignored, including the ``.gitignore`` itself. The
+    exclude entry is still written — it is what keeps a repo whose ``.agitrack/`` predates this
+    clean — but nothing depends on it landing first."""
+    directory.mkdir(parents=True, exist_ok=True)
+    state_root = _state_root(directory)
+    if state_root is None:
+        return directory
+    marker = state_root / ".gitignore"
+    try:
+        if not marker.exists():
+            marker.write_text(_SELF_IGNORE, encoding="utf-8")
+    except OSError:
+        pass  # best-effort: a read-only or racing filesystem must never break the caller
+    return directory
+
+
+def _state_root(directory: Path) -> Path | None:
+    """The ``.agitrack/`` ancestor of ``directory`` (or itself), or None if there is none."""
+    for candidate in (directory, *directory.parents):
+        if candidate.name == STATE_DIRNAME:
+            return candidate
+    return None

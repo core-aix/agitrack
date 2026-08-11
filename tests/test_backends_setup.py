@@ -5,6 +5,7 @@ All backend availability checks and subprocess calls are mocked.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -242,10 +243,13 @@ def test_select_default_backend_picking_uninstalled_installs_and_selects_it():
     def fake_installed(name):
         return name == "claude" or name in installs
 
+    # "2" picks the backend; "y" confirms the install, which is no longer implicit — typing a
+    # number used to run `curl … | bash` immediately.
+    answers = iter(["2", "y"])
     with patch("agitrack.backends.setup.backend_installed", side_effect=fake_installed):
         result = select_default_backend(
             config,
-            input_fn=lambda _: "2",
+            input_fn=lambda _: next(answers),
             output_fn=lambda _: None,
             install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
         )
@@ -261,10 +265,11 @@ def test_select_default_backend_none_installed_pick_installs_chosen():
     def fake_installed(name):
         return name in installs
 
+    answers = iter(["1", "y"])  # pick, then confirm the install (no longer implicit)
     with patch("agitrack.backends.setup.backend_installed", side_effect=fake_installed):
         result = select_default_backend(
             config,
-            input_fn=lambda _: "1",
+            input_fn=lambda _: next(answers),
             output_fn=lambda _: None,
             install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
         )
@@ -397,3 +402,93 @@ def test_backend_question_starts_a_clearly_separated_block():
     # Two newlines: the first ends any partial line left by an installer's output, the
     # second leaves a blank line so the question reads as a new section.
     assert lines[0].startswith("\n\nAgent backends:")
+
+
+def test_a_backend_installed_off_path_is_found(tmp_path, monkeypatch):
+    """N5: detection was PATH-only, so a working `claude` at %APPDATA%\\npm or ~/.local/bin was
+    reported "not installed" — with a reinstall recipe whose official installer drops it in that
+    same directory, so a naive user could loop. `_candidate_bin_dirs()` already hardcoded exactly
+    those paths (with the comment "claude.cmd lands here"), but its only call site was INSIDE the
+    install routine, after a successful install."""
+    from agitrack.backends import setup
+
+    bindir = tmp_path / "offpath-bin"
+    bindir.mkdir()
+    shim = bindir / "claude"
+    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    shim.chmod(0o755)
+
+    monkeypatch.setenv("PATH", "/nonexistent")
+    monkeypatch.setattr(setup, "_candidate_bin_dirs", lambda npm, run: [str(bindir)])
+
+    assert setup.backend_installed("claude") is True
+    # ...and the directory is added to PATH, so the launch that follows actually works rather
+    # than reporting success and then failing to spawn.
+    assert str(bindir) in os.environ["PATH"]
+
+
+def test_a_backend_that_is_really_missing_is_still_reported_missing(tmp_path, monkeypatch):
+    from agitrack.backends import setup
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(setup, "_candidate_bin_dirs", lambda npm, run: [str(tmp_path / "also-empty")])
+
+    assert setup.backend_installed("claude") is False
+
+
+def test_the_codex_install_hint_does_not_use_the_403_endpoint():
+    """The chatgpt.com installer endpoint returns HTTP 403 from some networks (two independent
+    live-test runs confirmed it), so the hint would hand the user a command that fails."""
+    from agitrack.backends.setup import install_hint
+
+    hint = install_hint("codex")
+    assert "chatgpt.com/backend-api/codex/install" not in hint
+    assert "@openai/codex" in hint
+
+
+def test_picking_an_uninstalled_backend_asks_before_downloading_it():
+    """N0: typing a number ran `curl … | bash` IMMEDIATELY — no y/N, no abort, the only
+    disclosure a trailing clause on the question above. A user picking the agent they PLANNED to
+    use later got an unannounced ~291 MB download piped from the network into a shell."""
+    from agitrack.backends import setup
+
+    class _Config:
+        default_backend = None
+
+    installs: list[str] = []
+    printed: list[str] = []
+    answers = iter(["2", "n"])  # pick a not-installed backend, then decline the install
+
+    with patch("agitrack.backends.setup.backend_installed", side_effect=lambda name: False):
+        chosen = setup.select_default_backend(
+            _Config(),
+            input_fn=lambda prompt: next(answers),
+            output_fn=printed.append,
+            install_fn=lambda name, **kw: installs.append(name) or True,
+        )
+
+    assert installs == []  # declined ⇒ nothing was downloaded
+    text = "\n".join(printed)
+    assert "is not installed yet" in text
+    assert "stays your default" in text  # declining is not a dead end
+    assert chosen  # ...and the choice was still saved
+
+
+def test_confirming_the_install_still_installs():
+    from agitrack.backends import setup
+
+    class _Config:
+        default_backend = None
+
+    installs: list[str] = []
+    answers = iter(["2", "y"])
+
+    with patch("agitrack.backends.setup.backend_installed", side_effect=lambda name: False):
+        setup.select_default_backend(
+            _Config(),
+            input_fn=lambda prompt: next(answers),
+            output_fn=lambda text: None,
+            install_fn=lambda name, **kw: installs.append(name) or True,
+        )
+
+    assert len(installs) == 1

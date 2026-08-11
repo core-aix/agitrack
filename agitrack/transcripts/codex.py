@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.fileio import safe_is_dir
 from agitrack.transcripts import capabilities as caps
 from agitrack.transcripts.edits import merge_edits_by_path, tracked_edit
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
@@ -102,7 +103,7 @@ def watch_roots() -> list[Path]:
     current = root
     for _ in range(3):  # YYYY / MM / DD
         try:
-            children = sorted(child for child in current.iterdir() if child.is_dir())
+            children = sorted(child for child in current.iterdir() if safe_is_dir(child))
         except OSError:
             break
         if not children:
@@ -162,7 +163,7 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
 def _rollout_files() -> list[Path]:
     """Every rollout file on disk, newest mtime first. The fallback index."""
     root = _sessions_root()
-    if not root.is_dir():
+    if not safe_is_dir(root):
         return []
     try:
         files = [path for path in root.rglob("rollout-*.jsonl") if path.is_file()]

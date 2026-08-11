@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agitrack import __version__
-from agitrack.proc import console_isolation_kwargs, detach_kwargs, pid_alive, terminate_pid
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, detach_kwargs, pid_alive, terminate_pid
 
 # Human-readable name for each daemon kind, shown in `--daemons`.
 KIND_LABELS = {
@@ -43,6 +43,14 @@ _SERVE_FLAGS = (
     ("--backtrace-serve", "backtrace"),
     ("--background-serve", "background"),
 )
+
+
+def _custom_config_dir() -> str:
+    """``AGITRACK_CONFIG_DIR`` if the user set one, else ``""``. A set value means "this is a
+    private aGiTrack universe" — the process-table scan cannot honour that, so it stands down."""
+    from agitrack.env import getenv_compat
+
+    return (getenv_compat("CONFIG_DIR") or "").strip()
 
 
 def _registry_dir() -> Path:
@@ -120,19 +128,37 @@ def deregister(pid: int | None = None) -> None:
         pass
 
 
-def list_running() -> list[DaemonInfo]:
-    """Every aGiTrack daemon currently alive.
+def list_running(*, repo: str | os.PathLike[str] | None = None) -> list[DaemonInfo]:
+    """Every aGiTrack daemon currently alive, optionally only those serving ``repo``.
 
     Combines two sources so nothing is missed: the registry (rich — carries the URL/version and is
     cross-platform) AND a scan of the OS process table (authoritative — finds a daemon even if it
     never wrote a registry entry, e.g. one started before this feature existed). Deduped by pid,
-    with the registry entry preferred where both have it."""
+    with the registry entry preferred where both have it.
+
+    ``repo`` narrows the result to daemons whose repo is that path (or inside it), which is what
+    makes a scoped stop possible: the unscoped one reaches across every repository the user has."""
     by_pid: dict[int, DaemonInfo] = {info.pid: info for info in _registry_entries()}
     for info in _scan_daemon_processes():
         by_pid.setdefault(info.pid, info)  # a registered entry (URL/version) wins over a bare scan
     out = list(by_pid.values())
+    if repo is not None:
+        out = [info for info in out if _serves_repo(info, repo)]
     out.sort(key=lambda info: (info.kind, info.repo))
     return out
+
+
+def _serves_repo(info: DaemonInfo, repo: str | os.PathLike[str]) -> bool:
+    """Whether ``info`` is a daemon for ``repo``. Paths are resolved so a symlinked or
+    relatively-recorded repo still matches; a daemon with no recorded repo never does."""
+    if not info.repo:
+        return False
+    try:
+        want = Path(repo).expanduser().resolve()
+        have = Path(info.repo).expanduser().resolve()
+    except OSError:
+        return str(info.repo) == str(repo)
+    return have == want or want in have.parents
 
 
 def _registry_entries() -> list[DaemonInfo]:
@@ -170,7 +196,15 @@ def _scan_daemon_processes() -> list[DaemonInfo]:
     """aGiTrack daemons found directly in the OS process table — matched by their unique internal
     ``--*-serve`` flag, so a daemon that never registered is still listed and can be restarted (its
     command line is its own re-launch command). Cross-platform (``ps`` on POSIX, PowerShell/CIM on
-    Windows); best-effort, empty if neither is available (the registry alone is then used)."""
+    Windows); best-effort, empty if neither is available (the registry alone is then used).
+
+    Skipped entirely under a custom ``AGITRACK_CONFIG_DIR``. The scan has no way to tell which
+    config dir a process belongs to, so under isolation it reported — and ``--daemons stop`` then
+    killed — every daemon on the machine, including other test slots' and the developer's own live
+    session. Isolation that the registry honours but the scan ignores is not isolation; the
+    registry is the authority whenever the caller has asked for a private one."""
+    if _custom_config_dir():
+        return []
     out: list[DaemonInfo] = []
     mine = os.getpid()
     for line in _process_command_lines():
@@ -200,13 +234,17 @@ def _process_command_lines() -> list[str]:
             'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }',
         ]
     else:
-        command = ["ps", "-axww", "-o", "pid=,args="]
+        # `-x` without `-a`: THIS user's processes only. A shared machine's other users have
+        # their own registries and their own daemons, and we must never list (let alone signal)
+        # someone else's — signalling would fail anyway, but naming them in a stop listing is
+        # already a leak of what else is running on the box.
+        command = ["ps", "-xww", "-o", "pid=,args="]
     try:
         # On Windows this scan IS a PowerShell process, and it is called from console-less
         # daemons (the self-update path restarts the others). Without isolation it puts a
         # PowerShell window on the user's desktop for as long as the scan takes.
         result = subprocess.run(
-            command, capture_output=True, text=True, timeout=15, check=False, **console_isolation_kwargs()
+            command, capture_output=True, **UTF8_TEXT, timeout=15, check=False, **console_isolation_kwargs()
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -246,7 +284,7 @@ def restart_all(*, exclude_pid: int | None = None, log=lambda message: None) -> 
     env = {**os.environ, "PYTHONSAFEPATH": "1"}
     home = str(Path.home())
     restarted = 0
-    for info in list_running():
+    for info in _signal_targets([i for i in list_running() if i.pid != skip and i.cmd]):
         if info.pid == skip or not info.cmd:
             continue
         try:
@@ -271,14 +309,18 @@ def restart_all(*, exclude_pid: int | None = None, log=lambda message: None) -> 
     return restarted
 
 
-def stop_all(*, exclude_pid: int | None = None, log=lambda message: None) -> tuple[int, list[str]]:
-    """Stop every running aGiTrack daemon, across all repositories.
+def stop_all(
+    *, exclude_pid: int | None = None, repo: str | os.PathLike[str] | None = None, log=lambda message: None
+) -> tuple[int, list[str]]:
+    """Stop every running aGiTrack daemon, across all repositories — or only ``repo``'s.
 
     Returns ``(stopped, still_running)`` — the count that went away and a description of any that
     would not, so the caller can report a partial result honestly rather than claiming success.
-    Each is SIGTERM'd (their handlers shut down cleanly and deregister) and waited for; a daemon
-    that ignores it is left alone and named rather than escalated to SIGKILL, since a stuck
-    dashboard is far less bad than one killed mid-write of its handshake or state.
+    Each is asked to exit and waited for; a daemon that ignores it is left alone and named rather
+    than escalated, since a stuck dashboard is far less bad than one killed mid-write of its
+    handshake or state. On POSIX that ask is SIGTERM and the daemon's own handler runs; on Windows
+    ``terminate_pid`` is ``TerminateProcess``, so NO handler runs and the daemon is stopped
+    abruptly — its registry entry is reaped here instead of by itself.
 
     The CURRENT process is skipped by default: `agitrack --daemons stop` run from inside a live
     session must not terminate that session.
@@ -286,7 +328,7 @@ def stop_all(*, exclude_pid: int | None = None, log=lambda message: None) -> tup
     skip = exclude_pid if exclude_pid is not None else os.getpid()
     stopped = 0
     survivors: list[str] = []
-    for info in list_running():
+    for info in _signal_targets([i for i in list_running(repo=repo) if i.pid != skip]):
         if info.pid == skip:
             continue
         try:
@@ -303,6 +345,41 @@ def stop_all(*, exclude_pid: int | None = None, log=lambda message: None) -> tup
         except Exception as error:  # a daemon we cannot signal (gone, or not ours) is not a failure
             survivors.append(f"{info.function} for {info.repo_name} (pid {info.pid}): {error}")
     return stopped, survivors
+
+
+def _live_agitrack_pids() -> set[int] | None:
+    """PIDs on this machine whose command line is an aGiTrack daemon, or ``None`` if the process
+    table could not be read.
+
+    ``pid_alive()`` alone is not identity: a registry entry survives a crash, and after a reboot
+    the OS happily reassigns that number to something else entirely — an editor, a browser, the
+    user's build. Signalling it because a stale ``<pid>.json`` says "daemon" is how a stop-all
+    reaches a process aGiTrack never started. One scan, taken only on the paths that actually
+    signal, is the cheap way to require proof."""
+    lines = _process_command_lines()
+    if not lines:
+        return None  # cannot verify — callers fall back to trusting the registry
+    pids: set[int] = set()
+    for line in lines:
+        pid_str, _, command = line.strip().partition(" ")
+        if pid_str.isdigit() and any(flag in command for flag, _kind in _SERVE_FLAGS):
+            pids.add(int(pid_str))
+    return pids
+
+
+def _signal_targets(candidates: list[DaemonInfo]) -> list[DaemonInfo]:
+    """``candidates`` minus any whose PID is demonstrably not an aGiTrack daemon (PID reuse).
+    Stale registry entries for those PIDs are reaped on the way out."""
+    live = _live_agitrack_pids()
+    if live is None:
+        return candidates
+    out: list[DaemonInfo] = []
+    for info in candidates:
+        if info.pid in live:
+            out.append(info)
+        else:
+            deregister(info.pid)
+    return out
 
 
 def _safe_unlink(path: Path) -> None:
