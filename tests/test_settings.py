@@ -530,6 +530,28 @@ def test_agent_theme_seen_round_trips_per_backend(tmp_path):
     assert GlobalConfig(path=tmp_path / "config.json").agent_theme_seen("claude") is True  # survives a restart
 
 
+def test_agent_theme_seen_drops_keys_left_by_the_object_repr_bug(tmp_path):
+    # An earlier aGiTrack keyed this by str(<proxy agent object>), so every launch filed the
+    # scheme under a fresh key containing a memory address: never read back, and the shared
+    # config grew one entry per session forever. Writing prunes what that left behind.
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agent_theme_seen": {
+                    "<agitrack.backends.proxy_agents.ClaudeProxyAgent object at 0x103e09010>": "light",
+                    "<agitrack.backends.proxy_agents.ClaudeProxyAgent object at 0x105109010>": "light",
+                    "opencode": "dark",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = GlobalConfig(path=path)
+    config.set_agent_theme_seen("claude", False)
+    assert set(GlobalConfig(path=path).data["agent_theme_seen"]) == {"claude", "opencode"}
+
+
 def test_agent_theme_seen_writes_only_when_it_changed(tmp_path, monkeypatch):
     # It is recorded from the render path, and the global file is shared by every aGiTrack
     # process on the machine — so an unchanged value must not rewrite it.

@@ -875,7 +875,18 @@ class ScreenRenderer:
         Two signals, strongest first: the backgrounds the agent fills (a dark theme fills
         dark), and the colour of its text (a dark theme writes light text). Either alone is
         enough; neither is consulted below a minimum sample, so a couple of coloured words
-        can't decide the whole screen's canvas."""
+        can't decide the whole screen's canvas.
+
+        The text signal counts only ALPHANUMERIC glyphs — real text, not the rules, borders
+        and block graphics a TUI draws around it. That is not a detail: a backend picks a
+        readable contrast for text it wants read, but a deliberately subtle one for furniture,
+        and the furniture grey often lands on the wrong side of the midpoint in one of the two
+        themes. Measured on Claude's opening screen, whose separators are 300 of the ~480
+        coloured cells: counting everything gives "light text" for BOTH themes (the light
+        theme's #999999 rules outvote its #666666 text), so a light-themed Claude in a dark
+        terminal was never recognised and kept the terminal's colours; counting only letters
+        and digits gives 144 cells that are unanimous in each theme — #666666 for light,
+        #999999 for dark."""
         bg_dark = bg_light = fg_dark = fg_light = 0
         for cells in body:
             for cell in cells.values():
@@ -885,8 +896,8 @@ class ScreenRenderer:
                         bg_dark += 1
                     else:
                         bg_light += 1
-                if not (getattr(cell, "data", " ") or " ").strip():
-                    continue  # blank cells say nothing about the text colour
+                if not (getattr(cell, "data", " ") or " ").strip().isalnum():
+                    continue  # blank cells and furniture say nothing about the TEXT colour
                 foreground = _luminance(getattr(cell, "fg", "default"))
                 if foreground is not None:
                     if foreground < 128:
@@ -973,8 +984,18 @@ class ScreenRenderer:
         colours and then visibly flips. The remembered value is only a head start: it is
         applied before the first frame and replaced without ceremony by the first frame that
         actually has an opinion, so a theme changed since the last run costs one sample, not
-        a wrong screen for the whole session."""
-        if agent_dark is None or getattr(self, "agent_background", "auto") != "auto":
+        a wrong screen for the whole session.
+
+        A FORCED ``agent_background`` needs no guess at all: the canvas is already known from
+        the setting, so it is applied here too — without it a forced session opened in the
+        terminal's colours and only switched on the first frame `update_canvas` saw."""
+        setting = getattr(self, "agent_background", "auto")
+        if setting in {"dark", "light"}:
+            self._canvas = _CANVAS_DARK if setting == "dark" else _CANVAS_LIGHT
+            self._canvas_votes = 0
+            self._canvas_decided = True  # settled by the setting; no frame can overrule it
+            return
+        if agent_dark is None or setting != "auto":
             return
         self._canvas = None if agent_dark == _host_bg_is_dark(self) else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
         self._canvas_votes = 0

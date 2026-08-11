@@ -632,6 +632,10 @@ class GlobalConfig:
             return
         stored = self.data.get("agent_theme_seen")
         seen = dict(stored) if isinstance(stored, dict) else {}
+        # Drop entries an earlier aGiTrack filed under a repr of the backend OBJECT (address
+        # included, so a new key every launch). They can never match a backend name again, and
+        # without this the file keeps every one it accumulated, forever.
+        seen = {key: value for key, value in seen.items() if " object at 0x" not in str(key)}
         seen[backend] = "dark" if dark else "light"
         self.data["agent_theme_seen"] = seen
         self.save()

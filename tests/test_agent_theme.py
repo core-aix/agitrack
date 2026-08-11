@@ -14,6 +14,7 @@ the frame it produces.
 from __future__ import annotations
 
 import os
+import select
 from types import SimpleNamespace
 
 import pytest
@@ -434,3 +435,147 @@ def test_a_missing_or_broken_config_never_blocks_startup():
     runner._apply_remembered_agent_theme()  # must not raise: this is only a display head start
     runner.remember_agent_theme(True)
     assert runner._canvas is None
+
+
+# ---------------------------------------------------------------------------
+# What counts as "text" in the foreground signal
+# ---------------------------------------------------------------------------
+
+# Claude's opening screen, to scale: two full-width rules in one grey and a footer of real
+# text in another. Both greys are mid-range, but only the TEXT one moves with the theme —
+# the light theme writes #666666 text between #999999 rules, the dark theme writes #999999
+# text between #888888 rules. Counting every coloured glyph therefore calls BOTH of them
+# dark (the rules outnumber the text 300 to 144); counting only letters and digits reads
+# them correctly. This was live: a light-themed Claude in a dark terminal was never
+# recognised, so the canvas never came on and its dark-on-dark text stayed unreadable.
+CLAUDE_LIGHT_SPLASH = (
+    b"\x1b[38;2;153;153;153m" + b"-" * 150 + b"\r\n" + b"-" * 150 + b"\r\n"
+    b"\x1b[38;2;102;102;102m" + b"manual mode on 24 shortcuts here " * 4 + b"\r\n"
+)
+CLAUDE_DARK_SPLASH = (
+    b"\x1b[38;2;136;136;136m" + b"-" * 150 + b"\r\n" + b"-" * 150 + b"\r\n"
+    b"\x1b[38;2;153;153;153m" + b"manual mode on 24 shortcuts here " * 4 + b"\r\n"
+)
+
+
+def test_the_text_signal_ignores_rules_and_box_drawing():
+    light = make_renderer(DARK_TERMINAL, CLAUDE_LIGHT_SPLASH, rows=6, cols=150)
+    dark = make_renderer(LIGHT_TERMINAL, CLAUDE_DARK_SPLASH, rows=6, cols=150)
+    assert light.agent_theme_is_dark(light.visible_lines(light.rows)) is False
+    assert dark.agent_theme_is_dark(dark.visible_lines(dark.rows)) is True
+
+
+def test_a_light_agent_in_a_dark_terminal_gets_a_light_canvas_from_the_splash():
+    # The mirror of the original complaint, on the frame that is actually on screen at startup.
+    renderer = make_renderer(DARK_TERMINAL, CLAUDE_LIGHT_SPLASH, rows=6, cols=150)
+    sample(renderer)
+    assert renderer._canvas == ("ffffff", "1c1c1c")
+
+
+# ---------------------------------------------------------------------------
+# A forced background is known before anything is painted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("setting,canvas", [("dark", ("1c1c1c", "d0d0d0")), ("light", ("ffffff", "1c1c1c"))])
+def test_a_forced_background_is_applied_before_the_first_frame(setting, canvas):
+    # Nothing has to be inferred or remembered here — the setting IS the answer — so the
+    # session must open in it instead of switching over once the first frame is sampled.
+    renderer = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT, setting=setting)
+    renderer.apply_remembered_theme(None)
+    assert renderer._canvas == canvas
+
+
+def test_opting_out_still_starts_with_no_canvas():
+    renderer = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT, setting="terminal")
+    renderer.apply_remembered_theme(True)
+    assert renderer._canvas is None
+
+
+def test_the_runner_fills_the_cleared_screen_for_a_forced_background(monkeypatch):
+    written: list[bytes] = []
+    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
+    runner.agent_background = "dark"
+    runner.global_config = SimpleNamespace(agent_theme_seen=lambda backend: None)  # never observed
+    monkeypatch.setattr("agitrack.proxy.renderer.write_frame", written.append)
+
+    runner._apply_remembered_agent_theme()
+
+    assert runner._canvas == ("1c1c1c", "d0d0d0")
+    assert written and written[0].endswith(b"\x1b[2J\x1b[H") and b"48;2;28;28;28" in written[0]
+
+
+# ---------------------------------------------------------------------------
+# Answering the backend while aGiTrack is still starting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX PTY only: the service selects on the child's pty master fd, and Windows "
+    "skips host-terminal capability detection altogether (see _detect_host_terminal).",
+)
+def test_the_backend_is_answered_before_the_reactor_starts():
+    """A backend asks the terminal for its colours in its first milliseconds and gives up
+    within ~0.1 s (measured for codex). aGiTrack spawns it early on purpose and used to read
+    nothing until the reactor started — one slow startup step later — so the query expired
+    unread and the backend fell back to its no-information defaults: codex drew its DARK
+    palette, and no panel tint at all, in a white terminal, in every session."""
+    import pty
+    import time
+    import tty
+
+    from agitrack.proxy.process import BackendProcess
+
+    master, slave = pty.openpty()
+    # Raw: a CANONICAL slave holds written input in the line discipline until a newline, and
+    # a terminal reply carries none — the backend would see nothing, which is not the failure
+    # under test.
+    tty.setraw(slave)
+    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL, host_fg_value=b"rgb:1c1c/1c1c/1c1c")
+    runner.init_screen(12, 60)
+    runner.active.process = BackendProcess(master_fd=master, child_pid=None)
+    runner.host_da = b"\x1b[?62c"
+    try:
+        runner._start_early_capability_service()
+        os.write(slave, b"\x1b]11;?\x1b\\hello")  # the query, plus a byte of ordinary output
+        reply = b""
+        deadline = time.monotonic() + 5.0  # polled, not slept: no fixed-time synchronisation
+        while time.monotonic() < deadline and b"\x07" not in reply:
+            readable, _, _ = select.select([slave], [], [], 0.05)
+            if slave in readable:
+                reply += os.read(slave, 4096)
+        assert b"\x1b]11;rgb:ffff/ffff/ffff\x07" in reply, reply
+    finally:
+        runner._stop_early_capability_service()
+        os.close(slave)
+        os.close(master)
+    # Nothing it read is lost: the reactor takes over with the screen already carrying it.
+    assert "hello" in "".join(runner.screen.display)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX PTY only (see above).")
+def test_stopping_the_early_service_is_safe_to_repeat():
+    # It is stopped on the normal path AND in run()'s finally, so a crash between the spawn
+    # and the reactor cannot leave a second reader on the child's fd.
+    runner = make_runner()
+    runner._stop_early_capability_service()
+    runner._stop_early_capability_service()
+    assert runner._early_capability_thread is None
+
+
+def test_the_memory_is_keyed_by_the_backend_name_not_the_agent_object():
+    """A session's ``backend`` field holds the proxy AGENT. Keying on ``str()`` of it wrote
+    ``<...ClaudeProxyAgent object at 0x103e09010>`` — a new key every launch, so nothing was
+    ever read back (every start was a cold start) and the shared config grew without bound.
+    Seen in the wild: two such keys in the developer's own config.json."""
+    runner = make_runner()
+    runner.active.backend = SimpleNamespace(name="codex")
+    assert runner._theme_memory_key() == "codex"
+
+
+def test_the_memory_key_falls_back_to_the_runner_and_then_the_state():
+    runner = make_runner()
+    runner.active.backend = None
+    runner.backend = SimpleNamespace(name="opencode")
+    assert runner._theme_memory_key() == "opencode"
