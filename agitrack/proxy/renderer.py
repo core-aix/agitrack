@@ -256,6 +256,58 @@ def _color_code(color: str, foreground: bool, mode: str) -> str | None:
     return str(base + _ANSI_COLOR_NAMES[color]) if color in _ANSI_COLOR_NAMES else None
 
 
+# WHY THIS IS CACHED TOO. `cell_sgr` runs once per CELL of every frame — 9,552 times for a
+# 50x200 screen — and it is a pure function of the cell's style, the canvas and the colour
+# mode. It was rebuilding that string from scratch every time: seven attribute probes, a list,
+# two `color_code` hops through the runner's re-export, and a join. cProfile over a 50x200
+# frame of diff-coloured scrollback put 4.2 of its 5.1 s in `cell_sgr` and the `color_code`
+# chain under it; the frame measured 4.29 ms against a RENDER_MIN_INTERVAL budget of 33 ms,
+# spent on the same thread that reads stdin, up to 30 times a second while output flows.
+#
+# A screen holds very FEW distinct styles even when it holds thousands of distinct cells, so
+# the cache hits on essentially every cell after the first of its kind. Counted on a real
+# captured codex screen at 45x150: 6,750 cells, 217 distinct `Char`s — and **13** distinct
+# styles. That is why the glyph is deliberately NOT part of the key (it does not affect the
+# SGR): keying on the cell itself would cache 217 entries to answer 13 questions. Measured on
+# a 50x200 frame: 4.29 ms -> 2.66 ms coloured, 3.98 ms -> 2.65 ms plain.
+_CELL_SGR_CACHE_SIZE = 4096  # distinct (style, canvas, mode) triples; a screen shows about a dozen
+
+
+@functools.lru_cache(maxsize=_CELL_SGR_CACHE_SIZE)
+def _cell_sgr(style: tuple, canvas: "tuple[str, str] | None", mode: str) -> str:
+    fg_color, bg_color, bold, dim, italics, underscore, blink, reverse, strikethrough = style
+    codes = []
+    if bold:
+        codes.append("1")
+    if dim:
+        codes.append("2")
+    if italics:
+        codes.append("3")
+    if underscore:
+        codes.append("4")
+    if blink:
+        codes.append("5")
+    if reverse:
+        codes.append("7")
+    if strikethrough:
+        codes.append("9")
+    if canvas:
+        # A cell the backend left at the terminal default carries the forced background
+        # instead, so the canvas shows through every gap the agent did not paint.
+        canvas_bg, canvas_fg = canvas
+        if fg_color == "default":
+            fg_color = canvas_fg
+        if bg_color == "default":
+            bg_color = canvas_bg
+    foreground = _color_code(fg_color, True, mode)
+    background = _color_code(bg_color, False, mode)
+    if foreground:
+        codes.append(foreground)
+    if background:
+        codes.append(background)
+    return ";".join(codes)
+
+
 def detect_color_mode(environ=None) -> str:
     # Mirror the colour-depth detection OpenCode itself uses so that aGiTrack
     # re-emits colours in the exact encoding OpenCode produced. aGiTrack and the
@@ -886,41 +938,29 @@ class ScreenRenderer:
         the original colour encoding, so the cell is byte-equivalent to a
         native session on the same terminal.
 
-        The one exception is the canvas: when the agent's colour scheme disagrees with the
-        host terminal's, a cell left at the terminal default is painted in the agent's
-        scheme instead — otherwise the agent's own dark panels would sit in a sea of the
-        terminal's white (see "Agent-theme adaptation")."""
-        codes = []
-        if getattr(cell, "bold", False):
-            codes.append("1")
-        if getattr(cell, "dim", False):
-            codes.append("2")  # faint — pyte drops it, so we track it on _DimChar (#113)
-        if getattr(cell, "italics", False):
-            codes.append("3")
-        if getattr(cell, "underscore", False):
-            codes.append("4")
-        if getattr(cell, "blink", False):
-            codes.append("5")
-        if getattr(cell, "reverse", False):
-            codes.append("7")
-        if getattr(cell, "strikethrough", False):
-            codes.append("9")
-        canvas = getattr(self, "_canvas", None)
-        cell_fg = getattr(cell, "fg", "default")
-        cell_bg = getattr(cell, "bg", "default")
-        if canvas:
-            canvas_bg, canvas_fg = canvas
-            if cell_fg == "default":
-                cell_fg = canvas_fg
-            if cell_bg == "default":
-                cell_bg = canvas_bg
-        fg = self.color_code(cell_fg, foreground=True)
-        bg = self.color_code(cell_bg, foreground=False)
-        if fg:
-            codes.append(fg)
-        if bg:
-            codes.append(bg)
-        return ";".join(codes)
+        The one exception is the canvas: under a forced ``agent_background`` a cell left at
+        the terminal default is painted in that background instead, so the whole screen —
+        the backend's panels and the gaps between them — is one colour (see "Agent
+        background"). With the default setting there is no canvas and the cell is emitted
+        exactly as the backend wrote it.
+
+        The work itself is in the cached ``_cell_sgr`` below; all this does is read the cell's
+        STYLE off it (never its ``data`` — the glyph does not affect the SGR)."""
+        return _cell_sgr(
+            (
+                getattr(cell, "fg", "default"),
+                getattr(cell, "bg", "default"),
+                getattr(cell, "bold", False),
+                getattr(cell, "dim", False),  # faint — pyte drops it, so we track it on _DimChar (#113)
+                getattr(cell, "italics", False),
+                getattr(cell, "underscore", False),
+                getattr(cell, "blink", False),
+                getattr(cell, "reverse", False),
+                getattr(cell, "strikethrough", False),
+            ),
+            getattr(self, "_canvas", None),
+            getattr(self, "color_mode", "truecolor"),
+        )
 
     def color_code(self: RendererHost, color: str, *, foreground: bool) -> str | None:
         return _color_code(color, foreground, getattr(self, "color_mode", "truecolor"))
@@ -932,8 +972,9 @@ class ScreenRenderer:
         rendered = []
         current = ""  # SGR body currently applied on the host terminal ("" == default)
         sel_start, sel_end = sel if sel else (-1, -1)
-        # A column the backend never wrote to is the canvas: with an agent theme that
-        # disagrees with the terminal it must carry the canvas colours, not the terminal's.
+        # A column the backend never wrote to is the canvas: under a forced background it
+        # must carry the canvas colours, not the terminal's. "" (the default) leaves it bare,
+        # so the host terminal's own background shows through exactly as before the feature.
         empty = self.canvas_sgr_body()
         for col in range(cols):
             cell = cells.get(col)

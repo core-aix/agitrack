@@ -16,6 +16,21 @@ from agitrack.update.updater import _version_tuple
 from proxy_helpers import make_runner
 
 
+@pytest.fixture(autouse=True)
+def _code_on_disk_has_not_moved(monkeypatch):
+    """Pin the "a newer aGiTrack landed on disk under this session" check to False.
+
+    `_running_code_is_stale` compares `disk_fingerprint()` — the git HEAD of the checkout the
+    tests are running FROM — against the one captured when `agitrack.update.restart` was
+    imported. Anything that commits to that checkout while the suite runs therefore flips it
+    to True mid-run, and the reminder it raises pre-empts the update notices these tests assert
+    on: three of them failed exactly that way when aGiTrack committed a turn during a local run.
+    The staleness path is real and tested on its own (`test_a_newer_install_on_disk_is_reported_once`);
+    it must not ride along in every other update test, whose subject is a different notice.
+    """
+    monkeypatch.setattr("agitrack.proxy.runner.ProxyRunner._running_code_is_stale", lambda self: False, raising=True)
+
+
 def _git(args, cwd):
     subprocess.run(["git", *args], cwd=str(cwd), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -530,6 +545,31 @@ def test_consume_update_result_notifies_once():
     assert runner._update_offered is True
     assert "update available" in (runner.message or "")
     # A second consume with the same (already offered) status does not re-notify.
+    runner.message = None
+    runner._consume_update_check_result()
+    assert runner.message is None
+
+
+def test_a_newer_install_on_disk_is_reported_once(monkeypatch):
+    """A self-update (this instance's or another's) replaced the code under a live session.
+
+    Restarting underneath the user is never right — the session is mid-conversation — so this
+    path only REMINDS, and it takes precedence over the ordinary "an update is available"
+    notice because the update in question is already installed.
+    """
+    runner = make_runner()
+    monkeypatch.setattr("agitrack.proxy.runner.ProxyRunner._running_code_is_stale", lambda self: True)
+    runner._update_status = None
+    runner._update_offered = False
+    runner._update_worker_result = _available_status()
+    runner._update_check_thread = SimpleNamespace(is_alive=lambda: False)
+
+    runner._consume_update_check_result()
+
+    assert runner._update_offered is True
+    assert "updated itself in the background" in (runner.message or "")
+    assert "Restart aGiTrack" in runner.message
+    # Reminded once, not on every pass: nagging a session that cannot act on it is noise.
     runner.message = None
     runner._consume_update_check_result()
     assert runner.message is None

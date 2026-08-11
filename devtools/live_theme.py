@@ -4,11 +4,12 @@
 Why this is separate from ``live_tui.py``
 -----------------------------------------
 ``live_tui`` proves a MODE works by polling git, and it STRIPS every escape sequence to match
-screen text. Agent-theme adaptation is the exact opposite question: the whole feature is which
-background colour lands in the cells the backend never painted, and in aGiTrack's own chrome.
-Stripping the escapes throws away the evidence, so this harness keeps every byte, re-runs it
-through the same pyte screen aGiTrack itself uses, and asserts on cell colours and on the SGR
-sequences in the stream. It reuses ``live_tui``'s pty plumbing (``Tui``, boot, ``check``).
+screen text. The background behind the agent is the exact opposite question: the whole subject
+is which background colour lands in the cells the backend never painted, and in aGiTrack's own
+chrome. Stripping the escapes throws away the evidence, so this harness keeps every byte,
+re-runs it through the same pyte screen aGiTrack itself uses, and asserts on cell colours and
+on the SGR sequences in the stream. It reuses ``live_tui``'s pty plumbing (``Tui``, boot,
+``check``).
 
 The rule from ``live_tui`` still governs: never conclude something happened by reading the
 screen loosely. "The status bar looked dark" is not a result; ``bg == '1c1c1c'`` for 6750 of
@@ -40,10 +41,10 @@ because that is the colour aGiTrack reported to it.
 Usage
 -----
     python devtools/live_theme.py --workdir /tmp/agitrack-theme --backend claude
-    python devtools/live_theme.py --workdir /tmp/agitrack-theme --backend codex mismatch startup
+    python devtools/live_theme.py --workdir /tmp/agitrack-theme --backend codex profiles overrides
 
-No agent turn is ever run here: a booted TUI already paints everything the inference reads, so
-these scenarios cost no tokens.
+Only ``stable`` runs an agent turn (it has to: its whole subject is a screen whose CONTENT
+changes). ``profiles``, ``mismatch`` and ``overrides`` assert on a booted TUI and cost no tokens.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -107,30 +109,6 @@ def backgrounds(screen, rows: int = ROWS, cols: int = COLS) -> Counter:
     return counts
 
 
-def foregrounds(screen, rows: int = ROWS, cols: int = COLS) -> Counter:
-    counts: Counter = Counter()
-    for row in range(rows):
-        line = screen.buffer[row]
-        for col in range(cols):
-            if (line[col].data or " ").strip():
-                counts[line[col].fg] += 1
-    return counts
-
-
-def row_text(screen, row: int, cols: int = COLS) -> str:
-    return "".join((screen.buffer[row][col].data or " ") for col in range(cols)).rstrip()
-
-
-def rows_matching(screen, needle: str, rows: int = ROWS) -> list[int]:
-    return [row for row in range(rows) if needle in row_text(screen, row)]
-
-
-def box_columns(screen, row: int) -> list[int]:
-    """The columns strictly inside a popup's border on *row* (empty when there is no box)."""
-    edges = [col for col in range(COLS) if (screen.buffer[row][col].data or " ") in "┃┏┓┗┛━"]
-    return list(range(edges[0] + 1, edges[-1])) if len(edges) >= 2 else []
-
-
 def describe(screen) -> str:
     counts = backgrounds(screen)
     return ", ".join(f"{colour}×{count}" for colour, count in counts.most_common(4))
@@ -171,10 +149,6 @@ def theme_home(tag: str, **settings) -> Path:
     data.update(settings)
     (home / "config.json").write_text(json.dumps(data), encoding="utf-8")
     return home
-
-
-def home_config(home: Path) -> dict:
-    return json.loads((home / "config.json").read_text(encoding="utf-8"))
 
 
 def claude_home(tag: str, theme: str | None) -> Path:
@@ -235,9 +209,9 @@ def themed_from_config(backend: str) -> bool:
     return backend == "claude"
 
 
-def stage(tag: str, agent_theme: str | None, host: str, *, background: str = "terminal") -> tuple[Path, Path, dict]:
-    """A throwaway repo plus the environment that puts *agent_theme* in front of a *host*
-    terminal. Returns (repo, aGiTrack config home, child env)."""
+def stage(tag: str, agent_theme: str | None = None, *, background: str = "terminal") -> tuple[Path, Path, dict]:
+    """A throwaway repo plus the environment that puts *agent_theme* in front of the terminal
+    ``launch`` stages. Returns (repo, aGiTrack config home, child env)."""
     repo = lt.make_repo(f"th_{tag}")
     home = theme_home(tag, agent_background=background)
     env = {
@@ -266,6 +240,35 @@ def launch(repo: Path, env: dict, host: str, tag: str, *, args: list[str] | None
 def debug_log(repo: Path) -> str:
     logs = sorted((repo / ".agitrack").glob("proxy-debug-*.log"))
     return logs[-1].read_text(encoding="utf-8", errors="replace") if logs else ""
+
+
+def told_the_backend(log: str) -> list[str]:
+    """Every DISTINCT background aGiTrack answered the backend's OSC 11 with, in order.
+
+    THE OTHER HALF OF THE FEATURE, and the one the screen cannot show directly. A backend that
+    themes itself asks what background it is drawing on; aGiTrack answers on the child's pty,
+    where nothing else can see it, so `_answer_terminal_queries` logs what it sent. What the
+    backend PAINTS is downstream evidence of the same thing (and is asserted separately), but
+    this is the answer itself — and it is what makes a silent terminal work at all, since there
+    the value comes from the platform rather than from any reply.
+    """
+    seen: list[str] = []
+    for match in re.finditer(r"answered backend capability query with (b'[^']*'|b\"[^\"]*\")", log):
+        for value in re.findall(r"\\x1b\]11;([^\\]*)\\x07", match.group(1)):
+            if not seen or seen[-1] != value:
+                seen.append(value)
+    return seen
+
+
+def _osc_value(colour: str) -> str:
+    """A canvas hex colour in the ``rgb:rrrr/gggg/bbbb`` shape an OSC 11 answer carries."""
+    return "rgb:" + "/".join(colour[at : at + 2] * 2 for at in (0, 2, 4))
+
+
+def derived_background(log: str) -> str | None:
+    """The background aGiTrack worked out from the PLATFORM (only when the terminal was silent)."""
+    match = re.search(r"host background derived from the platform: b'([^']*)'", log)
+    return match.group(1) if match else None
 
 
 def settle(handle: lt.Tui, seconds: float = 3.0) -> None:
@@ -351,7 +354,7 @@ def s_profiles() -> None:
         name = profile or "silent (answers nothing, like Terminal.app)"
         tag = f"{lt.BACKEND[:2]}_prof_{profile or 'silent'}"
         title = f"{lt.BACKEND}: {name} terminal"
-        repo, home, env = stage(tag, None, profile or "light")
+        repo, home, env = stage(tag)
         handle = launch(repo, env, profile, tag)
         try:
             handle.boot(tag)
@@ -374,6 +377,75 @@ def s_profiles() -> None:
                 str(sorted(status_backgrounds(screen))),
             )
             check(f"{title}: chrome resets with a plain SGR reset", PLAIN_RESET in handle.raw)
+            # AND the backend was told the truth about it — the half the screen cannot show.
+            log = debug_log(repo)
+            told = told_the_backend(log)
+            if profile:
+                want = lt.HOST_THEMES[profile][0].decode()
+                check(
+                    f"{title}: the backend was told the terminal's REAL background",
+                    told == [want],
+                    f"told {told}, terminal is {want}",
+                )
+            else:
+                # Nothing answered, so the value can only have come from the platform. On the
+                # reporter's own setup (Apple Terminal) that is their profile's background; on
+                # a machine where nothing is derivable, the honest answer is to say nothing.
+                derived = derived_background(log)
+                check(
+                    f"{title}: a silent terminal is answered from the PLATFORM, or not at all",
+                    told == ([derived] if derived else []),
+                    f"told {told}, derived {derived}",
+                )
+        finally:
+            handle.kill()
+
+
+def s_mismatch() -> None:
+    """An agent themed AGAINST the terminal is still not a reason to repaint the terminal.
+
+    This is the case the old inference existed for, and the one the new rule deliberately
+    declines to act on: the user picked a dark theme inside claude and a WHITE terminal
+    profile outside it, so the two really do disagree — and aGiTrack still leaves the white
+    terminal alone. Only claude can be staged this way; codex has no light/dark control and
+    opencode's themes all follow the reported background (see the module docstring), so for
+    those two "mismatch" is not a state that exists.
+    """
+    if not themed_from_config(lt.BACKEND):
+        print(f"(skipped: {lt.BACKEND} has no light/dark theme of its own to disagree with)", flush=True)
+        return
+    for theme, profile in (("dark", "basic"), ("light", "homebrew")):
+        tag = f"{lt.BACKEND[:2]}_mis_{theme}"
+        title = f"{lt.BACKEND}: {theme}-themed agent in a {profile} terminal"
+        repo, home, env = stage(tag, theme)
+        handle = launch(repo, env, profile, tag)
+        try:
+            handle.boot(tag)
+            settle(handle)
+            screen = emulate(handle.raw)
+            verdict = canvas_verdict(screen)
+            check(
+                f"{title}: the terminal's own colours stand anyway",
+                verdict == "none",
+                f"got {verdict}; {describe(screen)}",
+            )
+            check(
+                f"{title}: no canvas sequence is EVER on the wire",
+                canvas_transitions(handle.raw) == [],
+                str(canvas_transitions(handle.raw)),
+            )
+            # That the mismatch was really staged is asserted from the BACKEND'S OWN config,
+            # not from the screen: claude's opening screen paints ~15 coloured cells, far too
+            # few to read a scheme off, and reading a scheme off a screen is the thing that
+            # started all this. The screen's (usually inconclusive) verdict is reported as
+            # detail so a run that does have enough colour still shows it.
+            settings = json.loads((lt.WORKDIR / f"claude-{tag}" / "settings.json").read_text(encoding="utf-8"))
+            check(
+                f"{title}: the agent really was staged {theme}",
+                settings.get("theme") == theme,
+                f"claude settings.json theme={settings.get('theme')!r}; "
+                f"screen says dark={backend_is_dark(screen, None)}; {describe(screen)}",
+            )
         finally:
             handle.kill()
 
@@ -398,7 +470,7 @@ def s_stable() -> None:
         name = profile or "silent"
         tag = f"{lt.BACKEND[:2]}_stable_{name}"
         title = f"{lt.BACKEND}: a full turn in a {name} terminal"
-        repo, home, env = stage(tag, None, profile or "light")
+        repo, home, env = stage(tag)
         handle = launch(repo, env, profile, tag)
         try:
             handle.boot(tag)
@@ -434,7 +506,7 @@ def s_overrides() -> None:
     for setting in ("dark", "light"):
         tag = f"{lt.BACKEND[:2]}_ov_{setting}"
         title = f"{lt.BACKEND}: agent_background={setting} in a light terminal"
-        repo, home, env = stage(tag, None, "light", background=setting)
+        repo, home, env = stage(tag, background=setting)
         handle = launch(repo, env, "light", tag)
         try:
             handle.boot(tag)
@@ -447,11 +519,25 @@ def s_overrides() -> None:
                 canvas_transitions(handle.raw) == [setting],
                 str(canvas_transitions(handle.raw)),
             )
+            # The forced colour REPLACES the terminal's in the relay — asserted on the answer
+            # itself, and then on what the backend did with it.
+            told = told_the_backend(debug_log(repo))
+            want = _osc_value(CANVAS[setting][0])
+            check(
+                f"{title}: the backend was told {setting}, NOT the terminal's real colour",
+                told == [want],
+                f"told {told}, wanted {want} (terminal is {lt.HOST_THEMES['light'][0].decode()})",
+            )
+            # ...and it acted on it. Stated as "never painted AGAINST it" rather than "painted
+            # for it", because a booted-but-idle claude fills ~15 coloured cells — too few for
+            # `backend_is_dark` to have an opinion at all. Asserting the opposite is absent
+            # still catches the failure that matters (a backend fighting the canvas), and it
+            # does not turn "this screen carries no evidence" into a false report of one.
             painted = backend_is_dark(screen, setting)
             check(
-                f"{title}: the backend was told the forced colour (it painted to match)",
-                painted is (setting == "dark"),
-                f"backend painted for dark={painted}; {describe(screen)}",
+                f"{title}: and the backend never painted AGAINST it",
+                painted is not (setting != "dark"),
+                f"backend painted for dark={painted} (None = too few coloured cells to tell); {describe(screen)}",
             )
             # The canvas goes on with the very first clear: the setting IS the answer, so there
             # is nothing to wait for and no white/black flash before it.
@@ -472,18 +558,23 @@ def s_overrides() -> None:
     # And the default relays the truth, which is the whole reason nothing has to adapt.
     tag = f"{lt.BACKEND[:2]}_ov_terminal"
     title = f"{lt.BACKEND}: the default relays the real terminal colour"
-    repo, home, env = stage(tag, None, "light", background="terminal")
+    repo, home, env = stage(tag, background="terminal")
     handle = launch(repo, env, "light", tag)
     try:
         handle.boot(tag)
         settle(handle)
         log = debug_log(repo)
         check(f"{title}: aGiTrack detected the staged light terminal", "bg=b'rgb:ffff/ffff/ffff'" in log, log[:200])
+        check(
+            f"{title}: and relayed exactly that, unchanged, to the backend",
+            told_the_backend(log) == ["rgb:ffff/ffff/ffff"],
+            str(told_the_backend(log)),
+        )
         screen = emulate(handle.raw)
         check(
-            f"{title}: the backend painted for a light background",
-            backend_is_dark(screen, None) is False,
-            str(backend_is_dark(screen, None)),
+            f"{title}: the backend never painted for a DARK one",
+            backend_is_dark(screen, None) is not True,
+            f"backend painted for dark={backend_is_dark(screen, None)} (None = too few coloured cells to tell)",
         )
         check(
             f"{title}: so no canvas is needed, and none is applied",
@@ -496,6 +587,7 @@ def s_overrides() -> None:
 
 SCENARIOS = {
     "profiles": s_profiles,
+    "mismatch": s_mismatch,
     "stable": s_stable,
     "overrides": s_overrides,
 }

@@ -183,6 +183,39 @@ def test_nothing_samples_the_screen_on_a_timer_any_more():
         assert not hasattr(ScreenRenderer, gone), f"ScreenRenderer.{gone} is back"
 
 
+def test_the_cell_sgr_cache_is_keyed_on_everything_that_changes_the_answer():
+    """`cell_sgr` runs once per CELL of every frame, so its result is memoized on the cell's
+    style. A key that left anything out would paint a whole session in a stale colour — the
+    canvas and the colour depth are both part of the answer, and both can differ between two
+    renderer hosts alive in the same process (a session switch re-derives them).
+
+    The glyph is deliberately NOT in the key: it does not affect the SGR, and including it
+    would cache one entry per distinct character for no gain (counted on a real screen: 217
+    distinct cells, 13 distinct styles)."""
+    from pyte.screens import Char
+
+    cell = Char(data="x", fg="default", bg="default")
+    dark = make_renderer(LIGHT_TERMINAL, b"", setting="dark")
+    plain = make_renderer(LIGHT_TERMINAL, b"", setting="terminal")
+
+    # Same cell, different canvas → different SGR, and the cache must not conflate them.
+    assert dark.cell_sgr(cell) != plain.cell_sgr(cell)
+    assert plain.cell_sgr(cell) == ""  # untouched cell, no canvas: nothing is emitted for it
+    assert dark.cell_sgr(cell) == dark.cell_sgr(Char(data="Z", fg="default", bg="default"))  # glyph is irrelevant
+
+    # Same cell and canvas, different colour depth → different encoding.
+    truecolor = make_renderer(LIGHT_TERMINAL, b"", setting="dark")
+    truecolor.color_mode = "truecolor"
+    palette = make_renderer(LIGHT_TERMINAL, b"", setting="dark")
+    palette.color_mode = "256"
+    assert "48;2;28;28;28" in truecolor.cell_sgr(cell)
+    assert "48;5;" in palette.cell_sgr(cell)
+
+    # And every attribute still reaches the output.
+    styled = Char(data="x", fg="ff0000", bg="00ff00", bold=True, italics=True, underscore=True, reverse=True)
+    assert truecolor.cell_sgr(styled) == "1;3;4;7;38;2;255;0;0;48;2;0;255;0"
+
+
 def test_a_frame_builds_the_visible_screen_exactly_once(monkeypatch):
     # The per-tick scan doubled the screen's cost; the frame itself must still cost one pass.
     renderer = make_renderer(LIGHT_TERMINAL, LIGHT_AGENT)
@@ -311,6 +344,75 @@ def test_what_the_runner_answers_the_backend_with(monkeypatch):
     runner.agent_background = "dark"
     runner._answer_terminal_queries(b"\x1b]10;?\x07\x1b]11;?\x07")
     assert written == [b"\x1b]10;rgb:d0d0/d0d0/d0d0\x07\x1b]11;rgb:1c1c/1c1c/1c1c\x07"]
+
+
+def test_a_silent_terminals_derived_background_is_what_the_backend_is_told(monkeypatch):
+    """The whole chain for the terminal that answers NOTHING — which is the reporter's own
+    (Apple Terminal implements no colour report at all).
+
+    With inference gone, this relay is the ONLY thing that gets a self-theming backend onto
+    the user's actual background, so it must not be quietly orphaned: `_seed_derived_host_background`
+    asks the platform, and what it learns has to come back out of `_answer_terminal_queries`.
+    Both halves are exercised here rather than mocked in the middle."""
+    runner = make_runner(
+        master_fd=99, host_fg_value=None, host_bg_value=None, host_da=None, host_palette={}, screen=None
+    )
+    written: list[bytes] = []
+    real_write = os.write
+    monkeypatch.setattr(
+        os, "write", lambda fd, data: (written.append(data), len(data))[1] if fd == 99 else real_write(fd, data)
+    )
+
+    # Nothing known yet and nothing derivable: the query is simply not answered — an invented
+    # background would be a guess painted over the user's real one.
+    monkeypatch.setattr("agitrack.proxy.host_background.detect_host_background", lambda environ=None: None)
+    runner._seed_derived_host_background()
+    runner._answer_terminal_queries(b"\x1b]11;?\x07")
+    assert written == []
+
+    # Now the platform does know (COLORFGBG, an Apple Terminal profile, …): that value — not a
+    # default, and not the backend's own fallback — is what reaches the backend.
+    monkeypatch.setattr(
+        "agitrack.proxy.host_background.detect_host_background", lambda environ=None: b"rgb:ffff/ffff/ffff"
+    )
+    runner._seed_derived_host_background()
+    runner._answer_terminal_queries(b"\x1b]11;?\x07")
+    assert written == [b"\x1b]11;rgb:ffff/ffff/ffff\x07"]
+
+    # And a real reply that arrives later is never overwritten by the derived guess.
+    written.clear()
+    runner.host_bg_value = DARK_TERMINAL
+    runner._seed_derived_host_background()
+    runner._answer_terminal_queries(b"\x1b]11;?\x07")
+    assert written == [b"\x1b]11;" + DARK_TERMINAL + b"\x07"]
+
+
+@pytest.mark.parametrize("answered", [True, False], ids=["terminal answers OSC 11", "terminal is silent"])
+def test_detection_still_enables_the_kitty_keyboard_for_a_shift_modified_menu_key(monkeypatch, tmp_path, answered):
+    """A neighbour of the background derivation, broken by living inside it.
+
+    `_seed_derived_host_background` returns early once a background is known, so once the
+    kitty-keyboard enable was moved in there it stopped running at all on a terminal that
+    ANSWERS OSC 11 — and on a silent one the only call that reached it was the pre-detection
+    one, before `host_kitty_keyboard` was known, so it no-opped too. A shift-modified menu key
+    (Ctrl-Shift-G) is then indistinguishable from Ctrl-G and the menu never opens."""
+    config = GlobalConfig(path=tmp_path / "config.json")
+    config.data["menu_key"] = "ctrl+shift+g"
+    assert config.is_shift_modified
+    runner = make_runner(host_bg_value=None, global_config=config)
+    runner.host_kitty_keyboard = True
+    runner._host = None
+    monkeypatch.setattr(
+        "agitrack.proxy.terminal.TerminalHost.detect_host_terminal",
+        lambda self, debug_fn=None: setattr(self, "host_bg_value", LIGHT_TERMINAL) if answered else None,
+    )
+    monkeypatch.setattr("agitrack.proxy.host_background.detect_host_background", lambda environ=None: None)
+    enabled: list[bool] = []
+    monkeypatch.setattr(runner, "_enable_kitty_keyboard", lambda: enabled.append(True))
+
+    runner._detect_host_terminal()
+
+    assert enabled == [True]
 
 
 # ---------------------------------------------------------------------------

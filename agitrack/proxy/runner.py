@@ -198,6 +198,10 @@ _PYTE_HOSTILE_CSI_RE = re.compile(rb"\x1b\[[<>=][0-9;:]*[ -/]*[@-~]")
 # Shift+Enter instead of the disambiguated encoding the backend's keybindings
 # (e.g. Claude's newline-in-input) expect.
 _KEYBOARD_PROTO_RE = re.compile(rb"\x1b\[(?:[><=][0-9;]*u|\?u|>4(?:;[0-9]+)?m)")
+# The cheap presence check in front of `_sync_terminal_modes`: every private-mode set/reset
+# (`ESC [ ? <n> h|l`) and every keyboard-protocol negotiation it looks for begins with `ESC [`
+# and one of these four introducers, so a chunk without one cannot contain anything it wants.
+_TERMINAL_MODE_MARKER_RE = re.compile(rb"\x1b\[[?><=]")
 # Kitty keyboard protocol encoding for control keys: CSI <keycode> ; <modifiers> u
 # For Ctrl-A through Ctrl-Z: keycode is 97-122 (lowercase a-z), modifier is 5 (Ctrl+base)
 # We decode these back to plain control bytes (0x01-0x1a) so the menu key works
@@ -9894,6 +9898,19 @@ class ProxyRunner:
         # literal text. Excluding only 1003 stops the hover flood while keeping drag-copy working
         # (the confirmed leak is button 35 = no-button motion; see the proxy-raw trace and
         # devtools/winmouse/FINDINGS.md). Disables are always mirrored.
+        #
+        # CHEAP REJECT FIRST, exactly as `_answer_terminal_queries` does. Everything below is a
+        # private-mode set/reset or a keyboard-protocol negotiation, and every one of those
+        # starts `ESC [` + one of `? > < =`. Without this guard the method ran THIRTY full
+        # substring scans plus a regex over every chunk the backend produced — measured 4.46 ms
+        # per megabyte of ordinary scroll output containing no escape sequence in it at all, on
+        # the reactor thread that also reads stdin. One pass decides it instead: 4.46 -> 0.29 ms.
+        # (A regex, not four `in` checks: those cost 1.97 ms for the same buffer, because each
+        # is its own full scan, while the regex's leading literal lets it memchr for ESC once.)
+        # A sequence split across two chunks is missed either way — the scans below are
+        # whole-buffer too — so the guard changes nothing about what is detected.
+        if not _TERMINAL_MODE_MARKER_RE.search(output):
+            return
         _no_host_enable = {b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
@@ -9962,6 +9979,17 @@ class ProxyRunner:
         # instead; `detect_host_background` is read-only and never prompts. Only a terminal that
         # stayed silent is asked, so a real answer is never second-guessed.
         self._seed_derived_host_background()
+        # If the menu key requires shift modifier, enable the kitty keyboard protocol
+        # so the terminal sends distinguishable escape sequences. This has to be HERE, after
+        # detection: `_enable_kitty_keyboard` does nothing unless `host_kitty_keyboard` says
+        # the terminal speaks the protocol, and that is exactly what detection just found out.
+        # It lived inside `_seed_derived_host_background` for a while, which broke it outright
+        # in both directions — that method returns early once a background is known, so a
+        # terminal that ANSWERS OSC 11 never reached it at all, and the pre-detection call
+        # (right after the spawn) ran it before `host_kitty_keyboard` was known and it
+        # no-opped. Either way a shift-modified menu key stopped being distinguishable.
+        if self.global_config is not None and self.global_config.is_shift_modified:
+            self._enable_kitty_keyboard()
 
     def _seed_derived_host_background(self) -> None:
         """Fill in the terminal's background from the platform when it will not report one.
@@ -9988,10 +10016,6 @@ class ProxyRunner:
         if derived:
             self.host_bg_value = derived
             self._debug(f"host background derived from the platform: {derived!r}")
-        # If the menu key requires shift modifier, enable the kitty keyboard protocol
-        # so the terminal sends distinguishable escape sequences.
-        if self.global_config.is_shift_modified:
-            self._enable_kitty_keyboard()
 
     def _enable_kitty_keyboard(self) -> None:
         # Proactively enable the kitty keyboard protocol for shift-modified menu keys.
@@ -10147,7 +10171,10 @@ class ProxyRunner:
         response = bytearray()
         # A forced background ("dark"/"light") is reported to the backend in place of the
         # terminal's real colours, so a backend that themes itself from them agrees with the
-        # canvas aGiTrack paints. "auto" relays the truth (see forced_canvas_osc_values).
+        # canvas aGiTrack paints. The default ("terminal") relays the truth — the terminal's
+        # own answer, or the one derived from the platform when it gave none (see
+        # forced_canvas_osc_values and _seed_derived_host_background). That truthful relay is
+        # the whole reason nothing has to adapt: the backend themes to the real terminal.
         forced = forced_canvas_osc_values(self)
         fg_value = forced[0] if forced else self.host_fg_value
         bg_value = forced[1] if forced else self.host_bg_value
@@ -10167,6 +10194,14 @@ class ProxyRunner:
         if self.host_da and re.search(rb"\x1b\[(?:0)?c", output):
             response += self.host_da
         if response:
+            if self.debug_proxy:
+                # WHAT THE BACKEND WAS ACTUALLY TOLD. A backend themes itself from this answer,
+                # so when its colours look wrong the first question is whether it got one at
+                # all and what was in it — and the answer is written from two places (here and
+                # the early service) to a child pty nothing else can see. Guarded by the flag,
+                # and the branch only runs when a query was really present (the cheap reject
+                # above skips ordinary output), so it costs nothing in a normal session.
+                self._debug(f"answered backend capability query with {bytes(response)!r} (forced={forced is not None})")
             try:
                 self.active.process.write(bytes(response))
             except OSError:
