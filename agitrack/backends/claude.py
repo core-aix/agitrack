@@ -127,6 +127,19 @@ class ClaudeBackend:
 
             note = agent_system_note(use_worktrees=False)
             command.extend(["--append-system-prompt", _flatten(note) if to_stdin else note])
+            # LET IT EDIT. `claude -p` has no terminal to approve a Write/Edit on, so with no
+            # permission flag every one of them is auto-DECLINED: `agitrack --prompt` spent real
+            # tokens, changed nothing, and exited 0 through an invisible `no_changes` — 2 of 4
+            # billed turns produced zero work, and the agent's actual reply ("I need permission
+            # to create the file") was written to state.json and never shown.
+            #
+            # `acceptEdits` is the narrowest mode that makes the command mean anything: file
+            # edits inside the working directory, still no unattended shell. It is added only
+            # for a CODING run — never for `bare`, which is the summarizer and must not touch
+            # files at all — and never when the user passed their own permission flag, whose
+            # choice wins.
+            if not any(arg.startswith("--permission-mode") for arg in self.backend_args):
+                command.extend(["--permission-mode", "acceptEdits"])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate

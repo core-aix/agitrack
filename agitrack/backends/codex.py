@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
-from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, resolve_subprocess_command
 
 # Cap a ``bare`` (summarizer) call. A hung call would never finish, leaving the commit
 # unsummarized and — since one summary runs per session at a time — blocking every later
@@ -134,7 +134,7 @@ class CodexBackend:
         process = subprocess.Popen(
             resolve_subprocess_command(command),  # find/launch codex(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
-            text=True,
+            **UTF8_TEXT,
             # Codex reads a piped stdin and folds it into the prompt as a `<stdin>` block ("Reading
             # additional input from stdin..."). aGiTrack's own stdin is the user's TERMINAL, so
             # inheriting it would let the coding agent consume the keystrokes meant for the host —

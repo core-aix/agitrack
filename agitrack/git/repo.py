@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from agitrack.proc import console_isolation_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 
 
 class GitError(RuntimeError):
@@ -93,6 +93,19 @@ def read_cache() -> Iterator[None]:
 # the "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
 _NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".codex/", ".opencode/")
 
+# git's per-repo comment character while aGiTrack manages the repo. See
+# GitRepo.ensure_comment_char_preserves_headings for why it is not "#" and not "auto".
+_COMMENT_CHAR = ";"
+
+
+def _PARTIAL_CLONE_KEYS(remote: str) -> list[str]:
+    """Every config key a ``git fetch --filter=…`` writes behind the caller's back."""
+    return [
+        f"remote.{remote}.partialclonefilter",
+        f"remote.{remote}.promisor",
+        "core.repositoryformatversion",
+    ]
+
 
 def _is_scaffolding(path: str) -> bool:
     return path.startswith(_NEVER_STAGE_PREFIXES)
@@ -116,15 +129,28 @@ class GitRepo:
 
     @classmethod
     def discover(cls, path: Path) -> "GitRepo":
-        process = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=path,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
-        )
+        # Check the path OURSELVES before handing it to git as `cwd`. A missing directory made
+        # subprocess raise FileNotFoundError, and a file made it raise NotADirectoryError (on
+        # Windows both arrive as `[WinError 267] The directory name is invalid`) — raw OSErrors
+        # that reached the user verbatim, leaking `PosixPath('…')` / a bare WinError with no path,
+        # no mention of `--repo`, and no way to tell the two cases apart. One line from the good
+        # sibling message that the not-a-repo case already had.
+        if not path.exists():
+            raise GitError(f"Not a Git repository: {path} (no such directory)")
+        if not path.is_dir():
+            raise GitError(f"Not a Git repository: {path} (that is a file, not a directory)")
+        try:
+            process = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=path,
+                **UTF8_TEXT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
+            )
+        except OSError as error:  # unreadable directory, permissions, a path git cannot chdir into
+            raise GitError(f"Cannot read the Git repository at {path}: {error}") from error
         if process.returncode != 0:
             raise GitError(f"Not a Git repository: {path}")
         return cls(Path(process.stdout.strip()))
@@ -141,7 +167,7 @@ class GitRepo:
         process = subprocess.run(
             ["git", "init"],
             cwd=path,
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -198,7 +224,22 @@ class GitRepo:
         return self._run(["git", "diff", "HEAD"], check=False).stdout
 
     def add_tracked(self) -> None:
-        self._run(["git", "add", "-u"])
+        """Stage every modification to already-tracked files — EXCEPT the agent scaffolding dirs.
+
+        The untracked path has always filtered ``_NEVER_STAGE_PREFIXES``; this one did not, and
+        `git add -u` has no such notion. In a repo that TRACKS ``.claude/`` — committing
+        ``settings.json`` or a ``commands/`` dir is ordinary team practice — that meant aGiTrack's
+        OWN edit to ``.claude/settings.local.json`` (the Stop/SessionStart hooks it installs) was
+        swept into the user's history, complete with this machine's absolute venv path, in a file
+        the whole team shares. Stopping then left the repo dirty with a change the user never
+        made. "Nothing aGiTrack writes is ever staged" has to hold on both sides of tracked."""
+        excludes = [f":(exclude){prefix.rstrip('/')}" for prefix in _NEVER_STAGE_PREFIXES]
+        result = self._run(["git", "add", "-u", "--", ".", *excludes], check=False)
+        if result.returncode != 0:
+            # A pathspec excluding a directory that is ALSO git-ignored can error on older git.
+            # Falling back to the unfiltered add is still better than failing the commit; the
+            # scaffolding is then dropped from the snapshot by comparable_tree() anyway.
+            self._run(["git", "add", "-u"])
 
     def staged_paths(self) -> list[str]:
         """Paths currently in the index (names only). Used to snapshot the index BEFORE a
@@ -472,8 +513,20 @@ class GitRepo:
     # --- branches / worktrees / merges (used by concurrent-session support) ---
 
     def current_branch(self) -> str:
-        # Returns the branch name, or "HEAD" when detached.
-        return self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        """The branch name, ``"HEAD"`` when detached, or the branch HEAD *points at* on an
+        UNBORN branch — a fresh ``git init`` with no commits, the very first state a new user
+        can be in.
+
+        Never raises. ``git rev-parse --abbrev-ref HEAD`` fails outright on an unborn branch
+        (``fatal: ambiguous argument 'HEAD'``), and because this ran with ``check=True`` that
+        GitError escaped as a raw traceback out of ``agitrack -d text`` — while ``-d html`` was
+        worse, reporting success and then serving a page that spun forever while every ``/data``
+        request crashed server-side."""
+        process = self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        if process.returncode == 0:
+            return process.stdout.strip()
+        unborn = self._run(["git", "symbolic-ref", "--short", "HEAD"], check=False)
+        return unborn.stdout.strip() if unborn.returncode == 0 else ""
 
     def rev_parse(self, ref: str) -> str:
         return self._run(["git", "rev-parse", ref]).stdout.strip()
@@ -505,19 +558,58 @@ class GitRepo:
         reads as untracked to the dashboard/story. It is silent and unrecoverable from the new
         commit alone.
 
-        ``auto`` (git ≥ 2.11) picks a character the message doesn't already use at line start, so
-        git's own editor comments still work and nothing else changes. Set with ``--local``: it is
-        scoped to the repo aGiTrack manages and never touches the user's global config. Idempotent,
-        and it never overrides a value the user (or another tool) already chose.
-        """
+        An EXPLICIT character, not ``auto``. ``auto`` reads better — it picks a character the
+        message does not already use at line start — but git 2.54 deprecates it: every subsequent
+        `git commit` prints a deprecation warning plus 8-9 hint lines, FOREVER, including long
+        after the user has removed aGiTrack entirely, and the hint tells them to run
+        `git config unset core.commentChar`, i.e. to undo aGiTrack's own heading guard. It breaks
+        outright in Git 3.0. Six independent live-test scenarios found it.
+
+        ``;`` is the replacement: a line-initial ``;`` is rare in prose and in the languages
+        aGiTrack's traces quote, where a line-initial ``#`` is near-universal (markdown headings,
+        shell, Python, YAML) — which is the whole reason the default is unusable here.
+
+        Set with ``--local``: scoped to the repo aGiTrack manages, never the user's global config.
+        Idempotent, and it never overrides a value the user (or another tool) already chose.
+        ``agitrack.commentchar`` records that WE set it, so teardown can put the repo back exactly
+        as it found it and never unset a value that was the user's."""
         try:
-            if self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip():
-                return False  # already configured here — never override the user's choice
+            existing = self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip()
+            ours = self._run(["git", "config", "--local", "--get", "agitrack.commentchar"], check=False).stdout.strip()
+            if existing:
+                # Migrate the deprecated `auto` we ourselves wrote in an earlier version; anything
+                # else in there is the user's and stays untouched.
+                if existing == "auto" and ours:
+                    self._run(["git", "config", "--local", "core.commentChar", _COMMENT_CHAR], check=False)
+                return False
             if self._run(["git", "config", "--get", "core.commentChar"], check=False).stdout.strip():
                 return False  # a global/system value the user picked already protects (or is theirs)
-            return self._run(["git", "config", "--local", "core.commentChar", "auto"], check=False).returncode == 0
+            if self._run(["git", "config", "--local", "core.commentChar", _COMMENT_CHAR], check=False).returncode != 0:
+                return False
+            self._run(["git", "config", "--local", "agitrack.commentchar", _COMMENT_CHAR], check=False)
+            return True
         except Exception:
             return False  # never let a config tweak block startup
+
+    def restore_comment_char(self) -> bool:
+        """Undo :meth:`ensure_comment_char_preserves_headings`, if aGiTrack was the one that set
+        it. Returns True when something was unset.
+
+        Teardown has to include this: the config was written into every tracked repo and never
+        removed — not by ``-b stop``, not by ``--remove-hooks`` — so it outlived a full uninstall.
+        The ``agitrack.commentchar`` marker is what makes this safe: a value the user chose (or
+        one another tool set afterwards) is left alone."""
+        try:
+            ours = self._run(["git", "config", "--local", "--get", "agitrack.commentchar"], check=False).stdout.strip()
+            if not ours:
+                return False
+            current = self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip()
+            self._run(["git", "config", "--local", "--unset", "agitrack.commentchar"], check=False)
+            if current and current != ours:
+                return False  # somebody else owns it now
+            return self._run(["git", "config", "--local", "--unset", "core.commentChar"], check=False).returncode == 0
+        except Exception:
+            return False
 
     def unlanded_commits(self, ref: str) -> list[str]:
         """Commits on *ref* that no branch, tag or remote-tracking ref contains — oldest first.
@@ -880,11 +972,36 @@ class GitRepo:
         # the background (and on the exit path), where a prompt would hang with no
         # way to answer. Cached creds / credential helpers still work. The timeout
         # bounds a stalled fetch; cancel kills it immediately on user request.
+        # A `--filter` fetch does not just set `partialclonefilter`: git also writes
+        # `remote.<r>.promisor=true` and bumps `core.repositoryformatversion` to 1 — and it does
+        # NOT write the matching `extensions.partialClone`, so the repo is left in a state git
+        # itself would not have produced. Only the filter was ever undone, so a documented
+        # READ-ONLY report (`--backtrace text`) permanently mutated the user's git config,
+        # reproduced from pristine; in a submodule setup it edited the vendored dependency's own
+        # config. Snapshot all three and put them back exactly as they were — including doing
+        # nothing at all in a repo that genuinely IS a partial clone.
+        restore = self._config_snapshot(_PARTIAL_CLONE_KEYS(remote)) if filter_blobs else None
         ok = self._run_bounded(cmd, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout, cancel=cancel) == 0
-        if filter_blobs and ok:
-            # Don't turn the user's remote into a permanently-filtered clone.
-            self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
+        if restore is not None:
+            self._restore_config(restore)
         return ok
+
+    def _config_snapshot(self, keys: list[str]) -> dict[str, str | None]:
+        """Each key's current local value, or None when unset. Local scope only: this is for
+        restoring config aGiTrack is about to disturb, and a global/system value is not ours."""
+        snapshot: dict[str, str | None] = {}
+        for key in keys:
+            result = self._run(["git", "config", "--local", "--get", key], check=False)
+            snapshot[key] = result.stdout.strip() if result.returncode == 0 else None
+        return snapshot
+
+    def _restore_config(self, snapshot: dict[str, str | None]) -> None:
+        """Put every key back to its snapshotted value (unsetting the ones that were absent)."""
+        for key, value in snapshot.items():
+            if value is None:
+                self._run(["git", "config", "--local", "--unset-all", key], check=False)
+            else:
+                self._run(["git", "config", "--local", key, value], check=False)
 
     def resolve_blob_oid(self, ref: str, path: str) -> str | None:
         """The blob id at ``ref:path``, read from the (present) tree — so it resolves even when
@@ -1016,7 +1133,7 @@ class GitRepo:
             cwd=self.repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **UTF8_TEXT,
             env={**os.environ, **env} if env else None,
             # A cancellable network git (push) run from the console-less background daemon
             # would flash its own console window on Windows without this (proc.py).

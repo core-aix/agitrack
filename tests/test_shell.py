@@ -330,3 +330,141 @@ def test_a_shell_run_that_starts_does_persist_the_switch(tmp_path, monkeypatch):
 
     assert AgitrackState(repo.repo).backend == "codex"
     assert GlobalConfig().default_backend == "codex"
+
+
+def test_json_events_stdout_carries_only_json(tmp_path, monkeypatch, capsys):
+    """C38: the interactive prompt writes "> " with NO newline, so under --json-events the next
+    event came out glued to it as `> {"type": "response", …}` — the one event carrying the
+    agent's answer, and the only unparseable line (json-ok=1, non-json=7). codex and opencode
+    escaped it only because their streamed reply happened to terminate the line first. The
+    privacy banner, the prompt echo, "Staged untracked files:" and "aGiTrack is summarizing…"
+    were interleaved into the same stream."""
+    import json
+
+    from agitrack.shell.runner import AgitrackShell
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
+    repo = GitRepo.discover(tmp_path)
+    shell = AgitrackShell(repo, json_events=True, prompts=["hello"])
+    shell._emit({"type": "response", "text": "hi"})
+    shell._say("a human-readable notice")
+    print("> echoed prompt", file=shell._human)
+
+    captured = capsys.readouterr()
+    for line in captured.out.splitlines():
+        if line.strip():
+            json.loads(line)  # every stdout line must parse
+    assert "a human-readable notice" in captured.err
+    assert "> echoed prompt" in captured.err
+
+
+def test_without_json_events_human_output_stays_on_stdout(tmp_path, capsys):
+    """The default shell must be unchanged: prose on stdout, exactly as before."""
+    from agitrack.shell.runner import AgitrackShell
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
+    repo = GitRepo.discover(tmp_path)
+    shell = AgitrackShell(repo)
+    shell._say("a human-readable notice")
+
+    captured = capsys.readouterr()
+    assert "a human-readable notice" in captured.out
+    assert captured.err == ""
+
+
+def test_a_prompt_run_prints_the_agents_reply(tmp_path, monkeypatch, capsys):
+    """C37: `_emit` is a no-op without --json-events, so a plain `agitrack --prompt "…"` showed
+    the privacy banner and the echoed prompt and then NOTHING — the agent's answer appeared
+    nowhere on screen (it went only into state.json and the commit trace). On claude that meant
+    a turn whose entire content was "I need permission to create the file" looked like a silent
+    success."""
+    shell, _repo = _scripted_shell(tmp_path, monkeypatch, ["do the thing"])
+    shell.run()
+
+    assert "created hello.py" in capsys.readouterr().out
+
+
+def test_a_turn_that_changed_nothing_says_so_without_verbose(tmp_path, monkeypatch, capsys):
+    """ "No code changes" used to print only under --verbose, so a declined permission, a refusal
+    and a real success were indistinguishable from the outside — all silence, all exit 0."""
+
+    class NoOpBackend(FakeBackend):
+        def run(self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True):
+            return AgentResult(
+                backend=self.name,
+                session_id="ses-1",
+                model="m",
+                final_response="I need permission to create the file.",
+                exit_code=0,
+                tokens=TokenUsage(),
+            )
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setitem(shell_mod.BACKENDS, "claude", NoOpBackend)
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    _no_input(monkeypatch)
+    repo = GitRepo.init(tmp_path / "demo")
+    AgitrackShell(repo, backend="claude", prompts=["do the thing"]).run()
+
+    out = capsys.readouterr().out
+    assert "No code changes were made" in out
+    assert "I need permission to create the file." in out
+
+
+def test_claude_headless_gets_a_permission_mode_for_coding_runs(tmp_path):
+    """Out of the box `claude -p` has no terminal to approve a Write/Edit on and no permission
+    flag was ever passed, so every edit auto-declined: the turn spent real tokens, produced
+    nothing, and exited 0 through an invisible `no_changes`."""
+    from agitrack.backends.claude import ClaudeBackend
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"result": "ok", "session_id": "s"}'
+        stderr = ""
+
+    backend = ClaudeBackend(tmp_path)
+    import agitrack.backends.claude as claude_mod
+
+    original = claude_mod.subprocess.run
+
+    def _spy(command, **kwargs):
+        captured["command"] = command
+        return _Proc()
+
+    claude_mod.subprocess.run = _spy
+    try:
+        backend.run("do it", model=None, session_id=None)
+        coding = list(captured["command"])
+        backend.run("summarize", model=None, session_id=None, bare=True, system_prompt="be brief")
+        summarizing = list(captured["command"])
+    finally:
+        claude_mod.subprocess.run = original
+
+    assert "--permission-mode" in coding and "acceptEdits" in coding
+    # The summarizer must never be allowed to touch files.
+    assert "--permission-mode" not in summarizing
+
+
+def test_a_user_supplied_permission_mode_wins(tmp_path):
+    from agitrack.backends.claude import ClaudeBackend
+    import agitrack.backends.claude as claude_mod
+
+    captured: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = '{"result": "ok", "session_id": "s"}'
+        stderr = ""
+
+    backend = ClaudeBackend(tmp_path, backend_args=["--permission-mode", "plan"])
+    original = claude_mod.subprocess.run
+    claude_mod.subprocess.run = lambda command, **kw: (captured.update(command=command), _Proc())[1]
+    try:
+        backend.run("do it", model=None, session_id=None)
+    finally:
+        claude_mod.subprocess.run = original
+
+    assert captured["command"].count("--permission-mode") == 1
+    assert "acceptEdits" not in captured["command"]

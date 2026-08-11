@@ -275,3 +275,52 @@ def test_the_recorded_resume_pointer_still_wins_when_there_is_one(tmp_path):
     root_state.backend_session_id = "the-session-i-quit-in"
 
     assert runner._startup_resume_id(root_state) == "the-session-i-quit-in"
+
+
+def test_recover_explains_a_no_worktree_crash_instead_of_saying_nothing_to_recover(tmp_path):
+    """C35: after a --no-worktree crash this printed "Nothing to recover." — BYTE-IDENTICAL to
+    the never-tracked case — and the agent's work stayed uncommitted forever, while `--help`
+    promised recovery unconditionally. The behaviour is deliberate (`recovery.py`: worktree
+    sessions only); the silence was not."""
+    import subprocess
+
+    from agitrack.config import GlobalConfig
+    from agitrack.git import GitRepo
+    from agitrack.recovery import RecoveryService
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    # What a --no-worktree crash leaves: the agent's edit, live in the base tree.
+    (root / "hello.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "hello.txt"], cwd=root, check=True)
+
+    summary = RecoveryService(GitRepo.discover(root), GlobalConfig()).recover().summary()
+
+    assert "Nothing to recover automatically" in summary
+    assert "--no-worktree" in summary
+    assert "git status" in summary  # a next step the user can actually take
+
+
+def test_a_genuinely_empty_repo_still_says_nothing_to_recover(tmp_path):
+    import subprocess
+
+    from agitrack.config import GlobalConfig
+    from agitrack.git import GitRepo
+    from agitrack.recovery import RecoveryService
+
+    root = tmp_path / "clean"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+
+    assert RecoveryService(GitRepo.discover(root), GlobalConfig()).recover().summary() == "Nothing to recover."

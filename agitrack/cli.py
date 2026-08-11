@@ -8,10 +8,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
+from agitrack.backends.setup import backend_installed, select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends, backend_phrase
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
-from agitrack.proc import console_isolation_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
 from agitrack.config import GlobalConfig, settings
 from agitrack.shell import AgitrackShell
 
@@ -102,11 +102,21 @@ def _maybe_install_tool(name: str, *, required: bool) -> bool:
     # Two leading newlines, not one: whatever ran before this may have been a subprocess
     # (an installer, `gh auth status`) whose output does not end in a newline, so the first
     # closes that partial line and the second leaves a blank line before the question.
+    #
+    # An OPTIONAL tool defaults to NO. `gh` is explicitly optional — aGiTrack degrades to git
+    # author names without it — yet a bare Enter shelled straight into `brew install gh`, which
+    # is a package install nobody asked for on the most reflexive keypress there is. `git` is
+    # genuinely required for aGiTrack to work at all, so that one keeps its Y default.
+    default_yes = required
+    suffix = "[Y/n]" if default_yes else "[y/N]"
     try:
-        answer = _ask(f"\n\n{label} isn't installed. Install it now{note}? [Y/n]: ").strip().lower()
+        answer = _ask(f"\n\n{label} isn't installed. Install it now{note}? {suffix}: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
-    if answer in {"n", "no"}:
+    if default_yes:
+        if answer in {"n", "no"}:
+            return False
+    elif not answer.startswith("y"):
         return False
     return install_system_tool(name)
 
@@ -116,7 +126,7 @@ def _git_config_global(config_args: list[str]) -> str:
     try:
         result = subprocess.run(
             ["git", "config", "--global", *config_args],
-            text=True,
+            **UTF8_TEXT,
             capture_output=True,
             check=False,
             **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
@@ -173,8 +183,17 @@ def _make_console_output_lossy() -> None:
 def main(argv: list[str] | None = None) -> int:
     _make_console_output_lossy()
     parser = argparse.ArgumentParser(
+        # `prog` explicitly, or Python 3.14 on Windows derives it from sys.argv[0] and the usage
+        # line becomes `usage: python.exe C:\Users\<name>\AppData\Local\Python\...\Scripts\agitrack`
+        # — the user's home layout leaked into any pasted help output, and the only line over 80
+        # columns.
+        prog="agitrack",
         description="Interactive agent + git commit orchestration.",
         add_help=False,
+        # NO PREFIX MATCHING. It let `--overwrite` resolve to `--overwrite-shared`, so a message
+        # naming a flag that does not exist appeared to work — and would have broken silently the
+        # moment a second `--overwrite*` option was added. An unambiguous typo is still a typo.
+        allow_abbrev=False,
     )
     parser.add_argument(
         "-h",
@@ -238,7 +257,15 @@ def main(argv: list[str] | None = None) -> int:
         "--export-dir",
         default=None,
         help="where `-d export` writes the static demo site (default: .agitrack/demo-site "
-        "inside the repo). The directory is replaced.",
+        "inside the repo). The directory is REPLACED: it must be empty, absent, or a previous "
+        "export, otherwise the command refuses rather than deleting files it did not write "
+        "(pass --force to delete it anyway).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="with `-d export`, allow --export-dir to replace a non-empty directory that "
+        "aGiTrack did not write. Everything currently in it is deleted permanently.",
     )
     parser.add_argument(
         "--backtrace",
@@ -285,7 +312,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="list every running aGiTrack daemon across ALL repositories — its function (repo "
         "dashboard, backtrace dashboard, or background mode), repo name, and PID — then exit. "
-        "`--daemons stop` stops all of them (the session you run it from is never stopped).",
+        "`--daemons stop` stops them (the session you run it from is never stopped). Add `--repo "
+        "<path>` to list or stop only that repository's daemons; without it the reach is every "
+        "repository you have. A non-interactive `--daemons stop` needs `--yes`, since there is "
+        "no one there to answer the confirmation.",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="answer yes to confirmations that would otherwise be asked interactively. Required "
+        "for `--daemons stop` when there is no terminal to prompt on.",
     )
     parser.add_argument(
         "--share-sessions",
@@ -305,7 +342,11 @@ def main(argv: list[str] | None = None) -> int:
         "instead of refusing them. Rewinds them for every collaborator, so it is opt-in.",
     )
     # --- options without a short form, in rough order of how often they matter ---
-    parser.add_argument("--repo", default=".", help="target Git repository path")
+    # Default None rather than "." so callers can tell "the user named a repo" from "we fell back
+    # to the cwd" — `--daemons` scopes on that difference, and error messages only mention --repo
+    # when the user actually typed it. Normalised to "." right after parsing, so every other
+    # reader of args.repo is unaffected.
+    parser.add_argument("--repo", default=None, help="target Git repository path")
     parser.add_argument(
         "--backend",
         choices=available_backends(),
@@ -321,9 +362,10 @@ def main(argv: list[str] | None = None) -> int:
         "--auto-commit",
         dest="auto_commit",
         action="store_true",
-        help="force automatic (aGiTrack-triggered) commits — the default in background mode, so "
-        "this only matters to override a configured 'manual_commits': true. aGiTrack commits each "
-        "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
+        help="force automatic (aGiTrack-triggered) commits in EVERY mode — the default already, "
+        "so this only matters to override a configured 'manual_commits': true, or an earlier -m "
+        "on the same command line. aGiTrack commits each agent turn itself and folds tracking "
+        "into the agent's own commits via a prepare-commit-msg hook.",
     )
     parser.add_argument(
         "--delay-merge",
@@ -351,9 +393,10 @@ def main(argv: list[str] | None = None) -> int:
         dest="log_file",
         default=None,
         metavar="PATH",
-        help="append notable aGiTrack events (an AI change detected, a commit made, a merge "
-        "integrated, an update available) to PATH — a plain-text log you can `tail -f`. Works in "
-        "every mode, with or without -b. A relative path is resolved against the repo root. Also "
+        help="append notable aGiTrack events (a daemon starting or stopping, an AI change "
+        "detected, a commit made, an update available) to PATH — a plain-text log you can "
+        "`tail -f`. Works in every mode: the TUI, -b, --prompt and --json. A relative path is "
+        "resolved against the repo root, and a log inside the repo is git-ignored for you. Also "
         "settable via 'log_file' in config.",
     )
     parser.add_argument(
@@ -361,11 +404,13 @@ def main(argv: list[str] | None = None) -> int:
         "--no-sandbox",
         dest="no_sandbox",
         action="store_true",
-        help="do not confine the agent's writes to its session worktree. By default aGiTrack "
-        "confines the agent to its worktree (plus .git): on macOS/Linux via the OS sandbox "
-        "(sandbox-exec/bubblewrap), and where no sandbox is available (e.g. Windows) via a git "
-        "pre-commit guard that stops the agent from committing into the base repo. Also settable "
-        "via 'sandbox' in config. (--no-sandbox is kept as an alias.)",
+        help="do not confine the agent's writes inside this REPOSITORY. By default aGiTrack "
+        "stops the agent writing anywhere in the repo except its own session worktree (plus "
+        ".git): on macOS/Linux via the OS sandbox (sandbox-exec/bubblewrap), and where no "
+        "sandbox is available (e.g. Windows) via a git pre-commit guard that stops the agent "
+        "committing into the base repo. It protects the REPOSITORY, not the rest of the disk — "
+        "writes outside the repo are allowed either way, by construction. Also settable via "
+        "'sandbox' in config. (--no-sandbox is kept as an alias.)",
     )
     parser.add_argument(
         "--allowed-edit-paths",
@@ -398,10 +443,13 @@ def main(argv: list[str] | None = None) -> int:
         "--recover",
         action="store_true",
         help="finalize work left by a session that exited abruptly (e.g. the VSCode window "
-        "was closed mid-turn): for each session worktree, commit a finished turn's "
+        "was closed mid-turn): for each session WORKTREE, commit a finished turn's "
         "uncommitted changes and merge it into the base branch (skipping the merge on a "
-        "conflict). Runs headlessly and no-ops if a live aGiTrack holds the repo lock. Used "
-        "by the VSCode extension on close; also runnable manually.",
+        "conflict). Worktree sessions only — a --no-worktree run leaves the agent's edits in "
+        "your own working tree, intermixed with your changes, so committing them for you would "
+        "be unsafe and `--recover` reports them instead. Runs headlessly and no-ops if a live "
+        "aGiTrack holds the repo lock. Used by the VSCode extension on close; also runnable "
+        "manually.",
     )
     parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
     parser.add_argument(
@@ -437,9 +485,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ui-bridge",
         action="store_true",
-        help="with --json, run a long-lived JSON-RPC session over stdin/stdout where "
-        "interactive questions (menus, confirmations, text input) are asked of the driver "
-        "program instead of a terminal — for embedding aGiTrack behind an editor/GUI front-end",
+        help="with --json, run a long-lived session over stdin/stdout where interactive "
+        "questions (menus, confirmations, text input) are asked of the driver program instead "
+        "of a terminal — for embedding aGiTrack behind an editor/GUI front-end. The protocol is "
+        'NEWLINE-DELIMITED JSON ({"type": ...} objects), not JSON-RPC 2.0; see the module '
+        "docstring in agitrack/shell/bridge.py for the message types. Pair it with "
+        "--skip-privacy-ack for a stream that carries nothing but events.",
     )
     parser.add_argument(
         "--mode",
@@ -454,10 +505,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-privacy-ack",
         action="store_true",
-        # Suppress the one-time privacy warning/acknowledgment. Set automatically
-        # when aGiTrack re-execs itself after an in-app (menu) update — the user already
-        # acknowledged it this session — and not meant for manual use.
-        help=argparse.SUPPRESS,
+        # Was SUPPRESS'd as an internal flag (aGiTrack sets it when re-exec'ing itself after an
+        # in-app update, where the user acknowledged this session already). But it is also the
+        # only way to get a clean machine-readable stream out of --json/--ui-bridge, and a
+        # driver author cannot find a flag that is not in --help.
+        help="do not print the startup privacy warning. Intended for programmatic drivers "
+        "(--json / --ui-bridge), where the banner is prose on a stream meant to carry only "
+        "events. aGiTrack also sets it internally when it re-execs itself after an update.",
     )
     parser.add_argument(
         "--autostart-on-change",
@@ -545,6 +599,11 @@ def main(argv: list[str] | None = None) -> int:
     # argparse leaves a single leading "--" separator in the remainder; drop it.
     if backend_args and backend_args[0] == "--":
         backend_args = backend_args[1:]
+    # `--repo` parses as None when absent so the two cases stay distinguishable (see its help);
+    # from here on it is the plain path every other reader expects.
+    repo_given = args.repo is not None
+    if not repo_given:
+        args.repo = "."
 
     # First run: ask the user to choose a default backend before launching.
     config = GlobalConfig()
@@ -573,22 +632,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.daemons == "stop":
-        # Global: stop every aGiTrack daemon anywhere. No repo/git needed — the registry is
-        # user-wide, which is the point: this is the "I have strays I cannot find" escape hatch.
+        # Stop aGiTrack daemons: every one anywhere, or — with --repo — only that repository's.
+        # No repo/git needed for the global form; the registry is user-wide, which is the point:
+        # this is the "I have strays I cannot find" escape hatch.
         from agitrack.daemons import list_running, stop_all
         from agitrack.metrics.collect import _abbreviate_home
 
-        # Show what is about to die BEFORE killing it. This reaches across every repository the
-        # user has, so a bare "stop all" typed while thinking about one repo can take down
-        # dashboards for four others; the listing is what makes that visible in time.
-        doomed = [info for info in list_running() if info.pid != os.getpid()]
+        scope = str(Path(args.repo).expanduser()) if repo_given else None
+        # Show what is about to die BEFORE killing it. Unscoped, this reaches across every
+        # repository the user has, so a bare "stop all" typed while thinking about one repo can
+        # take down dashboards for four others; the listing is what makes that visible in time.
+        doomed = [info for info in list_running(repo=scope) if info.pid != os.getpid()]
         if not doomed:
-            print("No aGiTrack daemons are currently running.")
+            where = f" for {_abbreviate_home(scope)}" if scope else ""
+            print(f"No aGiTrack daemons are currently running{where}.")
             return 0
         print(f"About to stop {len(doomed)} aGiTrack daemon(s):\n")
         for info in doomed:
             print(f"  {info.pid:>7}  {info.function:<20}  {_abbreviate_home(info.repo)}")
-        if sys.stdin.isatty():
+        if not args.yes:
+            if not sys.stdin.isatty():
+                # Previously the confirmation was simply skipped without a tty, so a script or CI
+                # job silently killed every daemon on the machine — including the developer's own
+                # live session — while `--daemons list` still advertised "(lists them and asks
+                # first)". Unattended destruction now has to be asked for.
+                print(
+                    "\nRefusing to stop them: there is no terminal to confirm on.\n"
+                    "Re-run with --yes to stop the daemons listed above"
+                    f"{'' if scope else ', or with --repo <path> to stop only one repository'}."
+                )
+                return 1
             try:
                 answer = input("\nStop all of these? [Y/n]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -597,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Cancelled. Nothing was stopped.")
                 return 0
         print()
-        stopped, survivors = stop_all(log=lambda message: print(f"  {message}"))
+        stopped, survivors = stop_all(repo=scope, log=lambda message: print(f"  {message}"))
         if not stopped and not survivors:
             print("No aGiTrack daemons are currently running.")
         elif stopped:
@@ -611,11 +684,13 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.daemons import list_running
         from agitrack.metrics.collect import _abbreviate_home
 
-        running = list_running()
+        scope = str(Path(args.repo).expanduser()) if repo_given else None
+        running = list_running(repo=scope)
         if not running:
-            print("No aGiTrack daemons are currently running.")
+            where = f" for {_abbreviate_home(scope)}" if scope else ""
+            print(f"No aGiTrack daemons are currently running{where}.")
             return 0
-        print("aGiTrack daemons running:\n")
+        print(f"aGiTrack daemons running{f' for {_abbreviate_home(scope)}' if scope else ''}:\n")
         print(f"  {'PID':>7}  {'FUNCTION':<20}  DIRECTORY")
         for info in running:
             location = _abbreviate_home(info.repo)
@@ -637,7 +712,9 @@ def main(argv: list[str] | None = None) -> int:
         # current one, so "stop them all" must not read as "stop the ones for this project".
         print(
             f"\nTo stop all {len(running)} of them, in every repository above:\n"
-            "  agitrack --daemons stop        (lists them and asks first)"
+            "  agitrack --daemons stop        (lists them and asks first)\n"
+            "To stop only one repository's, which is usually what you want:\n"
+            "  agitrack --repo <path> --daemons stop"
         )
         return 0
 
@@ -746,6 +823,19 @@ def main(argv: list[str] | None = None) -> int:
             from agitrack.metrics import render_dashboard
 
             print(render_dashboard(dashboard_repo))
+            # `-d html` diverts an empty repo to the backtrace view with an explanation, but
+            # `-d text` printed a zeroed report and stopped — the cheap, obvious command giving
+            # the less helpful answer. Say the same thing it says, without hijacking the output.
+            from agitrack.metrics.suggest import has_tracked_tokens
+
+            if not has_tracked_tokens(dashboard_repo):
+                print(
+                    "\nNo aGiTrack-tracked commits carrying token counts yet, which is why every "
+                    "number above is zero.\n"
+                    "  • `agitrack` or `agitrack -b` in this repository starts recording them.\n"
+                    "  • `agitrack --backtrace` reconstructs what your past agent sessions already "
+                    "did here, without waiting."
+                )
             return 0
         if args.dashboard == "stop":
             from agitrack.metrics import stop_dashboard_daemon
@@ -756,14 +846,26 @@ def main(argv: list[str] | None = None) -> int:
 
             return dashboard_daemon_status(dashboard_repo)
         if args.dashboard == "export":
-            from agitrack.metrics.export import export_static_demo
+            from agitrack.metrics.export import ExportTargetError, export_static_demo
 
             out_dir = (
                 Path(args.export_dir).expanduser()
                 if args.export_dir
                 else dashboard_repo.repo / ".agitrack" / "demo-site"
             )
-            export_static_demo(dashboard_repo, out_dir)
+            try:
+                export_static_demo(dashboard_repo, out_dir, force=getattr(args, "force", False))
+            except ExportTargetError as error:
+                print(error)
+                return 1
+            except OSError as error:
+                # Most often a path too long for the platform (deep nesting near MAX_PATH),
+                # which used to surface as a raw traceback naming a RELATIVE path — the one
+                # thing that cannot be pasted back into a shell. Half-written output is left
+                # in place deliberately; deleting it here would be a second surprise.
+                print(f"Could not write the static demo site to {out_dir}: {error}")
+                print("The export is incomplete. A shorter --export-dir usually fixes this.")
+                return 1
             print(f"Static demo dashboard written to {out_dir}")
             print("Serve the directory with any static web host (or open index.html directly).")
             return 0
@@ -808,6 +910,16 @@ def main(argv: list[str] | None = None) -> int:
 
         return repo_status(status_repo)
 
+    if args.overwrite_shared and not args.share_sessions:
+        # `--overwrite-shared` is a MODIFIER, and it was read nowhere except next to
+        # --share-sessions — so on its own it fell straight through to launching a full agent
+        # session. Someone who typed it meaning to fix a rejected share got a live agent instead.
+        print(
+            "--overwrite-shared only means something together with --share-sessions.\n"
+            "Did you mean:  agitrack --share-sessions --overwrite-shared"
+        )
+        return 2
+
     if args.share_sessions:
         # `agitrack --share-sessions`: push every local session for this repo to origin, then
         # exit. Needs a git repo (the shared store lives on a ref there) but nothing else — no
@@ -817,7 +929,7 @@ def main(argv: list[str] | None = None) -> int:
         except (GitError, OSError) as error:
             print(error)
             return 1
-        return _run_share_sessions(share_repo, overwrite=args.overwrite_shared)
+        return _run_share_sessions(share_repo, overwrite=args.overwrite_shared, assume_yes=args.yes)
 
     if args.remove_hooks:
         # Let the user fully opt out of aGiTrack's commit-time tracking by removing every hook it
@@ -850,11 +962,17 @@ def main(argv: list[str] | None = None) -> int:
             rh_config.set("autotrack_hook", "off", scope="repo")
         except Exception:
             pass
+        # The other thing aGiTrack wrote into the repo's config and never took back. Left in
+        # place, git 2.54 prints a deprecation warning plus 8-9 hint lines on EVERY commit,
+        # forever, long after the user has removed aGiTrack — the opposite of an opt-out.
+        comment_char_restored = rh_repo.restore_comment_char()
         if removed:
             print(f"Removed aGiTrack git hook(s): {', '.join(removed)}. Any chained project hooks were restored.")
             print("Auto-start is now off for this repo. Re-enable it in Ctrl-G → settings or `agitrack -b`.")
         else:
             print("No aGiTrack hooks were installed in this repository. Auto-start is now off.")
+        if comment_char_restored:
+            print("Also restored this repo's core.commentChar, which aGiTrack had set.")
         return 0
 
     if args.precommit_sync:
@@ -1010,16 +1128,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {share_config_error}")
         return 1
     manual_commits = True if getattr(args, "manual_commits", False) else getattr(config, "manual_commits", False)
+    # --auto-commit forces auto commits even over a configured 'manual_commits': true. This
+    # override used to sit INSIDE the `if background:` block below, so in the TUI the flag was a
+    # silent no-op: the turn stayed latent on refs/agitrack/manual/…, the branch never advanced,
+    # and nothing said why. It applies to every mode, which is what its --help always implied.
+    if getattr(args, "auto_commit", False):
+        manual_commits = False
     # Background (headless) mode: aGiTrack tracks a user-driven native backend session instead
     # of running the interactive TUI. `-b`/`--background` (const "run") or the 'background' config
-    # key enable it; `-b stop`/`status` were handled earlier and never reach here.
+    # key enable it; `-b stop`/`status` were handled earlier and never reach here. Background
+    # mode ALWAYS runs without a worktree, and uses AUTO commits by default (like interactive
+    # mode); --manual-commits / -m (or config manual_commits) opts into manual.
     background = (getattr(args, "background", None) == "run") or getattr(config, "background", False)
-    if background:
-        # Background mode ALWAYS runs without a worktree, and uses AUTO commits by default (like
-        # interactive mode). --manual-commits / -m (or config manual_commits) opts into manual;
-        # --auto-commit forces auto even over a configured manual_commits: true.
-        if getattr(args, "auto_commit", False):
-            manual_commits = False
     # Manual-commit mode edits the current branch directly and defers commits to the user, so
     # it necessarily runs without a worktree (there is no per-turn branch to integrate).
     use_worktrees = False if (args.no_worktree or manual_commits or background) else config.use_worktrees
@@ -1038,11 +1158,33 @@ def main(argv: list[str] | None = None) -> int:
     # run (scripted / no TTY) with nothing configured, so fail clearly instead.
     effective_backend = args.backend or config.default_backend
     if not effective_backend:
-        print(
-            "No coding agent backend is configured. Run aGiTrack in an interactive "
-            "terminal to choose a default, or pass --backend <" + "|".join(available_backends()) + ">."
-        )
-        return 1
+        # Exactly one backend installed ⇒ there is nothing to choose. Refusing here made an
+        # explicitly HEADLESS mode require a terminal for its first run: with no TTY, bare
+        # `agitrack` and `agitrack -b` both stopped at this gate identically whether one or two
+        # backends were present, so the entire documented first-run prompt chain was unreachable
+        # and five separate scenarios in the live test dead-ended on it. A single unambiguous
+        # candidate is the one case where picking for the user cannot be picking wrong; it is
+        # announced, and it is NOT persisted as the global default — that choice stays theirs.
+        installed = [name for name in available_backends() if backend_installed(name)]
+        if len(installed) == 1:
+            effective_backend = installed[0]
+            # Carry it downstream the same way an explicit --backend does. Every launcher below
+            # reads args.backend, so resolving it only into this local would have left them
+            # resolving "no backend" all over again a few lines later.
+            args.backend = effective_backend
+            print(f"Using the only coding agent backend installed on this machine: {effective_backend}.")
+            print("Choose a different default anytime with `--backend <name>` or Ctrl-G → backend.")
+        else:
+            # Offer only what is actually here. The old message listed all three unconditionally,
+            # so on a box with one backend two of its three suggestions would have failed.
+            options = "|".join(installed or available_backends())
+            print(
+                "No coding agent backend is configured. Run aGiTrack in an interactive "
+                f"terminal to choose a default, or pass --backend <{options}>."
+            )
+            if not installed:
+                print("None of the supported backends are installed on this machine yet.")
+            return 1
     # Resolve the backend launch wrapper (--backend-command, else config) for the backend
     # this run will use. Validate the flag here so a malformed value fails fast and clearly.
     backend_command, backend_command_error = _resolve_backend_command(args.backend_command, config, effective_backend)
@@ -1083,7 +1225,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"aGiTrack background tracker already running (PID {owner_pid}, current version) — left in place."
                 )
                 return 0
-            replaced = replace_running_tracker(repo, owner_pid=owner_pid) and management_lock.acquire()
+            # retry_seconds: the daemon we just terminated may still hold the OS lock for a
+            # moment — on Windows `TerminateProcess` flips pid_alive instantly but the byte-range
+            # lock survives ~100 ms of handle teardown. Without the retry this lost 9 times out
+            # of 9 and left ZERO writers on the repo.
+            stopped = replace_running_tracker(repo, owner_pid=owner_pid)
+            replaced = stopped and management_lock.acquire(retry_seconds=3.0)
+            if stopped and not replaced:
+                # Do NOT fall through to "already running (PID N)": that names the PID we just
+                # killed and tells the user to stop a process that no longer exists.
+                print(
+                    "Stopped the previous background tracker, but could not take over this "
+                    "repo's lock in time.\nNothing is tracking it now — re-run `agitrack -b`."
+                )
+                return 1
         if not replaced:
             print(already_running_message(owner_pid, repo_root=repo.repo))
             return 1
@@ -1150,7 +1305,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
             # privacy warning here (it auto-proceeds without a TTY) before the shell starts.
-            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+            # Under --json-events (and not the bridge, which frames everything itself) stdout is
+            # a pure JSON stream, so the banner goes to stderr — a driver's json.loads(line)
+            # used to throw on the very first line it read, before `ready` ever arrived.
+            banner_stream = sys.stderr if (args.json_events and not args.ui_bridge) else sys.stdout
+            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack, stream=banner_stream):
                 management_lock.release()
                 return 1
             management_lock.release()  # json/scripted mode runs via AgitrackShell, which takes its own lock
@@ -1168,6 +1327,7 @@ def main(argv: list[str] | None = None) -> int:
                 commit_guidance=commit_guidance,
                 json_events=args.json_events,
                 ui_bridge=args.ui_bridge,
+                log_file=log_file_spec,
             ).run()
         else:
             # Before the TUI takes over the terminal, check the GitHub CLI and let the
@@ -1444,7 +1604,7 @@ def _ask(question: str) -> str:
     return input(question)
 
 
-def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) -> bool:
+def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False, stream=None) -> bool:
     """Show the privacy warning at startup; the user must acknowledge it to
     continue. Without a TTY there is no way to acknowledge, and a scripted run
     (``--prompt``) already has its input on the command line, so in both cases
@@ -1453,10 +1613,14 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
 
     ``skip`` suppresses the warning entirely; aGiTrack sets it when re-exec'ing
     itself after an in-app (menu) update, where the user acknowledged the
-    warning earlier this session and should not be prompted again."""
+    warning earlier this session and should not be prompted again.
+
+    ``stream`` redirects the banner. Under ``--json-events`` stdout carries one JSON object per
+    line and nothing else, so a banner printed there made the obvious ``json.loads(line)`` throw
+    on the very first line a driver read — before ``ready`` ever arrived."""
     if skip:
         return True
-    print(_privacy_warning())
+    print(_privacy_warning(), file=stream or sys.stdout)
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
     # _ask discards anything already sitting in the terminal's input queue before reading, so
@@ -1467,10 +1631,10 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     try:
         answer = _ask("Press Enter to acknowledge and continue (q to quit): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        print("\naGiTrack not started.")
+        print("\naGiTrack not started.", file=stream or sys.stdout)
         return False
     if answer in {"q", "quit", "n", "no"}:
-        print("aGiTrack not started.")
+        print("aGiTrack not started.", file=stream or sys.stdout)
         return False
     return True
 
@@ -1572,7 +1736,47 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     return (True, True)
 
 
-def _run_share_sessions(repo: "GitRepo", *, overwrite: bool = False) -> int:
+def _confirm_bulk_share(repo: "GitRepo", *, overwrite: bool, assume_yes: bool = False) -> bool:
+    """Ask before `--share-sessions` uploads anything. True to proceed.
+
+    Says what is uploaded EVERY time, not once — a bulk share is a fresh upload of possibly
+    sensitive transcripts each run, which is exactly why the in-TUI share re-shows its warning
+    on every share rather than remembering an answer.
+
+    Without a terminal there is nobody to ask, so it refuses and names `--yes`: a script that
+    was going to publish conversations must say so explicitly. `--overwrite-shared` additionally
+    REWINDS collaborators' copies, so it is called out separately."""
+    notice = [
+        f"About to share every local agent session for {repo.repo} to 'origin'.",
+        "",
+        "Each session's full transcript is uploaded: your prompts, the agent's replies, and the",
+        "inputs to its tools — which can include file contents, command output, and secrets.",
+        "Review what is in these conversations before sharing.",
+    ]
+    if overwrite:
+        notice.append("")
+        notice.append("--overwrite-shared: this REPLACES shared copies that already have newer turns.")
+    print("\n".join(notice))
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("\nNot sharing: there is no terminal to confirm on. Re-run with --yes to share anyway.")
+        return False
+    try:
+        answer = _ask("\nShare them now? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if not answer.startswith("y"):
+        print("Nothing was shared.")
+        return False
+    try:
+        GlobalConfig().acknowledge_session_sharing()
+    except Exception:
+        pass
+    return True
+
+
+def _run_share_sessions(repo: "GitRepo", *, overwrite: bool = False, assume_yes: bool = False) -> int:
     """`--share-sessions`: push every local session for ``repo`` to origin, reporting as it goes.
 
     Progress is printed per session because a bulk share is one network round trip each — a
@@ -1582,12 +1786,20 @@ def _run_share_sessions(repo: "GitRepo", *, overwrite: bool = False) -> int:
     """
     from agitrack.sessions.bulk import share_all
 
-    def progress(index: int, total: int, candidate) -> None:
+    def progress(index: int, total: int, candidate) -> None:  # noqa: D401 - inner helper
         print(f"  [{index}/{total}] {candidate.name} ({candidate.backend})… ", end="", flush=True)
 
     def on_result(outcome) -> None:
         detail = f" — {outcome.detail}" if outcome.detail else ""
         print(f"{outcome.status}{detail}", flush=True)
+
+    # INFORMED CONSENT, the same requirement the in-TUI share has enforced all along. This path
+    # published every local session's full transcript — every prompt, every reply, tool inputs
+    # including file contents — to 'origin' with no consent prompt and no privacy sentence, and
+    # never read or set `session_sharing_acknowledged`. One command, many conversations, and it
+    # is exactly the bulk case where a stray secret is most likely to be in one of them.
+    if not _confirm_bulk_share(repo, overwrite=overwrite, assume_yes=assume_yes):
+        return 0
 
     print(f"Sharing local sessions for {repo.repo} to origin…")
     result = share_all(repo, progress=progress, on_result=on_result, overwrite=overwrite)

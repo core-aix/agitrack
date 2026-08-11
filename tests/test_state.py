@@ -403,3 +403,178 @@ def test_a_second_state_on_the_active_sessions_config_does_not_drop_its_settings
     assert reloaded.merge_branch == "main"
     assert reloaded.summarization_model == "gpt-5.4-mini"
     assert reloaded.summarization_enabled is False
+
+
+def _repo_with_history(tmp_path):
+    import subprocess
+
+    from agitrack.git import GitRepo
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / "a.txt").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    return GitRepo.discover(root)
+
+
+def _porcelain(repo):
+    import subprocess
+
+    # core.excludesFile=/dev/null: this machine's personal global ignore must not mask the leak,
+    # which is exactly how it stayed invisible on the developer's own box.
+    return subprocess.run(
+        ["git", "-c", "core.excludesFile=/dev/null", "status", "-uall", "--porcelain"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout
+
+
+def test_the_state_dir_ignores_itself_the_moment_it_exists(tmp_path):
+    """`.git/info/exclude` was the only thing keeping `.agitrack/` out of the user's tree, and it
+    is written by a DIFFERENT code path — so any run that created a lock, a config or a dashboard
+    log and then exited before tracking started left `?? .agitrack/` behind, in a repo aGiTrack
+    had just said it never touched. A `.gitignore` holding `*` inside the directory needs no
+    second code path and no ordering."""
+    from agitrack.fileio import ensure_state_dir
+
+    repo = _repo_with_history(tmp_path)
+    ensure_state_dir(repo.repo / ".agitrack")
+
+    assert (repo.repo / ".agitrack" / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+    assert _porcelain(repo) == ""
+
+
+def test_taking_the_repo_lock_alone_never_dirties_the_tree(tmp_path):
+    """Acquiring the lock is often the FIRST thing a run does, before the exclude line is
+    written. A run refused as a second writer, or aborted, must leave nothing behind."""
+    from agitrack.git import RepoLock
+
+    repo = _repo_with_history(tmp_path)
+    lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert lock.acquire()
+    try:
+        assert _porcelain(repo) == ""
+    finally:
+        lock.release()
+    assert _porcelain(repo) == ""
+
+
+def test_writing_any_state_file_ignores_the_directory(tmp_path):
+    """Every writer goes through atomic_write_text, so none of them can be the one that forgets."""
+    from agitrack.fileio import atomic_write_text
+
+    repo = _repo_with_history(tmp_path)
+    atomic_write_text(repo.repo / ".agitrack" / "state.json", "{}")
+    assert _porcelain(repo) == ""
+
+
+def test_the_self_ignore_is_only_written_inside_the_state_dir(tmp_path):
+    """ensure_state_dir is used for ordinary directories too; it must never drop a `*` gitignore
+    into one of the user's own."""
+    from agitrack.fileio import ensure_state_dir
+
+    other = tmp_path / "not-ours" / "nested"
+    ensure_state_dir(other)
+    assert other.is_dir()
+    assert not (other / ".gitignore").exists()
+    assert not (tmp_path / "not-ours" / ".gitignore").exists()
+
+
+def test_the_claude_settings_file_agitrack_writes_is_excluded(tmp_path):
+    """aGiTrack excluded its own `.agitrack/` but never `.claude/settings.local.json`, which it
+    also writes (the Stop / SessionStart hooks). A new user saw `?? .claude/` the moment they ran
+    `agitrack -b`; in a submodule it surfaced in the parent as ` M vendor/sub`. It stayed
+    invisible on the developers' machines only because of a personal global ignore rule aGiTrack
+    did not create."""
+    from agitrack.config.state import AgitrackState
+
+    repo = _repo_with_history(tmp_path)
+    AgitrackState(repo.repo).ensure_local_ignore()
+    (repo.repo / ".claude").mkdir()
+    (repo.repo / ".claude" / "settings.local.json").write_text("{}", encoding="utf-8")
+
+    assert _porcelain(repo) == ""
+    exclude = (repo.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert ".claude/settings.local.json" in exclude
+    assert ".agitrack/" in exclude
+
+
+def test_ensure_local_ignore_is_idempotent(tmp_path):
+    from agitrack.config.state import AgitrackState
+
+    repo = _repo_with_history(tmp_path)
+    state = AgitrackState(repo.repo)
+    state.ensure_local_ignore()
+    state.ensure_local_ignore()
+    state.ensure_local_ignore()
+
+    lines = (repo.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert lines.count(".agitrack/") == 1
+    assert lines.count(".claude/settings.local.json") == 1
+
+
+def test_add_tracked_never_stages_agitracks_own_edits(tmp_path):
+    """B5: in a repo that TRACKS `.claude/`, aGiTrack's own hook edits were committed into the
+    user's history — `add_tracked()` is `git add -u`, which has no `_NEVER_STAGE_PREFIXES`
+    filter. A machine-absolute venv path landed in a file the whole team shares, and stopping
+    then left the repo dirty with a change the user never made."""
+    import subprocess
+
+    repo = _repo_with_history(tmp_path)
+    settings = repo.repo / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text('{"hooks": {}}\n', encoding="utf-8")
+    subprocess.run(["git", "add", "-f", ".claude"], cwd=repo.repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "team settings"], cwd=repo.repo, check=True)
+
+    # aGiTrack rewrites it (adding its Stop hook); the user edits a file of their own.
+    settings.write_text('{"hooks": {"Stop": ["/home/someone/.venv/bin/python"]}}\n', encoding="utf-8")
+    (repo.repo / "a.txt").write_text("edited by the agent\n", encoding="utf-8")
+
+    repo.add_tracked()
+
+    staged = repo.staged_paths()
+    assert "a.txt" in staged  # the agent's real work still gets committed
+    assert ".claude/settings.local.json" not in staged
+
+
+def test_a_config_with_a_utf8_bom_is_read_not_discarded(tmp_path, monkeypatch):
+    """A realistic Windows footgun: `Out-File -Encoding utf8` writes a BOM, which makes
+    json.load raise — and the whole config was then silently discarded and replaced with
+    defaults, with no warning. The user's settings simply stopped applying."""
+    import json
+
+    from agitrack.config import GlobalConfig
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    (cfg / "config.json").write_text(
+        json.dumps({"default_backend": "codex", "manual_commits": True}), encoding="utf-8-sig"
+    )
+
+    config = GlobalConfig()
+
+    assert config.default_backend == "codex"
+    assert config.manual_commits is True
+
+
+def test_repo_state_with_a_utf8_bom_is_read_not_quarantined(tmp_path):
+    import json
+
+    from agitrack.config import AgitrackState
+
+    repo = _repo_with_history(tmp_path)
+    state_path = repo.repo / ".agitrack" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"backend": "opencode"}), encoding="utf-8-sig")
+
+    assert AgitrackState(repo.repo).backend == "opencode"
+    assert not state_path.with_name("state.json.bak").exists()  # not quarantined as corrupt

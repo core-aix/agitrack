@@ -52,3 +52,69 @@ def test_event_log_survives_unwritable_path(tmp_path):
     blocker = tmp_path / "afile"
     blocker.write_text("x")
     EventLog(blocker / "sub" / "events.log").emit("commit", sha="abc")  # must not raise
+
+
+def _repo(tmp_path):
+    import subprocess
+
+    from agitrack.git import GitRepo
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / "a.txt").write_text("hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    return GitRepo.discover(root)
+
+
+def test_an_in_repo_log_file_is_git_ignored(tmp_path):
+    """The default place to put the log is the repo root (a relative `--log-file events.log`
+    resolves there) and nothing excluded it. In the TUI that left a permanent `?? events.log`;
+    under -b the tracker's own `git add` swept the file into the AGENT'S commit, so aGiTrack's
+    telemetry about a turn ended up inside the turn, attributed to the AI, in permanent
+    history."""
+    import subprocess
+
+    from agitrack.events import EventLog, exclude_log_file, resolve_log_path
+
+    repo = _repo(tmp_path)
+    path = resolve_log_path("events.log", repo.repo)
+    exclude_log_file(repo.repo, path)
+    EventLog(path).emit("daemon-start", backend="claude")
+
+    porcelain = subprocess.run(
+        ["git", "-c", "core.excludesFile=/dev/null", "status", "-uall", "--porcelain"],
+        cwd=repo.repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout
+    assert porcelain == ""
+    assert path.read_text(encoding="utf-8").strip().endswith("backend=claude")
+
+
+def test_a_log_file_outside_the_repo_is_left_alone(tmp_path):
+    from agitrack.events import exclude_log_file
+
+    repo = _repo(tmp_path)
+    exclude_log_file(repo.repo, tmp_path / "elsewhere.log")
+    exclude = repo.repo / ".git" / "info" / "exclude"
+    assert not exclude.exists() or "elsewhere.log" not in exclude.read_text(encoding="utf-8")
+
+
+def test_the_one_shot_shell_honours_log_file(tmp_path, monkeypatch):
+    """`--log-file` was parsed, passed to the background tracker and the proxy runner, then
+    DROPPED: AgitrackShell took no log_file argument at all, so `--prompt`/`--json` runs — even
+    ones that made real commits — created no log file anywhere, no warning, exit 0, while
+    `--help` said verbatim "Works in every mode"."""
+    from agitrack.shell.runner import AgitrackShell
+
+    repo = _repo(tmp_path)
+    shell = AgitrackShell(repo, log_file="events.log")
+
+    assert shell.events.enabled
+    assert shell.events.path == repo.repo / "events.log"

@@ -66,6 +66,35 @@ from agitrack.metrics.web import (
 
 _REPO_URL = "https://github.com/core-aix/agitrack"
 
+# Written at the root of every export. `-d export` REPLACES its output directory, so before
+# deleting anything we require proof the directory is ours: this marker, or emptiness. Without
+# it a mistyped `--export-dir ~/Documents` was an unrecoverable `shutil.rmtree` (no recycle bin,
+# no confirmation, exit 0 with the ordinary success message).
+EXPORT_MARKER = ".agitrack-export"
+
+
+class ExportTargetError(Exception):
+    """``--export-dir`` points at a directory that is not an aGiTrack export and is not empty."""
+
+
+def _clear_target(out_dir: Path, *, force: bool) -> None:
+    """Empty ``out_dir`` for a fresh export, refusing to delete anyone else's files.
+
+    Deletion is allowed only when the directory is empty, carries our marker, or ``force`` is
+    set. Anything else raises rather than destroying data we cannot identify as ours."""
+    if not out_dir.exists():
+        return
+    if not out_dir.is_dir():
+        raise ExportTargetError(f"--export-dir is not a directory: {out_dir}")
+    if not force and any(out_dir.iterdir()) and not (out_dir / EXPORT_MARKER).exists():
+        raise ExportTargetError(
+            f"Refusing to replace {out_dir}: it is not empty and was not written by aGiTrack.\n"
+            f"`-d export` REPLACES its output directory — everything in it would be deleted.\n"
+            "Point --export-dir at a new or empty directory, or pass --force to delete this one anyway."
+        )
+    shutil.rmtree(out_dir)
+
+
 # How much history the demo ships: the dashboard's "last 30 days" range, not all time.
 _DEMO_WINDOW_DAYS = 30
 
@@ -575,9 +604,13 @@ def _inject_shim(html: str, shim: str) -> str:
     return html[:at] + shim + "\n" + html[at:]
 
 
-def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
-    """Write the static demo site for ``repo`` into ``out_dir`` (replaced if present).
-    Returns ``out_dir``."""
+def export_static_demo(repo: GitRepo, out_dir: Path, *, force: bool = False) -> Path:
+    """Write the static demo site for ``repo`` into ``out_dir``.
+
+    ``out_dir`` is REPLACED, so it must be empty, absent, or a previous export (marked with
+    ``EXPORT_MARKER``) unless ``force``. Raises ``ExportTargetError`` otherwise. Returns
+    ``out_dir``."""
+    _clear_target(out_dir, force=force)
     dash = build_dashboard(repo, sha_logins=cached_logins(repo))
     browser = git_browser(repo, dash.stats, "HEAD")
     files, sha_paths = context_from_browser(browser, dash.stats)
@@ -589,10 +622,15 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     frm = max(0, newest - _DEMO_WINDOW_DAYS * 86400)
     demo_stats = [stat for stat in dash.stats if stat.timestamp and stat.timestamp >= frm]
 
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
     demo = out_dir / "demo"
     demo.mkdir(parents=True)
+    # Written first, so an export interrupted half-way is still recognisable as ours and the
+    # retry does not have to refuse it.
+    (out_dir / EXPORT_MARKER).write_text(
+        "This directory is an aGiTrack static dashboard export (`agitrack -d export`).\n"
+        "Re-exporting here REPLACES its entire contents. Delete this file to protect it.\n",
+        encoding="utf-8",
+    )
 
     # /data for each chart granularity (last-30-days scope — the only filter the demo serves).
     for granularity in GRANULARITIES:

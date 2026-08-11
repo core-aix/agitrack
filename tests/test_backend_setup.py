@@ -120,9 +120,11 @@ def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
     monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude" or name in installs)
     second = available_backends()[1]
     config = FakeConfig()
+    # "2" picks it; "y" confirms the install, which is no longer implicit — typing a number
+    # used to run `curl … | bash` immediately, with no y/N and no abort.
     chosen = select_default_backend(
         config,
-        input_fn=_inputs("2"),
+        input_fn=_inputs("2", "y"),
         output_fn=lambda _s: None,
         install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
     )
