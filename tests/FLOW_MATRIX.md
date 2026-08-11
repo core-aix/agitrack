@@ -528,22 +528,20 @@ a URL. Every row here is about that record staying honest — a stale one makes 
 | Background tracker restart leaves an in-flight turn for the replacement (no force-capture at the swap); a real stop still captures it | `test_background_restart_leaves_in_flight_turns_for_the_replacement`, `test_background_run_execs_replacement_after_update` | mock |
 | Ctrl-G dashboard is a free-standing daemon like `-d`: it keeps serving after aGiTrack quits AND after the terminal closes, until `-d stop` (popup says so); exit never kills it | `test_proxy_dashboard.py::test_dashboard_command_spawns_process_and_opens_browser`, `test_dashboard_is_never_stopped_by_agitrack_exit` | mock |
 
-## 13b. Terminal appearance: following the agent's colour scheme (`tests/test_agent_theme.py`)
-How the rendered screen looks when the agent's theme and the terminal's disagree — the user
-picks a theme inside the backend, and aGiTrack has to paint the rest of the screen to match.
+## 13b. Terminal appearance: the background behind the agent (`tests/test_agent_theme.py`)
+The terminal's own colours are the default and the fallback; only an explicit
+`agent_background` of `dark`/`light` overrides them, and then for the whole session. aGiTrack
+used to INFER the agent's scheme from the colours on screen, which made the background follow
+the screen's content and flip every few seconds — most of this section is the absence of that.
 | Sequence | Test(s) | Kind |
 |---|---|---|
-| Dark agent theme in a light terminal (and the reverse) → the whole screen adapts | `test_dark_agent_in_a_light_terminal_gets_a_dark_canvas`, `test_light_agent_in_a_dark_terminal_gets_a_light_canvas`, `test_unpainted_cells_carry_the_canvas_instead_of_the_terminal_background` | unit |
-| Agent and terminal agree → nothing overridden, frame unchanged | `test_a_matching_terminal_is_left_completely_alone`, `test_without_a_canvas_the_line_is_emitted_exactly_as_before` | unit |
-| User switches the theme INSIDE the agent → aGiTrack follows, idle screen included | `test_switching_the_agent_theme_switches_the_canvas`, `test_the_runner_follows_a_theme_change_while_the_screen_is_idle` | unit |
-| A transient frame (diff, banner) must not flip an established scheme | `test_one_odd_frame_does_not_flip_an_established_canvas`, `test_a_few_coloured_cells_do_not_decide_the_screen`, `test_an_uncoloured_screen_has_no_opinion` | unit |
-| aGiTrack's own chrome (status bar, popups) sits on the same scheme | `test_agitracks_own_chrome_sits_on_the_canvas` | unit |
-| `agent_background` setting: force dark/light, or opt out entirely | `test_forced_dark_and_light_ignore_both_the_agent_and_the_terminal`, `test_terminal_setting_opts_out_of_the_whole_feature`, `test_agent_background_defaults_to_auto_and_rejects_nonsense`, `test_agent_background_is_offered_in_the_settings_menu` | unit |
-| A forced background is also what the backend is told (OSC 10/11) | `test_only_a_forced_background_is_reported_to_the_backend`, `test_a_forced_background_is_what_the_backend_is_told` | mock |
-| Every renderer hook the frame needs is re-exported by the runner (else the screen freezes) | `test_the_runner_exposes_every_canvas_hook_the_renderer_calls` | unit |
-| Session OPENS in the agent's scheme (remembered from last run), no flip a beat later | `test_a_remembered_theme_paints_the_first_frame_before_any_output_arrives`, `test_the_runner_starts_from_the_scheme_the_backend_used_last_time`, `test_frames_are_sampled_without_a_throttle_until_the_scheme_is_known` | unit |
-| Theme changed between sessions → the first real frame overrules the remembered one | `test_the_first_real_frame_overrules_a_remembered_theme_at_once`, `test_an_unknown_or_matching_remembered_theme_changes_nothing` | unit |
-| The scheme is recorded per backend, and a broken/missing config never blocks startup | `test_the_scheme_is_remembered_for_the_next_launch`, `test_the_runner_records_the_scheme_it_observes`, `test_a_missing_or_broken_config_never_blocks_startup`, `test_agent_theme_seen_round_trips_per_backend` | unit |
+| Every terminal profile keeps its own colours, whatever the agent paints (white, cream, 50% grey, black, blue, green x dark/light/plain agent) | `test_the_terminals_own_colours_are_kept_whatever_the_agent_paints`, `test_an_unknown_terminal_background_changes_nothing_either`, `test_the_frame_is_emitted_exactly_as_it_would_be_without_the_feature` | unit |
+| A turn's changing content (prose → code block → prose) never moves the background — the oscillation bug | `test_a_turns_worth_of_changing_content_never_moves_the_background`, `test_a_forced_background_is_just_as_immovable`, `test_painting_a_frame_cannot_touch_the_canvas` | unit |
+| Nothing samples the screen on a timer, and a frame builds it exactly once (the per-tick, screen-sized cost on the stdin thread) | `test_nothing_samples_the_screen_on_a_timer_any_more`, `test_a_frame_builds_the_visible_screen_exactly_once` | unit |
+| A forced `dark`/`light` fills the unpainted cells and aGiTrack's own chrome, from before the first frame | `test_a_forced_background_fills_the_cells_the_agent_left_alone`, `test_agitracks_own_chrome_sits_on_a_forced_canvas`, `test_a_forced_background_is_in_place_before_the_first_frame`, `test_a_forced_background_needs_no_answer_from_the_terminal`, `test_the_runner_fills_the_cleared_screen_for_a_forced_background`, `test_the_default_setting_writes_nothing_to_the_screen` | unit |
+| The backend is told the terminal's REAL background (so a self-theming agent agrees with it), or the forced one | `test_the_terminals_real_colour_is_what_the_backend_is_told`, `test_a_forced_background_is_reported_in_place_of_the_terminals`, `test_what_the_runner_answers_the_backend_with`, `test_the_backend_is_answered_before_the_reactor_starts` | mock + real-proc |
+| `agent_background` setting: default, choices, and old configs holding the removed `auto` | `test_the_default_is_the_terminals_own_colours`, `test_a_config_still_holding_the_old_auto_reads_as_terminal`, `test_setting_it_to_something_unknown_falls_back_to_terminal`, `test_an_unrecognised_setting_falls_back_to_the_terminals_colours`, `test_agent_background_defaults_to_the_terminals_own_colours`, `test_agent_background_is_offered_in_the_settings_menu` | unit |
+| Every renderer hook the frame needs is re-exported by the runner (else the screen freezes); a broken config never blocks startup | `test_the_runner_exposes_every_canvas_hook_the_renderer_calls`, `test_a_missing_or_broken_config_never_blocks_startup` | unit |
 | Startup hands stdin to the capability round trip at once (no poll-cycle wait) | `test_handing_stdin_over_does_not_wait_out_the_pumps_poll_cycle`, `test_the_pause_pipe_never_swallows_a_keystroke` | real-proc |
 
 ## 14. Windows-specific (#118)

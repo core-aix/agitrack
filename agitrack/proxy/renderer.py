@@ -380,7 +380,7 @@ def forced_canvas_osc_values(host) -> tuple[bytes, bytes] | None:
     the canvas aGiTrack paints. Otherwise the relay is truthful, which is the whole reason no
     adaptation is needed: the backend is told exactly what the user's terminal is drawing on
     (from the platform, if the terminal itself will not say) and themes to it."""
-    setting = getattr(host, "agent_background", "auto")
+    setting = getattr(host, "agent_background", "terminal")
     if setting not in {"dark", "light"}:
         return None
     background, foreground = _CANVAS_DARK if setting == "dark" else _CANVAS_LIGHT
@@ -560,24 +560,13 @@ class RendererHost(Protocol):
     # during render so the input loop knows whether PgUp/PgDn should scroll the message.
     _message_max_scroll: int
 
-    # Agent-theme adaptation (host-level): the user's setting, the canvas currently in
-    # effect, and the vote/sample state that keeps it from flipping on a transient frame.
+    # Agent background (host-level): the user's setting and the canvas it implies.
     agent_background: str
     _canvas: tuple[str, str] | None
-    _canvas_votes: int
-    _canvas_sampled_at: float
-    _canvas_decided: bool
-    CANVAS_SAMPLE_INTERVAL: float
-    CANVAS_VOTES_TO_SWITCH: int
-    CANVAS_MIN_BG_CELLS: int
-    CANVAS_MIN_FG_CELLS: int
-    CANVAS_MAJORITY: float
 
     # Renderer methods invoked on ``self`` from sibling methods
     def cell_sgr(self, cell) -> str: ...
-    def agent_theme_is_dark(self, body) -> bool | None: ...
-    def update_canvas(self, body, *, now: float | None = ...) -> None: ...
-    def apply_remembered_theme(self, agent_dark: bool | None) -> None: ...
+    def apply_agent_background(self) -> None: ...
     def canvas_sgr_body(self) -> str: ...
     def reset_sgr(self) -> str: ...
     def color_code(self, color: str, *, foreground: bool) -> str | None: ...
@@ -663,16 +652,13 @@ class ScreenRenderer:
         self._in_sync_update: bool = False
         self._sync_since: float = 0.0
 
-        # Agent-theme adaptation (see "canvas" above). ``agent_background`` is the user's
-        # setting ("auto" | "dark" | "light" | "terminal"); ``_canvas`` is the (bg, fg) pair
-        # currently painted under the agent, or None to use the host terminal's own colours.
-        self.agent_background: str = "auto"
+        # Agent background (see "canvas" above). ``agent_background`` is the user's setting
+        # ("terminal" | "dark" | "light"); ``_canvas`` is the (bg, fg) pair painted under the
+        # agent, or None — the default — to use the host terminal's own colours. ``_canvas`` is
+        # a pure function of the setting (`apply_agent_background`), so it never changes on its
+        # own: nothing the agent puts on screen can repaint the user's background.
+        self.agent_background: str = "terminal"
         self._canvas: tuple[str, str] | None = None
-        self._canvas_votes: int = 0  # consecutive samples agreeing on a DIFFERENT canvas
-        self._canvas_sampled_at: float = 0.0
-        # Whether a frame has actually told us the agent's scheme yet. Until it has, every
-        # frame is sampled (no throttle) and any canvas in place is only a remembered guess.
-        self._canvas_decided: bool = False
 
     # ------------------------------------------------------------------
     # Screen initialisation
@@ -853,188 +839,24 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # Agent-theme adaptation
+    # Agent background
     # ------------------------------------------------------------------
 
-    CANVAS_SAMPLE_INTERVAL = 0.5  # how often the agent's colour scheme is re-sampled
-    CANVAS_VOTES_TO_SWITCH = 2  # agreeing samples before an ESTABLISHED canvas changes
-    CANVAS_MIN_BG_CELLS = 40  # painted background cells needed for the bg signal to count
-    CANVAS_MIN_FG_CELLS = 80  # coloured glyphs needed for the (weaker) foreground signal
-    CANVAS_MAJORITY = 0.6  # share of the sample that must agree
+    def apply_agent_background(self: RendererHost) -> None:
+        """Set the canvas from the ``agent_background`` setting. That is the whole rule.
 
-    def agent_theme_is_dark(self: RendererHost, body) -> bool | None:
-        """Whether the backend is painting for a DARK background, read off the frame in
-        ``body`` — or None when the frame carries no opinion (a plain, uncoloured screen).
+        "dark"/"light" paint that background behind the agent; anything else — "terminal",
+        the default, and any unrecognised value — paints nothing, so every cell the backend
+        leaves unpainted keeps the HOST TERMINAL's own background, which is what the user
+        chose when they picked their terminal profile.
 
-        Two signals, strongest first: the backgrounds the agent fills (a dark theme fills
-        dark), and the colour of its text (a dark theme writes light text). Either alone is
-        enough; neither is consulted below a minimum sample, so a couple of coloured words
-        can't decide the whole screen's canvas.
-
-        The text signal counts only ALPHANUMERIC glyphs — real text, not the rules, borders
-        and block graphics a TUI draws around it. That is not a detail: a backend picks a
-        readable contrast for text it wants read, but a deliberately subtle one for furniture,
-        and the furniture grey often lands on the wrong side of the midpoint in one of the two
-        themes. Measured on Claude's opening screen, whose separators are 300 of the ~480
-        coloured cells: counting everything gives "light text" for BOTH themes (the light
-        theme's #999999 rules outvote its #666666 text), so a light-themed Claude in a dark
-        terminal was never recognised and kept the terminal's colours; counting only letters
-        and digits gives 144 cells that are unanimous in each theme — #666666 for light,
-        #999999 for dark."""
-        bg_dark = bg_light = fg_dark = fg_light = 0
-        for cells in body:
-            for cell in cells.values():
-                background = _luminance(getattr(cell, "bg", "default"))
-                if background is not None:
-                    if background < 128:
-                        bg_dark += 1
-                    else:
-                        bg_light += 1
-                if not (getattr(cell, "data", " ") or " ").strip().isalnum():
-                    continue  # blank cells and furniture say nothing about the TEXT colour
-                foreground = _luminance(getattr(cell, "fg", "default"))
-                if foreground is not None:
-                    if foreground < 128:
-                        fg_dark += 1
-                    else:
-                        fg_light += 1
-        total_bg = bg_dark + bg_light
-        if total_bg >= self.CANVAS_MIN_BG_CELLS:
-            if bg_dark / total_bg >= self.CANVAS_MAJORITY:
-                return True
-            if bg_light / total_bg >= self.CANVAS_MAJORITY:
-                return False
-        total_fg = fg_dark + fg_light
-        if total_fg >= self.CANVAS_MIN_FG_CELLS:
-            if fg_light / total_fg >= self.CANVAS_MAJORITY:
-                return True  # light text ⇒ the agent expects a dark background behind it
-            if fg_dark / total_fg >= self.CANVAS_MAJORITY:
-                return False
-        return None
-
-    def update_canvas(self: RendererHost, body, *, now: float | None = None) -> None:
-        """Re-decide the canvas from the frame about to be painted (see "canvas" above).
-
-        ``dark``/``light`` force it, ``terminal`` disables it entirely, and ``auto`` adapts:
-        a canvas is painted only while the agent's inferred scheme DISAGREES with the host
-        terminal's own background, so the usual matching setup renders exactly as before."""
-        setting = getattr(self, "agent_background", "auto")
-        if setting == "dark":
-            self._canvas = _CANVAS_DARK
-            return
-        if setting == "light":
-            self._canvas = _CANVAS_LIGHT
-            return
-        if setting != "auto":  # "terminal" (or anything unrecognised): host colours, as before
-            self._canvas = None
-            return
-        moment = time.monotonic() if now is None else now
-        # The throttle applies only AFTER the scheme is known. Until then every frame is
-        # examined, so the moment the backend paints something readable the screen is already
-        # in the right colours — throttling here would instead show the wrong scheme for up to
-        # a sample interval at startup, which is precisely when the user is looking at it.
-        if self._canvas_decided and moment - self._canvas_sampled_at < self.CANVAS_SAMPLE_INTERVAL:
-            return
-        self._canvas_sampled_at = moment
-        agent_dark = self.agent_theme_is_dark(body)
-        if agent_dark is None:
-            return  # nothing to learn from this frame; keep whatever is painted now
-        if not _host_bg_known(self):
-            # THE TERMINAL HAS NOT SAID WHAT IT IS DRAWING ON — no OSC 11 support, or an answer
-            # still in flight (tmux, ssh and forwarded sessions routinely reply after detection's
-            # bounded wait). Leave its colours alone: an unknown background must never be turned
-            # into a repaint of the user's whole screen.
-            #
-            # Guessing here is what broke it. `_host_bg_is_dark` answers "dark" when it does not
-            # know, so a dark agent "matched" a WHITE terminal, no canvas was painted — and the
-            # decision LATCHED, because the code below sets `_canvas_decided`. Every later change
-            # then needs CANVAS_VOTES_TO_SWITCH agreeing samples, so the terminal's real answer,
-            # arriving moments later on stdin, could not simply take effect: the session sat with
-            # the agent's dark panels floating in a white screen until enough repaints happened
-            # to out-vote the guess — which is why it came right only once the user SCROLLED.
-            #
-            # Staying undecided is the whole point: the first sample after the answer lands is
-            # then a FIRST decision, adopted outright, and the throttle above does not apply
-            # while undecided, so it is sampled on the very next reactor tick.
-            self._canvas = None
-            return
-        host_dark = _host_bg_is_dark(self)
-        target = None if agent_dark == host_dark else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
-        # Remember the scheme for the NEXT launch of this backend, so that session starts in
-        # the right colours instead of inferring them again from scratch.
-        getattr(self, "remember_agent_theme", lambda dark: None)(agent_dark)
-        if target == self._canvas:
-            self._canvas_votes = 0
-            self._canvas_decided = True  # what is painted is confirmed; throttle from here
-            return
-        # WHILE IT IS STILL UNCERTAIN, SHOW THE TERMINAL'S OWN COLOURS. Dropping TO the terminal
-        # (target None) is that state, and BEFORE anything is committed it is adopted at once —
-        # it is the safe answer and costs nothing. Moving AWAY from it always needs repeated
-        # agreement, at startup as much as later; and once a canvas IS committed, every change
-        # needs agreement too, including dropping back to the terminal — otherwise one light
-        # banner inside a dark session would repaint the whole background.
-        #
-        # Adopting the first opinionated frame outright is what produced the flash: a backend
-        # asks what background it is drawing on, paints its DEFAULT (dark) while it waits, and
-        # re-themes when the answer arrives. aGiTrack read those first dark frames as the
-        # agent's scheme, painted the whole screen dark to match — and then followed the agent
-        # back to light a moment later. The user saw a dark session turn bright a few seconds in,
-        # which is precisely the flip this whole mechanism exists to prevent.
-        #
-        # Requiring agreement costs nothing now that an undecided canvas is re-sampled on every
-        # reactor tick rather than once per CANVAS_SAMPLE_INTERVAL: a genuinely dark agent is
-        # matched within a few ticks, and a backend still making its mind up never repaints the
-        # screen on the strength of a frame it is about to contradict.
-        if target is not None or self._canvas_decided:
-            self._canvas_votes += 1
-            if self._canvas_votes < self.CANVAS_VOTES_TO_SWITCH:
-                return
-        self._canvas = target
-        self._canvas_votes = 0
-        # "Decided" means COMMITTED to what is on screen, not merely "a frame had an opinion".
-        # It gates the sample throttle, so setting it before adoption made the confirming sample
-        # wait out a whole interval — turning the settling period into a visible delay, which is
-        # the opposite of the point.
-        self._canvas_decided = True
-        # Chrome composed before this decision (the status bar) is a frame behind, so ask for
-        # one more paint: the next frame is drawn entirely in the new scheme.
-        self._render_pending = True
-        getattr(self, "_debug", lambda message: None)(
-            f"agent theme {'dark' if agent_dark else 'light'} vs {'dark' if host_dark else 'light'} "
-            f"terminal → canvas {target[0] if target else 'off (terminal colours)'}"
-        )
-
-    def apply_remembered_theme(self: RendererHost, agent_dark: bool | None) -> None:
-        """Start the session in the scheme this backend used LAST time (``None`` = unknown).
-
-        Inference needs a frame with colour in it, and the backend takes a moment to paint
-        one — so without this the first second of a session is drawn in the terminal's own
-        colours and then visibly flips. The remembered value is only a head start: it is
-        applied before the first frame and replaced without ceremony by the first frame that
-        actually has an opinion, so a theme changed since the last run costs one sample, not
-        a wrong screen for the whole session.
-
-        A FORCED ``agent_background`` needs no guess at all: the canvas is already known from
-        the setting, so it is applied here too — without it a forced session opened in the
-        terminal's colours and only switched on the first frame `update_canvas` saw."""
-        setting = getattr(self, "agent_background", "auto")
-        if setting in {"dark", "light"}:
-            self._canvas = _CANVAS_DARK if setting == "dark" else _CANVAS_LIGHT
-            self._canvas_votes = 0
-            self._canvas_decided = True  # settled by the setting; no frame can overrule it
-            return
-        if agent_dark is None or setting != "auto":
-            return
-        if not _host_bg_known(self):
-            # Same rule as `update_canvas`: with no answer from the terminal there is nothing to
-            # disagree WITH, so the session opens in the terminal's own colours. Applying a
-            # remembered scheme against an assumed background would repaint the whole screen on
-            # the strength of two guesses stacked on each other.
-            self._canvas = None
-            return
-        self._canvas = None if agent_dark == _host_bg_is_dark(self) else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
-        self._canvas_votes = 0
-        self._canvas_decided = False  # a guess, not an observation — the first frame overrules it
+        Called once before the first frame and again whenever the setting is edited, and
+        nowhere else. The canvas cannot therefore change mid-session unless the user changes
+        it: there is no sampling, no vote, no timer and nothing read off the screen, so the
+        background the session opens with is the background it ends with.
+        """
+        setting = getattr(self, "agent_background", "terminal")
+        self._canvas = {"dark": _CANVAS_DARK, "light": _CANVAS_LIGHT}.get(setting)
 
     def canvas_sgr_body(self: RendererHost) -> str:
         """The SGR parameters that paint the canvas colours, or "" when there is no canvas."""
@@ -1380,10 +1202,9 @@ class ScreenRenderer:
         # the terminal's last row instead: an over-large `rows` just overwrites the bottom
         # row and never scrolls, so a stale geometry can't smear the status bar up the screen.
         body = self.visible_lines(rows)
-        # Decide (at most a few times a second) whether the agent's colour scheme disagrees
-        # with the terminal's, before anything in this frame is painted — every reset below
-        # then carries the canvas, so the whole frame is drawn in one consistent scheme.
-        self.update_canvas(body)
+        # No canvas decision here: `_canvas` is fixed by the `agent_background` setting (see
+        # "canvas" above) and every reset below just carries it, so the whole frame is drawn
+        # in one scheme and the frame's CONTENT can never change what that scheme is.
         reset = self.reset_sgr()
         parts = [f"\x1b[?2026h{reset}\x1b[?25l\x1b[H"]
         for index, cells in enumerate(body):

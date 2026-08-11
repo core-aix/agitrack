@@ -1,191 +1,219 @@
-"""Tests for the agent-theme adaptation ("canvas") in agitrack/proxy/renderer.py.
+"""Tests for the agent background ("canvas") in agitrack/proxy/renderer.py.
 
-aGiTrack paints every cell itself, so a cell the backend left at the terminal default used
-to come out in the HOST terminal's background. With a dark agent theme in a light terminal
-that produced a screen that was half dark panels and half white — the bug these cover. The
-canvas fills those cells to match the scheme the AGENT is painting in, and follows the agent
-when the user switches its theme mid-session.
+aGiTrack paints every cell itself, so a cell the backend leaves at the terminal default is
+emitted as such and shows the HOST TERMINAL's background. That is the behaviour, and it is
+not negotiable: the terminal's own colours are the default and the fallback. Only an explicit
+``agent_background`` of "dark"/"light" overrides them, and then for the whole session.
 
-Everything here drives the renderer directly (no pty, no backend): the screen is fed the
-escape sequences a dark- or light-themed agent emits, and the decision is checked against
-the frame it produces.
+The bulk of this file exists because aGiTrack once inferred the agent's own light/dark scheme
+from the colours on screen and repainted the terminal to match. That inference read the
+screen's CONTENT, so it moved with the content: a turn that printed a code block (its own dark
+fill) voted dark, the plain prose after it voted light, and the background flipped back and
+forth every couple of seconds — "the color keeps switching every few seconds, which makes the
+TUI unusable". So the tests below assert the *absence* of that: whatever the agent paints, and
+whatever the terminal's background is, the canvas is a pure function of the setting.
+
+Everything here drives the renderer directly (no pty, no backend).
 """
 
 from __future__ import annotations
 
 import os
 import select
-from types import SimpleNamespace
 
 import pytest
 from proxy_helpers import make_runner
 
+from agitrack.config.settings import GlobalConfig
 from agitrack.proxy.renderer import ScreenRenderer, forced_canvas_osc_values
 
-LIGHT_TERMINAL = b"rgb:ffff/ffff/ffff"
 # The canvas pairs the renderer installs, named so an assertion says which SCHEME it means.
 DARK_CANVAS = ("1c1c1c", "d0d0d0")
 LIGHT_CANVAS = ("ffffff", "1c1c1c")
-DARK_TERMINAL = b"rgb:0000/0000/0000"
 
-# What a themed agent puts on the screen: coloured text, plus a filled panel (an input box,
-# a banner) — the two signals the canvas decision reads.
+# Real Terminal.app profiles, decoded from the user's own preferences. `Novel` and
+# `Silver Aerogel` are the ones that broke the old rule: a cream and an exactly-50%-grey
+# background sit on the light/dark threshold, so the comparison against them was a coin toss.
+TERMINAL_PROFILES = {
+    "Basic": b"rgb:ffff/ffff/ffff",  # white (the profile stores no colour: white IS the default)
+    "Novel": b"rgb:dfdf/dbdb/c3c3",  # cream — mid-tone
+    "Silver Aerogel": b"rgb:8080/8080/8080",  # exactly 50% grey — the worst case
+    "Homebrew": b"rgb:0000/0000/0000",  # black
+    "Ocean": b"rgb:2222/4f4f/bcbc",  # deep blue
+    "Grass": b"rgb:1313/7777/3d3d",  # green
+}
+LIGHT_TERMINAL = TERMINAL_PROFILES["Basic"]
+DARK_TERMINAL = TERMINAL_PROFILES["Homebrew"]
+
+# What a themed agent puts on the screen. These are what the old rule voted on.
 DARK_AGENT = b"\x1b[38;2;212;212;212m" + b"dark theme text line\r\n" * 8 + b"\x1b[48;2;30;30;30m" + b" panel " * 6
 LIGHT_AGENT = b"\x1b[38;2;40;40;40m" + b"light theme text line\r\n" * 8 + b"\x1b[48;2;245;245;245m" + b" panel " * 6
-PLAIN_AGENT = b"no colours here at all\r\n" * 8  # nothing to infer a scheme from
+PLAIN_AGENT = b"no colours here at all\r\n" * 8
+
+# A turn's worth of screens, in the order a real one produces them. The middle frame is the
+# code block whose own dark fill used to flip the vote — the user's own diagnosis: "it shows
+# dark if the view doesn't have a code snippet, and it switches back to bright when there is".
+TURN_FRAMES = [
+    PLAIN_AGENT,
+    LIGHT_AGENT,
+    b"\x1b[48;2;24;24;24m\x1b[38;2;220;220;220m" + b"def render(self): return 1   \r\n" * 9,  # code block
+    LIGHT_AGENT,
+    b"\x1b[48;2;250;250;250m\x1b[38;2;20;20;20m" + b"plain prose after the block  \r\n" * 9,
+    DARK_AGENT,
+    PLAIN_AGENT,
+]
 
 
-def make_renderer(host_bg: bytes | None, feed: bytes, *, setting: str = "auto", rows: int = 12, cols: int = 60):
+def make_renderer(host_bg: bytes | None, feed: bytes, *, setting: str = "terminal", rows: int = 12, cols: int = 60):
     renderer = ScreenRenderer(rows, cols)
     renderer.host_bg_value = host_bg
     renderer.agent_background = setting
+    renderer.apply_agent_background()
     renderer.init_screen(rows, cols)
     assert renderer.stream is not None
     renderer.stream.feed(feed)
     return renderer
 
 
-def sample(renderer, *, times: int = 2) -> None:
-    """Run the canvas decision ``times`` times, far enough apart to clear the throttle.
+def backgrounds_across(renderer, frames) -> list[str]:
+    """The background SGR each frame is painted with, one entry per frame.
 
-    The default is TWO because moving away from the terminal's own colours now needs agreeing
-    samples: a backend paints its default scheme while it waits to be told the background, and
-    adopting that first frame was what made sessions flash dark and then turn bright. Dropping
-    BACK to the terminal is still adopted on the first sample — it is the safe state.
+    Reads the trailing (never-written-to) row, whose colour is the canvas itself: with no
+    canvas it is bare spaces, with one it carries the canvas's fill. Any change in this list
+    is a change the user would have watched happen to their whole screen.
     """
-    body = renderer.visible_lines(renderer.rows)
-    for step in range(times):
-        renderer.update_canvas(body, now=renderer._canvas_sampled_at + 10 * (step + 1))
+    seen = []
+    for frame in frames:
+        renderer.init_screen(renderer.rows, renderer.cols)
+        assert renderer.stream is not None
+        renderer.stream.feed(frame)
+        body = renderer.visible_lines(renderer.rows)
+        seen.append(renderer.render_line(body[len(body) - 1], cols=8))
+    return seen
 
 
 # ---------------------------------------------------------------------------
-# Reading the agent's colour scheme off the screen
+# The rule: the terminal's colours, unless the user said otherwise
 # ---------------------------------------------------------------------------
 
 
-def test_agent_theme_read_from_what_the_backend_paints():
-    dark = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    light = make_renderer(LIGHT_TERMINAL, LIGHT_AGENT)
-    assert dark.agent_theme_is_dark(dark.visible_lines(dark.rows)) is True
-    assert light.agent_theme_is_dark(light.visible_lines(light.rows)) is False
-
-
-def test_an_uncoloured_screen_has_no_opinion():
-    # No fills, no coloured text: nothing to infer, and inferring anyway would flip the
-    # canvas on every plain screen (a backend still starting up, a cleared session).
-    plain = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT)
-    assert plain.agent_theme_is_dark(plain.visible_lines(plain.rows)) is None
-    sample(plain, times=4)
-    assert plain._canvas is None
-
-
-def test_a_few_coloured_cells_do_not_decide_the_screen():
-    # Two coloured words are below every minimum, so a stray highlight can't repaint the
-    # whole background.
-    renderer = make_renderer(LIGHT_TERMINAL, b"plain\r\n\x1b[38;2;250;250;250mtwo words\x1b[0m\r\nplain\r\n")
-    assert renderer.agent_theme_is_dark(renderer.visible_lines(renderer.rows)) is None
-
-
-# ---------------------------------------------------------------------------
-# Adopting (and not adopting) a canvas
-# ---------------------------------------------------------------------------
-
-
-def test_dark_agent_in_a_light_terminal_gets_a_dark_canvas():
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")
-
-
-def test_light_agent_in_a_dark_terminal_gets_a_light_canvas():
-    renderer = make_renderer(DARK_TERMINAL, LIGHT_AGENT)
-    sample(renderer)
-    assert renderer._canvas == ("ffffff", "1c1c1c")
-
-
-@pytest.mark.parametrize("host,feed", [(DARK_TERMINAL, DARK_AGENT), (LIGHT_TERMINAL, LIGHT_AGENT)])
-def test_a_matching_terminal_is_left_completely_alone(host, feed):
-    # The common setup. Nothing is overridden, so the frame is byte-identical to what
-    # aGiTrack drew before the canvas existed.
-    renderer = make_renderer(host, feed)
-    sample(renderer, times=4)
+@pytest.mark.parametrize("agent", [DARK_AGENT, LIGHT_AGENT, PLAIN_AGENT], ids=["dark", "light", "plain"])
+@pytest.mark.parametrize("profile", sorted(TERMINAL_PROFILES), ids=sorted(TERMINAL_PROFILES))
+def test_the_terminals_own_colours_are_kept_whatever_the_agent_paints(profile, agent):
+    # The whole matrix: six real Terminal.app profiles (white, cream, 50% grey, black, blue,
+    # green) against a dark, a light and an uncoloured agent. None of the 18 combinations may
+    # produce a canvas — there is nothing to weigh up, so there is nothing to get wrong.
+    renderer = make_renderer(TERMINAL_PROFILES[profile], agent)
     assert renderer._canvas is None
     assert renderer.reset_sgr() == "\x1b[0m"
     assert renderer.canvas_sgr_body() == ""
 
 
-def test_the_first_canvas_is_adopted_without_waiting_for_repeats():
-    # Votes are only cast when something repaints, and a session that has gone quiet does
-    # not repaint — so requiring repeats here could leave a mismatched screen half dark and
-    # half white until the user typed.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
-    assert renderer._canvas is not None
+def test_an_unknown_terminal_background_changes_nothing_either():
+    # No OSC 11 answer and nothing derivable from the platform. "When in doubt, always use the
+    # terminal's colour" — and being in doubt is not special-cased, because nothing is inferred.
+    for agent in (DARK_AGENT, LIGHT_AGENT):
+        assert make_renderer(None, agent)._canvas is None
 
 
-def test_a_canvas_change_asks_for_a_repaint():
-    # The status bar for this frame was composed before the decision, so the new scheme
-    # needs one more paint to cover the whole screen.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    renderer._render_pending = False
-    sample(renderer)
-    assert renderer._render_pending is True
-
-
-def test_the_decision_is_throttled():
+def test_the_frame_is_emitted_exactly_as_it_would_be_without_the_feature():
     renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
     body = renderer.visible_lines(renderer.rows)
-    renderer.update_canvas(body, now=100.0)
-    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL)  # confirmed
-    assert renderer._canvas is not None
-    renderer._canvas = None  # a further look inside the sample interval must not re-decide
-    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL * 1.5)
+    assert renderer.render_line(body[len(body) - 1], cols=5) == "     "  # untouched row: plain spaces
+
+
+# ---------------------------------------------------------------------------
+# Oscillation: the bug. Content must never move the background.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("profile", sorted(TERMINAL_PROFILES), ids=sorted(TERMINAL_PROFILES))
+def test_a_turns_worth_of_changing_content_never_moves_the_background(profile):
+    """THE BUG: "the color keeps switching between light and dark every few seconds".
+
+    A turn prints prose, then a code block with its own dark fill, then prose again. The old
+    rule read the screen's content, so each of those frames voted differently and the whole
+    background followed — repainting the user's screen every couple of seconds for as long as
+    the session ran. Painting is now decided by the setting alone, so the sequence of frames
+    is irrelevant: every frame in the turn must be painted on the same background.
+    """
+    renderer = make_renderer(TERMINAL_PROFILES[profile], b"")
+    seen = backgrounds_across(renderer, TURN_FRAMES)
+    assert len(set(seen)) == 1, f"the background changed mid-turn: {seen}"
     assert renderer._canvas is None
 
 
+@pytest.mark.parametrize("setting", ["dark", "light"])
+def test_a_forced_background_is_just_as_immovable(setting):
+    # The other half: an explicit setting is not a starting point that content may revise.
+    renderer = make_renderer(TERMINAL_PROFILES["Novel"], b"", setting=setting)
+    canvas = renderer._canvas
+    assert canvas == (DARK_CANVAS if setting == "dark" else LIGHT_CANVAS)
+    seen = backgrounds_across(renderer, TURN_FRAMES)
+    assert len(set(seen)) == 1, f"a forced background moved: {seen}"
+    assert renderer._canvas == canvas
+
+
+def test_painting_a_frame_cannot_touch_the_canvas():
+    """The structural guarantee behind the two tests above.
+
+    `render` used to call `update_canvas` on the body it was about to paint, so *drawing* the
+    screen was also what decided what colour to draw it in. Nothing in the paint path may
+    write `_canvas` any more — that is what makes oscillation impossible rather than rare.
+    """
+    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
+    runner.agent_background = "dark"
+    runner._apply_agent_background(repaint=False)
+    ScreenRenderer.init_screen(runner, 12, 60)
+    for frame in TURN_FRAMES:
+        runner.stream.feed(frame)
+        runner._render()
+        assert runner._canvas == DARK_CANVAS
+
+
+def test_nothing_samples_the_screen_on_a_timer_any_more():
+    """The reactor's timers phase used to rebuild and re-scan the whole visible screen on
+    EVERY tick (`_service_agent_theme` → `update_canvas` → a per-cell scan of the frame,
+    measured at ~3 ms on a 50x200 screen and ~4 ms at 60x240). That ran on the same thread as
+    stdin, up to 60 times a second while output was flowing, purely to re-take a decision that
+    no longer exists. Both the service and the scan it drove are gone."""
+    runner = make_runner()
+    for gone in ("_service_agent_theme", "update_canvas", "agent_theme_is_dark", "remember_agent_theme"):
+        assert not hasattr(runner, gone), f"{gone} is back on the hot path"
+        assert not hasattr(ScreenRenderer, gone), f"ScreenRenderer.{gone} is back"
+
+
+def test_a_frame_builds_the_visible_screen_exactly_once(monkeypatch):
+    # The per-tick scan doubled the screen's cost; the frame itself must still cost one pass.
+    renderer = make_renderer(LIGHT_TERMINAL, LIGHT_AGENT)
+    monkeypatch.setattr("agitrack.proxy.renderer.write_frame", lambda data: None)
+    calls: list[int] = []
+    original = renderer.visible_lines
+    monkeypatch.setattr(renderer, "visible_lines", lambda rows: (calls.append(rows), original(rows))[1])
+    renderer.render(
+        rows=renderer.rows,
+        cols=renderer.cols,
+        scroll_back=0,
+        status_line_str="",
+        input_capturing=False,
+        input_text="",
+        input_matches=[],
+        input_selected=None,
+        message=None,
+        message_sticky=False,
+        message_until=0.0,
+    )
+    assert len(calls) == 1, calls
+
+
 # ---------------------------------------------------------------------------
-# Following a theme switch inside the agent
+# What a forced background actually paints
 # ---------------------------------------------------------------------------
 
 
-def test_switching_the_agent_theme_switches_the_canvas():
-    # The user runs /theme inside the backend: the canvas must follow, not stay on the
-    # scheme the session started in.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")
-
-    renderer.init_screen(renderer.rows, renderer.cols)  # the agent repaints in its new theme
-    assert renderer.stream is not None
-    renderer.stream.feed(LIGHT_AGENT)
-    sample(renderer, times=ScreenRenderer.CANVAS_VOTES_TO_SWITCH)
-    assert renderer._canvas is None  # a light agent in a light terminal needs no canvas
-
-
-def test_one_odd_frame_does_not_flip_an_established_canvas():
-    # A full-screen diff or a light banner inside a dark session is exactly the transient
-    # that must NOT repaint the whole background.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
-    established = renderer._canvas
-
-    renderer.init_screen(renderer.rows, renderer.cols)
-    assert renderer.stream is not None
-    renderer.stream.feed(LIGHT_AGENT)
-    sample(renderer, times=1)  # a single disagreeing sample
-    assert renderer._canvas == established
-
-
-# ---------------------------------------------------------------------------
-# What actually gets painted
-# ---------------------------------------------------------------------------
-
-
-def test_unpainted_cells_carry_the_canvas_instead_of_the_terminal_background():
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
+def test_a_forced_background_fills_the_cells_the_agent_left_alone():
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="dark")
     body = renderer.visible_lines(renderer.rows)
-
     text_line = renderer.render_line(body[0], cols=20)
     assert "48;2;28;28;28" in text_line  # the agent's own text now sits on the canvas
     empty_line = renderer.render_line(body[len(body) - 1], cols=10)
@@ -193,16 +221,8 @@ def test_unpainted_cells_carry_the_canvas_instead_of_the_terminal_background():
     assert "38;2;208;208;208" in empty_line  # with a legible default foreground
 
 
-def test_without_a_canvas_the_line_is_emitted_exactly_as_before():
-    renderer = make_renderer(DARK_TERMINAL, DARK_AGENT)
-    sample(renderer)
-    body = renderer.visible_lines(renderer.rows)
-    assert renderer.render_line(body[len(body) - 1], cols=5) == "     "  # untouched row: plain spaces
-
-
-def test_agitracks_own_chrome_sits_on_the_canvas():
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    sample(renderer)
+def test_agitracks_own_chrome_sits_on_a_forced_canvas():
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="dark")
     # The status bar inverts the canvas colours (not the terminal's), and a popup's
     # interior resets to them, so aGiTrack's UI reads as part of the same screen.
     status = renderer.status_line(
@@ -222,32 +242,22 @@ def test_agitracks_own_chrome_sits_on_the_canvas():
     assert any("48;2;28;28;28" in part for part in parts)
 
 
-# ---------------------------------------------------------------------------
-# The agent_background setting
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("setting,canvas", [("dark", DARK_CANVAS), ("light", LIGHT_CANVAS)])
+def test_a_forced_background_is_in_place_before_the_first_frame(setting, canvas):
+    # Nothing has to be observed first — the setting IS the answer — so the session opens in
+    # it rather than switching over once something has been painted.
+    renderer = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT, setting=setting)
+    assert renderer._canvas == canvas
 
 
-def test_forced_dark_and_light_ignore_both_the_agent_and_the_terminal():
-    dark = make_renderer(DARK_TERMINAL, LIGHT_AGENT, setting="dark")
-    sample(dark)
-    assert dark._canvas == ("1c1c1c", "d0d0d0")
-    light = make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="light")
-    sample(light)
-    assert light._canvas == ("ffffff", "1c1c1c")
+def test_a_forced_background_needs_no_answer_from_the_terminal():
+    for setting, expected in (("dark", DARK_CANVAS), ("light", LIGHT_CANVAS)):
+        assert make_renderer(None, DARK_AGENT, setting=setting)._canvas == expected
 
 
-def test_terminal_setting_opts_out_of_the_whole_feature():
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="terminal")
-    sample(renderer, times=4)
-    assert renderer._canvas is None
-    assert renderer.reset_sgr() == "\x1b[0m"
-
-
-def test_an_unknown_host_background_is_treated_as_dark():
-    # A terminal that never answered the OSC 11 query: assume the common default rather
-    # than repainting a screen on a guess.
-    renderer = make_renderer(None, DARK_AGENT)
-    sample(renderer, times=4)
+def test_an_unrecognised_setting_falls_back_to_the_terminals_colours():
+    # Belt and braces for a hand-edited config: anything not understood must be the safe state.
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="chartreuse")
     assert renderer._canvas is None
 
 
@@ -256,78 +266,24 @@ def test_an_unknown_host_background_is_treated_as_dark():
 # ---------------------------------------------------------------------------
 
 
-def test_only_a_forced_background_is_reported_to_the_backend():
-    # Under "auto" the relay stays truthful: the canvas is inferred FROM what the backend
-    # paints, so reporting it back could make the two chase each other.
+def test_the_terminals_real_colour_is_what_the_backend_is_told():
+    """This is why no adaptation is needed. A backend that themes itself asks the terminal
+    what background it is on; aGiTrack answers truthfully — including from the platform when
+    the terminal itself will not answer at all (Apple Terminal) — so the backend paints for
+    the user's actual terminal and there is nothing left to disagree with."""
     assert forced_canvas_osc_values(make_renderer(LIGHT_TERMINAL, DARK_AGENT)) is None
-    assert forced_canvas_osc_values(make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="terminal")) is None
+
+
+def test_a_forced_background_is_reported_in_place_of_the_terminals():
     forced = forced_canvas_osc_values(make_renderer(LIGHT_TERMINAL, DARK_AGENT, setting="dark"))
     assert forced == (b"rgb:d0d0/d0d0/d0d0", b"rgb:1c1c/1c1c/1c1c")
     forced_light = forced_canvas_osc_values(make_renderer(DARK_TERMINAL, LIGHT_AGENT, setting="light"))
     assert forced_light == (b"rgb:1c1c/1c1c/1c1c", b"rgb:ffff/ffff/ffff")
 
 
-# ---------------------------------------------------------------------------
-# The runner side: ProxyRunner drives the canvas through its own delegation
-# ---------------------------------------------------------------------------
-
-
-def test_the_runner_exposes_every_canvas_hook_the_renderer_calls():
-    # ScreenRenderer's methods run with ``self`` being the ProxyRunner (duck-typed
-    # delegation), so a hook the runner doesn't re-export makes EVERY frame raise —
-    # the screen then freezes on whatever was painted last. Regression test for exactly
-    # that: reset_sgr/update_canvas were called by render before the runner re-exported them.
-    runner = make_runner(cols=20)
-    for name in ("reset_sgr", "canvas_sgr_body", "update_canvas", "agent_theme_is_dark"):
-        assert callable(getattr(runner, name)), name
-    assert runner.reset_sgr() == "\x1b[0m"  # no canvas by default
-    for constant in (
-        "CANVAS_SAMPLE_INTERVAL",
-        "CANVAS_VOTES_TO_SWITCH",
-        "CANVAS_MIN_BG_CELLS",
-        "CANVAS_MIN_FG_CELLS",
-        "CANVAS_MAJORITY",
-    ):
-        assert getattr(runner, constant) == getattr(ScreenRenderer, constant), constant
-
-
-def _runner_showing(feed: bytes, *, host_bg: bytes, setting: str = "auto"):
-    """A runner whose screen holds what a themed agent painted."""
-    runner = make_runner(rows=12, cols=60, host_bg_value=host_bg)
-    runner.agent_background = setting
-    ScreenRenderer.init_screen(runner, 12, 60)
-    runner.stream.feed(feed)
-    return runner
-
-
-def test_the_runner_follows_a_theme_change_while_the_screen_is_idle():
-    # The decision is also taken from the main loop, not only while painting: after the
-    # agent falls quiet nothing repaints, and a mismatched screen would otherwise stay
-    # mismatched until the user typed.
-    runner = _runner_showing(DARK_AGENT, host_bg=LIGHT_TERMINAL)
-    # Two ticks, because moving off the terminal's own colours needs agreeing samples now — and
-    # this is the path that supplies them when nothing is repainting. The ticks are not made to
-    # wait for each other: the throttle only starts once a canvas is committed.
-    runner._service_agent_theme()
-    runner._service_agent_theme()
-    assert runner._canvas == ("1c1c1c", "d0d0d0")
-
-
-def test_the_runner_theme_service_is_silent_when_opted_out():
-    runner = _runner_showing(DARK_AGENT, host_bg=LIGHT_TERMINAL, setting="terminal")
-    runner._service_agent_theme()
-    assert runner._canvas is None
-
-
-def test_the_runner_theme_service_never_raises_without_a_screen():
-    runner = make_runner()
-    runner.screen = None
-    runner._service_agent_theme()  # must be a no-op, not an exception in the main loop
-
-
-def test_a_forced_background_is_what_the_backend_is_told(monkeypatch):
-    # A backend that themes itself from the reported background (OpenCode) has to agree
-    # with the canvas aGiTrack paints, or the two schemes fight.
+def test_what_the_runner_answers_the_backend_with(monkeypatch):
+    # A backend that themes itself from the reported background (codex, opencode) has to agree
+    # with whatever aGiTrack paints, or the two schemes fight.
     runner = make_runner(
         master_fd=99,
         host_fg_value=b"rgb:0000/0000/0000",
@@ -347,7 +303,7 @@ def test_a_forced_background_is_what_the_backend_is_told(monkeypatch):
 
     monkeypatch.setattr(os, "write", fake_write)
 
-    runner.agent_background = "auto"
+    runner.agent_background = "terminal"
     runner._answer_terminal_queries(b"\x1b]11;?\x07")
     assert written == [b"\x1b]11;" + LIGHT_TERMINAL + b"\x07"]  # the terminal's real colour
 
@@ -358,167 +314,75 @@ def test_a_forced_background_is_what_the_backend_is_told(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Starting in the right colours (no visible flip a beat after launch)
+# The runner side
 # ---------------------------------------------------------------------------
 
 
-def test_a_remembered_theme_paints_the_first_frame_before_any_output_arrives():
-    # Inference needs a frame with colour in it, and the backend takes a moment to draw one.
-    # The scheme carried over from the last run covers exactly that gap.
-    renderer = ScreenRenderer(12, 60)
-    renderer.host_bg_value = LIGHT_TERMINAL
-    renderer.agent_background = "auto"
-    renderer.init_screen(12, 60)
-
-    renderer.apply_remembered_theme(True)  # last session's agent painted dark
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")
-    body = renderer.visible_lines(renderer.rows)
-    assert "48;2;28;28;28" in renderer.render_line(body[0], cols=10)  # …and it is already painted
-
-
-def test_an_unknown_or_matching_remembered_theme_changes_nothing():
-    renderer = make_renderer(LIGHT_TERMINAL, b"")
-    renderer.apply_remembered_theme(None)  # never seen this backend before
-    assert renderer._canvas is None
-    renderer.apply_remembered_theme(False)  # light agent, light terminal → no canvas needed
-    assert renderer._canvas is None
-
-
-def test_a_remembered_theme_is_ignored_when_the_user_forced_one():
-    renderer = make_renderer(LIGHT_TERMINAL, b"", setting="terminal")
-    renderer.apply_remembered_theme(True)
-    assert renderer._canvas is None
-
-
-def test_the_first_real_frame_overrules_a_remembered_theme_at_once():
-    # The user switched the agent's theme between sessions: the remembered scheme is a guess,
-    # so it must not need repeated agreement to be replaced.
-    renderer = make_renderer(LIGHT_TERMINAL, LIGHT_AGENT)
-    renderer.apply_remembered_theme(True)  # remembered dark…
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")
-    sample(renderer)  # …but this session's agent is light
-    assert renderer._canvas is None
-
-
-def test_frames_are_sampled_without_a_throttle_until_the_scheme_is_known():
-    # Throttling before the first decision would show the wrong colours for up to a sample
-    # interval at startup — the delay this removes. Afterwards the throttle applies again.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    body = renderer.visible_lines(renderer.rows)
-    renderer.update_canvas(body, now=100.0)
-    # Confirmation is required, but it is not made to WAIT: while undecided every frame is
-    # examined, so the confirming sample is the very next one rather than a sample interval away.
-    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL / 10)
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")
-    assert renderer._canvas_decided is True
-
-
-def test_the_scheme_is_remembered_for_the_next_launch():
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    remembered: list[bool] = []
-    renderer.remember_agent_theme = remembered.append  # type: ignore[attr-defined]
-    sample(renderer)
-    assert remembered and all(remembered)  # recorded on each sample; the value is what matters
-
-
-def test_the_runner_starts_from_the_scheme_the_backend_used_last_time(monkeypatch):
-    written: list[bytes] = []
-    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
-    runner.agent_background = "auto"
-    runner.global_config = SimpleNamespace(agent_theme_seen=lambda backend: True)
-    monkeypatch.setattr("agitrack.proxy.renderer.write_frame", written.append)
-
-    runner._apply_remembered_agent_theme()
-
-    assert runner._canvas == ("1c1c1c", "d0d0d0")
-    # The alternate screen was just cleared to the TERMINAL's background; repaint it in the
-    # agent's, or the user stares at a white screen until the backend's first frame lands.
-    assert written and written[0].endswith(b"\x1b[2J\x1b[H")
-    assert b"48;2;28;28;28" in written[0]
-
-
-def test_the_runner_records_the_scheme_it_observes(monkeypatch):
-    recorded: list[tuple] = []
-    runner = make_runner(backend="opencode")
-    runner.global_config = SimpleNamespace(set_agent_theme_seen=lambda backend, dark: recorded.append((backend, dark)))
-    runner.remember_agent_theme(True)
-    assert recorded == [(runner.active.backend, True)]  # per backend: one may be dark, another light
-
-
-def test_a_missing_or_broken_config_never_blocks_startup():
-    runner = make_runner(host_bg_value=LIGHT_TERMINAL)
-    runner.global_config = None  # e.g. a bare/for_testing runner
-    runner._apply_remembered_agent_theme()  # must not raise: this is only a display head start
-    runner.remember_agent_theme(True)
-    assert runner._canvas is None
-
-
-# ---------------------------------------------------------------------------
-# What counts as "text" in the foreground signal
-# ---------------------------------------------------------------------------
-
-# Claude's opening screen, to scale: two full-width rules in one grey and a footer of real
-# text in another. Both greys are mid-range, but only the TEXT one moves with the theme —
-# the light theme writes #666666 text between #999999 rules, the dark theme writes #999999
-# text between #888888 rules. Counting every coloured glyph therefore calls BOTH of them
-# dark (the rules outnumber the text 300 to 144); counting only letters and digits reads
-# them correctly. This was live: a light-themed Claude in a dark terminal was never
-# recognised, so the canvas never came on and its dark-on-dark text stayed unreadable.
-CLAUDE_LIGHT_SPLASH = (
-    b"\x1b[38;2;153;153;153m" + b"-" * 150 + b"\r\n" + b"-" * 150 + b"\r\n"
-    b"\x1b[38;2;102;102;102m" + b"manual mode on 24 shortcuts here " * 4 + b"\r\n"
-)
-CLAUDE_DARK_SPLASH = (
-    b"\x1b[38;2;136;136;136m" + b"-" * 150 + b"\r\n" + b"-" * 150 + b"\r\n"
-    b"\x1b[38;2;153;153;153m" + b"manual mode on 24 shortcuts here " * 4 + b"\r\n"
-)
-
-
-def test_the_text_signal_ignores_rules_and_box_drawing():
-    light = make_renderer(DARK_TERMINAL, CLAUDE_LIGHT_SPLASH, rows=6, cols=150)
-    dark = make_renderer(LIGHT_TERMINAL, CLAUDE_DARK_SPLASH, rows=6, cols=150)
-    assert light.agent_theme_is_dark(light.visible_lines(light.rows)) is False
-    assert dark.agent_theme_is_dark(dark.visible_lines(dark.rows)) is True
-
-
-def test_a_light_agent_in_a_dark_terminal_gets_a_light_canvas_from_the_splash():
-    # The mirror of the original complaint, on the frame that is actually on screen at startup.
-    renderer = make_renderer(DARK_TERMINAL, CLAUDE_LIGHT_SPLASH, rows=6, cols=150)
-    sample(renderer)
-    assert renderer._canvas == ("ffffff", "1c1c1c")
-
-
-# ---------------------------------------------------------------------------
-# A forced background is known before anything is painted
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("setting,canvas", [("dark", ("1c1c1c", "d0d0d0")), ("light", ("ffffff", "1c1c1c"))])
-def test_a_forced_background_is_applied_before_the_first_frame(setting, canvas):
-    # Nothing has to be inferred or remembered here — the setting IS the answer — so the
-    # session must open in it instead of switching over once the first frame is sampled.
-    renderer = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT, setting=setting)
-    renderer.apply_remembered_theme(None)
-    assert renderer._canvas == canvas
-
-
-def test_opting_out_still_starts_with_no_canvas():
-    renderer = make_renderer(LIGHT_TERMINAL, PLAIN_AGENT, setting="terminal")
-    renderer.apply_remembered_theme(True)
-    assert renderer._canvas is None
+def test_the_runner_exposes_every_canvas_hook_the_renderer_calls():
+    # ScreenRenderer's methods run with ``self`` being the ProxyRunner (duck-typed
+    # delegation), so a hook the runner doesn't re-export makes EVERY frame raise —
+    # the screen then freezes on whatever was painted last.
+    runner = make_runner(cols=20)
+    for name in ("reset_sgr", "canvas_sgr_body", "apply_agent_background"):
+        assert callable(getattr(runner, name)), name
+    assert runner.reset_sgr() == "\x1b[0m"  # no canvas by default
 
 
 def test_the_runner_fills_the_cleared_screen_for_a_forced_background(monkeypatch):
     written: list[bytes] = []
     runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
     runner.agent_background = "dark"
-    runner.global_config = SimpleNamespace(agent_theme_seen=lambda backend: None)  # never observed
     monkeypatch.setattr("agitrack.proxy.renderer.write_frame", written.append)
 
-    runner._apply_remembered_agent_theme()
+    runner._apply_agent_background()
 
-    assert runner._canvas == ("1c1c1c", "d0d0d0")
+    assert runner._canvas == DARK_CANVAS
+    # The alternate screen was just cleared to the TERMINAL's background; repaint it in the
+    # forced one, or the user stares at a white screen until the backend's first frame lands.
     assert written and written[0].endswith(b"\x1b[2J\x1b[H") and b"48;2;28;28;28" in written[0]
+
+
+def test_the_default_setting_writes_nothing_to_the_screen(monkeypatch):
+    # Nothing to fill, so no frame — the terminal's own cleared screen is already correct.
+    written: list[bytes] = []
+    runner = make_runner(rows=12, cols=60, host_bg_value=LIGHT_TERMINAL)
+    monkeypatch.setattr("agitrack.proxy.renderer.write_frame", written.append)
+    runner._apply_agent_background()
+    assert runner._canvas is None
+    assert written == []
+
+
+def test_a_missing_or_broken_config_never_blocks_startup():
+    runner = make_runner(host_bg_value=LIGHT_TERMINAL)
+    runner.global_config = None  # e.g. a bare/for_testing runner
+    runner._apply_agent_background()  # must not raise: this is a display detail
+    assert runner._canvas is None
+
+
+# ---------------------------------------------------------------------------
+# The setting itself
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_is_the_terminals_own_colours(tmp_path):
+    assert GlobalConfig(path=tmp_path / "config.json").agent_background == "terminal"
+    assert GlobalConfig.AGENT_BACKGROUND_CHOICES == ("terminal", "dark", "light")
+
+
+def test_a_config_still_holding_the_old_auto_reads_as_terminal(tmp_path):
+    # "auto" was the inference that oscillated. Every config on every machine that ran the
+    # old default still says it, and it must decay to the safe state, not to a guess.
+    path = tmp_path / "config.json"
+    path.write_text('{"agent_background": "auto"}\n', encoding="utf-8")
+    assert GlobalConfig(path=path).agent_background == "terminal"
+
+
+def test_setting_it_to_something_unknown_falls_back_to_terminal(tmp_path):
+    config = GlobalConfig(path=tmp_path / "config.json")
+    config.agent_background = "auto"
+    assert config.agent_background == "terminal"
+    config.agent_background = "dark"
+    assert config.agent_background == "dark"
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +400,10 @@ def test_the_backend_is_answered_before_the_reactor_starts():
     within ~0.1 s (measured for codex). aGiTrack spawns it early on purpose and used to read
     nothing until the reactor started — one slow startup step later — so the query expired
     unread and the backend fell back to its no-information defaults: codex drew its DARK
-    palette, and no panel tint at all, in a white terminal, in every session."""
+    palette, and no panel tint at all, in a white terminal, in every session.
+
+    This is now the ONLY thing keeping a self-theming backend in step with the terminal, so
+    it matters more than it did: get the answer to it, and nothing has to be adapted after."""
     import pty
     import time
     import tty
@@ -578,135 +445,3 @@ def test_stopping_the_early_service_is_safe_to_repeat():
     runner._stop_early_capability_service()
     runner._stop_early_capability_service()
     assert runner._early_capability_thread is None
-
-
-def test_the_memory_is_keyed_by_the_backend_name_not_the_agent_object():
-    """A session's ``backend`` field holds the proxy AGENT. Keying on ``str()`` of it wrote
-    ``<...ClaudeProxyAgent object at 0x103e09010>`` — a new key every launch, so nothing was
-    ever read back (every start was a cold start) and the shared config grew without bound.
-    Seen in the wild: two such keys in the developer's own config.json."""
-    runner = make_runner()
-    runner.active.backend = SimpleNamespace(name="codex")
-    assert runner._theme_memory_key() == "codex"
-
-
-def test_the_memory_key_falls_back_to_the_runner_and_then_the_state():
-    runner = make_runner()
-    runner.active.backend = None
-    runner.backend = SimpleNamespace(name="opencode")
-    assert runner._theme_memory_key() == "opencode"
-
-
-# ---------------------------------------------------------------------------
-# An unknown terminal background is not an excuse to repaint the user's screen
-# ---------------------------------------------------------------------------
-
-
-def test_an_unknown_terminal_background_leaves_the_terminals_own_colours_alone():
-    """No OSC 11 answer means no opinion — so nothing is repainted.
-
-    `_host_bg_is_dark` must return a bool for accent contrast and guesses DARK when it does not
-    know. Acting on that guess here repainted whole sessions wrongly: a dark agent "matched" an
-    unknown-therefore-dark terminal, so no canvas was painted — and in a WHITE terminal the user
-    was left reading the agent's dark panels floating in white, which is the mixed screen this
-    feature exists to prevent.
-    """
-    for agent in (DARK_AGENT, LIGHT_AGENT):
-        renderer = make_renderer(None, agent)
-        sample(renderer)
-        assert renderer._canvas is None, "an unknown background must not paint a canvas"
-
-
-def test_an_unknown_background_stays_undecided_so_the_terminals_answer_still_counts():
-    """THE BUG THE USER SAW: "it only shows the correct color after I scroll".
-
-    Detection waits a bounded time, and tmux / ssh / forwarded terminals routinely answer after
-    it. The reply lands moments later — but the guess had already LATCHED `_canvas_decided`, and
-    every change after the first needs CANVAS_VOTES_TO_SWITCH agreeing samples. So the real
-    answer could not simply take effect; it had to out-vote the guess, and votes are only cast
-    when something repaints. A quiet session therefore stayed wrong until the user scrolled.
-
-    Staying undecided makes the first sample after the answer a FIRST decision, adopted at once.
-    """
-    renderer = make_renderer(None, DARK_AGENT)
-    sample(renderer)
-    assert renderer._canvas is None
-    assert not renderer._canvas_decided, "a guess must never latch the decision"
-
-    renderer.host_bg_value = LIGHT_TERMINAL  # the terminal's late reply arrives
-    sample(renderer)  # ONE sample, not CANVAS_VOTES_TO_SWITCH of them
-
-    assert renderer._canvas == DARK_CANVAS
-
-
-def test_an_unknown_background_is_resampled_immediately_not_after_the_throttle():
-    # The throttle applies only once a real decision exists. While abstaining the renderer must
-    # keep looking every tick, or the late answer waits out a sample interval on top.
-    renderer = make_renderer(None, DARK_AGENT)
-    body = renderer.visible_lines(renderer.rows)
-    renderer.update_canvas(body, now=100.0)
-    renderer.host_bg_value = LIGHT_TERMINAL
-    # Both confirming samples land far INSIDE one CANVAS_SAMPLE_INTERVAL: nothing is committed
-    # yet, so the throttle does not apply and the settling period is not also a delay.
-    renderer.update_canvas(body, now=100.001)
-    renderer.update_canvas(body, now=100.002)
-
-    assert renderer._canvas == DARK_CANVAS
-
-
-def test_a_remembered_scheme_is_not_applied_against_an_assumed_background():
-    # The pre-paint head start has the same rule: two guesses stacked on each other must not
-    # repaint the screen before a single frame has been seen.
-    renderer = make_renderer(None, b"")
-    renderer.apply_remembered_theme(True)
-    assert renderer._canvas is None
-
-    renderer.host_bg_value = LIGHT_TERMINAL
-    renderer.apply_remembered_theme(True)
-    assert renderer._canvas == DARK_CANVAS
-
-
-def test_a_forced_background_still_applies_without_any_terminal_answer():
-    # Abstaining is only for `auto`. An explicit setting is the user's own instruction and needs
-    # no terminal cooperation at all.
-    for setting, expected in (("dark", DARK_CANVAS), ("light", LIGHT_CANVAS)):
-        renderer = make_renderer(None, DARK_AGENT, setting=setting)
-        renderer.apply_remembered_theme(None)
-        assert renderer._canvas == expected
-
-
-def test_the_backends_pre_answer_default_never_repaints_the_screen():
-    """THE FLASH THE USER SAW: "starts dark, switches to bright a few seconds later".
-
-    A backend asks the terminal what background it is drawing on and paints its OWN default —
-    dark — while it waits. Adopting that first opinionated frame outright meant aGiTrack
-    repainted the whole screen dark to match a scheme the agent was about to abandon, then
-    followed it back to light once the answer arrived. During any uncertain period the screen
-    must simply stay in the TERMINAL's colours.
-    """
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    body = renderer.visible_lines(renderer.rows)
-
-    renderer.update_canvas(body, now=100.0)  # the agent's dark pre-answer frame
-    assert renderer._canvas is None, "one frame of the agent's default must not repaint anything"
-
-    # It learns the background and repaints light — agreeing with the terminal, so still nothing.
-    renderer.init_screen(renderer.rows, renderer.cols)
-    assert renderer.stream is not None
-    renderer.stream.feed(LIGHT_AGENT)
-    renderer.update_canvas(renderer.visible_lines(renderer.rows), now=100.1)
-
-    assert renderer._canvas is None, "the session never left the terminal's own colours"
-
-
-def test_an_agent_that_really_is_dark_is_still_matched_promptly():
-    # The other half: settling must not become a delay. A backend whose scheme is genuinely dark
-    # keeps saying so, and the confirming sample is the very next frame — no throttle applies
-    # until something is committed.
-    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
-    body = renderer.visible_lines(renderer.rows)
-
-    renderer.update_canvas(body, now=100.0)
-    renderer.update_canvas(body, now=100.001)  # far inside CANVAS_SAMPLE_INTERVAL
-
-    assert renderer._canvas == DARK_CANVAS

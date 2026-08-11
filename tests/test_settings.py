@@ -486,24 +486,28 @@ def test_save_repo_really_preserves_keys_it_does_not_own(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_agent_background_defaults_to_auto_and_rejects_nonsense(tmp_path):
+def test_agent_background_defaults_to_the_terminals_own_colours(tmp_path):
     config = GlobalConfig(path=tmp_path / "config.json")
-    assert config.agent_background == "auto"  # follow the agent's own light/dark theme
+    assert config.agent_background == "terminal"  # the safe default: never repaint the screen
 
     config.agent_background = "DARK"  # case-insensitive
     assert config.agent_background == "dark"
     config.agent_background = "chartreuse"  # unrecognised ⇒ back to the safe default
-    assert config.agent_background == "auto"
+    assert config.agent_background == "terminal"
+    # "auto" was the inference that flipped the background back and forth with the screen's
+    # content. Configs written by an older aGiTrack still carry it; it must decay to "terminal".
+    config.agent_background = "auto"
+    assert config.agent_background == "terminal"
 
 
 def test_agent_background_is_a_seeded_knob_and_repo_overridable(tmp_path):
     config = GlobalConfig(path=tmp_path / "config.json")
     config.seed_defaults()
-    assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["agent_background"] == "auto"
+    assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["agent_background"] == "terminal"
 
     config.load_repo_overlay(tmp_path / "repo")
-    config.set("agent_background", "terminal", scope="repo")  # opt out for this repo only
-    assert config.agent_background == "terminal"
+    config.set("agent_background", "dark", scope="repo")  # force it for this repo only
+    assert config.agent_background == "dark"
 
 
 def test_agent_background_is_offered_in_the_settings_menu():
@@ -514,60 +518,4 @@ def test_agent_background_is_offered_in_the_settings_menu():
     spec = next(entry for entry in specs if entry["key"] == "agent_background")
     assert spec["kind"] == "choice"
     assert spec["options"] == list(GlobalConfig.AGENT_BACKGROUND_CHOICES)
-    assert not spec.get("restart")  # it is read every frame, so it applies immediately
-
-
-def test_agent_theme_seen_round_trips_per_backend(tmp_path):
-    # Remembered STATE, not a setting: it exists so a session can open in the right colours
-    # instead of inferring them again while the user watches.
-    config = GlobalConfig(path=tmp_path / "config.json")
-    assert config.agent_theme_seen("claude") is None  # never observed
-
-    config.set_agent_theme_seen("claude", True)
-    config.set_agent_theme_seen("opencode", False)  # one agent dark, another light
-    assert config.agent_theme_seen("claude") is True
-    assert config.agent_theme_seen("opencode") is False
-    assert GlobalConfig(path=tmp_path / "config.json").agent_theme_seen("claude") is True  # survives a restart
-
-
-def test_agent_theme_seen_drops_keys_left_by_the_object_repr_bug(tmp_path):
-    # An earlier aGiTrack keyed this by str(<proxy agent object>), so every launch filed the
-    # scheme under a fresh key containing a memory address: never read back, and the shared
-    # config grew one entry per session forever. Writing prunes what that left behind.
-    path = tmp_path / "config.json"
-    path.write_text(
-        json.dumps(
-            {
-                "agent_theme_seen": {
-                    "<agitrack.backends.proxy_agents.ClaudeProxyAgent object at 0x103e09010>": "light",
-                    "<agitrack.backends.proxy_agents.ClaudeProxyAgent object at 0x105109010>": "light",
-                    "opencode": "dark",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    config = GlobalConfig(path=path)
-    config.set_agent_theme_seen("claude", False)
-    assert set(GlobalConfig(path=path).data["agent_theme_seen"]) == {"claude", "opencode"}
-
-
-def test_agent_theme_seen_writes_only_when_it_changed(tmp_path, monkeypatch):
-    # It is recorded from the render path, and the global file is shared by every aGiTrack
-    # process on the machine — so an unchanged value must not rewrite it.
-    config = GlobalConfig(path=tmp_path / "config.json")
-    config.set_agent_theme_seen("claude", True)
-    saves = []
-    monkeypatch.setattr(GlobalConfig, "save", lambda self: saves.append(1))
-    config.set_agent_theme_seen("claude", True)
-    assert saves == []
-    config.set_agent_theme_seen("claude", False)
-    assert saves == [1]
-
-
-def test_agent_theme_seen_is_not_advertised_as_a_setting(tmp_path):
-    # _default_config is the user-facing knob registry; remembered state does not belong in it
-    # (same rule as pending_manual_update / session_sharing).
-    config = GlobalConfig(path=tmp_path / "config.json")
-    config.seed_defaults()
-    assert "agent_theme_seen" not in json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert not spec.get("restart")  # saving it re-derives the canvas and repaints, so it applies at once
