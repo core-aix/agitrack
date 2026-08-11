@@ -1737,6 +1737,18 @@ class ProxyRunner:
             self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
+        # ANSWER THE BACKEND FROM THE MOMENT IT EXISTS. It asks what background it is drawing on
+        # within milliseconds of starting and gives up in well under a second, but everything
+        # that could answer used to happen much later: a dozen startup steps, and then
+        # `_detect_host_terminal` — which BLOCKS for its whole timeout on a terminal that never
+        # replies at all (Apple Terminal implements no colour report). The question expired
+        # unread on every launch, the backend fell back to its own default (dark), and the
+        # session opened dark in a white terminal, only coming right seconds later once the
+        # agent had been told the truth some other way. A platform-derived background needs no
+        # round trip, so it is known HERE — before anything else runs — and the responder starts
+        # at once. `_detect_host_terminal` still refines it: a real reply always wins.
+        self._seed_derived_host_background()
+        self._start_early_capability_service()
         self._start_file_watcher()
         # Identify the reactor thread and open the self-pipe the git worker writes to
         # so it can wake `select` on demand (e.g. to present a dialog) instead of
@@ -9963,13 +9975,33 @@ class ProxyRunner:
         # because it had no background to compare the agent against either. Ask the platform
         # instead; `detect_host_background` is read-only and never prompts. Only a terminal that
         # stayed silent is asked, so a real answer is never second-guessed.
-        if not self.host_bg_value:
-            from agitrack.proxy.host_background import detect_host_background
+        self._seed_derived_host_background()
 
+    def _seed_derived_host_background(self) -> None:
+        """Fill in the terminal's background from the platform when it will not report one.
+
+        SOME TERMINALS NEVER ANSWER `OSC 11`. macOS Terminal.app is the common one: it draws
+        true colour perfectly well but implements no colour REPORT, so detection waits out its
+        whole timeout on every launch and learns nothing. With no background to relay, the
+        backend falls back to its own default — dark — and paints a dark UI in a white terminal.
+
+        Called twice on purpose: once immediately after the spawn, so the responder has an
+        answer before the backend's question arrives, and again after `_detect_host_terminal`,
+        for the terminal that answers but whose reply carried no usable colour. Only a value we
+        do not already have is filled in, so a real reply is never overwritten by a derived one.
+        """
+        if self.host_bg_value:
+            return
+        from agitrack.proxy.host_background import detect_host_background
+
+        try:
             derived = detect_host_background()
-            if derived:
-                self.host_bg_value = derived
-                self._debug(f"host background derived from the platform: {derived!r}")
+        except Exception as error:  # a colour hint is never worth failing startup
+            self._debug(f"host background derivation failed: {error!r}")
+            return
+        if derived:
+            self.host_bg_value = derived
+            self._debug(f"host background derived from the platform: {derived!r}")
         # If the menu key requires shift modifier, enable the kitty keyboard protocol
         # so the terminal sends distinguishable escape sequences.
         if self.global_config.is_shift_modified:

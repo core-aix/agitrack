@@ -981,27 +981,42 @@ class ScreenRenderer:
             return
         host_dark = _host_bg_is_dark(self)
         target = None if agent_dark == host_dark else (_CANVAS_DARK if agent_dark else _CANVAS_LIGHT)
-        decided = self._canvas_decided
-        self._canvas_decided = True
         # Remember the scheme for the NEXT launch of this backend, so that session starts in
         # the right colours instead of inferring them again from scratch.
         getattr(self, "remember_agent_theme", lambda dark: None)(agent_dark)
         if target == self._canvas:
             self._canvas_votes = 0
+            self._canvas_decided = True  # what is painted is confirmed; throttle from here
             return
-        # The first inferred canvas is adopted as soon as a frame has an opinion — including
-        # over a scheme carried in from the last session, which is a guess until the running
-        # agent contradicts it. Waiting for repeats would be worse than useless: votes are only
-        # cast when something repaints, and a screen that has gone quiet doesn't — so a
-        # mismatched session could sit there, half dark and half white, until the user typed.
-        # Every change after that (including dropping back to the terminal's own colours) does
-        # need repeated agreement, so a transient diff or coloured banner can't flip it.
-        if decided:
+        # WHILE IT IS STILL UNCERTAIN, SHOW THE TERMINAL'S OWN COLOURS. Dropping TO the terminal
+        # (target None) is that state, and BEFORE anything is committed it is adopted at once —
+        # it is the safe answer and costs nothing. Moving AWAY from it always needs repeated
+        # agreement, at startup as much as later; and once a canvas IS committed, every change
+        # needs agreement too, including dropping back to the terminal — otherwise one light
+        # banner inside a dark session would repaint the whole background.
+        #
+        # Adopting the first opinionated frame outright is what produced the flash: a backend
+        # asks what background it is drawing on, paints its DEFAULT (dark) while it waits, and
+        # re-themes when the answer arrives. aGiTrack read those first dark frames as the
+        # agent's scheme, painted the whole screen dark to match — and then followed the agent
+        # back to light a moment later. The user saw a dark session turn bright a few seconds in,
+        # which is precisely the flip this whole mechanism exists to prevent.
+        #
+        # Requiring agreement costs nothing now that an undecided canvas is re-sampled on every
+        # reactor tick rather than once per CANVAS_SAMPLE_INTERVAL: a genuinely dark agent is
+        # matched within a few ticks, and a backend still making its mind up never repaints the
+        # screen on the strength of a frame it is about to contradict.
+        if target is not None or self._canvas_decided:
             self._canvas_votes += 1
             if self._canvas_votes < self.CANVAS_VOTES_TO_SWITCH:
                 return
         self._canvas = target
         self._canvas_votes = 0
+        # "Decided" means COMMITTED to what is on screen, not merely "a frame had an opinion".
+        # It gates the sample throttle, so setting it before adoption made the confirming sample
+        # wait out a whole interval — turning the settling period into a visible delay, which is
+        # the opposite of the point.
+        self._canvas_decided = True
         # Chrome composed before this decision (the status bar) is a frame behind, so ask for
         # one more paint: the next frame is drawn entirely in the new scheme.
         self._render_pending = True
