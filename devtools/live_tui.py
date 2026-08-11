@@ -177,7 +177,9 @@ def trust_claude(repo: Path) -> None:
     entry["hasCompletedProjectOnboarding"] = True
     entry.setdefault("allowedTools", [])
     entry.setdefault("history", [])
-    tmp = path.with_suffix(".live-harness.tmp")
+    # Pid-unique: two harness processes (one per backend) run side by side, and a shared temp
+    # name let one rename the other's half-written file over the developer's real ~/.claude.json.
+    tmp = path.with_suffix(f".live-harness-{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data), encoding="utf-8")
     tmp.replace(path)
 
@@ -251,7 +253,9 @@ class Tui:
         'Try "',  # codex / claude composer placeholder
         "for shortcuts",  # claude composer footer
         "to interrupt",
-        "/help for help",  # opencode
+        "/help for help",  # opencode (older builds)
+        "ctrl+p commands",  # opencode 1.18's composer footer — its splash no longer says /help
+        "Ask anything...",  # opencode's composer placeholder
     )
     # A backend's own "may I write this file?" dialog; Enter takes the permissive default.
     PERMISSION_PROMPTS = ("Do you want to", "1. Yes", "Allow this", "y/n")
@@ -275,6 +279,9 @@ class Tui:
         # removes exactly the thing under test.
         self.host_theme = host_theme
         self.raw = bytearray()
+        # (monotonic time, offset into `raw`) for every chunk read, so "when did this byte
+        # appear?" can be answered — that is how a startup delay is measured rather than guessed.
+        self.timeline: list[tuple[float, int]] = []
         self.started = time.monotonic()
         self.master, slave = pty.openpty()
         # BEFORE the spawn, and on the SLAVE fd: sizing the master (or the child) instead
@@ -306,6 +313,7 @@ class Tui:
             if not chunk:
                 break
             raw += chunk
+            self.timeline.append((time.monotonic(), len(self.raw)))
             self.raw += chunk
             if self.host_theme:
                 # Answer the capability queries in this chunk immediately: detection gives the
@@ -336,6 +344,16 @@ class Tui:
         if label:
             print(f"--- {label} ---\n{text[-1200:] or '(no repaint)'}", flush=True)
         return text
+
+    def when(self, offset: int) -> float | None:
+        """Seconds after the spawn at which the byte at *offset* arrived (None if never)."""
+        stamp = None
+        for moment, start in self.timeline:
+            if start <= offset:
+                stamp = moment
+            else:
+                break
+        return None if stamp is None else stamp - self.started
 
     def kill(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -379,6 +397,11 @@ class Tui:
                 answer(b"n\r", "decline startup offer", 2.5)
             elif any(marker in window for marker in self._MODAL_PROMPTS):
                 answer(b"\r", "accept modal default", 2.5)
+            elif "User commit message" in window:
+                # aGiTrack offers to commit changes it found in the tree before the agent runs.
+                # A theme run turns the proxy debug log on, and that log lands in .agitrack/ of
+                # the throwaway repo — so the offer can appear on any boot. Decline it.
+                answer(b"skip\r", "skip the pre-agent user commit", 2.5)
             elif "Name this session" in window:
                 keys = (b"\x7f" * 60 + session_name.encode() + b"\r") if session_name else b"\r"
                 answer(keys, "name the session", 3.0)

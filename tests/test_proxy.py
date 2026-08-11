@@ -9044,12 +9044,25 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
 # --- issue #21: stopped backends are reaped, not left as zombies ----------------
 
 
+def _spawn_dummy_child(program: str, *args: str) -> int:
+    """A real child process to reap, WITHOUT forking this process.
+
+    These tests need a raw pid they can `os.waitpid` themselves, so `subprocess` is out — its
+    own bookkeeping would reap the child first and turn the assertions into `ChildProcessError`.
+    They used a bare `os.fork()`, which is the hazard: a pytest-xdist worker is multi-threaded,
+    and CPython already warns here ("This process is multi-threaded, use of fork() may lead to
+    deadlocks in the child"). A child forked out of a multi-threaded process can inherit a lock
+    held by a thread that does not exist in it and hang before reaching `os._exit`, still
+    holding the worker's execnet socket — and in 3.14 `os.fork()` in a multi-threaded process
+    becomes an error outright. `posix_spawn` runs no Python in the child at all.
+    """
+    return os.posix_spawn(program, [program, *args], os.environ)
+
+
 @_posix_only
 def test_terminate_child_queues_pid_and_reaper_collects_it():
     runner = make_runner(master_fd=None)
-    pid = os.fork()
-    if pid == 0:
-        os._exit(0)  # the "backend" exits as soon as it is signalled
+    pid = _spawn_dummy_child("/usr/bin/true")  # the "backend" exits at once
     runner.child_pid = pid
 
     runner._terminate_child()
@@ -9072,10 +9085,7 @@ def test_reaper_keeps_still_running_children():
     import signal as signal_mod
 
     runner = make_runner()
-    pid = os.fork()
-    if pid == 0:
-        time.sleep(30)
-        os._exit(0)
+    pid = _spawn_dummy_child("/bin/sleep", "30")
     runner._reap_pids = [pid]
 
     runner._reap_stopped_children()

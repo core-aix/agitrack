@@ -1035,6 +1035,12 @@ class ProxyRunner:
         self.host_palette: dict[bytes, bytes] = {}
         self.host_da: bytes | None = None
         self.host_kitty_keyboard: bool = False
+        # The early capability service (see _start_early_capability_service): the thread that
+        # answers the backend's terminal queries between the spawn and the reactor, and what it
+        # read while doing so.
+        self._early_capability_thread: threading.Thread | None = None
+        self._early_capability_stop = threading.Event()
+        self._early_capability_buffer = bytearray()
         self.color_mode = detect_color_mode()
         if os.name == "nt" and self.color_mode == "16":
             # The modern Windows console (conhost / Windows Terminal) renders 24-bit color and
@@ -1464,6 +1470,9 @@ class ProxyRunner:
                 "host_palette": {},
                 "host_da": None,
                 "host_kitty_keyboard": False,
+                "_early_capability_thread": None,
+                "_early_capability_stop": threading.Event(),
+                "_early_capability_buffer": bytearray(),
                 "color_mode": "truecolor",
                 "agent_background": "auto",
                 "_canvas": None,
@@ -1761,6 +1770,11 @@ class ProxyRunner:
             self._enter_host_screen()
             self._set_raw()  # POSIX saves old_attrs here; Windows enters console raw mode
             self._detect_host_terminal()
+            # The host terminal's own answers are known now, so the backend's copies of those
+            # questions can be answered — and they must be answered NOW, not when the reactor
+            # finally reads the child: the backend asked in its first milliseconds and gives up
+            # in well under a second (see _start_early_capability_service).
+            self._start_early_capability_service()
             # The host's own background is known now, so the scheme this backend used last
             # time can be applied BEFORE the first paint below — otherwise the session opens
             # in the terminal's colours and visibly flips once the backend has painted enough
@@ -1795,6 +1809,9 @@ class ProxyRunner:
             # user hook) and are no-ops when absent, so clearing then re-installing exactly what
             # THIS mode wants makes every mode-switch safe regardless of how the last run ended.
             self._reset_hook_slate()
+            # Startup is done, so the reactor becomes the child's sole reader again: join the
+            # early responder and give the screen everything it read while it was answering.
+            self._stop_early_capability_service()
             # Paint once before entering the loop. Every other frame is driven by backend output
             # or a keystroke, so until the backend emits its first byte there was nothing on
             # screen at all — and if that first byte was slow, the terminal sat showing whatever
@@ -1822,6 +1839,9 @@ class ProxyRunner:
             )
             self._crash_notice = crash_message(path, error)
         finally:
+            # Idempotent: a crash between the spawn and the reactor must not leave the early
+            # responder reading the child's fd behind everyone's back.
+            self._stop_early_capability_service()
             if self._prev_thread_excepthook is not None:
                 threading.excepthook = self._prev_thread_excepthook
                 self._prev_thread_excepthook = None
@@ -9990,6 +10010,98 @@ class ProxyRunner:
         self._debug(f"absorbed {len(replies)} late host-terminal reply/replies: {replies!r}")
         return _HOST_TERMINAL_REPLY_RE.sub(b"", data)
 
+    # ------------------------------------------------------------------
+    # Early capability service (spawn → reactor)
+    # ------------------------------------------------------------------
+
+    EARLY_CAPABILITY_POLL = 0.05  # how long the early responder blocks per select
+
+    def _start_early_capability_service(self) -> None:
+        """Answer the backend's terminal-capability queries while aGiTrack is still starting.
+
+        A backend asks the terminal what colours it is drawing on (OSC 10/11) in its first
+        milliseconds and waits only briefly for the answer — codex's window measured between
+        50 ms and 150 ms on this machine. aGiTrack spawns the backend EARLY on purpose, so it
+        loads while aGiTrack finishes starting, but nothing read its output until the reactor
+        began: one or two slow startup steps later (`_reset_hook_slate` alone measured 0.33 s).
+        The query therefore expired unread in the pty buffer and the backend fell back to its
+        no-information defaults — codex drew its DARK palette, and stopped tinting its panels
+        at all, in a white terminal, in EVERY session, however light the terminal was. That is
+        the invariant "the backend detects the same theme it would in a native session" broken
+        outright, and it also fed the agent-theme inference a screen that misrepresented the
+        agent, so aGiTrack painted a dark canvas over a light terminal to match it.
+
+        Polling between startup steps cannot fix it: the query arrives DURING one of them.
+        So the service runs on its own thread for exactly the startup window. It is the only
+        reader of the child's fd until :meth:`_stop_early_capability_service` joins it — which
+        happens before the reactor's first select — and everything it reads is kept and handed
+        to the normal output path there, so nothing is lost from the screen.
+
+        Requires the host terminal's own answers, so it starts after `_detect_host_terminal`.
+        """
+        if sys.platform == "win32":
+            # Nothing to relay: the Windows console does not answer the OSC/DA queries, so
+            # `_detect_host_terminal` collects nothing there — and the child's read fd is a
+            # bridged SOCKET, which `os.read` cannot take on Windows anyway.
+            return
+        if self.master_fd is None or self._early_capability_thread is not None:
+            return
+        self._early_capability_stop.clear()
+        self._early_capability_buffer = bytearray()
+        thread = threading.Thread(target=self._early_capability_loop, daemon=True, name="agitrack-early-capability")
+        self._early_capability_thread = thread
+        thread.start()
+
+    def _early_capability_loop(self) -> None:
+        while not self._early_capability_stop.is_set():
+            fd = self.master_fd
+            if fd is None:
+                return
+            try:
+                readable, _, _ = select.select([fd], [], [], self.EARLY_CAPABILITY_POLL)
+            except (OSError, ValueError):
+                return
+            if not readable:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return  # the child is gone; the reactor's own drain reports it
+            if not chunk:
+                return
+            self._early_capability_buffer += chunk
+            try:
+                self._answer_terminal_queries(chunk)
+            except Exception as error:  # startup must survive anything this touches
+                self._debug(f"early capability answer failed: {error!r}")
+
+    def _stop_early_capability_service(self) -> None:
+        """Join the early responder and hand what it read to the normal output path.
+
+        Called before the reactor starts, so from here on the reactor is the sole reader again.
+        The bytes are replayed through the same steps the reactor's pty phase applies, minus
+        the render — the startup paint follows immediately."""
+        thread = self._early_capability_thread
+        if thread is None:
+            return
+        self._early_capability_stop.set()
+        thread.join(timeout=2.0)
+        self._early_capability_thread = None
+        output = bytes(self._early_capability_buffer)
+        self._early_capability_buffer = bytearray()
+        if not output:
+            return
+        self._debug(f"early capability service read {len(output)} byte(s) before the reactor")
+        self._raw_capture("<", output)
+        self.last_child_output = time.monotonic()
+        self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
+        self._sync_terminal_modes(output)
+        self._forward_clipboard_osc(output)
+        self._track_sync_update(output)
+        self._feed_child_output(output)
+
     def _answer_terminal_queries(self, output: bytes) -> None:
         if self.master_fd is None:
             return
@@ -10451,10 +10563,22 @@ class ProxyRunner:
     def _theme_memory_key(self) -> str:
         """Which backend the remembered scheme belongs to — the session's own, since a
         backend switch mid-run changes who is painting. One user may well run one agent dark
-        and another light, so the memory is per backend, never global."""
+        and another light, so the memory is per backend, never global.
+
+        The key is the backend's NAME. A session's ``backend`` field holds the proxy AGENT, and
+        ``str()`` of that is an object repr with its memory address in it — a different key on
+        every launch, so the scheme was filed under fresh junk each run, never read back (every
+        start was a cold start), and the shared config grew an entry per session forever."""
         # getattr, not attribute access: Session's fields are declared in a FIELDS table, so
         # `backend` is not a statically-known attribute (and a bare Session has none at all).
-        return str(getattr(self.active, "backend", "") or getattr(self.state, "backend", "") or "default")
+        backend = getattr(self.active, "backend", None) or getattr(self, "backend", None)
+        name = getattr(backend, "name", backend)
+        if not name:
+            try:
+                name = self.state.backend  # this getter RAISES when nothing is configured
+            except Exception:
+                name = None
+        return str(name or "default")
 
     def remember_agent_theme(self, dark: bool) -> None:
         """Record what the running backend is painting, for the NEXT launch. Called from the
