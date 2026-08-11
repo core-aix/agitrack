@@ -9,11 +9,13 @@ keep every call site identical and platform-agnostic.
 
 from __future__ import annotations
 
+import codecs
 import os
 import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -35,6 +37,29 @@ from typing import Any
 # Annotated ``dict[str, Any]``: inferred as ``dict[str, object]`` it cannot satisfy any
 # ``subprocess.run`` overload when spread, and every call site fails to type-check.
 UTF8_TEXT: dict[str, Any] = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def fs_path(printed: str) -> Path:
+    """The other half of ``UTF8_TEXT``: a path a tool PRINTED, made usable as a path.
+
+    ``UTF8_TEXT`` gets the wire format right — git speaks UTF-8 — but decoding is only half
+    the round trip. Python encodes ``str`` paths back to bytes for every syscall using
+    ``sys.getfilesystemencoding()``, and that is **not** always UTF-8 on Linux: under
+    ``PYTHONUTF8=0`` in a non-UTF-8 locale (``LC_ALL=C``, a bare cron or systemd unit, a slim
+    container image with no locales installed) it is ASCII. So in ``/home/u/tëst`` the ``ë``
+    that came back correctly from ``git rev-parse --show-toplevel`` then blew up on the very
+    next line — ``Path(printed).resolve()`` raised ``UnicodeEncodeError`` from inside
+    ``posixpath.realpath``, before any of aGiTrack's own error handling could run, and every
+    command (``-s``, ``-d text``, the TUI) died on a raw traceback.
+
+    Re-decoding those UTF-8 bytes with ``os.fsdecode`` yields the surrogate-escaped form that
+    encodes back to *the same bytes on disk*, which is what the filesystem layer wants. Where
+    the filesystem encoding already is UTF-8 — always on Windows and macOS, and on Linux
+    unless someone has explicitly opted out — this is the identity.
+    """
+    if codecs.lookup(sys.getfilesystemencoding()).name == "utf-8":
+        return Path(printed)
+    return Path(os.fsdecode(printed.encode("utf-8", "surrogateescape")))
 
 
 def agitrack_invocation() -> list[str]:
