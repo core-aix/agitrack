@@ -168,7 +168,16 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
         data.pop("hooks", None)
     try:
         if data:
-            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            # Put the user's OWN FORMATTING back when what remains is their file again.
+            #
+            # aGiTrack rewrites this file with its own canonical `json.dumps(indent=2)`. On a repo
+            # that TRACKS settings.local.json that reformatting is a real, permanent diff: after
+            # `-b stop` removed every aGiTrack entry, `git status` still showed
+            # ` M .claude/settings.local.json` — the file re-indented and never restored — so the
+            # user was left holding a change they never made, forever. Measured on this exact
+            # case: bytes differ, JSON identical.
+            if not _restore_committed_bytes(path, data):
+                path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         elif _is_tracked_by_git(path):
             # Emptied but COMMITTED: some repos do track this file. Deleting it would show up
             # as a staged-able deletion of the user's own file, which is a far worse trace to
@@ -187,6 +196,46 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
             debug(f"could not update claude settings at {path}: {error!r}")
         return False
     return True
+
+
+def _restore_committed_bytes(path: Path, data: dict) -> bool:
+    """Write back the COMMITTED text of ``path`` when ``data`` is semantically identical to it.
+    Returns True when that happened.
+
+    This is what makes hook removal a true no-op on a repo that tracks the file: aGiTrack's own
+    formatting is undone, not merely its entries. Deliberately conservative — the committed bytes
+    are restored ONLY when the remaining JSON parses equal to the committed JSON, so a user edit
+    made since that commit is never reverted (in that case the caller falls back to writing our
+    own formatting, which is the best we can do)."""
+    committed = _committed_text(path)
+    if committed is None:
+        return False
+    try:
+        if json.loads(committed) != data:
+            return False
+    except (json.JSONDecodeError, ValueError):
+        return False
+    path.write_text(committed, encoding="utf-8", newline="")
+    return True
+
+
+def _committed_text(path: Path) -> str | None:
+    """``git show HEAD:<path>`` for this file, or None when it is untracked/unreadable."""
+    import subprocess
+
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:./{path.name}"],
+            cwd=path.parent,
+            capture_output=True,
+            **UTF8_TEXT,
+            **console_isolation_kwargs(),
+        )
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def _is_tracked_by_git(path: Path) -> bool:

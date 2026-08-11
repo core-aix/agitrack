@@ -491,3 +491,12 @@ def test_a_repo_that_really_is_a_partial_clone_keeps_its_settings(tmp_path):
         check=True,
     ).stdout.strip()
     assert kept == "blob:none"  # the user's own value, restored
+
+
+def test_discover_accepts_a_plain_string_path(tmp_path):
+    """The annotation says Path, but `cwd=` accepted a plain string for years so callers and
+    scripts pass one. The existence guards added for the `--repo` message are Path methods, and
+    without a coercion they turned a working call into `AttributeError: 'str' object has no
+    attribute 'exists'` — a worse failure than the one they were added to fix."""
+    repo = _init_repo(tmp_path)
+    assert GitRepo.discover(str(repo.repo)).repo == repo.repo
