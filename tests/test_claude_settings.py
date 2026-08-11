@@ -229,3 +229,70 @@ def test_the_autostart_hook_command_is_quoted_too(monkeypatch):
     command = claude_settings.hook_command(claude_settings.AUTOSTART_FLAG)
 
     assert command == r'"C:\Users\dev\python.exe" "-m" "agitrack" "--autostart-on-change"'
+
+
+def test_removing_our_hook_restores_the_users_own_formatting(tmp_path):
+    """D3 (second half): aGiTrack rewrites this file with its own canonical
+    `json.dumps(indent=2)`. On a repo that TRACKS settings.local.json that reformatting is a
+    real, permanent diff — after `-b stop` removed every aGiTrack entry, `git status` still
+    showed ` M .claude/settings.local.json`, the file re-indented and never restored, so the user
+    was left holding a change they never made. Measured live: bytes differ, JSON identical."""
+    import subprocess
+
+    from agitrack.backends import claude_settings
+
+    repo = tmp_path / "proj"
+    (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    settings = repo / ".claude" / "settings.local.json"
+    # The user's own formatting: compact, nested on one line — nothing json.dumps would produce.
+    original = '{\n  "permissions": { "allow": ["Bash(ls:*)"] },\n  "hooks": { "Stop": [ { "hooks": [] } ] }\n}\n'
+    settings.write_text(original, encoding="utf-8")
+    subprocess.run(["git", "add", "-f", ".claude/settings.local.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "team settings"], cwd=repo, check=True)
+
+    assert claude_settings.install_autostart_hook(repo)
+    assert settings.read_text(encoding="utf-8") != original  # ours is in there now
+    assert claude_settings.remove_autostart_hook(repo)
+
+    assert settings.read_text(encoding="utf-8") == original
+    porcelain = subprocess.run(
+        ["git", "-c", "core.excludesFile=/dev/null", "status", "--porcelain"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert porcelain == "", f"left a diff the user never made: {porcelain!r}"
+
+
+def test_a_user_edit_since_the_commit_is_never_reverted(tmp_path):
+    """The restore is deliberately conservative: committed bytes go back ONLY when what remains
+    parses equal to the committed JSON. An edit the user made since that commit must survive."""
+    import json
+    import subprocess
+
+    from agitrack.backends import claude_settings
+
+    repo = tmp_path / "proj"
+    (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    settings = repo / ".claude" / "settings.local.json"
+    settings.write_text('{"permissions": {"allow": []}}\n', encoding="utf-8")
+    subprocess.run(["git", "add", "-f", ".claude/settings.local.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "settings"], cwd=repo, check=True)
+
+    claude_settings.install_autostart_hook(repo)
+    # The user adds a permission of their own AFTER the commit.
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    data["permissions"]["allow"].append("Bash(git:*)")
+    settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    claude_settings.remove_autostart_hook(repo)
+
+    kept = json.loads(settings.read_text(encoding="utf-8"))
+    assert kept["permissions"]["allow"] == ["Bash(git:*)"]  # their edit survived the removal
