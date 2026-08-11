@@ -45,8 +45,14 @@ def make_renderer(host_bg: bytes | None, feed: bytes, *, setting: str = "auto", 
     return renderer
 
 
-def sample(renderer, *, times: int = 1) -> None:
-    """Run the canvas decision ``times`` times, far enough apart to clear the throttle."""
+def sample(renderer, *, times: int = 2) -> None:
+    """Run the canvas decision ``times`` times, far enough apart to clear the throttle.
+
+    The default is TWO because moving away from the terminal's own colours now needs agreeing
+    samples: a backend paints its default scheme while it waits to be told the background, and
+    adopting that first frame was what made sessions flash dark and then turn bright. Dropping
+    BACK to the terminal is still adopted on the first sample — it is the safe state.
+    """
     body = renderer.visible_lines(renderer.rows)
     for step in range(times):
         renderer.update_canvas(body, now=renderer._canvas_sampled_at + 10 * (step + 1))
@@ -130,9 +136,10 @@ def test_the_decision_is_throttled():
     renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
     body = renderer.visible_lines(renderer.rows)
     renderer.update_canvas(body, now=100.0)
+    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL)  # confirmed
     assert renderer._canvas is not None
-    renderer._canvas = None  # a second look inside the sample interval must not re-decide
-    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL / 2)
+    renderer._canvas = None  # a further look inside the sample interval must not re-decide
+    renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL * 1.5)
     assert renderer._canvas is None
 
 
@@ -165,7 +172,7 @@ def test_one_odd_frame_does_not_flip_an_established_canvas():
     renderer.init_screen(renderer.rows, renderer.cols)
     assert renderer.stream is not None
     renderer.stream.feed(LIGHT_AGENT)
-    sample(renderer)  # a single disagreeing sample
+    sample(renderer, times=1)  # a single disagreeing sample
     assert renderer._canvas == established
 
 
@@ -298,6 +305,10 @@ def test_the_runner_follows_a_theme_change_while_the_screen_is_idle():
     # agent falls quiet nothing repaints, and a mismatched screen would otherwise stay
     # mismatched until the user typed.
     runner = _runner_showing(DARK_AGENT, host_bg=LIGHT_TERMINAL)
+    # Two ticks, because moving off the terminal's own colours needs agreeing samples now — and
+    # this is the path that supplies them when nothing is repainting. The ticks are not made to
+    # wait for each other: the throttle only starts once a canvas is committed.
+    runner._service_agent_theme()
     runner._service_agent_theme()
     assert runner._canvas == ("1c1c1c", "d0d0d0")
 
@@ -394,9 +405,11 @@ def test_frames_are_sampled_without_a_throttle_until_the_scheme_is_known():
     # interval at startup — the delay this removes. Afterwards the throttle applies again.
     renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
     body = renderer.visible_lines(renderer.rows)
-    renderer.update_canvas(body, now=100.0)  # a plain screen: no opinion, nothing decided
+    renderer.update_canvas(body, now=100.0)
+    # Confirmation is required, but it is not made to WAIT: while undecided every frame is
+    # examined, so the confirming sample is the very next one rather than a sample interval away.
     renderer.update_canvas(body, now=100.0 + ScreenRenderer.CANVAS_SAMPLE_INTERVAL / 10)
-    assert renderer._canvas == ("1c1c1c", "d0d0d0")  # the very next frame still decided it
+    assert renderer._canvas == ("1c1c1c", "d0d0d0")
     assert renderer._canvas_decided is True
 
 
@@ -405,7 +418,7 @@ def test_the_scheme_is_remembered_for_the_next_launch():
     remembered: list[bool] = []
     renderer.remember_agent_theme = remembered.append  # type: ignore[attr-defined]
     sample(renderer)
-    assert remembered == [True]
+    assert remembered and all(remembered)  # recorded on each sample; the value is what matters
 
 
 def test_the_runner_starts_from_the_scheme_the_backend_used_last_time(monkeypatch):
@@ -633,7 +646,10 @@ def test_an_unknown_background_is_resampled_immediately_not_after_the_throttle()
     body = renderer.visible_lines(renderer.rows)
     renderer.update_canvas(body, now=100.0)
     renderer.host_bg_value = LIGHT_TERMINAL
-    renderer.update_canvas(body, now=100.001)  # far inside CANVAS_SAMPLE_INTERVAL
+    # Both confirming samples land far INSIDE one CANVAS_SAMPLE_INTERVAL: nothing is committed
+    # yet, so the throttle does not apply and the settling period is not also a delay.
+    renderer.update_canvas(body, now=100.001)
+    renderer.update_canvas(body, now=100.002)
 
     assert renderer._canvas == DARK_CANVAS
 
@@ -657,3 +673,40 @@ def test_a_forced_background_still_applies_without_any_terminal_answer():
         renderer = make_renderer(None, DARK_AGENT, setting=setting)
         renderer.apply_remembered_theme(None)
         assert renderer._canvas == expected
+
+
+def test_the_backends_pre_answer_default_never_repaints_the_screen():
+    """THE FLASH THE USER SAW: "starts dark, switches to bright a few seconds later".
+
+    A backend asks the terminal what background it is drawing on and paints its OWN default —
+    dark — while it waits. Adopting that first opinionated frame outright meant aGiTrack
+    repainted the whole screen dark to match a scheme the agent was about to abandon, then
+    followed it back to light once the answer arrived. During any uncertain period the screen
+    must simply stay in the TERMINAL's colours.
+    """
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
+    body = renderer.visible_lines(renderer.rows)
+
+    renderer.update_canvas(body, now=100.0)  # the agent's dark pre-answer frame
+    assert renderer._canvas is None, "one frame of the agent's default must not repaint anything"
+
+    # It learns the background and repaints light — agreeing with the terminal, so still nothing.
+    renderer.init_screen(renderer.rows, renderer.cols)
+    assert renderer.stream is not None
+    renderer.stream.feed(LIGHT_AGENT)
+    renderer.update_canvas(renderer.visible_lines(renderer.rows), now=100.1)
+
+    assert renderer._canvas is None, "the session never left the terminal's own colours"
+
+
+def test_an_agent_that_really_is_dark_is_still_matched_promptly():
+    # The other half: settling must not become a delay. A backend whose scheme is genuinely dark
+    # keeps saying so, and the confirming sample is the very next frame — no throttle applies
+    # until something is committed.
+    renderer = make_renderer(LIGHT_TERMINAL, DARK_AGENT)
+    body = renderer.visible_lines(renderer.rows)
+
+    renderer.update_canvas(body, now=100.0)
+    renderer.update_canvas(body, now=100.001)  # far inside CANVAS_SAMPLE_INTERVAL
+
+    assert renderer._canvas == DARK_CANVAS
