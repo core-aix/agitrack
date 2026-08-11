@@ -23,6 +23,9 @@ from proxy_helpers import make_runner
 from agitrack.proxy.renderer import ScreenRenderer, forced_canvas_osc_values
 
 LIGHT_TERMINAL = b"rgb:ffff/ffff/ffff"
+# The canvas pairs the renderer installs, named so an assertion says which SCHEME it means.
+DARK_CANVAS = ("1c1c1c", "d0d0d0")
+LIGHT_CANVAS = ("ffffff", "1c1c1c")
 DARK_TERMINAL = b"rgb:0000/0000/0000"
 
 # What a themed agent puts on the screen: coloured text, plus a filled panel (an input box,
@@ -579,3 +582,78 @@ def test_the_memory_key_falls_back_to_the_runner_and_then_the_state():
     runner.active.backend = None
     runner.backend = SimpleNamespace(name="opencode")
     assert runner._theme_memory_key() == "opencode"
+
+
+# ---------------------------------------------------------------------------
+# An unknown terminal background is not an excuse to repaint the user's screen
+# ---------------------------------------------------------------------------
+
+
+def test_an_unknown_terminal_background_leaves_the_terminals_own_colours_alone():
+    """No OSC 11 answer means no opinion — so nothing is repainted.
+
+    `_host_bg_is_dark` must return a bool for accent contrast and guesses DARK when it does not
+    know. Acting on that guess here repainted whole sessions wrongly: a dark agent "matched" an
+    unknown-therefore-dark terminal, so no canvas was painted — and in a WHITE terminal the user
+    was left reading the agent's dark panels floating in white, which is the mixed screen this
+    feature exists to prevent.
+    """
+    for agent in (DARK_AGENT, LIGHT_AGENT):
+        renderer = make_renderer(None, agent)
+        sample(renderer)
+        assert renderer._canvas is None, "an unknown background must not paint a canvas"
+
+
+def test_an_unknown_background_stays_undecided_so_the_terminals_answer_still_counts():
+    """THE BUG THE USER SAW: "it only shows the correct color after I scroll".
+
+    Detection waits a bounded time, and tmux / ssh / forwarded terminals routinely answer after
+    it. The reply lands moments later — but the guess had already LATCHED `_canvas_decided`, and
+    every change after the first needs CANVAS_VOTES_TO_SWITCH agreeing samples. So the real
+    answer could not simply take effect; it had to out-vote the guess, and votes are only cast
+    when something repaints. A quiet session therefore stayed wrong until the user scrolled.
+
+    Staying undecided makes the first sample after the answer a FIRST decision, adopted at once.
+    """
+    renderer = make_renderer(None, DARK_AGENT)
+    sample(renderer)
+    assert renderer._canvas is None
+    assert not renderer._canvas_decided, "a guess must never latch the decision"
+
+    renderer.host_bg_value = LIGHT_TERMINAL  # the terminal's late reply arrives
+    sample(renderer)  # ONE sample, not CANVAS_VOTES_TO_SWITCH of them
+
+    assert renderer._canvas == DARK_CANVAS
+
+
+def test_an_unknown_background_is_resampled_immediately_not_after_the_throttle():
+    # The throttle applies only once a real decision exists. While abstaining the renderer must
+    # keep looking every tick, or the late answer waits out a sample interval on top.
+    renderer = make_renderer(None, DARK_AGENT)
+    body = renderer.visible_lines(renderer.rows)
+    renderer.update_canvas(body, now=100.0)
+    renderer.host_bg_value = LIGHT_TERMINAL
+    renderer.update_canvas(body, now=100.001)  # far inside CANVAS_SAMPLE_INTERVAL
+
+    assert renderer._canvas == DARK_CANVAS
+
+
+def test_a_remembered_scheme_is_not_applied_against_an_assumed_background():
+    # The pre-paint head start has the same rule: two guesses stacked on each other must not
+    # repaint the screen before a single frame has been seen.
+    renderer = make_renderer(None, b"")
+    renderer.apply_remembered_theme(True)
+    assert renderer._canvas is None
+
+    renderer.host_bg_value = LIGHT_TERMINAL
+    renderer.apply_remembered_theme(True)
+    assert renderer._canvas == DARK_CANVAS
+
+
+def test_a_forced_background_still_applies_without_any_terminal_answer():
+    # Abstaining is only for `auto`. An explicit setting is the user's own instruction and needs
+    # no terminal cooperation at all.
+    for setting, expected in (("dark", DARK_CANVAS), ("light", LIGHT_CANVAS)):
+        renderer = make_renderer(None, DARK_AGENT, setting=setting)
+        renderer.apply_remembered_theme(None)
+        assert renderer._canvas == expected
