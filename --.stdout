@@ -1,0 +1,7 @@
+aGiTrack dashboard daemon live at http://127.0.0.1:8765/ (pid 784779).
+Runs in the background (surviving this terminal) until `agitrack -d stop`.
+The dashboard is bound to this machine's loopback, so reach it over an SSH tunnel.
+Run this ON YOUR OWN MACHINE (in a new terminal; leave it running):
+    ssh -N -L 8765:localhost:8765 shiqiangwang@10.207.195.222
+then open:
+    http://localhost:8765/
