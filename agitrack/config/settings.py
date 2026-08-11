@@ -136,6 +136,16 @@ def _default_path() -> Path:
     return base / "config.json"
 
 
+# Keys a removed feature wrote and nothing reads any more. `seed_defaults` deletes them on the
+# next run, so an existing user's config does not keep them forever. Only ever add a key here
+# once NOTHING reads it — a key still consulted anywhere would be silently reset by this.
+_REMOVED_KEYS = (
+    # The light/dark scheme each backend was last seen painting, for the screen-content
+    # inference that oscillated and was deleted (see renderer.py, "Agent background").
+    "agent_theme_seen",
+)
+
+
 class GlobalConfig:
     """User-wide aGiTrack configuration stored in ``~/.agitrack/config.json``.
 
@@ -210,6 +220,15 @@ class GlobalConfig:
         for key, default in self._default_config().items():
             if key not in self.data:
                 self.data[key] = default
+                added = True
+        # And drop what a REMOVED feature left behind, so the file stays a readable list of the
+        # knobs that exist. `agent_theme_seen` recorded the light/dark scheme each backend was
+        # last seen painting, for an inference that no longer exists (see renderer.py, "Agent
+        # background"); nothing reads it now, and the code that used to prune it went with the
+        # feature — so without this it sits in every existing user's config forever.
+        for gone in _REMOVED_KEYS:
+            if gone in self.data:
+                del self.data[gone]
                 added = True
         if added:
             self.save()

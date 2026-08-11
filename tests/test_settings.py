@@ -510,6 +510,23 @@ def test_agent_background_is_a_seeded_knob_and_repo_overridable(tmp_path):
     assert config.agent_background == "dark"
 
 
+def test_seed_defaults_drops_what_a_removed_feature_left_behind(tmp_path):
+    # `agent_theme_seen` recorded the scheme each backend was last seen painting, for the
+    # screen-content inference that oscillated and was deleted. Nothing reads it now, and the
+    # code that used to prune it went with the feature — so every existing user's config would
+    # otherwise carry it forever, next to the knobs that actually exist.
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"agent_theme_seen": {"claude": "dark"}, "menu_key": "ctrl-y"}), encoding="utf-8")
+
+    config = GlobalConfig(path=path)
+    assert config.seed_defaults() is True
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert "agent_theme_seen" not in written
+    assert written["menu_key"] == "ctrl-y"  # a real setting is never touched
+    assert GlobalConfig(path=path).seed_defaults() is False  # and it is a no-op from then on
+
+
 def test_agent_background_is_offered_in_the_settings_menu():
     # Without a menu entry the setting exists only as hand-edited JSON.
     from agitrack.proxy.runner import ProxyRunner

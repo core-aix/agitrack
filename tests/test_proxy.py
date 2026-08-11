@@ -2547,8 +2547,11 @@ def test_render_frame_colour_conversion_is_bounded_by_distinct_colours():
     try:
         renderer_module._nearest_256 = counting_nearest
         renderer_module.write_frame = frames.append
-        # Start from a cold cache so the first frame's conversions are all counted.
-        for cached in (renderer_module._hex_color_code, renderer_module._color_code):
+        # Start from a cold cache so the first frame's conversions are all counted. `_cell_sgr`
+        # belongs in this list even though it converts nothing itself: it sits IN FRONT of
+        # `_color_code`, so a style another test already rendered would skip the conversion
+        # entirely and make `cold` depend on test order.
+        for cached in (renderer_module._hex_color_code, renderer_module._color_code, renderer_module._cell_sgr):
             if hasattr(cached, "cache_clear"):
                 cached.cache_clear()
 
@@ -9328,6 +9331,34 @@ def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
     assert b"\x1b[<u" not in writes  # kitty pop suppressed
     assert b"\x1b[>4;2m" in writes  # modifyOtherKeys still mirrored
     assert b"\x1b[>4;0m" in writes
+
+
+def test_sync_terminal_modes_rejects_a_chunk_that_cannot_contain_a_mode(monkeypatch):
+    """Heavy scroll output must not be scanned thirty times over.
+
+    Every sequence this method looks for is `ESC [` + one of `? > < =`; without a presence
+    check in front, each of the twelve mouse modes cost two full substring scans of the whole
+    chunk (plus three more modes, plus a regex) on the reactor thread that also reads stdin —
+    measured 4.46 ms per megabyte of ordinary output with no escape sequence in it at all,
+    against 0.26 ms with the check. What it DETECTS is unchanged, so both halves are asserted:
+    a chunk with no introducer does no work, and one with a mode is still mirrored in full.
+    """
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = True
+    writes: list[bytes] = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    # SGR colour and cursor motion are `ESC [` sequences too, and none of them is a mode:
+    # the guard has to let this through without mirroring anything.
+    runner._sync_terminal_modes(b"\x1b[1;32mgreen\x1b[0m\r\n\x1b[12;40Hplain scrollback\x1b[K")
+    assert writes == []
+    assert runner.child_mouse is False
+
+    runner._sync_terminal_modes(b"before\x1b[?1002h between \x1b[>1u after")
+    assert b"\x1b[?1002h" in writes and b"\x1b[>1u" in writes
+    assert runner.child_mouse is True
 
 
 def test_sync_terminal_modes_windows_drops_hover_motion_keeps_drag(monkeypatch):
