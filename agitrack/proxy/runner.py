@@ -6658,8 +6658,8 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # --abbrev-ref HEAD`, three `diff --quiet`, three `ls-files --others` for one
             # Enter — and on Windows a process spawn is ~38 ms, so those repeats WERE the
             # latency (740 ms measured, 100% of it in git). One scope de-duplicates them;
-            # any command that writes drops the cache from under itself, and the pipeline
-            # lock's boundaries drop it too (see git/repo.py's read_cache).
+            # any command that writes — on this thread or on the git worker — drops the
+            # cache from under it (see git/repo.py's read_cache).
             with git_read_cache():
                 if submit:
                     submitted_prompt = self.passthrough_prompt.decode(errors="ignore").strip()

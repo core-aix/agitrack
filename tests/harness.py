@@ -45,6 +45,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from agitrack.git import GitRepo
 
 
@@ -367,12 +369,21 @@ def launch(
             on_spawn(child)
         return child
 
-    monkeypatch.setattr(runner_module, "make_child_process", _make_child)
-    monkeypatch.setattr(runner_module, "make_host_terminal", lambda _owner: host)
+    # PROCESS-GLOBAL patches, on a MonkeyPatch this function undoes itself (see the finally
+    # below). Callers pass a bare `pytest.MonkeyPatch()`, which — unlike the fixture — is never
+    # undone, and `sys.stdin`/`sys.stdout` are shared with every other test in the worker. Left
+    # patched, every later test in that process believes it is sitting on a terminal: on Windows
+    # that made `AgitrackShell` build a real prompt_toolkit session and die with
+    # NoConsoleScreenBufferError, in a test file that has nothing to do with this harness. The
+    # platform factories are undone with them for the same reason — nothing outside a launch
+    # should be handed fakes.
+    own_patch = pytest.MonkeyPatch()
+    own_patch.setattr(runner_module, "make_child_process", _make_child)
+    own_patch.setattr(runner_module, "make_host_terminal", lambda _owner: host)
     # A TTY is a hard gate at the top of run(); nothing below it touches fd 0 directly
     # (everything goes through the host terminal), so asserting the gate is enough.
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    own_patch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    own_patch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
     runner_kwargs.setdefault("backend", "claude")
     runner_kwargs.setdefault("skip_privacy_ack", True)  # the real ack path, told not to prompt
@@ -478,6 +489,7 @@ def launch(
     try:
         harness.exit_code = runner.run()
     finally:
+        own_patch.undo()
         host.close()
         for child in children:
             child.teardown()

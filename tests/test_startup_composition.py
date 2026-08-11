@@ -13,7 +13,9 @@ makes the test a coin toss (it passed on macOS and failed on Linux for exactly t
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,36 @@ from harness import FakeChildProcess, FakeHostTerminal, init_repo, launch
 # Windows job's "full test suite" quietly meant "minus the composition layer". The fakes now
 # bridge through a socketpair exactly as platform/nt.py does, so the sequence under test is the
 # product's on both platforms. See harness._channel.
+
+
+def test_launch_leaves_the_process_as_it_found_it(tmp_path):
+    """The harness must not leak its fakes, or its TTY lie, into the rest of the worker.
+
+    `launch` tells the runner that stdin and stdout are a terminal, because a TTY check is a
+    hard gate at the top of `run()`. Those two objects are process-global and shared with every
+    other test in the worker, and the tests here pass a bare `pytest.MonkeyPatch()` — which,
+    unlike the fixture, is never undone. So the lie outlived the test: every later test in that
+    process believed it was sitting on a terminal. On Windows that made `AgitrackShell` build a
+    real prompt_toolkit session and die with NoConsoleScreenBufferError in
+    `test_summary_scratch.py`, three files away from anything to do with this harness — and it
+    only surfaced when these tests started running on Windows at all. On POSIX the same leak
+    quietly changes behaviour instead of failing, which is worse.
+    """
+    from agitrack.proxy import runner as runner_module
+
+    def _state():
+        return (
+            sys.stdin.isatty(),
+            sys.stdout.isatty(),
+            runner_module.make_child_process,
+            runner_module.make_host_terminal,
+        )
+
+    before = _state()
+
+    launch(tmp_path, pytest.MonkeyPatch())
+
+    assert _state() == before, "launch() left process-global state patched after it returned"
 
 
 def test_fakes_satisfy_the_platform_protocols():
@@ -497,6 +529,22 @@ def test_pressing_enter_does_not_ask_git_the_same_question_twice(tmp_path):
     emerges from half a dozen collaborating helpers each asking independently, which is
     exactly what a composition test is for. And it asserts on a COUNT, never on elapsed time,
     so it is deterministic in CI on any machine (see AGENTS.md, "Timing-dependent tests").
+
+    WHAT COUNTS AS THE SUBMIT PATH, AND WHY IT IS NOT A WALL-CLOCK WINDOW. Pressing Enter also
+    sets the git worker going, and the update checker runs on its own thread throughout; both
+    spawn git concurrently, so "every git command seen between the keystroke and the forward"
+    is a different set on every machine. An earlier version asserted on exactly that and was
+    green on Windows, red on Linux and red-differently on macOS — the worker had simply got
+    further along by the time the keystroke was forwarded. What is being pinned here is the
+    cost the USER waits through, so only reads whose stack goes through `_reactor_stdin_phase`
+    count. Reads the worker makes in parallel are a separate scope and, being concurrent with
+    the wait rather than inside it, are not latency.
+
+    AND WHY A REPEAT AFTER A WRITE IS ALLOWED. The cache deliberately does not survive a write
+    from ANY thread — the worker committing the previous turn must not leave the submit path
+    reasoning about a tree that no longer exists. So "asked twice" is only a defect when
+    nothing wrote in between, which is what this checks; whether the worker's commit lands
+    mid-submit is a scheduling detail, and asserting it never does would put the coin toss back.
     """
     monkeypatch = pytest.MonkeyPatch()
     repo = init_repo(tmp_path)
@@ -504,12 +552,28 @@ def test_pressing_enter_does_not_ask_git_the_same_question_twice(tmp_path):
     import agitrack.git.repo as repo_module
 
     submitting = {"on": False}
-    spawned: list[tuple[str, tuple]] = []
+    # (kind, key) in spawn order. "read" is a cacheable read made while the user waits;
+    # "write" is anything that drops the cache, on any thread. Mirrors GitRepo._run's own
+    # classification — including that a call carrying stdin, a custom env or a timeout is
+    # never cached — so the test and the code cannot drift apart on what a read is.
+    events: list[tuple[str, tuple[str, tuple]]] = []
     real_run = repo_module.subprocess.run
 
     def _recording_run(command, **kwargs):
         if submitting["on"]:
-            spawned.append((str(kwargs.get("cwd")), tuple(command)))
+            frames = {frame.name for frame in traceback.extract_stack()}
+            if "_run" not in frames:  # GitRepo.discover/init bypass the cache entirely
+                return real_run(command, **kwargs)
+            cacheable = (
+                kwargs.get("input") is None
+                and kwargs.get("timeout") is None
+                and kwargs.get("env") is None
+                and _subcommand(tuple(command)) in repo_module._CACHEABLE_SUBCOMMANDS
+            )
+            if not cacheable:
+                events.append(("write", ("", ())))
+            elif "_reactor_stdin_phase" in frames:
+                events.append(("read", (str(kwargs.get("cwd")), tuple(command))))
         return real_run(command, **kwargs)
 
     monkeypatch.setattr(repo_module.subprocess, "run", _recording_run)
@@ -532,11 +596,20 @@ def test_pressing_enter_does_not_ask_git_the_same_question_twice(tmp_path):
     launch(tmp_path, monkeypatch, repo=repo, reactor_iterations=600, script=_script, on_tick=_tick)
 
     assert typed["enter"], "the prompt was never typed; the harness did not reach the submit"
-    # Only READ-ONLY commands: a repeated write is a different bug and would be a real change
-    # in behaviour, so it is deliberately not swept up here.
-    reads = [entry for entry in spawned if _subcommand(entry[1]) in repo_module._CACHEABLE_SUBCOMMANDS]
-    assert reads, f"no read-only git commands were seen during the submit; got {spawned}"
-    repeated = {entry for entry in reads if reads.count(entry) > 1}
-    assert not repeated, "the submit path re-ran read-only git commands:\n  " + "\n  ".join(
-        f"{count}x {cmd}" for cmd, count in ((e, reads.count(e)) for e in repeated)
+    assert [key for kind, key in events if kind == "read"], (
+        f"no read-only git commands ran in the stdin phase: {events}"
+    )
+    # Only READ-ONLY commands are checked for repeats: a repeated write is a different bug and
+    # would be a real change in behaviour, so it is deliberately not swept up here.
+    repeated: list[tuple[str, tuple]] = []
+    seen: set[tuple[str, tuple]] = set()
+    for kind, key in events:
+        if kind == "write":
+            seen.clear()  # every cache is dropped; asking again from here is correct
+        elif key in seen:
+            repeated.append(key)
+        else:
+            seen.add(key)
+    assert not repeated, "the submit path re-ran read-only git commands with no write in between:\n  " + "\n  ".join(
+        f"{cwd}: {' '.join(cmd)}" for cwd, cmd in repeated
     )
