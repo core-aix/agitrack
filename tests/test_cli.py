@@ -748,6 +748,51 @@ def _autostart_config(tmp_path):
     return cfg
 
 
+def test_the_autostart_prompt_describes_what_this_backend_will_actually_install(tmp_path, monkeypatch, capsys):
+    """The prompt is the consent moment, so it has to match what gets written.
+
+    Answering yes installs a git pre-commit hook on every backend, and ADDITIONALLY a turn-end
+    hook in the repo's `.claude/settings.local.json` — but only on Claude Code, which is the
+    only backend exposing one. Describing that file to a Codex or OpenCode user would promise
+    an install that never happens and hide the limit that does apply to them: nothing is picked
+    up until they commit.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    cli._maybe_prompt_background_hook(_autostart_config(tmp_path / "claude"), scripted=False, backend="claude")
+    claude_text = capsys.readouterr().out
+    cli._maybe_prompt_background_hook(_autostart_config(tmp_path / "codex"), scripted=False, backend="codex")
+    codex_text = capsys.readouterr().out
+
+    assert ".claude/settings.local.json" in claude_text
+    assert "without waiting for a commit" in claude_text
+    assert ".claude" not in codex_text
+    assert "at your next COMMIT" in codex_text  # the limitation, said plainly
+    for text in (claude_text, codex_text):
+        assert "pre-commit hook" in text  # the part every backend gets
+        assert "--remove-hooks" in text
+
+
+def test_the_prompt_resolves_the_backend_the_daemon_will_use(tmp_path, monkeypatch):
+    # --backend wins; otherwise the repo's own recorded backend; otherwise the global default.
+    # Getting this wrong shows the wrong description to the user, which is the whole point.
+    import json as _json
+
+    from agitrack.git import GitRepo
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    repo = GitRepo.discover(tmp_path)
+    config = _autostart_config(tmp_path)
+
+    assert cli._autostart_backend(repo, "opencode", config) == "opencode"  # the flag wins
+
+    (tmp_path / ".agitrack").mkdir(exist_ok=True)
+    (tmp_path / ".agitrack" / "state.json").write_text(_json.dumps({"backend": "codex"}), encoding="utf-8")
+    assert cli._autostart_backend(repo, None, config) == "codex"  # then what this repo ran
+
+
 def test_background_hook_prompt_enable_off_and_reask_when_off(tmp_path, monkeypatch, capsys):
     # `agitrack -b` explains the auto-start hook and records the repo-scoped choice.
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
