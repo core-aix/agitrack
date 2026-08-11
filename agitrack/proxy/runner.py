@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import filecmp
-import hashlib
 import os
 from agitrack.env import getenv_compat
 import queue
@@ -34,17 +33,14 @@ from agitrack.backends.setup import BackendUnavailable, backend_installed, ensur
 from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.commits import (
     apply_summary_to_message,
-    build_auto_fold_message,
     build_manual_squash_trailer,
-    build_pending_trailer,
     is_fully_tracked_message,
-    is_in_flight_only_message,
     build_user_commit_message,
     summary_metadata_lines,
-    write_lf,
 )
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
+from agitrack.git import read_cache as git_read_cache
 from agitrack.git import hooks as git_hooks
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
@@ -56,7 +52,20 @@ from agitrack.proxy.integration import IntegrationService, MergeContext, MergePh
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
-from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
+from agitrack.proxy.textutil import strip_ansi
+
+# ProxyRunner's session-sharing half, split out by concern (see sharing.py's header for why
+# it is a mixin). The module-level helpers are re-exported because they were part of this
+# module's surface before the split and are imported from here by tests.
+from agitrack.proxy.sharing import (  # noqa: F401  (re-exported for import compatibility)
+    SessionSharingMixin,
+    _push_rejection_reason,
+    _redact_and_cap,
+    _shared_transcript_rows,
+)
+from agitrack.proxy.branch_watch import BranchWatchMixin
+from agitrack.proxy.manual_commits import ManualCommitsMixin
+from agitrack.proxy.updates import UpdatesMixin
 from agitrack.transcripts import SessionRef
 
 
@@ -223,12 +232,6 @@ _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 # ProxyRunner._track_bracketed_paste and the modal module's docstring.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
-# String-level escape stripper for captured subprocess output (e.g. a backend updater's
-# spinner) so it reduces to readable lines for a status message: drop CSI/OSC sequences and
-# lone ESC pairs, and turn carriage-returns (used to redraw a spinner in place) into newlines
-# so each frame is its own line and the last meaningful one survives.
-_ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
-
 # OSC 52 (set/clear the terminal clipboard), BEL- or ST-terminated. The backend emits this to
 # copy to the clipboard; because aGiTrack renders the screen via pyte (which consumes OSC and
 # only the visible grid is re-emitted), it must be forwarded to the host terminal explicitly or
@@ -251,38 +254,6 @@ _HOST_TERMINAL_REPLY_RE = re.compile(
 )
 
 
-def _strip_ansi(text: str) -> str:
-    return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
-
-
-def _push_rejection_reason(error: str) -> str:
-    """The most informative line of a failed `git push`'s stderr — the part that names WHY
-    the remote rejected it (a stale lease, a protected ref, a declined hook, a permission
-    denial). Git buries the reason among progress lines, so showing the whole blob (or a
-    blind prefix slice) hides it; this surfaces the line that actually explains the failure."""
-    raw = [line.strip() for line in (error or "").splitlines()]
-    # Drop git's "remote: " prefix so the reason reads cleanly.
-    lines = [(line[len("remote:") :].strip() if line.startswith("remote:") else line) for line in raw]
-    lines = [line for line in lines if line]
-    if not lines:
-        return "origin returned no error — the push likely timed out; check your connection and retry"
-    # GitHub's push protection / repository rulesets (NOT a custom hook) carry the actionable
-    # detail — which secret was found, an unblock URL, the rule — on lines OTHER than the bare
-    # "declined" summary. Surface those so the user can actually resolve it.
-    detail = [
-        line
-        for line in lines
-        if any(m in line.lower() for m in ("secret", "push protection", "rule violation", "ruleset", "unblock", "http"))
-    ]
-    if detail:
-        return " | ".join(detail[:4])[:400]
-    markers = ("rejected", "denied", "declined", "permission", "forbidden", "protected", "stale info")
-    for line in lines:
-        if any(marker in line.lower() for marker in markers):
-            return line[:200]
-    return lines[-1][:200]  # else the last line, which usually carries git's summary
-
-
 # The claude CLI refuses to resume a session that is still held by a running
 # background agent, printing this and exiting (e.g. a stale `bg` agent from an
 # earlier run). Its own remedy is --fork-session, which aGiTrack applies
@@ -293,25 +264,6 @@ _FORK_HINT_RE = re.compile(r"running as a background agent|--fork-session", re.I
 # Sentinel: the summarizer-model picker was dismissed (Esc), distinct from a real None choice
 # ("same as the session model"). Lets _choose_summarizer_model report "no change" unambiguously.
 _NO_MODEL_PICK = object()
-
-
-def _shared_transcript_rows(transcript: str) -> int:
-    # Recorded in the share manifest so the resume menu can tell at a glance whether
-    # a shared copy is older/newer than the local one without reading either blob.
-    from agitrack.sessions import count_transcript_rows
-
-    return count_transcript_rows(transcript)
-
-
-def _redact_and_cap(backend, raw: str, max_bytes: int) -> tuple[str, bool]:
-    """Redact secrets, then bound the transcript to ``max_bytes`` (keeping a resumable recent
-    tail) so a large session can't exceed Git's per-file size limit. Returns the (possibly
-    trimmed) shared text and whether it was trimmed."""
-    from agitrack.sessions import redact_transcript
-
-    redacted = redact_transcript(raw)
-    capped = backend.cap_shared_transcript(redacted, max_bytes)
-    return capped, capped != redacted
 
 
 def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
@@ -683,7 +635,7 @@ class ProxyInput:
             self.selected_index = (self.selected_index + delta) % len(matches)
 
 
-class ProxyRunner:
+class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, UpdatesMixin):
     # The active session's integration target. It is a Session.FIELDS entry exposed
     # via a custom property added at the bottom of this module; declared here so mypy
     # knows its type (the property is attached dynamically).
@@ -2215,1365 +2167,6 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")
 
-    # --- manual-commit mode (--manual-commits): hidden latent commits + a hook that ----
-    # --- folds their tracking into the user's own commit (a strict addition, off by ----
-    # --- default; none of this runs unless self._manual_commits is True). --------------
-
-    def _manual_ref(self) -> str:
-        """The hidden ref that chains this session's per-turn latent commits."""
-        return f"refs/agitrack/manual/{self.state.session_id}"
-
-    def _manual_agit_dir(self):
-        return self.base_repo.repo / ".agitrack"
-
-    @property
-    def _latent_tracking(self) -> bool:
-        """Whether this session records turns as hidden latent commits and folds them via the
-        prepare-commit-msg hook — true for ALL no-worktree sessions (manual OR auto). Worktree
-        mode commits per-branch and integrates as before (false). Derived (not stored) so it is
-        always consistent with ``_use_worktrees`` even in tests that build the runner directly."""
-        return not self._use_worktrees
-
-    @property
-    def _noworktree_auto(self) -> bool:
-        """No-worktree mode WITHOUT manual commits: aGiTrack folds the pending latent turns into a
-        commit itself, and the fold hook folds the agent's OWN commits (cover is only the backup)."""
-        return (not self._use_worktrees) and (not self._manual_commits)
-
-    def _setup_manual_commit_mode(self) -> None:
-        """Startup wiring for manual-commit mode: install the fold/reset hooks (unless a
-        custom ``core.hooksPath`` makes that impossible — then the poll+cover fallback runs
-        instead), point the latent chain at the current HEAD, and render the initial trailer
-        so even a first commit with no agent turns is attributed to the session.
-
-        Also used by no-worktree AUTO mode (``_latent_tracking``): the same hooks fold the agent's
-        own commits, and aGiTrack folds any remaining pending turns itself (see _auto_fold_latent)."""
-        if not self._latent_tracking:
-            return
-        self._manual_hooks_installed = False
-        try:
-            if self.base_repo.core_hooks_path():
-                self._debug("manual-commit hooks skipped: core.hooksPath is set (using poll+cover fallback)")
-            else:
-                self._manual_hooks_installed = git_hooks.install_manual_commit_hooks(
-                    self.base_repo.hooks_dir(), debug=self._debug
-                )
-        except Exception as error:
-            self._debug(f"manual-commit hook install failed: {error!r}")
-        # Also install the PERSISTENT auto-track pre-commit hook so a commit made LATER — after
-        # this aGiTrack exits (e.g. a reboot) — still records its AI work and folds it into that
-        # commit. It defers to a live tracker (this session), so it's a no-op while we run; it earns
-        # its keep once aGiTrack is gone. The worktree base-commit guard wants the same hook slot,
-        # so a worktree run steps this one aside and restores it on teardown (see
-        # `_install_base_commit_guard`); this path is no-worktree/_latent_tracking.
-        self._install_autotrack_precommit_hook()
-        # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
-        # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
-        self._reset_stale_manual_ref()
-        # …and the same for chains left by sessions that are GONE — a crash, a Ctrl-C, a mode
-        # switch, or edits the user discarded. `_reset_stale_manual_ref` only ever looks at our
-        # own ref, so nothing revisited those and their turns rode into an unrelated later
-        # commit, attributing AI authorship to code that never contained it.
-        try:
-            from agitrack.commits.manual import prune_abandoned_refs
-
-            dropped = prune_abandoned_refs(
-                self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug
-            )
-            if dropped:
-                # Say so. Discarding a chain is the right call (its work is no longer uncommitted),
-                # but it is still AI attribution going away, and the user should hear about it
-                # rather than find out from a history that is quietly missing a turn.
-                count = len(dropped)
-                chains = "chain" if count == 1 else "chains"
-                self._set_message(
-                    f"aGiTrack: discarded {count} abandoned tracking {chains} from an earlier session — "
-                    "their changes are no longer uncommitted, so they had nothing left to attribute.",
-                    seconds=10.0,
-                )
-        except Exception as error:
-            self._debug(f"abandoned-ref prune failed: {error!r}")
-        # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
-        # didn't fold), and the durable trailer/ref files the hook reads.
-        try:
-            self._manual_last_head = self.repo.rev_parse("HEAD")
-        except Exception:
-            self._manual_last_head = None
-        self._render_manual_trailer()
-
-    def _teardown_manual_commit_mode(self) -> None:
-        # Unconditional (NOT gated on _latent_tracking): removal must run even in worktree mode so
-        # a stale manual fold-hook left by a prior crashed no-worktree run is cleared. It only
-        # removes aGiTrack's OWN marked hooks (restoring any chained user hook) and is a no-op when
-        # none are installed, so calling it in any mode is safe.
-        try:
-            if self.base_repo is not None and not self.base_repo.core_hooks_path():
-                git_hooks.remove_manual_commit_hooks(self.base_repo.hooks_dir(), debug=self._debug)
-        except Exception as error:
-            self._debug(f"manual-commit hook removal failed: {error!r}")
-
-    def _manual_pending_count(self) -> int:
-        """How many latent turns are recorded but not yet folded into a commit (cheap: no
-        message reads). Used by the exit reminder."""
-        if not self._latent_tracking:
-            return 0
-        tip = self.repo.ref_sha(self._manual_ref())
-        if not tip:
-            return 0
-        try:
-            return len(self.repo.log_shas("HEAD", tip))
-        except Exception:
-            return 0
-
-    def _manual_pending_refs(self) -> list[str]:
-        """Every latent ref still holding turns that no branch contains — not just this session's.
-
-        Mirrors :meth:`ManualCommitTracker.pending_refs` (the proxy keeps its own copy of the
-        latent machinery): the ref name embeds the agitrack session id, so a new session or a
-        backend switch moves it and folding only the current ref would drop the turns recorded
-        before the switch."""
-        try:
-            refs = self.base_repo.list_refs("refs/agitrack/manual/")
-        except Exception as error:
-            self._debug(f"manual ref enumeration failed: {error!r}")
-            refs = []
-        current = self._manual_ref()
-        if current not in refs:
-            refs.append(current)
-        return [ref for ref in refs if self.repo.ref_sha(ref)]
-
-    def _manual_pending_shas(self) -> list[str]:
-        """The latent commits awaiting a fold across every session's ref, oldest first.
-
-        "Reachable from no branch" — not ``HEAD..ref`` — is what makes this correct after a fold:
-        the post-commit hook advances the ref to a real branch commit, so a plain range walk
-        reported that already-folded work as pending again the moment HEAD moved to another
-        branch, and it folded (and billed) a second time."""
-        seen: set[str] = set()
-        stamped: list[tuple[int, str]] = []
-        for ref in self._manual_pending_refs():
-            try:
-                shas = self.repo.unlanded_commits(ref)
-            except Exception as error:
-                self._debug(f"manual pending walk failed for {ref}: {error!r}")
-                continue
-            for sha in shas:
-                if sha in seen:
-                    continue
-                seen.add(sha)
-                stamped.append((self.repo.commit_timestamp(sha) or 0, sha))
-        stamped.sort(key=lambda item: item[0])
-        return [sha for _stamp, sha in stamped]
-
-    def _manual_pending_bodies(self) -> list[str]:
-        """Commit-message bodies of the pending latent turns (oldest first): the commits on
-        the latent ref that HEAD does not yet contain.
-
-        Each body already carries the turn's full metadata + interaction trace (written
-        synchronously when the latent commit was recorded — the fold never waits on it). The
-        LLM summary is computed asynchronously and lands as a git NOTE on the latent commit
-        (which is never HEAD, so it can't be amended into the message); fold it into the body
-        here when it has arrived, so the user's commit gets the summarized message. If the user
-        commits before a summary finishes, it is simply omitted — the metadata/trace are still
-        there."""
-        bodies: list[str] = []
-        for sha in self._manual_pending_shas():
-            body = self.repo.commit_message(sha)
-            if not body:
-                continue
-            try:
-                summary = self.repo.notes_show(sha, namespace="agitrack/commit-summary")
-            except Exception:
-                summary = None
-            if summary and summary.strip():
-                body = apply_summary_to_message(body, summary)
-            bodies.append(body)
-        return bodies
-
-    def _note_in_flight(self, facts: dict | None) -> None:
-        """Remember (or clear) the running turn's facts, refreshed from every session export.
-
-        Re-renders the fold trailer on a change so it is already current if the agent commits
-        mid-turn. The proxy needs this because — unlike the background daemon, which the
-        pre-commit hook nudges synchronously — it otherwise renders only as turns COMPLETE, and
-        a turn that has merely STARTED is exactly the case this attribution exists for."""
-        changed = getattr(self, "_in_flight", None) != facts
-        self._in_flight = facts
-        if changed:
-            self._render_manual_trailer()
-
-    def _in_flight_attribution(self) -> dict | None:
-        """The running turn's facts for the fold trailer, or None when nothing should be
-        attributed. Mirrors ``ManualCommitTracker.in_flight_attribution``: a turn must actually
-        be in progress AND the working tree must differ from the latent tip, so a commit with no
-        AI work in it still gets no trailer."""
-        facts = getattr(self, "_in_flight", None)
-        if not facts:
-            return None
-        try:
-            if not self._manual_tree_differs_from_tip(self.repo.snapshot_worktree_tree()):
-                return None
-        except Exception as error:
-            self._debug(f"in-flight snapshot failed: {error!r}")
-            return None
-        return facts
-
-    def _render_manual_trailer(self) -> None:
-        """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and
-        the ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns
-        exist the trailer carries the ``commit_type: user`` block plus each turn's full
-        trace/metadata; when none are pending but the agent is mid-turn with changes in the tree
-        it carries the in-flight attribution block instead (so an agent that commits its own work
-        before the turn ends is still tracked); otherwise it is empty and a purely human commit
-        is untouched."""
-        if not self._latent_tracking:
-            return
-        try:
-            agit_dir = self._manual_agit_dir()
-            agit_dir.mkdir(parents=True, exist_ok=True)
-            # Every ref this commit will fold, one per line, LF-terminated (see commits.write_lf:
-            # a CRLF name makes `git update-ref` refuse and the refs never advance on Windows).
-            refs = self._manual_pending_refs()
-            if self._manual_ref() not in refs:
-                refs.append(self._manual_ref())
-            write_lf(agit_dir / "manual-ref", "\n".join(refs) + "\n")
-            trailer = build_pending_trailer(
-                agitrack_session_id=self.state.session_id,
-                latent_bodies=self._manual_pending_bodies(),
-                in_flight=self._in_flight_attribution(),
-            )
-            write_lf(agit_dir / "manual-pending-trailer", trailer)
-        except Exception as error:
-            self._debug(f"manual trailer render failed: {error!r}")
-
-    def _manual_tree_differs_from_tip(self, tree: str) -> bool:
-        """Whether *tree* differs from the latent tip's tree (or HEAD's when the chain is
-        empty) — i.e. whether there is uncommitted agent work to account for."""
-        tip = self.repo.ref_sha(self._manual_ref())
-        try:
-            # `comparable_tree`, never a raw `^{tree}` — the snapshot on the other side of this
-            # comparison drops the agent scaffolding dirs. See GitRepo.comparable_tree.
-            base_tree = self.repo.comparable_tree(tip or "HEAD")
-        except Exception:
-            base_tree = None
-        return tree != base_tree
-
-    def _manual_gate(self) -> bool:
-        """Commit gate for a manual-mode turn: True when the working tree changed since the
-        latent tip (or HEAD when the chain is empty). Caches the snapshot tree so
-        :meth:`_manual_record` doesn't re-snapshot."""
-        try:
-            self._manual_pending_tree = self.repo.snapshot_worktree_tree()
-        except Exception as error:
-            self._debug(f"manual snapshot failed: {error!r}")
-            self._manual_pending_tree = None
-            self._manual_allow_unchanged = False
-            return False
-        if self._manual_tree_differs_from_tip(self._manual_pending_tree):
-            self._manual_allow_unchanged = False
-            return True
-        # An unchanged tree normally means the turn left nothing to record. It does NOT when the
-        # agent committed its own work mid-turn: that commit carries an in-flight block only, so
-        # the turn's trace and tokens are still owed, and declining here loses them outright.
-        # Record with the tree as it stands — the latent commit is metadata, not a diff.
-        self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
-        return self._manual_allow_unchanged
-
-    def _manual_record(self, message: str) -> str | None:
-        """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
-        commit-tree it onto the latent tip, and advance ONLY the latent ref — HEAD and the
-        user's index are untouched. Returns the short sha, or None if the tree is unchanged."""
-        tree = getattr(self, "_manual_pending_tree", None)
-        self._manual_pending_tree = None
-        if tree is None:
-            try:
-                tree = self.repo.snapshot_worktree_tree()
-            except Exception as error:
-                self._debug(f"manual snapshot failed: {error!r}")
-                return None
-        tip = self.repo.ref_sha(self._manual_ref())
-        re_anchored = False
-        if tip is not None and not self.repo.has_object_local(tip):
-            # Kept in lockstep with `ManualCommitTracker.record`: `git gc --prune` can collect a
-            # latent commit (unreachable from any branch by design), after which every lookup
-            # against the tip raises — and record() runs on EVERY turn, so interactive `-m` would
-            # silently stop tracking for the rest of the session. Re-anchor at HEAD: the chain
-            # restarts and only the already-lost turns are lost.
-            self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
-            tip, re_anchored = None, True
-        parent = tip or self.repo.rev_parse("HEAD")
-        allow_unchanged = getattr(self, "_manual_allow_unchanged", False)
-        self._manual_allow_unchanged = False
-        # Defensive: nothing new since the baseline — the latent tip, or HEAD when the chain is
-        # EMPTY (the same baseline the gate uses, and previously exempt from this guard, so an
-        # ungated record() wrote a phantom first turn against an untouched tree). Skipped when the
-        # gate allowed an unchanged tree (the agent committed the turn's work itself) and after a
-        # re-anchor, where HEAD is a fallback parent rather than evidence that nothing happened —
-        # either way the turn's tokens would vanish.
-        baseline = None if re_anchored else (tip or "HEAD")
-        if not allow_unchanged and baseline is not None and tree == self.repo.comparable_tree(baseline):
-            return None
-        sha = self.repo.commit_tree(tree, parents=[parent], message=message)
-        self.repo.update_ref(self._manual_ref(), sha)
-        self._render_manual_trailer()
-        return self.repo.short_sha(sha)
-
-    def _reset_stale_manual_ref(self) -> bool:
-        """Reset the latent ref to HEAD when its recorded turns are STALE, so they are never
-        re-folded into an unrelated future commit. The one rule, applied both at startup and
-        on every poll: turns are stale when either
-
-          * the tip is an ANCESTOR of HEAD — they are already committed/folded (a normal
-            in-aGiTrack commit resets the ref via the post-commit hook; this catches a bypassed
-            or interrupted one); or
-          * the working tree is CLEAN (its snapshot equals HEAD's tree) — nothing is left to
-            fold, so any pending turns are already reflected in HEAD. This is the case when a
-            commit was made OUTSIDE aGiTrack: while aGiTrack runs, the fold hook already
-            combined the turns INTO that commit (any terminal, even ``--no-verify``); after it
-            has exited, the hook is gone so the trace is unavoidably lost for that commit — but
-            either way the pending chain is now redundant and dropping it prevents its trace
-            from re-attaching to a later commit.
-
-        A DIRTY tree with a diverged tip means real uncommitted work remains, so the turns are
-        kept and fold on the next commit. Never merges — the ref is only ever reset, so there
-        is no git conflict. Returns True when it reset the ref."""
-        try:
-            head = self.repo.rev_parse("HEAD")
-            tip = self.repo.ref_sha(self._manual_ref())
-            if not tip:
-                return False
-            clean = self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD")
-            if clean and is_in_flight_only_message(self.repo.commit_message(head)):
-                # A clean tree normally means the fold hook already combined the pending turns
-                # INTO HEAD, so they are redundant. It does NOT when HEAD carries only an
-                # IN-FLIGHT block: the agent committed while its turn was still running, so that
-                # commit records who made the change but not the turn's trace or tokens — which
-                # are still owed. Dropping the chain here is what loses them for good, and in
-                # manual mode (where aGiTrack must not commit) the chain is the ONLY thing
-                # holding them until the user's next commit folds them in.
-                # Same rule as `_uncovered_backend_commits`: in-flight ≠ accounted for.
-                #
-                # Narrow on purpose: a commit with NO aGiTrack metadata (made outside aGiTrack,
-                # where the hook never ran) still drops the chain as before — that trace is
-                # unavoidably lost, and keeping the chain would re-attach it to some later,
-                # unrelated commit.
-                return False
-            if clean or self.repo.is_ancestor(tip, head):
-                self.repo.update_ref(self._manual_ref(), head)
-                return True
-        except Exception as error:
-            self._debug(f"manual ref reset failed: {error!r}")
-        return False
-
-    def _service_manual_commit_mode(self) -> None:
-        """Per-loop upkeep for manual-commit mode (throttled). With the hooks installed, react
-        to a commit (the post-commit signal fired, or HEAD simply moved) by dropping the now-
-        stale latent chain and re-rendering the trailer — so a commit made outside aGiTrack,
-        which the fold hook already combined the pending turns into, also resets the ref.
-        Without hooks (custom core.hooksPath), fall back to detecting the commit by polling
-        HEAD and adding a cover commit. Runs for all no-worktree modes (``_latent_tracking``):
-        in no-worktree AUTO mode this is also how the agent's own commit resets the chain after
-        the fold hook folds tracking into it."""
-        if not self._latent_tracking:
-            return
-        now = time.monotonic()
-        if now - getattr(self, "_manual_poll_at", 0.0) < self.BASE_POLL_SECONDS:
-            return
-        self._manual_poll_at = now
-        # No-worktree AUTO mode: aGiTrack folds any pending turns into a commit itself (so the
-        # user doesn't have to). A clean tree means the agent already committed — the fold hook
-        # folded the tracking into that commit — so this is a no-op then.
-        if self._noworktree_auto:
-            self._auto_fold_latent_pending()
-        if getattr(self, "_manual_hooks_installed", False):
-            signal_file = self._manual_agit_dir() / "manual-commit-signal"
-            try:
-                mtime = signal_file.stat().st_mtime
-            except OSError:
-                mtime = None
-            try:
-                head = self.repo.rev_parse("HEAD")
-            except Exception:
-                return
-            signalled = mtime is not None and mtime != getattr(self, "_manual_signal_mtime", None)
-            moved = head != self._manual_last_head
-            if signalled or moved:
-                self._manual_signal_mtime = mtime
-                self._manual_last_head = head
-                # A commit happened: if it absorbed the pending turns (tree now clean, or the
-                # tip is already in HEAD), drop the stale chain. The post-commit hook normally
-                # did this already; doing it here too makes it robust to a bypassed hook.
-                self._reset_stale_manual_ref()
-                self._render_manual_trailer()
-        else:
-            self._reconcile_manual_external_commit()
-
-    def _reconcile_manual_external_commit(self) -> None:
-        """Poll+cover FALLBACK for when the fold hook can't run (custom core.hooksPath): if
-        HEAD moved since we last looked and pending latent turns exist, the user committed
-        outside the hook — add a cover commit carrying the pending tracking (its tree equals
-        the new HEAD's, so it introduces no diff), then reset the latent ref. A no-op when
-        the hook is installed (it already folded the tracking and reset the ref)."""
-        if not self._latent_tracking or getattr(self, "_manual_hooks_installed", False):
-            return
-        try:
-            head = self.repo.rev_parse("HEAD")
-        except Exception:
-            return
-        last = getattr(self, "_manual_last_head", None)
-        if last is None:
-            self._manual_last_head = head
-            return
-        if head == last:
-            return
-        self._manual_last_head = head
-        tip = self.repo.ref_sha(self._manual_ref())
-        bodies = self._manual_pending_bodies()
-        if not tip or not bodies:
-            self._render_manual_trailer()
-            return
-        message = "<aGiTrack> track agent turns\n\n" + build_manual_squash_trailer(
-            agitrack_session_id=self.state.session_id, latent_bodies=bodies
-        )
-        try:
-            head_tree = self.repo.rev_parse("HEAD^{tree}")
-            self.repo.cover_commit(message, first_parent=head, second_parent=tip, tree=head_tree)
-            self._manual_last_head = self.repo.rev_parse("HEAD")
-            self.repo.update_ref(self._manual_ref(), self.repo.rev_parse("HEAD"))
-        except Exception as error:
-            self._debug(f"manual cover reconcile failed: {error!r}")
-        self._render_manual_trailer()
-
-    def _auto_fold_latent_pending(self, *, force: bool = False) -> None:
-        """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
-        the branch advances per turn (like normal auto mode) but the interaction trace/metadata
-        rides the SAME commit as the code — no separate cover. A clean working tree means the agent
-        (or user) already committed its work, in which case the prepare-commit-msg fold hook folded
-        the tracking into THAT commit (cover being only the backup), so there is nothing to do.
-
-        ``force`` skips the summary-defer wait below: it is set on the EXIT finalize, where the
-        summary has already been joined and serviced separately, and where we must land the commit
-        NOW — the throttled poll that normally folds does not run during teardown, so without this
-        the turn's changes would stay recorded only as a latent commit and never reach HEAD (the
-        reported 'commit not made, not even on exit' bug in no-worktree auto mode)."""
-        if not self._noworktree_auto:
-            return
-        tip = self.repo.ref_sha(self._manual_ref())
-        if not tip:
-            return
-        try:
-            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
-                return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
-        except Exception:
-            return
-        # Hold the fold briefly while this turn's summary is still in flight: the summary lands
-        # as a note on the (never-HEAD) latent commit, which _manual_pending_bodies folds into the
-        # message below — but only if it has arrived first. Without this wait the poll folds within
-        # ~3s, long before the multi-second LLM summary returns, so the folded commit keeps its
-        # prompt-based subject and the summary is orphaned as a note (the reported no-worktree bug).
-        # Bounded by SUMMARY_WAIT_SECONDS: past the deadline we fold as-is, summary becomes notes-only.
-        if not force and self._summary_blocks_integration(time.monotonic()):
-            return
-        bodies = self._manual_pending_bodies()
-        message = build_auto_fold_message(bodies)
-        if not message:
-            return
-        try:
-            folded = list(self.repo.log_shas("HEAD", tip))  # the latent turns this fold absorbs
-        except Exception:
-            folded = []
-        try:
-            self.repo.add_tracked()
-            declined = set(self.state.declined_untracked())
-            # The user's own untracked files (see _begin_agent_turn) are NOT this turn's output:
-            # staging them here put a file the user never agreed to commit into an agent commit
-            # that says nothing about it. They stay untracked until the user stages them.
-            theirs = self.user_untracked_since_fold or frozenset()
-            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined and p not in theirs])
-            if not self.repo.has_staged_changes():
-                return
-            # The message already carries the folded metadata, so the prepare-commit-msg hook's
-            # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
-            sha = self.repo.commit(message)
-            self._reset_stale_manual_ref()
-            self._manual_last_head = self.repo.rev_parse("HEAD")
-            self._render_manual_trailer()
-            self._last_agent_commit_id = sha
-            self._sessions_with_activity.add(self.state.session_id)
-            # Remember which latent turns this fold absorbed, so a summary that lands AFTER the
-            # deadline can still be amended into the real commit instead of being stranded on the
-            # latent one (see _folded_head_for). Only the newest fold is tracked: once HEAD moves
-            # on, amending is no longer safe anyway.
-            self._last_auto_fold = {
-                "head": self._manual_last_head,
-                "latent": folded,
-                "single": len(bodies) == 1,
-            }
-            # This fold is closed: the next turn re-establishes which untracked files are the
-            # user's (they may have staged, deleted or added some in the meantime).
-            self.user_untracked_since_fold = None
-        except Exception as error:
-            self._debug(f"auto fold failed: {error!r}")
-
-    def _check_base_branch_drift(self) -> None:
-        # Poll the branch checked out in the repo directory. The status bar bolds a
-        # session whose merge target differs from it; when the directory MOVES to a
-        # branch that differs from the active session's merge target, ask where this
-        # session's changes should merge. (Each session has its own merge branch,
-        # independent of the directory's checkout and of the other sessions.)
-        if self._base_branch is None:
-            return
-        if not self._use_worktrees:
-            # No-worktree mode (#9): the agent edits the directory's branch directly, so a
-            # session can only ever land its work on that current branch — never a different
-            # merge target. There is no merge-target dialog; just warn (and follow) when the
-            # directory's branch is switched.
-            self._check_no_worktree_branch_change()
-            return
-        if self.worktree is None:
-            return
-        now = time.monotonic()
-        if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
-            return
-        self._base_drift_check_at = now
-        # Cheap pre-check: the checked-out branch only changes when `.git/HEAD` is
-        # rewritten (a checkout — a commit does not touch it), so skip the git
-        # subprocess and reuse the cached branch when HEAD's mtime is unchanged. The
-        # pending-merge-prompt handling below depends on session merge state, not
-        # HEAD, so it still runs every tick.
-        git_dir = self._base_git_dir()
-        head_sig = self._newest_mtime([git_dir / "HEAD"]) if git_dir is not None else None
-        if head_sig is not None and head_sig == self._base_head_mtime:
-            current = self._repo_dir_branch  # HEAD untouched — branch is unchanged
-        else:
-            if head_sig is not None:
-                self._base_head_mtime = head_sig
-            try:
-                current = self.base_repo.current_branch()  # the branch checked out in the repo dir
-            except Exception:
-                return
-        if current is None:
-            return
-        moved = current != self._repo_dir_branch
-        self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
-        # A dir-change prompt this session deferred during a run fires once the run is idle
-        # AND its changes have MERGED into the session's original branch — not the moment
-        # the run goes idle (the just-finished work is still committing/integrating then,
-        # and must land on the original branch before we ask where future work should go).
-        # A cancelled run leaves nothing to integrate, so the dialog is free to appear. The
-        # flag is per-session, evaluated against the FRESH dir branch: if the directory has
-        # returned to this session's branch there's nothing to ask, and a different
-        # session's pending prompt is never touched (it has its own flag).
-        if self._pending_merge_prompt:
-            if self._base_branch == current:
-                self._pending_merge_prompt = False  # back in sync — this session's deferral is moot
-            elif not self.agent_in_flight and self._session_work_merged_into_base():
-                self._pending_merge_prompt = False
-                self._prompt_merge_targets_on_dir_change()
-            return  # handled this session's pending deferral; nothing else to do this tick
-        if not moved:
-            return  # the repo directory hasn't moved since the last poll
-        if self._base_branch == current:
-            return  # the session already merges into the directory's branch
-        if self.agent_in_flight:
-            # The session is mid-run — don't change its merge branch now. Warn that this
-            # run still lands on its current branch, and re-ask once its changes have
-            # merged there (or the run is cancelled, leaving nothing to merge).
-            self._pending_merge_prompt = True
-            self._set_message(
-                f"Repo is now on '{current}', but this run still merges into '{self._base_branch}'. "
-                f"You'll be asked again once its changes have merged into '{self._base_branch}'.",
-                seconds=10.0,
-            )
-            self._render()
-            return
-        self._prompt_merge_targets_on_dir_change()
-
-    def _check_no_worktree_branch_change(self) -> None:
-        # No-worktree mode: a session always works on (merges into) whatever branch is
-        # checked out in the repo directory and can never target a different one. If the
-        # user switches the directory's branch, future work simply lands on the new branch —
-        # warn so that change is never silent, and follow the directory so the status bar and
-        # accounting stay accurate. The warning fires once per switch (``_base_branch`` is
-        # advanced immediately, so the next poll sees no change).
-        now = time.monotonic()
-        if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
-            return
-        self._base_drift_check_at = now
-        # Cheap pre-check: a checkout rewrites `.git/HEAD`; if its mtime is unchanged
-        # the branch can't have switched, so skip the git subprocess entirely.
-        git_dir = self._base_git_dir()
-        if git_dir is not None:
-            head_sig = self._newest_mtime([git_dir / "HEAD"])
-            if head_sig == self._base_head_mtime:
-                return
-            self._base_head_mtime = head_sig
-        try:
-            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
-        except Exception:
-            return
-        if not current or current == self._base_branch:
-            if current:
-                self._repo_dir_branch = current  # keep the status bar fresh
-            return
-        old = self._base_branch
-        self._base_branch = current
-        self._repo_dir_branch = current
-        self._integration.base_branch = current
-        self._set_message(
-            f"The repo directory switched from '{old}' to '{current}'. Running without a "
-            f"worktree, the agent's changes now land on '{current}' — a session always "
-            f"follows the directory's current branch and can't merge into a different one.",
-            seconds=12.0,
-        )
-        self._render()
-
-    def _follow_agent_worktree_branch(self) -> None:
-        # The backend agent can switch the branch checked out IN ITS OWN WORKTREE with a plain
-        # `git checkout`/`git switch` — the worktree directory does not move, only HEAD. aGiTrack
-        # otherwise only ever leaves a worktree detached at base (between turns) or on a managed
-        # `agitrack/<backend>/<name>/tN` turn branch, so the worktree sitting on a NON-managed, named
-        # branch can only mean the agent moved it. Follow it: point the session's tracked branch
-        # (status bar + integration accounting) at it so cover commits keep landing there as
-        # normal — the existing `is_managed_branch` gates already skip auto-integrating a branch
-        # the agent owns — and tell the user once. (No-worktree mode is handled separately by
-        # `_check_no_worktree_branch_change`; there's no second branch to follow without a worktree.)
-        if self.worktree is None or self._base_branch is None:
-            return
-        now = time.monotonic()
-        if now - self._agent_branch_check_at < self.BASE_DRIFT_CHECK_SECONDS:
-            return
-        self._agent_branch_check_at = now
-        try:
-            current = self.repo.current_branch()  # the branch checked out in THIS session's worktree
-        except Exception:
-            return
-        # "HEAD" = detached (aGiTrack's between-turns state), a managed turn branch = aGiTrack's
-        # own doing, and a branch already equal to the tracked one = nothing new. None of those is
-        # an agent-driven switch.
-        if not current or current == "HEAD" or is_managed_branch(current) or current == self._base_branch:
-            return
-        self._base_branch = current
-        self._repo_dir_branch = current  # keep the status bar's branch fresh
-        self._integration.base_branch = current
-        self._set_message(f"Working branch switched to '{current}' by the backend agent.", seconds=10.0)
-        self._render()
-
-    def _session_work_merged_into_base(self) -> bool:
-        # True once the active session's work has landed on its merge branch — nothing
-        # uncommitted, mid-merge, or committed-but-unintegrated remains. Used to hold the
-        # deferred branch-switch dialog until a just-finished run's changes have merged
-        # into the original branch (a cancelled run leaves nothing pending, so it's True).
-        try:
-            return not self._integration.session_unintegrated(self.repo)
-        except Exception:
-            return True
-
-    def _prompt_merge_targets_on_dir_change(self) -> None:
-        # The repo directory was switched to another branch. Sessions keep merging into
-        # their own branches by default; offer to realign them. The first (default)
-        # option does nothing; then "switch only this session"; then, with more than
-        # one session, "switch ALL sessions" to the directory's branch.
-        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
-            return
-        if self._base_branch == self._repo_dir_branch:
-            return  # the active session already merges into the directory's branch
-        dir_branch = self._repo_dir_branch
-        options = [
-            "Do nothing — keep every session merging into its own branch",
-            f"Switch only '{self.name}' to '{dir_branch}'",
-        ]
-        if len(self.sessions or []) > 1:
-            options.append(f"Switch all idle sessions to '{dir_branch}' (running sessions keep their branch)")
-        choice = self._select_popup(
-            f"The repo directory is now on '{dir_branch}', but session '{self.name}' merges into "
-            f"'{self._base_branch}'. What should happen? "
-            f"(Change any session's merge branch later via Ctrl-G → session → Change a session's merge branch.)",
-            options,
-        )
-        if not choice or choice.startswith("Do nothing"):
-            self._set_message(
-                f"Sessions keep merging into their own branches (the repo directory is on '{dir_branch}').",
-                seconds=6.0,
-            )
-            self._render()
-            return
-        if choice.startswith("Switch all idle"):
-            self._retarget_all_sessions(dir_branch)
-            return
-        self._retarget_active_session(dir_branch)  # switch only the active session
-
-    def _prompt_merge_target_if_diverged(self) -> None:
-        # Used on a SESSION SWITCH: when the newly-active session merges into a branch
-        # other than the directory's, ask whether to keep its own branch (default) or
-        # switch it to the directory's.
-        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
-            return
-        if self._base_branch == self._repo_dir_branch:
-            return
-        if self.agent_in_flight:
-            return  # a running session's branch can't change mid-run; the status bar bolds the difference
-        choice = self._select_popup(
-            f"The repo directory is on '{self._repo_dir_branch}', but session '{self.name}' merges into "
-            f"'{self._base_branch}'. Where should this session's changes merge?",
-            [
-                f"Keep merging into '{self._base_branch}'",
-                f"Switch to '{self._repo_dir_branch}' (the current directory branch)",
-            ],
-        )
-        if choice and choice.startswith("Switch to '"):
-            self._retarget_active_session(self._repo_dir_branch)
-        else:
-            self._set_message(
-                f"'{self.name}' keeps merging into '{self._base_branch}' "
-                f"(the repo directory is on '{self._repo_dir_branch}').",
-                seconds=6.0,
-            )
-            self._render()
-
-    def _retarget_all_sessions(self, target: str) -> None:
-        # Re-point every IDLE session at `target` (used by "switch all idle sessions").
-        # A running session keeps the branch it started its turn on — its in-flight work
-        # must not split across branches — so it is left untouched and reported.
-        skipped: list[str] = []
-        for index in range(len(self.sessions)):
-            session = self.sessions[index]
-            if getattr(session, "agent_in_flight", False):
-                skipped.append(self._session_name(index))
-                continue
-            if session is self.active:
-                self._retarget_active_session(target)  # active, in place
-            else:
-                self._with_session(session, lambda: self._retarget_active_session(target))
-        if skipped:
-            self._set_message(
-                f"Kept {', '.join(skipped)} on their current branch — they're running a turn; "
-                f"re-point them once idle via Ctrl-G → session → Change a session's merge branch.",
-                seconds=10.0,
-            )
-            self._render()
-
-    def _reconcile_merge_branch(self, default_base: str | None) -> None:
-        # On startup/resume aGiTrack assumes a session merges into the directory's current
-        # branch (`default_base`). If a PRIOR run assigned this worktree a different merge
-        # branch (persisted in its state), honor that assignment instead and flag a
-        # confirmation prompt, so the user confirms the branch change before it takes
-        # effect rather than silently merging into a branch they didn't choose. Otherwise
-        # record `default_base` as this worktree's merge branch.
-        if self.state is None:
-            return
-        previous = self.state.merge_branch  # what the previous aGiTrack instance assigned
-        if previous and previous != default_base and self._branch_exists(previous):
-            self._base_branch = previous  # keep merging where the prior run was pointed
-            self._pending_merge_prompt = True  # confirm with the user once the TUI is ready
-        elif default_base is not None:
-            # No prior assignment, it already matches, or its branch is gone — record the
-            # directory's current branch as this worktree's merge branch.
-            self.state.merge_branch = default_base
-
-    def _branch_exists(self, branch: str) -> bool:
-        # Whether `branch` is a real local branch right now. On any error assume it does,
-        # so a prior merge-branch assignment is never silently dropped on a transient
-        # failure — only when the branch is provably gone.
-        try:
-            return branch in self.base_repo.list_branches()
-        except Exception:
-            return True
-
-    def _retarget_active_session(self, target: str) -> bool:
-        # Change the ACTIVE session's merge destination to `target` — per-session, so
-        # the other sessions and the repo directory are left untouched. Flush its
-        # pending work into the OLD target first, then re-point its worktree there.
-        if self.worktree is None or self._base_branch is None:
-            return False
-        if target == self._base_branch:
-            return True
-        if self.agent_in_flight:
-            # Never change a running session's merge branch mid-turn — its in-flight
-            # work would split across branches. Only an idle session can be re-pointed.
-            self._set_message(
-                f"'{self.name}' is running a turn — its merge branch can only be changed when idle. "
-                f"This run will merge into '{self._base_branch}'.",
-                seconds=10.0,
-            )
-            self._render()
-            return False
-        old = self._base_branch
-        self._exiting = True  # suppress the conflict-resolve popup during the flush
-        self._set_message(f"Integrating '{self.name}' into '{old}' before re-targeting…", seconds=30)
-        self._render()
-        self._integrate_session_keeping_alive()
-        if self._integration.session_unintegrated(self.repo):
-            self._exiting = False
-            self._set_message(
-                f"Can't change '{self.name}' merge target: it has unresolved work in '{old}'. "
-                f"Resolve it first ({self._menu_label()} → session).",
-                seconds=12.0,
-            )
-            self._render()
-            return False
-        self._base_branch = target  # the active session's new merge target (syncs the service)
-        if self.state is not None:
-            self.state.merge_branch = target  # keep the worktree's recorded merge branch in step
-        self._repoint_current_to_base()
-        self._exiting = False
-        self._set_message(f"'{self.name}' now merges into '{target}'.", seconds=8.0)
-        self._render()
-        return True
-
-    def _warn_if_base_edited(self) -> None:
-        # Fallback for un-sandboxed platforms: detect the agent editing the base
-        # repo (its working tree gaining uncommitted changes beyond the startup
-        # baseline) and warn, since those edits bypass aGiTrack's worktree tracking.
-        # (A direct *commit* to base is prevented outright by the pre-commit guard
-        # hook — see agitrack/git/hooks.py — which can attribute reliably via an env
-        # marker, something this status-based check cannot do.)
-        if not self._monitor_base_edits:
-            return
-        now = time.monotonic()
-        if now - self._base_check_at < self.BASE_EDIT_CHECK_SECONDS:
-            return
-        self._base_check_at = now
-        try:
-            current = set(self.base_repo.status_short().splitlines())
-        except Exception:
-            return
-        # Everything the agent has stranded in the base tree since startup (baseline stays
-        # pristine — only aGiTrack's own writes fold into it via _rebaseline_base_edits — so a
-        # stranded file stays counted for the exit reminder even after it's been warned once).
-        stranded = current - self._base_status_baseline
-        unwarned = stranded - self._base_warned_files
-        if unwarned:
-            files = ", ".join(sorted(line[3:] for line in list(unwarned) if len(line) > 3)[:5])
-            self._set_message(
-                f"Agent edited the base repo, outside its worktree ({files}). These "
-                "changes are not tracked by aGiTrack — move them into the worktree.",
-                seconds=12.0,
-            )
-            self._base_warned_files |= stranded  # warned now; don't re-nag the same files
-            self._render()
-
-    def _rebaseline_base_edits(self) -> None:
-        # Re-baseline the un-sandboxed base-edit monitor after aGiTrack ITSELF wrote into the base
-        # repo (the copy-back of stranded worktree files). Those files are aGiTrack's own action,
-        # not the agent editing outside its worktree, so fold them into the baseline rather than
-        # letting _warn_if_base_edited flag them as "Agent edited the base repo". No-op when the
-        # monitor isn't active (sandbox enforces confinement, or no worktree).
-        if not self._monitor_base_edits:
-            return
-        try:
-            self._base_status_baseline = set(self.base_repo.status_short().splitlines())
-        except Exception as error:
-            self._debug(f"rebaseline base edits failed: {error!r}")
-
-    def _remind_stranded_base_edits_on_exit(self) -> None:
-        # Last line of defense on an unsandboxed host (e.g. Ubuntu with unprivileged user
-        # namespaces restricted, where bwrap can't confine): if the agent left edits in the base
-        # tree outside its worktree, aGiTrack never committed them, and on exit the worktree is
-        # about to be removed — so surface them ONE more time, non-transiently, listing the files
-        # and where they are, rather than letting the work vanish quietly. Best-effort and never
-        # blocks exit. No-op when the monitor is off (sandbox enforces confinement, or no worktree).
-        if not self._monitor_base_edits:
-            return
-        try:
-            current = set(self.base_repo.status_short().splitlines())
-        except Exception:
-            return
-        stranded = sorted(line[3:] for line in (current - self._base_status_baseline) if len(line) > 3)
-        if not stranded:
-            return
-        shown = ", ".join(stranded[:8]) + (" …" if len(stranded) > 8 else "")
-        self._debug(f"stranded base-repo edits at exit: {stranded}")
-        self._set_message(
-            f"Heads up: the agent left {len(stranded)} change(s) in the base repo, outside its "
-            f"worktree ({shown}), which aGiTrack did NOT commit. They are in {self.base_repo.repo}; "
-            "review and move or commit them so the work isn't lost.",
-            seconds=20.0,
-        )
-        self._render()
-
-    @staticmethod
-    def _newest_mtime(paths) -> float:
-        """Newest modification time across *paths* (missing entries ignored).
-
-        A cheap change signal: a single ``stat`` per path, no work-tree walk, so a
-        git subprocess only runs when the underlying ref/HEAD file actually moved.
-        Returns 0.0 when nothing is present.
-        """
-        newest = 0.0
-        for path in paths:
-            try:
-                newest = max(newest, os.stat(path).st_mtime)
-            except OSError:
-                continue
-        return newest
-
-    def _base_git_dir(self):
-        """The repo dir's ``.git`` directory as a Path, or None when it can't be
-        resolved (e.g. a stubbed base repo in tests). Callers that can't resolve it
-        skip mtime-gating and fall back to reading git directly."""
-        repo = getattr(self.base_repo, "repo", None)
-        try:
-            return repo / ".git" if repo is not None else None
-        except TypeError:
-            return None
-
-    def _poll_base_advanced(self) -> None:
-        # aGiTrack advances the base itself (integration sets `_base_advanced`), but the
-        # base branch can also gain commits out of band — the user commits directly
-        # to it, pulls, rebases, etc. Poll its HEAD on a throttle and, when it moves
-        # for any reason, flag a sync so idle worktrees pick the new commits up
-        # (`_sync_idle_worktrees_to_base`). The first observation only records the
-        # baseline; it never triggers on startup.
-        if self.worktree is None or self._base_branch is None:
-            return
-        now = time.monotonic()
-        if now - self._base_poll_at < self.BASE_POLL_SECONDS:
-            return
-        self._base_poll_at = now
-        # Cheap pre-check: only shell out to `git rev-parse` when the base branch's
-        # ref (loose file or packed-refs) was actually rewritten since the last poll.
-        git_dir = self._base_git_dir()
-        if git_dir is not None:
-            sig = self._newest_mtime([git_dir / "refs" / "heads" / self._base_branch, git_dir / "packed-refs"])
-            if sig == self._base_ref_mtime:
-                self._prune_user_declined()  # keep the status-line count current
-                return
-            self._base_ref_mtime = sig
-        try:
-            head = self.base_repo.rev_parse(self._base_branch)
-        except Exception as error:
-            self._debug(f"base-head poll failed: {error!r}")
-            return
-        if self._last_base_head is not None and head != self._last_base_head:
-            self._base_advanced = True
-        self._last_base_head = head
-        self._prune_user_declined()  # keep the status-line count current
-
-    def _warn_if_cwd_drifted(self) -> None:
-        # `claude --resume` can restore a session's *saved* working directory and
-        # ignore the worktree aGiTrack launched it in (Claude Code issue #58591). When
-        # that happens the agent works in the wrong directory: its turns aren't
-        # tracked here and writes outside the worktree are sandbox-blocked. Detect
-        # it from the cwd the backend records, and warn once with how to recover.
-        #
-        # Only the cwd of a turn recorded *after* this launch counts (`since`): a
-        # resume — especially of an imported/shared session — leaves a stale cwd in
-        # the transcript that points elsewhere (the base repo, another machine's
-        # path) but is harmless, because the next real turn runs in the worktree.
-        # Without the time gate that stale value latched a confusing false warning
-        # before the agent had done anything (#72).
-        if self._cwd_drift_checked:
-            return
-        if self.worktree is None:
-            return
-        now = time.monotonic()
-        if now - self._cwd_check_at < self.CWD_CHECK_SECONDS:
-            return
-        self._cwd_check_at = now
-        fn = getattr(self.backend, "recorded_working_dir", None)
-        if fn is None:
-            self._cwd_drift_checked = True  # backend doesn't record a cwd
-            return
-        try:
-            recorded = fn(self.state.backend_session_id, since=self._cwd_launch_at or None)
-        except Exception as error:
-            self._debug(f"cwd drift check failed: {error!r}")
-            return
-        if not recorded:
-            return  # no post-launch turn recorded yet — check again next tick
-        self._cwd_drift_checked = True
-        if os.path.realpath(recorded) == os.path.realpath(str(self.repo.repo)):
-            return  # on the worktree, as intended
-        self._debug(f"cwd drift: backend recorded {recorded}, worktree is {self.repo.repo}")
-        self._set_message(
-            f"⚠ The agent ran a turn in:\n    {recorded}\n"
-            f"not this session's worktree:\n    {self.repo.repo}\n"
-            "This is Claude's resume-cwd bug (#58591): turns made there are NOT committed "
-            "by aGiTrack, and edits outside the worktree are blocked by the sandbox.\n"
-            f"To recover: {self._menu_label()} → session → start a NEW session (it launches fresh in the "
-            "worktree) and re-send your request there; resuming this conversation will keep "
-            "landing in the wrong directory. Any work already done in the other directory "
-            "stays there — move it into the worktree by hand if you need it tracked.",
-            seconds=30.0,
-        )
-        self._render()
-
-    # ------------------------------------------------------------------
-    # Self-update (#: check periodically, apply once sessions are finished)
-    # ------------------------------------------------------------------
-
-    def _update_checks_enabled(self) -> bool:
-        gc = getattr(self, "global_config", None)
-        return bool(getattr(gc, "check_for_updates", True)) if gc is not None else False
-
-    def _manual_update_pending(self) -> bool:
-        # True when a previous automatic update failed (or wasn't retried). The user
-        # is reminded once at startup, so the periodic in-session notice is held back.
-        gc = getattr(self, "global_config", None)
-        return bool(getattr(gc, "pending_manual_update", None)) if gc is not None else False
-
-    def _merge_session_active(self) -> bool:
-        # True while a merge / conflict resolution is in progress in ANY session
-        # (the active one, or a background session integrating its turn). Update
-        # prompts and updates are suppressed for the duration so they never
-        # interrupt a merge the user is in the middle of.
-        if getattr(self, "merge_ctx", None) is not None:
-            return True
-        return any(getattr(session, "merge_ctx", None) is not None for session in getattr(self, "sessions", []))
-
-    def _maybe_check_for_update(self) -> None:
-        # Kick off a background self-update check on a throttle, and surface a
-        # finished one. Network I/O (`git fetch`) runs on a worker thread so the
-        # terminal never stalls; the result is handed back and consumed here on
-        # the main thread.
-        if self._merge_session_active():
-            # Don't prompt mid-merge; a result that lands now stays pending and
-            # is surfaced once the merge is done.
-            return
-        self._consume_update_check_result()
-        if self._updater is None or not self._update_checks_enabled():
-            return
-        if self._update_pending or self._update_applying:
-            return  # already decided / in progress — stop nagging
-        if self._update_check_thread is not None and self._update_check_thread.is_alive():
-            return
-        now = time.monotonic()
-        if self._update_check_at and now - self._update_check_at < self.UPDATE_CHECK_SECONDS:
-            return
-        self._update_check_at = now
-
-        def worker() -> None:
-            try:
-                # Self-update rather than nag: keeping the INSTALLATION current is not a
-                # decision worth interrupting someone for. The session keeps running on the
-                # code it loaded — restarting mid-conversation would be the interruption —
-                # so this only installs, and the reminder below asks for a restart.
-                # attempt_self_update holds the cross-process lock, so several aGiTrack
-                # instances never upgrade the same install at once; on_status hands us the
-                # check it already ran so we don't pay for a second one.
-                from agitrack.update.selfupdate import attempt_self_update
-
-                def _status(status) -> None:
-                    self._update_worker_result = status
-
-                self._self_update_record = attempt_self_update(debug=self._debug, on_status=_status)
-            except Exception as error:  # never let a check crash the worker
-                self._debug(f"update check failed: {error!r}")
-                self._update_worker_result = None
-
-        self._update_worker_result = None
-        self._update_check_thread = threading.Thread(target=worker, daemon=True, name="agit-update-check")
-        self._update_check_thread.start()
-
-    def _consume_update_check_result(self) -> None:
-        thread = self._update_check_thread
-        if thread is None or thread.is_alive():
-            return
-        result = self._update_worker_result
-        self._update_check_thread = None
-        self._update_worker_result = None
-        if result is None or not result.ok:
-            return
-        self._update_status = result
-        # Feed the shared update marker so the dashboard banner and the pre-commit reminder
-        # reflect the same finding (best-effort; cleared when we're up to date again).
-        try:
-            from agitrack.update.marker import clear_update_marker, write_update_marker
-
-            if result.available:
-                write_update_marker(
-                    self.base_repo.repo, current=result.current, latest=result.latest, message=result.message
-                )
-            else:
-                clear_update_marker(self.base_repo.repo)
-        except Exception as error:
-            self._debug(f"update marker write failed: {error!r}")
-        record = getattr(self, "_self_update_record", None)
-        if record is not None and record.needs_user and not self._update_offered:
-            # aGiTrack could not install this one itself (Homebrew, an MSI, a Windows pip
-            # install): say so once, with the command that does it.
-            self._update_offered = True
-            detail = f" {record.instructions}" if record.instructions else ""
-            self._set_message(
-                f"aGiTrack {record.latest} is available but this installation has to be updated by you.{detail}",
-                seconds=15.0,
-            )
-            self._render()
-            return
-        if self._running_code_is_stale() and not self._update_offered:
-            # A self-update (ours or another instance's) landed newer code on disk while
-            # this session kept running on the old one. Remind, never restart.
-            self._update_offered = True
-            self._set_message(
-                "aGiTrack updated itself in the background. Restart aGiTrack when convenient to load "
-                f"the new version — {self._menu_label()} → 'update' restarts it once your sessions finish.",
-                seconds=15.0,
-            )
-            self._render()
-            return
-        if result.available and not self._update_offered and not self._manual_update_pending():
-            # Still worth a pointer when an update exists that we have not installed yet
-            # (e.g. the lock was held by another instance this round).
-            self._update_offered = True
-            self._set_message(
-                f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
-                seconds=12.0,
-            )
-            self._render()
-
-    def _running_code_is_stale(self) -> bool:
-        """Whether the code on disk has moved past what this process loaded — i.e. an
-        update landed underneath a running session (see selfupdate: daemons restart
-        themselves, sessions are only reminded)."""
-        try:
-            from agitrack.update.restart import RUNNING_FINGERPRINT, disk_fingerprint
-
-            current = disk_fingerprint()
-            return bool(current) and bool(RUNNING_FINGERPRINT) and current != RUNNING_FINGERPRINT
-        except Exception:
-            return False
-
-    def _ready_for_update(self) -> bool:
-        # "All sessions finished and commits are in": nothing is mid-turn,
-        # mid-parse, mid-merge, or mid-summary anywhere. The actual commit +
-        # integration of finished work is flushed by _finalize_pending_work()
-        # right before the update is applied.
-        if self._merge_session_active():
-            return False
-        if getattr(self, "agent_in_flight", False):
-            return False
-        if getattr(self, "agent_parse_active", False):
-            return False
-        if getattr(self, "pending_forwarded", None) or getattr(self, "pending_prompt_text", ""):
-            return False
-        if getattr(self, "_summary_pending", None) is not None:
-            return False
-        summary_thread = getattr(self, "_summary_thread", None)
-        if summary_thread is not None and summary_thread.is_alive():
-            return False
-        if self._running_background_session_names():
-            return False
-        return True
-
-    def _maybe_apply_pending_update(self) -> None:
-        if not self._update_pending or self._update_applying:
-            return
-        if not self._ready_for_update():
-            return
-        self._apply_update_and_restart()
-
-    def _apply_update_and_restart(self) -> None:
-        # Install the update, then commit + integrate every session's finished work
-        # (same path as exit) and ask run()'s teardown to re-exec aGiTrack.
-        #
-        # Order matters: apply the update FIRST, while the session is still fully
-        # intact. If it fails, the user is left exactly where they were — nothing
-        # torn down — and can keep working or retry. Doing the exit-finalize first
-        # (which removes the worktree and terminates the backend) and only THEN
-        # discovering apply() failed left the reactor running against a deleted
-        # worktree, so the next `git status` crashed with FileNotFoundError.
-        self._update_applying = True
-        self._update_pending = False
-        # When the code on disk is already current and only the running process is
-        # stale, there is nothing to install — just finish work and re-exec. (Don't
-        # run apply(): it would fetch/merge or pip-upgrade needlessly, and a dirty
-        # source checkout would even block a pure restart.)
-        restart_only = self._update_status is not None and self._update_status.restart_only
-        if restart_only:
-            message = "Restarting aGiTrack to load the updated code…"
-        else:
-            self._set_message("Updating aGiTrack…", seconds=30.0)
-            self._render()
-            result = self._updater.apply()
-            if not result.ok:
-                self._update_applying = False
-                # Remember so the next startup reminds the user (once) instead of the
-                # in-session notice re-appearing every check; the message already
-                # carries manual-update instructions. Session untouched — keep running.
-                if self.global_config is not None:
-                    target = (self._update_status.latest if self._update_status else "") or "available"
-                    self.global_config.pending_manual_update = target
-                self._update_offered = True  # stop the periodic notice this session
-                manual = ""
-                if self._updater is not None:
-                    try:
-                        manual = f" {self._updater.manual_update_instructions()}"
-                    except Exception:  # instructions are best-effort, never block the message
-                        manual = ""
-                self._set_message(f"aGiTrack update failed: {result.error}.{manual}", seconds=15.0)
-                self._render()
-                return  # session untouched — keep running
-            # The MSI updater only DOWNLOADS during apply(); the actual install is an
-            # elevated hand-off after we exit (the MSI replaces the running agitrack.exe).
-            # Flag it so the teardown launches the bootstrapper instead of re-exec'ing.
-            if getattr(self._updater, "pending_msi_path", None):
-                self._pending_msi_handoff = True
-            # Likewise, a Windows pip upgrade only RECORDS the command during apply() — the
-            # running agitrack.exe is locked, so the upgrade runs in a helper after we exit
-            # (which then relaunches us). Flag it for the teardown's bootstrapper hand-off.
-            if getattr(self._updater, "pending_pip_upgrade", None):
-                self._pending_pip_handoff = True
-            message = f"{result.message} Restarting aGiTrack…"
-        # Update is in place (or unnecessary): now finish commits and tear down for
-        # the re-exec.
-        self._set_message("Finishing commits, then restarting aGiTrack…", seconds=30.0)
-        self._render()
-        try:
-            self._finalize_pending_work()
-        except Exception as error:  # don't let a commit hiccup strand the update
-            self._debug(f"finalize before update restart failed: {error!r}")
-        # Stop the loop and let run()'s finally restore the terminal and release the
-        # lock before _pending_restart triggers the re-exec.
-        self._set_message(message, seconds=10.0)
-        self._render()
-        self._exit_child()
-        self._pending_restart = True
-        self.running = False
-
-    def _restart_now(self, message: str) -> None:
-        """Finish pending work and re-exec aGiTrack (the same teardown a self-update uses) so
-        launch-time settings — worktrees on/off, the default backend, timings — take effect.
-        run()'s teardown sees _pending_restart and performs the re-exec after restoring the
-        terminal and releasing the lock."""
-        self._set_message("Finishing commits, then restarting aGiTrack…", seconds=30.0)
-        self._render()
-        try:
-            self._finalize_pending_work()
-        except Exception as error:  # don't let a commit hiccup strand the restart
-            self._debug(f"finalize before settings restart failed: {error!r}")
-        self._set_message(message, seconds=10.0)
-        self._render()
-        self._exit_child()
-        self._pending_restart = True
-        self.running = False
-
-    def _msi_last_args_path(self) -> str | None:
-        # Per-user, no UAC needed to write, survives reboots. The MSI bootstrapper reads it
-        # to re-launch with the same flags after the install. None when LOCALAPPDATA is unset.
-        local = os.environ.get("LOCALAPPDATA")
-        if not local:
-            return None
-        return os.path.join(local, "aGiTrack", "last-args.txt")
-
-    def _write_msi_last_args(self) -> None:
-        # Frozen-Windows (MSI) only: record this launch's argv so a self-update can restore it.
-        if sys.platform != "win32" or not getattr(sys, "frozen", False):
-            return
-        path = self._msi_last_args_path()
-        if path is None:
-            return
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(subprocess.list2cmdline(list(sys.argv[1:])))
-        except OSError as error:
-            self._debug(f"could not write MSI last-args ({error!r})")
-
-    def _launch_msi_bootstrapper(self) -> bool:
-        """Hand the downloaded MSI off to the elevated installer and arrange the re-launch.
-        Delegates to :meth:`Updater.launch_msi_bootstrapper` (shared with the startup path so
-        both install MSI updates identically); on failure (e.g. UAC declined) records the
-        pending update so the next launch reminds, then the caller falls back to a normal
-        re-exec of the current version. Passes ``--skip-privacy-ack`` so the relaunched build
-        doesn't re-ask for the acknowledgment the user already gave this session."""
-        if self._updater is None:
-            return False
-        ok = self._updater.launch_msi_bootstrapper(["--skip-privacy-ack"])
-        if not ok and self.global_config is not None:
-            self.global_config.pending_manual_update = getattr(self._updater, "_msi_latest", "") or "available"
-        return ok
-
-    def _handle_update_command(self) -> None:
-        # Ctrl-G → "update": show the current update status and let the user opt
-        # in (applied once sessions finish), postpone, or stop update checks.
-        if self._update_applying:
-            self._set_message("An aGiTrack update is already in progress.")
-            self._render()
-            return
-        # Run a FRESH check on explicit request. The cached `_update_status` comes
-        # from the periodic background check (up to UPDATE_CHECK_SECONDS old), so it
-        # can miss a remote push or a local-disk update that landed since — which
-        # showed "up to date" even though a newer version already existed. A live
-        # check (compares running vs local HEAD vs remote) reflects reality now.
-        if self._updater is not None:
-            self._set_message("Checking for aGiTrack updates…")
-            self._render()
-            try:
-                self._update_status = self._updater.check()
-            except Exception as error:  # network/git hiccup: fall back to cached status
-                self._debug(f"on-demand update check failed: {error!r}")
-        status = self._update_status
-        if status is None:
-            # No completed check yet — make sure one is running and ask the user
-            # to retry, rather than blocking the UI on a network fetch.
-            self._update_check_at = 0.0
-            self._maybe_check_for_update()
-            self._set_message("Checking for aGiTrack updates… run 'update' again in a moment.")
-            self._render()
-            return
-        if not status.ok:
-            self._set_message(f"Update check failed: {status.error}")
-            self._render()
-            return
-        if not status.available:
-            self._set_message(f"aGiTrack is up to date ({status.current or 'current'}).")
-            self._render()
-            return
-        choice = self._select_popup(
-            status.message,
-            ["Update when sessions finish", "Not now", "Stop checking for updates"],
-        )
-        if choice == "Stop checking for updates":
-            if self.global_config is not None:
-                self.global_config.check_for_updates = False
-            self._set_message("aGiTrack will no longer check for updates.")
-            self._render()
-            return
-        if choice != "Update when sessions finish":
-            self._set_message("Update postponed.")
-            self._render()
-            return
-        self._update_pending = True
-        if self._ready_for_update():
-            self._apply_update_and_restart()
-        else:
-            self._set_message(
-                "aGiTrack will update and restart once all sessions finish and commits are in.",
-                seconds=8.0,
-            )
-            self._render()
-
-    def _backend_update_command(self) -> list[str] | None:
-        getter = getattr(self.backend, "update_command", None)
-        if not callable(getter):
-            return None
-        try:
-            cmd = getter()
-        except Exception as error:
-            self._debug(f"backend update_command failed: {error!r}")
-            return None
-        return list(cmd) if cmd else None
-
-    def _backend_update_via_agitrack(self) -> bool:
-        """Whether aGiTrack should drive this backend's update itself (from its UNCONFINED proxy)
-        rather than leaving it to the backend's own updater. True for a Homebrew-managed CLI on
-        macOS — independent of the sandbox toggle:
-          - sandboxed: the backend's own `brew upgrade` can't run at all (macOS forbids nesting
-            `sandbox-exec`), so aGiTrack MUST do it;
-          - unsandboxed: it *would* work, but the backend only nags with a prompt (and OpenCode's,
-            run interactively, has been failing for users), so aGiTrack does it silently instead.
-        (npm/native installs self-update cleanly; aGiTrack leaves those to the backend.)"""
-        if sys.platform != "darwin":
-            return False
-        exe = shutil.which(self.backend.name)
-        if not exe:
-            return False
-        real = os.path.realpath(exe)
-        # Homebrew kegs resolve under …/Cellar/…; the prefix is /opt/homebrew (Apple Silicon)
-        # or /usr/local (Intel). Matching either covers both layouts.
-        return "/Cellar/" in real or real.startswith("/opt/homebrew/") or real.startswith("/usr/local/")
-
     def _backend_child_env(self) -> dict[str, str] | None:
         """Extra environment for the interactive backend child only. When aGiTrack will apply
         this backend's update itself (it's a brew-managed backend on macOS and update checks are
@@ -3601,106 +2194,6 @@ class ProxyRunner:
             env.setdefault("COLORTERM", "truecolor")
             env.setdefault("FORCE_COLOR", "3")
         return env or None
-
-    def _backend_version(self) -> str:
-        """The backend CLI's reported version string, used to detect whether an update actually
-        landed. Empty when it can't be read."""
-        try:
-            from agitrack.proc import console_isolation_kwargs
-
-            proc = subprocess.run(
-                [self.backend.name, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
-            )
-        except Exception as error:
-            self._debug(f"backend version check failed: {error!r}")
-            return ""
-        return (proc.stdout or proc.stderr or "").strip()
-
-    def _maybe_auto_update_backend(self) -> None:
-        """Timers phase: when aGiTrack should drive this backend's update (a brew-managed CLI on
-        macOS — see _backend_update_via_agitrack), apply it AUTOMATICALLY from the UNCONFINED
-        proxy — no menu, no prompt, regardless of the sandbox toggle. Evaluated once per backend
-        (re-armed on a switch) and gated by the global update-check toggle. The updater itself
-        decides whether an upgrade is needed (it checks the backend's release server, not
-        Homebrew's possibly-stale local tap), so we don't pre-gate on `brew outdated`. Runs on a
-        background thread; the result is surfaced by _service_backend_update."""
-        name = getattr(self.backend, "name", None)
-        if name is None or self._backend_update_checked_for == name:
-            return
-        self._backend_update_checked_for = name  # evaluate each backend once (re-armed on switch)
-        if self.global_config is not None and not getattr(self.global_config, "check_for_updates", True):
-            return  # the user turned update checks off
-        if not self._backend_update_via_agitrack():
-            return  # the backend self-updates cleanly on its own; leave it to do so
-        if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
-            return
-        cmd = self._backend_update_command()
-        if cmd is None:
-            return
-        thread = threading.Thread(
-            target=self._auto_update_backend_worker, args=(name, cmd), daemon=True, name="agit-backend-update"
-        )
-        self._backend_update_thread = thread
-        thread.start()
-
-    def _auto_update_backend_worker(self, name: str, cmd: list[str]) -> None:
-        # Background: run the backend's own updater UNCONFINED so a package-manager updater
-        # (notably Homebrew's own sandbox-exec) isn't nested inside the agent's macOS sandbox —
-        # the very nesting macOS forbids, which is what breaks the in-backend self-update. The
-        # updater no-ops fast when already current, so we don't pre-check; we compare the CLI
-        # version before and after to report only a real change (and to catch a silent failure).
-        before = self._backend_version()
-        self._set_message(
-            f"Checking {name} for updates in the background "
-            f"(applying any — its own updater can't, inside aGiTrack's sandbox)…",
-            seconds=600.0,
-            sticky=True,
-        )
-        self._render()
-        cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
-        result: dict = {"name": name, "before": before}
-        try:
-            from agitrack.proc import console_isolation_kwargs
-
-            proc = subprocess.run(
-                cmd, cwd=cwd, capture_output=True, text=True, timeout=600, **console_isolation_kwargs()
-            )
-            result["code"] = proc.returncode
-            result["output"] = (proc.stdout or "") + (proc.stderr or "")
-        except Exception as error:
-            result["error"] = repr(error)
-        result["after"] = self._backend_version()
-        self._backend_update_result = result
-
-    def _service_backend_update(self) -> None:
-        """Main loop: surface a finished backend auto-update result (set by its worker thread)."""
-        result = self._backend_update_result
-        if result is None:
-            return
-        self._backend_update_result = None
-        name = result.get("name", "the agent")
-        if "error" in result:
-            self._set_message(f"Updating {name} failed: {result['error']}", seconds=12.0)
-            self._render()
-            return
-        before, after = result.get("before", ""), result.get("after", "")
-        output = _strip_ansi(result.get("output", ""))
-        lines = [line.strip() for line in output.splitlines() if line.strip()]
-        if after and before and after != before:
-            # The version actually changed — the update landed. (Authoritative, unlike the
-            # updater's exit code, which `opencode upgrade` reports as 0 even when it failed.)
-            self._set_message(f"{name} updated ({before} → {after}). Start a new session to use it.", seconds=12.0)
-        elif result.get("code") not in (0, None) or "fail" in output.lower() or "error" in output.lower():
-            flagged = [line for line in lines if "fail" in line.lower() or "error" in line.lower()]
-            detail = (flagged[-1] if flagged else (lines[-1] if lines else ""))[:200]
-            self._set_message(f"Updating {name} may have failed: {detail}", seconds=14.0)
-        else:
-            self._set_message(f"{name} is already up to date.", seconds=6.0)
-        self._render()
 
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
         # Wrap the backend so it can only write inside its session worktree (plus
@@ -6479,972 +4972,6 @@ class ProxyRunner:
                 return index
         return None
 
-    # --- sharing full sessions via git (issue #55) -------------------------
-
-    def _shared_store(self):
-        from agitrack.sessions import SharedSessionStore
-
-        # Operates on the base repo: it owns the remote and the shared object db.
-        return SharedSessionStore(self.base_repo)
-
-    def _share_identity(self, session_id: str | None, login: str) -> tuple[str, str, list[str]]:
-        """The ``(origin_owner, name, contributors)`` a share/auto-share writes under.
-
-        For a session imported from someone else, this is its recorded lineage origin
-        (owner + name), with the current sharer merged into the contributor set — so the
-        re-share updates the SAME entry (`<id1>+<id2>/<name>`, order-independent) rather
-        than spawning `<sharer>/<name>` on each machine. For a session originated here,
-        it's our own login + local name, contributors = [login]. A fork ("Keep both" or a
-        deliberate copy) records no origin, so it starts a fresh lineage here (#55)."""
-        rec = self._user_state().shared_origin(session_id) if session_id else None
-        if rec and rec.get("name"):
-            owner = rec.get("owner") or login
-            contributors = sorted({*rec.get("contributors", []), owner, login})
-            return owner, str(rec["name"]), contributors
-        return login, self._session_name(self.active_index), [login]
-
-    def _sweep_orphan_shared_sessions(self, *, fetch: bool) -> None:
-        # Reclaim dangling shared-session snapshots (old/unshared versions) left by
-        # rewrites — only when this repo has actually used sharing (the ref exists),
-        # so unrelated repos pay nothing. Only touches genuine session snapshots,
-        # never other unreachable commits. Best-effort.
-        try:
-            store = self._shared_store()
-            if not self.base_repo.ref_exists(store.ref):
-                return
-            store.cleanup_orphans(fetch=fetch)
-        except Exception as error:
-            self._debug(f"orphan-session sweep failed: {error!r}")
-
-    def _share_session(self) -> str:
-        # Returns _MENU_DONE once a share starts/reports (so the menu closes and the progress is
-        # visible) or _MENU_UP when the user backs out at the consent prompt (re-show the list).
-        backend = self.backend
-        if not getattr(backend, "supports_session_sharing", False):
-            self._set_message(
-                f"Sharing sessions isn't supported for the {backend.name} backend yet — "
-                "it has no portable transcript to share.",
-                seconds=10.0,
-            )
-            self._render()
-            return self._MENU_DONE
-        session_id = self.state.backend_session_id
-        if not session_id or not backend.session_belongs_to_repo(self.repo.repo, session_id):
-            self._set_message("No resumable session for this repo to share yet.")
-            self._render()
-            return self._MENU_DONE
-        # Informed consent before EVERY manual share — sharing is opt-in and never
-        # automatic, and each push uploads a fresh, possibly sensitive transcript, so
-        # the warning must appear every time, not just once. The first time it spells
-        # out exactly what is uploaded; afterwards a concise reminder — but the share
-        # never proceeds without an explicit "Yes".
-        if not self.global_config.session_sharing_acknowledged:
-            prompt = (
-                "Share this conversation with collaborators?\n"
-                "The conversation transcript is pushed to 'origin' and shared with the team.\n"
-                "It can contain file contents, command output, and secrets — review what's in\n"
-                "this session before sharing. Only this repo's sessions are ever uploaded."
-            )
-        else:
-            prompt = (
-                "Share this conversation now?\n"
-                "Its transcript — which can contain file contents, command output, and secrets —\n"
-                "will be pushed to 'origin'. Review what's in this session before sharing."
-            )
-        choice = self._select_popup(prompt, ["Yes, share it", "No, cancel"])
-        if choice != "Yes, share it":
-            self._set_message("Sharing cancelled.")
-            self._render()
-            return self._MENU_UP  # backed out before sharing — re-show the sessions list
-        self.global_config.acknowledge_session_sharing()
-        store = self._shared_store()
-        # The display name comes from cheap identity (no transcript read), so the progress
-        # notice and the keep-updated prompt below appear INSTANTLY. The heavy read+redact (and
-        # the push) run in the background op — previously they blocked the main thread here,
-        # which is the "it takes a while before the second confirmation" delay.
-        login = self.global_config.github_login or self._cached_or_resolve_login()
-        _owner, _name, contributors = self._share_identity(session_id, login)
-        display = f"{'+'.join(contributors)}/{_name}"
-
-        def op():
-            payload = self._share_payload(session_id)  # read + redact OFF the main thread
-            if payload is None:
-                return {"payload": None}
-            return {
-                "payload": payload,
-                "result": store.publish(
-                    github_id=payload["owner"],
-                    name=payload["name"],
-                    transcript=payload["redacted"],
-                    manifest=payload["manifest"],
-                    prune_gid=payload["sharer"],
-                    timeout=self.SHARE_PUSH_TIMEOUT,
-                ),
-            }
-
-        def outcome(box) -> str | None:
-            if "error" in box:
-                return f"Could not share session: {box['error']}"
-            data = box["result"]
-            payload = data.get("payload")
-            if payload is None:
-                return "Could not read the session transcript to share."
-            result = data["result"]
-            if result.behind:
-                # The shared copy already has newer turns than this session, so the push
-                # was refused. Don't just give up — stash it so the main loop can ask the
-                # user whether to overwrite or merge (can't prompt here: we're mid-iteration
-                # over the background-op list). Leave the auto-share hash/origin untouched
-                # since nothing was published yet.
-                self._pending_share_conflicts.append(
-                    {"payload": payload, "store": store, "display": payload["display"], "session_id": session_id}
-                )
-                return None
-            self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
-            # Record the lineage origin so a later re-share (here or on another machine)
-            # updates this same entry and keeps accumulating contributors.
-            self._user_state().set_shared_origin(
-                session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
-            )
-            return self._share_outcome_message(result, payload["display"], truncated=payload.get("truncated", False))
-
-        # The read+redact+push all run in the BACKGROUND so the terminal never freezes; the
-        # result lands as a notice. Only the exit-path share blocks (it must finish before the
-        # process quits, since daemon threads die with it).
-        self._run_share_op_async(f"share:{display}", f"Sharing '{display}' — pushing to origin…", op, outcome)
-        # Offer to keep it current automatically. This is a quick interactive prompt
-        # (not a network wait), shown while the push proceeds in the background.
-        if not self._session_auto_shared(session_id):
-            keep = self._select_popup(
-                "Keep this shared session up to date automatically?\n"
-                "New turns will be pushed to the shared copy as the conversation grows.",
-                ["Yes, keep it updated", "No, I'll re-share manually"],
-            )
-            if keep == "Yes, keep it updated":
-                self._set_session_auto_share(session_id, True)
-                self._set_message(
-                    f"'{display}' will auto-update as you work. Manage it via session → Manage shared.",
-                    seconds=8.0,
-                )
-                self._render()
-        return self._MENU_DONE  # the share is underway — close the menu so its progress shows
-
-    def _share_max_transcript_bytes(self) -> int:
-        """The max-transcript-bytes cap for sharing — user-configurable, with a safe fallback
-        when the config object predates the key. Already clamped to the hard limit by
-        GlobalConfig (and an over-limit config is refused at startup)."""
-        return getattr(self.global_config, "share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES)
-
-    def _share_payload(self, session_id: str):
-        """Read + redact the session transcript and build its manifest (no network,
-        no UI). Returns a dict with the lineage identity (``owner``/``name``/
-        ``contributors``/``display``), the actual ``sharer``, ``redacted`` text,
-        ``digest``, and ``manifest`` — or None when the transcript can't be read."""
-        backend = self.backend
-        raw = backend.export_session_raw(self.repo.repo, session_id) or backend.export_session_raw(
-            self.base_repo.repo, session_id
-        )
-        if not raw:
-            return None
-        from agitrack.sessions import github_login
-
-        shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
-        digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
-        login = self.global_config.github_login or github_login(self.base_repo)
-        self.global_config.github_login = login
-        owner, name, contributors = self._share_identity(session_id, login)
-        manifest = {
-            "github_id": owner,  # the lineage origin owner = the entry's ref path owner
-            "name": name,
-            "contributors": contributors,  # every github id that has shared this session
-            "backend": backend.name,
-            "model": self.state.model,
-            "session_id": session_id,
-            "agitrack_session_id": self.state.session_id,
-            "updated": int(time.time()),
-            "content_hash": digest,
-            "transcript_bytes": backend.transcript_size(self.base_repo.repo, session_id),
-            "transcript_rows": _shared_transcript_rows(shared),
-            "truncated": truncated,  # oldest middle turns dropped to fit Git's file-size limit
-        }
-        return {
-            "owner": owner,
-            "name": name,
-            "contributors": contributors,
-            "sharer": login,
-            "display": f"{'+'.join(contributors)}/{name}",
-            "redacted": shared,
-            "digest": digest,
-            "truncated": truncated,
-            "manifest": manifest,
-        }
-
-    def _share_outcome_message(self, result, display: str, *, truncated: bool = False) -> str:
-        if result.behind:
-            # The shared copy already has newer turns than this machine's copy —
-            # sharing would rewind it. Tell the user in plain language (no git jargon).
-            return (
-                f"Didn't share '{display}': the shared copy already has newer changes than "
-                f"this session. Resume the shared version first to catch up, then share again."
-            )
-        if not result.remote:
-            message = f"Saved shared session '{display}' locally (no 'origin' remote to push to)."
-        elif result.pushed:
-            # The ref isn't a branch, so GitHub's web UI won't show it; point the
-            # user at how to see/confirm it instead.
-            message = (
-                f"Shared '{display}' to origin (it lives on the custom ref refs/agitrack/shared-sessions, "
-                f"so it won't show on GitHub's web page). See it via session → Manage shared sessions, "
-                f"or: git ls-remote origin 'refs/agitrack/*'."
-            )
-        else:
-            # The push to origin failed. Show the REAL reason (a stale-lease race, a protected
-            # ref, a declined hook, a timeout) rather than always blaming a concurrent update —
-            # and never a bare "[]" from an empty error.
-            message = (
-                f"Saved '{display}' locally, but couldn't push it to origin. "
-                f"Reason: {_push_rejection_reason(result.error)}. Try sharing again."
-            )
-        if getattr(result, "merged", 0):
-            # A concurrent contributor's diverged copy was folded in rather than
-            # overwritten, so neither side's turns were lost.
-            message += f" Merged {result.merged} turn(s) shared by a collaborator."
-        if result.pruned:
-            message += f" Pruned {result.pruned} older shared session(s)."
-        if truncated and (result.pushed or not result.remote):
-            # The session was too big for Git's per-file limit, so only the most recent turns
-            # were shared. Put the note on its own line (after a blank one) so it stands out.
-            message += (
-                "\n\nNote: this session was large, so only the most recent turns were shared "
-                "(older ones were trimmed to fit the share size limit). Compact the conversation "
-                "if you want a smaller, cleaner shared copy."
-            )
-        return message
-
-    def _manage_shared_sessions_menu(self) -> str:
-        # Fetch the remote FIRST so the list reflects what's actually shared on origin — a
-        # session shared from another machine becomes manageable here, and one removed
-        # elsewhere drops out, instead of trusting a possibly-stale local/mirror view (which is
-        # what let a local-only session that never reached origin masquerade as "shared"). The
-        # fetch is cancelable and bounded; with no remote it's an instant local call. The list
-        # itself is still labelled from cheap data only (manifest + a stat-sized "newer?"
-        # check), never a transcript read/redact.
-        store = self._shared_store()
-        login = self.global_config.github_login or self._cached_or_resolve_login()
-        if not self._fetch_shared_with_cancel(store, "Fetching shared sessions from origin…"):
-            return self._MENU_UP  # the user stopped the fetch — back to the sessions menu
-        while True:
-            mine = [entry for entry in store.entries() if entry.github_id == login]
-            if not mine:
-                # _MENU_DONE (not _UP) so this message is VISIBLE on the agent screen: returning
-                # _UP re-shows the sessions menu straight over it, which reads as "nothing shows".
-                self._set_message("No sessions are shared in this repo. Use session → Share this session to share one.")
-                self._render()
-                return self._MENU_DONE
-            auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
-            options: list[str] = []
-            for entry in mine:
-                sid = entry.manifest.get("session_id", "")
-                status = self._shared_entry_status(entry, sid)
-                auto = " · auto-update on" if auto_state.auto_share_enabled(sid) else ""
-                age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
-                options.append(f"{entry.display}  ({age}{auto}) — {status}")
-            choice = self._select_popup("Your shared sessions — pick one to manage", options)
-            if choice is None:  # Esc → up one level (back to the sessions menu)
-                return self._MENU_UP
-            # An action that kicks off a background network op (update/unshare/auto-on) returns
-            # _MENU_DONE so the whole menu closes and the user can WATCH its progress notice
-            # ("Unsharing…" → "Unshared") on the live screen — instead of the menu re-showing
-            # over it. Backing out of an entry (_MENU_UP) re-shows this list.
-            if self._manage_one_shared_session(mine[options.index(choice)]) == self._MENU_DONE:
-                return self._MENU_DONE
-
-    def _shared_entry_status(self, entry, session_id: str) -> str:
-        # Cheap "is the shared copy current?" — compare the transcript's byte size
-        # (a stat) to the size recorded when it was shared. No read, no redact.
-        shared_bytes = entry.manifest.get("transcript_bytes")
-        current = self.backend.transcript_size(self.base_repo.repo, session_id) if session_id else None
-        if not shared_bytes or current is None:
-            return "shared"
-        if current > shared_bytes:
-            return "local has newer turns — Update to push them"
-        return "shared (up to date)"
-
-    def _manage_one_shared_session(self, entry) -> str:
-        # Returns _MENU_DONE to close the whole menu (so a background op's progress notice is
-        # visible on the live screen), or _MENU_UP to re-show the shared-sessions list.
-        sid = entry.manifest.get("session_id", "")
-        auto_on = self._session_auto_shared(sid)
-        actions = [
-            ("update", "↻ Update now (push latest turns)"),
-            ("auto", ("✓ Auto-update is ON — turn it off" if auto_on else "○ Turn ON auto-update")),
-            ("unshare", "✗ Unshare (remove for everyone)"),
-        ]
-        choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
-        if choice is None:
-            return self._MENU_UP  # Esc backs out to the list
-        kind = actions[[label for _, label in actions].index(choice)][0]
-        if kind == "update":
-            self._update_shared_entry(entry)
-            return self._MENU_DONE  # close the menu so the "Updating…" → result notice shows
-        if kind == "auto":
-            self._set_session_auto_share(sid, not auto_on)
-            if auto_on:
-                self._set_message(f"Auto-update disabled for {entry.display}.")
-                self._render()
-            else:
-                # Enabling syncs once right away, so the shared copy is current
-                # immediately instead of only on the next commit.
-                self._set_message(f"Auto-update on for {entry.display} — pushing the latest now…", seconds=10.0)
-                self._render()
-                self._update_shared_entry(entry)
-            return self._MENU_DONE  # close the menu so the message/push progress is visible
-        # Unsharing removes the session from origin for every collaborator and can't be undone,
-        # so confirm before doing it (mirrors the discard-confirm flow).
-        confirm = self._select_popup(
-            f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
-            ["No, keep it", "Yes, unshare"],
-        )
-        if confirm == "Yes, unshare":
-            self._unshare_entry(entry)
-            return self._MENU_DONE  # close the menu so "Unsharing…" → "Unshared" is visible
-        self._set_message("Kept the shared session.")
-        self._render()
-        return self._MENU_UP  # cancelled — back to the list
-
-    def _update_shared_entry(self, entry) -> None:
-        sid = entry.manifest.get("session_id", "")
-        raw = self.backend.export_session_raw(self.base_repo.repo, sid) if sid else None
-        if not raw:
-            self._set_message(f"Can't read the transcript for {entry.display} to update it.")
-            self._render()
-            return
-        shared, truncated = _redact_and_cap(self.backend, raw, self._share_max_transcript_bytes())
-        # Updating from the Manage menu counts as a (re-)share by the current user, so
-        # fold them into the contributor set — the entry stays under its origin owner.
-        login = self._cached_or_resolve_login()
-        contributors = sorted({*entry.contributors, login})
-        manifest = {
-            **entry.manifest,
-            "contributors": contributors,
-            "updated": int(time.time()),
-            "content_hash": hashlib.sha256(shared.encode("utf-8")).hexdigest(),
-            "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
-            "transcript_rows": _shared_transcript_rows(shared),
-            "truncated": truncated,
-        }
-        display = f"{'+'.join(contributors)}/{entry.name}"
-        store = self._shared_store()
-
-        def op():
-            return store.publish(
-                github_id=entry.github_id,
-                name=entry.name,
-                transcript=shared,
-                manifest=manifest,
-                prune_gid=login,
-                timeout=self.SHARE_PUSH_TIMEOUT,
-            )
-
-        def outcome(box) -> str:
-            if "error" in box:
-                return f"Could not update {display}: {box['error']}"
-            result = box["result"]
-            if sid:
-                self._auto_share_hash[sid] = manifest["content_hash"]
-            return self._share_outcome_message(result, display, truncated=truncated)
-
-        # Push in the BACKGROUND (same as the initial share) so the terminal never
-        # freezes; a progress notice shows now, the result lands when it finishes.
-        self._run_share_op_async(f"update:{display}", f"Updating '{display}' — pushing to origin…", op, outcome)
-
-    def _unshare_entry(self, entry) -> None:
-        # Unsharing is a one-way, fire-and-forget network op with no follow-up, and the
-        # user shouldn't have to wait on it — run it in the BACKGROUND so the session
-        # never freezes, showing a progress notice now and the result when it lands.
-        store = self._shared_store()
-        sid = entry.manifest.get("session_id", "")
-        if sid:
-            # Stop auto-pushing it immediately. _set_session_auto_share clears the WHOLE id
-            # lineage (the backend mints a new id on resume, so the opt-in may sit under a
-            # drifted id), so a single call disables it everywhere and the change persists.
-            self._set_session_auto_share(sid, False)
-
-        def op():
-            return store.unshare(entry.github_id, entry.name, timeout=self.SHARE_PUSH_TIMEOUT)
-
-        def outcome(box) -> str:
-            if "error" in box:
-                return f"Could not unshare {entry.display}: {box['error']}"
-            result = box["result"]
-            if not result.remote:
-                return f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
-            if result.pushed:
-                return f"Unshared {entry.display} (removed from origin)."
-            if not result.error:
-                # Nothing was rejected: the entry wasn't on origin (its share never reached it,
-                # or it was already removed there). It's gone from your list either way.
-                return f"Removed {entry.display} — it wasn't on origin (nothing to push)."
-            # Removed locally but the origin push was rejected even after the auto-retry — show
-            # the REASON git gave (not a blind prefix slice) so the user can tell a transient
-            # race from a permission/protected-ref/hook rejection they must fix on the remote.
-            return (
-                f"Removed {entry.display} locally, but origin rejected the push — re-run unshare "
-                f"from the menu to retry. Reason: {_push_rejection_reason(result.error)}"
-            )
-
-        self._run_share_op_async(
-            f"unshare:{entry.display}", f"Unsharing {entry.display} — removing from origin…", op, outcome
-        )
-
-    def _run_share_op_async(self, key: str, pending_text: str, op, outcome_fn) -> None:
-        """Run a best-effort network share op (e.g. unshare) on a daemon thread so the
-        session never freezes. Shows *pending_text* as a notice now; a later main-loop
-        tick (_service_background_share_ops) replaces it with ``outcome_fn(box)`` once
-        the worker finishes, where ``box`` is ``{"result": ...}`` or ``{"error": str}``.
-        The user keeps working throughout."""
-        self._set_session_notice(key, pending_text, seconds=180.0)
-        self._render()
-        box: dict = {}
-
-        def worker() -> None:
-            try:
-                box["result"] = op()
-            except Exception as error:
-                box["error"] = str(error)
-
-        thread = threading.Thread(target=worker, daemon=True, name="agit-share-op")
-        thread.start()
-        self._background_share_ops.append({"key": key, "thread": thread, "box": box, "outcome_fn": outcome_fn})
-
-    def _service_background_share_ops(self) -> None:
-        """Main-loop tick: surface each finished background share op's result as a
-        notice (replacing its in-progress one), and drop it from the pending list."""
-        if not self._background_share_ops:
-            return
-        still: list[dict] = []
-        for entry in self._background_share_ops:
-            if entry["thread"].is_alive():
-                still.append(entry)
-                continue
-            try:
-                text = entry["outcome_fn"](entry["box"])
-            except Exception as error:
-                self._debug(f"background share op outcome failed: {error!r}")
-                text = None
-            if text:
-                self._set_session_notice(entry["key"], text, seconds=10.0)
-        self._background_share_ops = still
-
-    def _service_share_conflicts(self) -> None:
-        """Main-loop tick: for each share refused because the shared copy was already
-        newer, ask the user whether to overwrite or merge, then re-share their way. Run
-        AFTER _service_background_share_ops (not inside it) so opening a modal and queuing
-        a new background op doesn't mutate the list that method is iterating."""
-        if not self._pending_share_conflicts:
-            return
-        pending, self._pending_share_conflicts = self._pending_share_conflicts, []
-        for conflict in pending:
-            self._resolve_share_behind(conflict)
-
-    def _resolve_share_behind(self, conflict: dict) -> None:
-        """Prompt the user about one behind-refused share — the shared copy already has
-        newer changes — and, if they choose, overwrite it with this session.
-
-        Only *overwrite* (or keep-as-is) is offered: when two copies of a session CAN be
-        combined they're union-merged automatically during a normal publish and never
-        reach this refusal, so the only sessions that land here are ones that can't be
-        merged (e.g. OpenCode's single-object export). For those, replace-or-keep is the
-        real choice."""
-        payload, store, display, session_id = (
-            conflict["payload"],
-            conflict["store"],
-            conflict["display"],
-            conflict["session_id"],
-        )
-        overwrite_opt = "Overwrite the shared copy with this session"
-        choice = self._select_popup(
-            f"The shared copy of '{display}' already has newer changes than this session.\n"
-            "Sharing would replace those newer changes with this older one. Proceed?",
-            [overwrite_opt, "Keep the newer shared copy (cancel)"],
-        )
-        if choice != overwrite_opt:
-            self._set_message(f"Didn't share '{display}' — left the newer shared copy as is.")
-            self._render()
-            return
-
-        def op():
-            return store.publish(
-                github_id=payload["owner"],
-                name=payload["name"],
-                transcript=payload["redacted"],
-                manifest=payload["manifest"],
-                prune_gid=payload["sharer"],
-                timeout=self.SHARE_PUSH_TIMEOUT,
-                overwrite=True,
-            )
-
-        def outcome(box) -> str | None:
-            if "error" in box:
-                return f"Could not share session: {box['error']}"
-            result = box["result"]
-            self._auto_share_hash[session_id] = payload["digest"]
-            self._user_state().set_shared_origin(
-                session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
-            )
-            if not result.pushed:
-                return self._share_outcome_message(result, display, truncated=payload.get("truncated", False))
-            note = ""
-            if payload.get("truncated"):
-                note = " (only the most recent turns were shared — older ones trimmed to fit the size limit)"
-            return f"Overwrote the shared copy of '{display}' on origin with this session.{note}"
-
-        self._run_share_op_async(f"share:{display}", f"Overwriting '{display}' — pushing to origin…", op, outcome)
-
-    def _session_auto_shared(self, session_id: str | None) -> bool:
-        # Read the opt-in from the BASE repo state (persists across runs); the
-        # session worktree where self.state lives is removed on exit (#55). Check
-        # the whole id lineage: the backend mints a new id on resume, so a session
-        # opted in under an earlier id must still count after that drift.
-        if not session_id:
-            return False
-        user = self._user_state()
-        return any(user.auto_share_enabled(sid) for sid in user.session_lineage(session_id))
-
-    def _session_is_shared(self, session_id: str | None, shared_ids: set[str]) -> bool:
-        # A session counts as shared if its current id, or any id it drifted from
-        # on resume, is in the shared set (#55) — so a resumed shared session is
-        # still recognised after the backend forks its id.
-        if not session_id:
-            return False
-        if session_id in shared_ids:
-            return True
-        return any(sid in shared_ids for sid in self._user_state().session_lineage(session_id))
-
-    def _my_shared_session_ids(self) -> set[str]:
-        # session_ids of conversations I've shared in this repo, from the LOCAL ref
-        # (no network) — used to mark shared sessions in the session menu.
-        if not getattr(self.backend, "supports_session_sharing", False):
-            return set()
-        try:
-            login = self.global_config.github_login
-            ids = set()
-            for entry in self._shared_store().entries():
-                if login and entry.github_id != login:
-                    continue
-                sid = entry.manifest.get("session_id")
-                if sid:
-                    ids.add(sid)
-            return ids
-        except Exception:
-            return set()
-
-    def _record_shared_alias_on_drift(self, previous: str | None, new_id: str | None) -> None:
-        # When the backend forks a new session id on resume, link new→previous so a
-        # session shared/auto-shared under the previous id stays recognised. Only
-        # record it for ids that actually belong to a shared lineage, to keep the
-        # alias map scoped (and avoid recording drift for unshared sessions) (#55).
-        if not previous or not new_id or previous == new_id:
-            return
-        try:
-            user = self._user_state()
-            relevant = (
-                user.auto_share_enabled(previous)
-                or previous in user.shared_session_aliases()
-                or previous in self._my_shared_session_ids()
-            )
-            if relevant:
-                user.add_shared_session_alias(new_id, previous)
-            # Carry the full lineage origin (owner + name + contributors) onto the new
-            # id, so a re-share after the backend forks the id still updates the same
-            # shared entry and keeps the contributor set (#55).
-            origin = user.shared_origin(previous)
-            if origin:
-                user.set_shared_origin(
-                    new_id, owner=origin["owner"], name=origin["name"], contributors=origin["contributors"]
-                )
-        except Exception as error:
-            self._debug(f"record shared alias failed: {error!r}")
-
-    def _set_session_auto_share(self, session_id: str, enabled: bool) -> None:
-        user = self._user_state()
-        if enabled:
-            user.set_auto_share(session_id, True)
-            return
-        # Disable across the WHOLE id lineage, not just this id. The backend mints a new
-        # session id on resume, so the opt-in may have been recorded under an earlier
-        # (ancestor) id; since `_session_auto_shared` checks the lineage, clearing only this
-        # id would leave an ancestor enabled — the session would then re-appear as auto-shared
-        # on the next aGiTrack run and the disable wouldn't persist (#55).
-        for sid in {session_id, *user.session_lineage(session_id)}:
-            if sid:
-                user.set_auto_share(sid, False)
-
-    def _cached_or_resolve_login(self) -> str:
-        # Resolve and cache the GitHub login. Only writes config when it actually
-        # changes, so callers on a hot path (auto-share) don't re-save every time.
-        cached = self.global_config.github_login
-        if cached:
-            return cached
-        from agitrack.sessions import github_login
-
-        login = github_login(self.base_repo)
-        self.global_config.github_login = login
-        return login
-
-    # --- auto-share: keep an opted-in session's shared copy current ---------
-
-    def _maybe_auto_share_active(self) -> None:
-        # Called when a commit lands (see _announce_agent_commit), so the GitHub
-        # round-trip happens at the commit cadence — not on a frequent timer.
-        # Reactor-thread part: only cheap checks, then hand ALL the heavy work
-        # (read transcript, redact, hash, push) to a background thread, so the UI
-        # loop never blocks. The in-flight guard + the worker's content-hash gate
-        # keep it from pushing redundantly on rapid commits.
-        backend = self.backend
-        if not getattr(backend, "supports_session_sharing", False):
-            return
-        sid = self.state.backend_session_id
-        if not sid or not self._session_auto_shared(sid):
-            return
-        if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
-            return
-        # Snapshot everything the worker needs on the main thread (these touch the
-        # active session / config, which can change underneath a thread).
-        login = self._cached_or_resolve_login()
-        owner, name, contributors = self._share_identity(sid, login)
-        ctx = {
-            "session_id": sid,
-            "owner": owner,
-            "name": name,
-            "contributors": contributors,
-            "login": login,
-            "backend": backend,
-            "repo_path": self.repo.repo,
-            "base_repo_path": self.base_repo.repo,
-            "model": self.state.model,
-            "agitrack_session_id": self.state.session_id,
-            "store": self._shared_store(),
-            "last_hash": self._auto_share_hash.get(sid),
-        }
-        self._auto_share_thread = threading.Thread(target=self._auto_share_worker, args=(ctx,), daemon=True)
-        self._auto_share_thread.start()
-
-    def _auto_share_worker(self, ctx: dict):
-        # Runs off the reactor thread; best-effort. Reads and redacts the (possibly large)
-        # transcript and pushes here, not on the loop. Returns the PublishResult on a push,
-        # or None when it skipped (no transcript / unchanged) or hit an error — the exit path
-        # inspects it. Records the outcome for the main loop to surface ONLY on failure/behind
-        # (success is silent: this fires on every commit). See _service_auto_share_outcome.
-        sid = ctx["session_id"]
-        try:
-            backend = ctx["backend"]
-            raw = backend.export_session_raw(ctx["repo_path"], sid) or backend.export_session_raw(
-                ctx["base_repo_path"], sid
-            )
-            if not raw:
-                return None
-            shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
-            digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
-            if digest == ctx["last_hash"]:
-                return None  # nothing new since the last push — skip the network round-trip
-            manifest = {
-                "github_id": ctx["owner"],  # lineage origin owner (entry's ref path owner)
-                "name": ctx["name"],
-                "contributors": ctx["contributors"],
-                "backend": backend.name,
-                "model": ctx["model"],
-                "session_id": sid,
-                "agitrack_session_id": ctx["agitrack_session_id"],
-                "updated": int(time.time()),
-                "content_hash": digest,
-                "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
-                "transcript_rows": _shared_transcript_rows(shared),
-                "truncated": truncated,
-            }
-            result = ctx["store"].publish(
-                github_id=ctx["owner"],
-                name=ctx["name"],
-                transcript=shared,
-                manifest=manifest,
-                prune_gid=ctx["login"],
-                # Bound the push: a stalled remote must not strand this worker, because the
-                # in-flight guard (_auto_share_thread.is_alive()) would then block EVERY future
-                # auto-share for the run — the session would silently stop updating (the bug).
-                timeout=self.SHARE_PUSH_TIMEOUT,
-            )
-            # Cache the digest ONLY after a real success, so a failed/refused push retries on
-            # the next commit instead of being silently marked "already shared" (which left the
-            # shared copy days stale with no error). A remote-less repo only has the local ref,
-            # so a successful local write counts as shared.
-            if result.pushed or not result.remote:
-                self._auto_share_hash[sid] = digest
-                # Carry truncation + sid so the main loop can show a ONE-TIME notice (it owns the
-                # "already warned" set, off this worker thread). Success is otherwise silent.
-                self._auto_share_outcome = {"ok": True, "truncated": truncated, "sid": sid, "name": ctx["name"]}
-            elif result.behind:
-                self._auto_share_outcome = {"behind": True, "name": ctx["name"]}
-            else:
-                self._auto_share_outcome = {"failed": result.error or "push rejected", "name": ctx["name"]}
-            return result
-        except Exception as error:
-            self._debug(f"auto-share failed: {error!r}")
-            self._auto_share_outcome = {"failed": str(error), "name": ctx["name"]}
-            return None
-
-    def _service_auto_share_outcome(self) -> None:
-        """Main-loop tick: surface the live auto-share worker's result. Only FAILURE and
-        'behind' are shown (success is silent — auto-share fires on every commit), so a push
-        that keeps failing becomes visible instead of leaving the shared copy quietly stale."""
-        outcome = self._auto_share_outcome
-        if outcome is None:
-            return
-        self._auto_share_outcome = None
-        name = outcome.get("name", "this session")
-        if "failed" in outcome:
-            self._set_session_notice(
-                "auto-share",
-                f"Auto-share for {name} failed: {str(outcome['failed'])[:120]} — it will retry on the next commit.",
-                seconds=12.0,
-            )
-            self._render()
-        elif outcome.get("behind"):
-            self._set_session_notice(
-                "auto-share",
-                f"Auto-share for {name} skipped — the shared copy already has newer turns than this machine.",
-                seconds=10.0,
-            )
-            self._render()
-        elif outcome.get("truncated") and outcome.get("sid") not in self._auto_share_truncation_warned:
-            # Tell the user ONCE that their oversized session is being trimmed to fit the share
-            # size limit — not on every commit's auto-share (that would spam). Marked here, on
-            # the main thread, so the show-once gate is race-free.
-            self._auto_share_truncation_warned.add(outcome["sid"])
-            self._set_session_notice(
-                "auto-share",
-                f"{name} is large, so auto-share shares only its most recent turns "
-                f"(older ones are trimmed to fit the share size limit). Compact the conversation for a smaller shared copy.",
-                seconds=12.0,
-            )
-            self._render()
-
-    def _auto_share_on_exit(self) -> None:
-        # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
-        # runs in a daemon thread fired on commit; quitting right after a turn
-        # (before that thread is scheduled, or while it is still pushing) would
-        # leave the final conversation unshared, since daemon threads are killed
-        # when the process exits. So push the active session's latest transcript
-        # here — but ONLY when it actually changed since the last share, and ALWAYS
-        # bounded so a stalled network can never hang exit.
-        backend = self.backend
-        if not getattr(backend, "supports_session_sharing", False):
-            return
-        sid = self.state.backend_session_id
-        if not sid or not self._session_auto_shared(sid):
-            return
-        # Nothing happened this run ⇒ nothing to share. This is the ground-truth
-        # gate: it skips a session that was only resumed and never typed into, so
-        # exit stays instant with no "Sharing…" message. It is robust where a
-        # transcript-digest comparison is not — Claude forks a new session id on
-        # resume and rewrites every transcript row, so the digest changes across
-        # runs even when the user did nothing. A turn this run, by contrast, always
-        # routes through on_commit_fn, which records the activity.
-        if self.state.session_id not in self._sessions_with_activity:
-            return
-        # Let a still-running live auto-share finish first, so we don't race it and
-        # so its updated content hash is visible to the change check below.
-        if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
-            self._auto_share_thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
-        # Among sessions that DID see a turn, still avoid a redundant push: compare
-        # the current transcript digest against this run's last live-pushed hash,
-        # then the already-published manifest hash.
-        digest = self._exit_share_digest(backend, sid)
-        if digest is None:
-            return  # transcript unreadable ⇒ nothing to share
-        last = self._auto_share_hash.get(sid) or self._published_content_hash(sid)
-        if digest == last:
-            return  # already shared this exact content ⇒ nothing to do
-        ctx = {
-            "session_id": sid,
-            # owner/name/contributors are resolved inside the bounded thread, after the
-            # login lookup (a gh call can stall) it depends on.
-            "login": None,
-            "backend": backend,
-            "repo_path": self.repo.repo,
-            "base_repo_path": self.base_repo.repo,
-            "model": self.state.model,
-            "agitrack_session_id": self.state.session_id,
-            "store": self._shared_store(),
-            "last_hash": last,
-        }
-        self._set_message("Sharing this session before exit…", seconds=30)
-        self._render()
-        # Bound the network round-trip: run the push (and the login lookup, which
-        # may shell out to gh) in a thread and wait at most EXIT_SHARE_TIMEOUT. A
-        # stalled push (offline, auth, unreachable remote) can never block exit —
-        # git ref updates are atomic, so an abandoned push simply doesn't land. On
-        # timeout or push failure, warn and continue.
-        outcome: dict = {}
-
-        def push() -> None:
-            try:
-                login = self._cached_or_resolve_login()
-                owner, name, contributors = self._share_identity(sid, login)
-                ctx.update(login=login, owner=owner, name=name, contributors=contributors)
-                outcome["result"] = self._auto_share_worker(ctx)
-            except Exception as error:  # a failed share is a warning, never a traceback on screen
-                self._debug(f"exit share failed: {error!r}")
-
-        thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
-        thread.start()
-        thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
-        if thread.is_alive():
-            self._set_message("Couldn't share this session before exit (timed out); continuing.", seconds=6.0)
-            self._render()
-            return
-        result = outcome.get("result")
-        if result is not None and result.remote and not result.pushed:
-            self._set_message("Couldn't share this session before exit (push failed); continuing.", seconds=6.0)
-            self._render()
-
-    def _exit_share_digest(self, backend, sid: str) -> str | None:
-        # The redacted-transcript digest for *sid*, matching the worker's gate, so
-        # the exit path can tell whether the latest conversation differs from what
-        # was last shared. None when the transcript can't be read.
-        try:
-            raw = backend.export_session_raw(self.repo.repo, sid) or backend.export_session_raw(
-                self.base_repo.repo, sid
-            )
-            if not raw:
-                return None
-            from agitrack.sessions import redact_transcript
-
-            return hashlib.sha256(redact_transcript(raw).encode("utf-8")).hexdigest()
-        except Exception as error:
-            self._debug(f"exit share digest failed: {error!r}")
-            return None
-
-    def _published_content_hash(self, sid: str) -> str | None:
-        # The content_hash of this session's already-published shared entry, read
-        # from the LOCAL shared ref (no network), so the exit gate can tell an
-        # unedited resumed session from one with genuinely new turns. Matched by
-        # session id across resume drift (lineage-aware).
-        try:
-            lineage = set(self._user_state().session_lineage(sid))
-            for entry in self._shared_store().entries():
-                if entry.manifest.get("session_id") in lineage:
-                    return entry.manifest.get("content_hash")
-        except Exception as error:
-            self._debug(f"published content hash lookup failed: {error!r}")
-        return None
-
-    def _fetch_shared_with_cancel(self, store, message: str) -> bool:
-        """Fetch the shared-session ref while keeping the UI alive and letting the
-        user press Esc to stop — needed when the fetch stalls on bad internet.
-        Returns True if the fetch finished, False if the user stopped it or it timed
-        out. Either way the LOCAL ref is left usable (possibly stale) for listing.
-
-        No remote ⇒ nothing to fetch over the network: do the cheap local call
-        inline (this also keeps headless/test runs off the interactive wait path)."""
-        if not store.repo.remote_exists():
-            store.fetch()
-            return True
-        result: dict = {}
-        cancel = threading.Event()
-
-        def worker() -> None:
-            try:
-                # Bound the git fetch and make it killable, so a stopped fetch's
-                # subprocess is terminated at once — never left running.
-                result["ok"] = store.fetch(timeout=self.SHARED_FETCH_TIMEOUT, cancel=cancel)
-            except Exception as error:  # never let a fetch failure escape the thread
-                result["error"] = repr(error)
-
-        thread = threading.Thread(target=worker, daemon=True, name="agit-shared-fetch")
-        thread.start()
-        self._set_message(f"{message}   ·   press Esc to stop", seconds=600)
-        self._render()
-        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0)
-        if status != "done":
-            cancel.set()  # kill the git fetch subprocess now — don't leave it running
-            note = "timed out" if status == "timeout" else "stopped"
-            self._set_message(f"Stopped fetching shared sessions ({note}).", seconds=6.0)
-            self._render()
-            return False
-        if result.get("error"):
-            self._debug(f"shared fetch failed: {result['error']}")
-        return True
-
-    def _drain_pty_until_done_or_esc(self, thread, *, deadline: float | None = None) -> str:
-        """Wait for *thread* while keeping the UI alive (PTYs draining) so the wait
-        is responsive, not a freeze, and the user can press Esc to stop.
-        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc, or
-        ``"timeout"`` if the optional *deadline* passes first. Shared by the two
-        cancellable shared-session fetches (listing and full-transcript)."""
-        thread.join(timeout=0.05)  # fast fetches (and tests) finish without the wait UI
-        if not thread.is_alive():
-            return "done"
-        try:
-            stdin_fd = self._stdin_fileno()
-        except (OSError, ValueError):
-            # No real stdin (headless/non-interactive): can't offer interactive
-            # cancel, so just wait for the thread, still honouring the deadline.
-            while thread.is_alive():
-                if deadline is not None and time.monotonic() > deadline:
-                    return "timeout"
-                thread.join(timeout=0.2)
-            return "done"
-        while thread.is_alive():
-            if deadline is not None and time.monotonic() > deadline:
-                return "timeout"
-            master = self.master_fd
-            background = self._background_fds() if self.sessions else {}
-            fds = [stdin_fd]
-            if master is not None:
-                fds.append(master)
-            fds.extend(background)
-            try:
-                readable, _, _ = select.select(fds, [], [], 0.2)
-            except (OSError, ValueError):
-                # stdin/PTY not selectable (headless): just wait for the thread.
-                thread.join(timeout=0.2)
-                continue
-            for fd in readable:
-                if fd == stdin_fd:
-                    chunk = self._read_stdin(32)
-                    if self._stdin_has_cancel(chunk):
-                        return "cancel"
-                    # Keystrokes typed while this wait runs belong to the live backend, not
-                    # to the wait — stash them on the same `_input_tail` pushback the main
-                    # reactor prepends to its next stdin read, so they are forwarded once the
-                    # wait ends instead of being silently dropped (the first keystrokes after
-                    # a backend switch land here while the new session's fetch is in flight).
-                    elif chunk:
-                        self._input_tail = self._input_tail + chunk
-                        # Restamp the hold: these are real keystrokes parked for the reactor,
-                        # not a sequence caught mid-flight, so they must not look already
-                        # expired to _input_tail_expired the moment the wait ends.
-                        self._input_tail_at = time.monotonic()
-                elif fd == master:
-                    output = self._drain_child_output()
-                    if output is not None:
-                        self.last_child_output = time.monotonic()
-                        self._feed_child_output(output)
-                elif fd in background:
-                    self._pump_background(background[fd])
-        return "done"
-
-    @staticmethod
-    def _stdin_has_cancel(data: bytes) -> bool:
-        """Whether *data* is a genuine cancel keystroke — a lone Esc or Ctrl-C — as
-        opposed to an escape SEQUENCE (mouse report, focus event, arrow key, bracketed
-        paste), every one of which also begins with ESC. With host mouse reporting on,
-        a mere mouse move emits ``\\x1b[<…`` and must NOT be read as the user pressing
-        Esc, or a fetch is cancelled the instant the pointer moves."""
-        if b"\x03" in data:  # Ctrl-C
-            return True
-        return data == b"\x1b"  # a bare Esc, not the lead byte of a longer sequence
-
     @staticmethod
     def _is_real_keypress(data: bytes) -> bool:
         """Whether *data* carries an actual keystroke rather than only terminal-emitted
@@ -7454,451 +4981,6 @@ class ProxyRunner:
         stripped = _X10_MOUSE_RE.sub(b"", stripped)
         stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
         return bool(stripped)
-
-    def _shared_is_older_than_local(self, entry, agent, session_id: str) -> bool:
-        """Whether the shared copy of ``entry`` has FEWER turns than the local copy of
-        ``session_id`` — i.e. resuming it would hand back an older conversation than the
-        user already has. Compares the manifest's recorded row count (cheap, no blob
-        read) against the local transcript's. Returns False when either is unknown (an
-        older manifest without the field, or no local transcript), so we never warn on a
-        guess."""
-        from agitrack.sessions import count_transcript_rows
-
-        shared_rows = entry.manifest.get("transcript_rows")
-        if not isinstance(shared_rows, int):
-            return False
-        raw = agent.export_session_raw(self.base_repo.repo, session_id)
-        if not raw:
-            return False
-        return shared_rows < count_transcript_rows(raw)
-
-    def _resume_shared_session_menu(self) -> str:
-        store = self._shared_store()
-        completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
-        if not completed:
-            # The user stopped the fetch: leave the menu entirely rather than
-            # dropping them into a possibly-stale, previously-fetched list (which
-            # would read as if the stop did nothing). _fetch_shared_with_cancel has
-            # already shown the "Stopped fetching…" notice; let it linger.
-            return self._MENU_UP
-        entries = store.entries()
-        if not entries:
-            self._set_message("No shared sessions found for this repo.")
-            self._render()
-            return self._MENU_UP
-        options: list[str] = []
-        for entry in entries:
-            extra = [str(entry.manifest[k]) for k in ("model",) if entry.manifest.get(k)]
-            if entry.manifest.get("updated"):
-                extra.append(self._format_age(entry.manifest["updated"]))
-            options.append(entry.display + (f"  ({' · '.join(extra)})" if extra else ""))
-        choice = self._select_popup("Resume a shared session (newest first)", options)
-        if choice is None:  # Esc → up one level to the sessions menu
-            return self._MENU_UP
-        entry = entries[options.index(choice)]
-        session_id = entry.manifest.get("session_id")
-        if not session_id:
-            self._set_message("That shared session is incomplete; cannot resume it.")
-            self._render()
-            return self._MENU_UP
-        # Resume with the backend the session was recorded by, not necessarily the
-        # active one — a shared OpenCode session must be imported/resumed by the
-        # OpenCode agent even while Claude is active (and vice versa). Reuse the
-        # active agent when it already matches; only build a fresh one to cross
-        # backends.
-        entry_backend = entry.manifest.get("backend") or self.backend.name
-        if entry_backend == self.backend.name:
-            agent = self.backend
-        else:
-            try:
-                agent = make_proxy_agent(entry_backend)
-            except ValueError:
-                self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
-                self._render()
-                return self._MENU_UP
-        # Remember the lineage origin this session was shared under (owner + name +
-        # contributors), so a later re-share (on this or any machine) updates the SAME
-        # shared entry and adds us to the contributor set, instead of spawning a new
-        # `<sharer>/<name>` that never converges (#55).
-        self._user_state().set_shared_origin(
-            session_id, owner=entry.github_id, name=entry.name, contributors=entry.contributors
-        )
-        # Everything below resolves WHAT to do (interactive popups) WITHOUT touching
-        # the transcript — the transcript fetch (which may hit the network) and the
-        # import then run on a worker thread (_begin_shared_resume) so the UI never
-        # freezes, and the resume itself completes on the main loop once ready.
-        live_index = next(
-            (
-                i
-                for i, s in enumerate(self.sessions)
-                if getattr(getattr(s, "state", None), "backend_session_id", None) == session_id
-            ),
-            None,
-        )
-        if live_index is not None:
-            # This exact conversation is already running here.
-            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            # Guard against silently downgrading: if the shared copy is OLDER than the
-            # running session (it doesn't have your latest turns), lead with keeping
-            # the newer one so "update" can't quietly throw away recent work.
-            shared_older = self._shared_is_older_than_local(entry, agent, session_id)
-            if shared_older:
-                header = (
-                    f"'{entry.display}' is already running here, and the shared copy is OLDER than "
-                    f"your current session — it doesn't include your latest changes. What would you like to do?"
-                )
-                opts = ["Stay as it is (keep my newer session)"]
-                if keep_both_id:
-                    opts.append("Keep both — copy the older shared version to a new session")
-                opts.append("Update anyway (replace my session with the older shared copy)")
-            else:
-                header = f"'{entry.display}' is already running here.\nWhat would you like to do?"
-                opts = ["Update this session to the shared version"]
-                if keep_both_id:
-                    opts.append("Keep both — copy the shared version to a new session")
-                opts.append("Stay as it is (no change)")
-            pick = self._select_popup(header, opts)
-            if pick is None:  # Esc → up one level to the sessions menu
-                return self._MENU_UP
-            if pick.startswith("Stay"):
-                self._switch_active(live_index)
-                return self._MENU_DONE
-            if pick.startswith("Update"):
-                # Pull the shared version into the running session: fetch it, then
-                # (on the main loop) restart the backend so it loads the new
-                # transcript — the agent can't pick up a swapped transcript live.
-                self._begin_shared_resume(
-                    store,
-                    entry,
-                    agent,
-                    action="update_live",
-                    name=None,
-                    resume_id=session_id,
-                    overwrite=True,
-                    as_id=None,
-                    backend=entry_backend,
-                )
-                return self._MENU_DONE
-            assert keep_both_id is not None
-            copy_name = self._prompt_session_name(
-                "Name the copied session", default=self._dedupe_session_name(entry.name)
-            )
-            if copy_name is None:  # Esc → up one level
-                return self._MENU_UP
-            self._begin_shared_resume(
-                store,
-                entry,
-                agent,
-                action="new",
-                name=copy_name,
-                resume_id=keep_both_id,
-                overwrite=False,
-                as_id=keep_both_id,
-                backend=entry_backend,
-            )
-            return self._MENU_DONE
-        # You may already have this exact shared session open under a DIFFERENT backend
-        # id: a multi-collaborator entry carries the *last sharer's* session_id, not
-        # yours, so the id check above misses your own copy and the resume would mint a
-        # new, differently-named session (the "session name got lost" report). Match by
-        # the shared LINEAGE (origin owner + name) instead and offer to continue your
-        # existing session — keeping its name — rather than duplicating it.
-        lineage_index = self._live_session_for_lineage(entry.github_id, entry.name)
-        if lineage_index is not None:
-            local_name = self._session_name(lineage_index)
-            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            opts = [f"Continue my existing '{local_name}' session"]
-            if keep_both_id:
-                opts.append("Fetch the shared version as a separate copy")
-            pick = self._select_popup(
-                f"You already have this shared session open locally as '{local_name}'.\nWhat would you like to do?",
-                opts,
-            )
-            if pick is None:  # Esc → up one level to the sessions menu
-                return self._MENU_UP
-            if pick.startswith("Continue"):
-                self._switch_active(lineage_index)
-                return self._MENU_DONE
-            assert keep_both_id is not None
-            copy_name = self._prompt_session_name(
-                "Name the copied session", default=self._dedupe_session_name(entry.name)
-            )
-            if copy_name is None:  # Esc → up one level
-                return self._MENU_UP
-            self._begin_shared_resume(
-                store,
-                entry,
-                agent,
-                action="new",
-                name=copy_name,
-                resume_id=keep_both_id,
-                overwrite=False,
-                as_id=keep_both_id,
-                backend=entry_backend,
-            )
-            return self._MENU_DONE
-        # Not running locally: pick a clear local name (#71), default to the original
-        # share name (deduped) — NOT a "<sharer>-<name>" slug, which grew without
-        # bound when sharing back and forth (#55).
-        name = self._prompt_session_name("Resume shared session", default=self._dedupe_session_name(entry.name))
-        if name is None:  # Esc → up one level to the sessions menu
-            return self._MENU_UP
-        overwrite, as_id, resume_id = False, None, session_id
-        if agent.has_local_session(self.base_repo.repo, session_id):
-            age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
-            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            # If the shared copy is OLDER than the local one, default to keeping the
-            # local (newer) copy so the user can't unknowingly replace recent work with
-            # a stale shared version (the "much older after resume" report).
-            shared_older = self._shared_is_older_than_local(entry, agent, session_id)
-            if shared_older:
-                header = (
-                    f"You already have a local copy of {entry.display}, and it's NEWER than the shared "
-                    f"version — the shared copy is missing your latest changes. What do you want to do?"
-                )
-                opts = ["Keep my local copy (the newer one)"]
-                if keep_both_id:
-                    opts.append("Keep both (fetch the older shared copy as a separate session)")
-                opts.append(f"Replace my local copy with the OLDER shared version (updated {age})")
-            else:
-                header = f"You already have a local copy of {entry.display}.\nWhich do you want to continue?"
-                opts = [f"Replace my local copy with the shared version (updated {age})"]
-                if keep_both_id:
-                    opts.append("Keep both (fetch the shared copy as a separate session)")
-                opts.append("Keep my local copy")
-            pick = self._select_popup(header, opts)
-            if pick is None:  # Esc → up one level to the sessions menu
-                return self._MENU_UP
-            if pick.startswith("Keep both"):
-                assert keep_both_id is not None
-                as_id = resume_id = keep_both_id
-            elif pick.startswith("Replace"):
-                overwrite = True
-            else:  # keep the local copy: resume it directly, no fetch/import needed
-                self._resume_conversation(name, session_id, backend=entry_backend)
-                return self._MENU_DONE
-        self._begin_shared_resume(
-            store,
-            entry,
-            agent,
-            action="new",
-            name=name,
-            resume_id=resume_id,
-            overwrite=overwrite,
-            as_id=as_id,
-            backend=entry_backend,
-        )
-        return self._MENU_DONE
-
-    def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
-        # Fetch the (possibly large) transcript on a worker thread, then WAIT for it
-        # cancellably: the UI keeps draining (no freeze) and the user can press Esc to
-        # stop a slow fetch. The import + session switch/restart still happen on the
-        # main loop (_service_shared_resume) once the result lands.
-        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
-            self._set_message("Already fetching a shared session — please wait.")
-            self._render()
-            return
-        session_id = entry.manifest.get("session_id")
-        self._shared_resume_result = None
-        cancel = threading.Event()
-        self._shared_resume_cancel = cancel
-
-        def worker() -> None:
-            try:
-                # Bound the full fetch (it can be large) and make it killable, so a
-                # cancel/exit terminates the git process at once instead of waiting.
-                transcript = store.read_transcript(entry, timeout=self.RESUME_FETCH_TIMEOUT, cancel=cancel)
-                if cancel.is_set():
-                    return  # cancelled (or exiting) while fetching — drop the result
-                if not transcript:
-                    self._shared_resume_result = {"error": "incomplete"}
-                    return
-                self._shared_resume_result = {
-                    "transcript": transcript,
-                    "action": action,
-                    "agent": agent,
-                    "session_id": session_id,
-                    "name": name,
-                    "resume_id": resume_id,
-                    "overwrite": overwrite,
-                    "as_id": as_id,
-                    "backend": backend,
-                    "entry_name": entry.name,
-                    # Lineage of the shared session being copied here, for the origin
-                    # note the first commit of the new session records.
-                    "origin_contributors": "+".join(entry.contributors),
-                }
-            except Exception as error:
-                if not cancel.is_set():
-                    self._shared_resume_result = {"error": repr(error)}
-
-        self._set_message(f"Fetching '{entry.display}'…   press Esc to cancel", seconds=600)
-        self._render()
-        self._shared_resume_thread = threading.Thread(target=worker, daemon=True, name="agit-shared-resume")
-        self._shared_resume_thread.start()
-        status = self._drain_pty_until_done_or_esc(
-            self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
-        )
-        if status == "cancel":
-            # The user pressed Esc: stop and reset all fetch state so a retry
-            # can start immediately. This is the ONLY path that reports "cancelled".
-            self._abort_shared_resume(cancel)
-            self._set_message(f"Stopped fetching '{entry.display}' (cancelled).", seconds=6.0)
-            self._render()
-            return
-        if status == "timeout":
-            # Past the deadline with the worker still stuck (a stalled network its own
-            # timeout didn't unwind in time): a FAILURE, not a user cancel. Say why and
-            # hold the notice until the user acknowledges it.
-            self._abort_shared_resume(cancel)
-            self._await_keypress(
-                f"Couldn't fetch '{entry.display}': the fetch timed out after "
-                f"{int(self.RESUME_FETCH_TIMEOUT)}s. Press any key to continue."
-            )
-            return
-        # The worker finished. If it failed, report WHY and keep the notice up until a
-        # keypress — never let a generic auto-dismissing (or "cancelled") message stand
-        # in for a real failure the user needs to see.
-        result = self._shared_resume_result
-        if result is not None and "error" in result:
-            self._abort_shared_resume(cancel)
-            reason = "the shared transcript is incomplete" if result["error"] == "incomplete" else result["error"]
-            self._await_keypress(f"Couldn't fetch '{entry.display}': {reason}. Press any key to continue.")
-            return
-        # Success: the import + session switch run on the main loop (_service_shared_resume).
-
-    def _abort_shared_resume(self, cancel: "threading.Event") -> None:
-        # Stop the in-flight transcript fetch and clear ALL resume state so the user
-        # can retry at once. Setting *cancel* makes the (daemon) worker drop any late
-        # result and the bounded git fetch self-terminate; nulling the shared cancel
-        # token clears the "fetch in progress" flag so nothing lingers to block or
-        # mis-handle an immediate retry. The next fetch installs a fresh token.
-        cancel.set()
-        self._shared_resume_result = None
-        self._shared_resume_thread = None
-        self._shared_resume_cancel = None
-
-    def _await_keypress(self, message: str) -> None:
-        """Show *message* and block — keeping the PTYs draining so the screen stays
-        live — until the user presses any key, so a failure notice can't scroll past
-        unseen. Headless/non-interactive callers (no real stdin) just set the message
-        and return, since there is no key to wait on."""
-        self._set_message(message, seconds=3600)
-        self._render()
-        try:
-            stdin_fd = self._stdin_fileno()
-        except (OSError, ValueError):
-            return
-        while self.running:
-            master = self.master_fd
-            background = self._background_fds() if self.sessions else {}
-            fds = [fd for fd in [stdin_fd, master] if fd is not None]
-            fds.extend(background)
-            try:
-                readable, _, _ = select.select(fds, [], [], 0.2)
-            except (OSError, ValueError):
-                return
-            for fd in readable:
-                if fd == stdin_fd:
-                    if self._is_real_keypress(self._read_stdin(32)):  # a key (not a mouse move) dismisses
-                        return
-                elif fd == master:
-                    output = self._drain_child_output()
-                    if output is not None:
-                        self.last_child_output = time.monotonic()
-                        self._feed_child_output(output)
-                elif fd in background:
-                    self._pump_background(background[fd])
-
-    def _cancel_inflight_shared_fetches(self) -> None:
-        # Stop any in-flight shared-session fetch immediately (used on exit): signal
-        # the cancel token so a still-running worker drops its result and never
-        # triggers a late session switch. The bounded git fetch self-terminates, and
-        # the daemon thread dies with the process. Best-effort and idempotent.
-        if self._shared_resume_cancel is not None:
-            self._shared_resume_cancel.set()
-        self._shared_resume_result = None
-
-    def _service_shared_resume(self) -> None:
-        result = self._shared_resume_result
-        if result is None:
-            return
-        # A cancelled/abandoned fetch must never complete a switch: drop a late result
-        # when there is no active fetch (token cleared by _abort_shared_resume) or its
-        # token is set (the user stopped it, or aGiTrack is exiting).
-        cancel = self._shared_resume_cancel
-        if cancel is None or cancel.is_set():
-            self._shared_resume_result = None
-            self._shared_resume_thread = None
-            return
-        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
-            return  # still fetching
-        self._shared_resume_result = None
-        self._shared_resume_thread = None
-        self._shared_resume_cancel = None  # fetch concluded — no token lingers to block a retry
-        if result.get("error") == "incomplete":
-            self._await_keypress("That shared session is incomplete; cannot resume it. Press any key to continue.")
-            return
-        if "error" in result:
-            self._await_keypress(f"Could not fetch the shared session: {result['error']}. Press any key to continue.")
-            return
-        if result["action"] == "update_live":
-            self._complete_live_shared_update(result)
-            return
-        # A new (or copied) session: import the transcript and resume it.
-        agent, sid = result["agent"], result["session_id"]
-        if not agent.import_shared_session(
-            self.base_repo.repo, sid, result["transcript"], overwrite=result["overwrite"], as_id=result["as_id"]
-        ):
-            self._set_message("Could not install the shared session for resume.", seconds=8.0)
-            self._render()
-            return
-        # A "Keep both" fork (as_id set) deliberately starts a SEPARATE lineage: record
-        # no origin for it, so sharing it later publishes a new `<you>/<name>` entry of
-        # its own rather than updating the session it was copied from (#55).
-        live_before = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
-        self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
-        state = self.state
-        if (
-            state is not None
-            and result["resume_id"] not in live_before
-            and state.backend_session_id == result["resume_id"]
-        ):
-            # A genuinely new local session copied from a collaborator's shared one
-            # (not a switch to an already-live session): record the copy so its first
-            # commit notes the context/tokens inherited from the shared conversation.
-            state.set_session_origin_event(
-                kind="copy",
-                source=result.get("session_id") or result["resume_id"],
-                source_name=result.get("entry_name"),
-                collaborator=result.get("origin_contributors"),
-            )
-
-    def _complete_live_shared_update(self, result: dict) -> None:
-        # Update the already-running session to the shared version: switch to it,
-        # overwrite its worktree transcript, then restart the backend so it loads
-        # the new content (a live agent won't pick up a transcript swapped under it).
-        agent, sid = result["agent"], result["session_id"]
-        idx = next(
-            (
-                i
-                for i, s in enumerate(self.sessions)
-                if getattr(getattr(s, "state", None), "backend_session_id", None) == sid
-            ),
-            None,
-        )
-        if idx is None:
-            # It stopped being live while fetching — fall back to a fresh resume.
-            agent.import_shared_session(self.base_repo.repo, sid, result["transcript"], overwrite=True)
-            self._resume_conversation(result["entry_name"], sid, backend=result["backend"])
-            return
-        self._switch_active(idx)
-        if not agent.import_shared_session(self.repo.repo, sid, result["transcript"], overwrite=True):
-            self._set_message("Could not update the session from the shared version.", seconds=8.0)
-            self._render()
-            return
-        self._restart_agent("Updated this session to the shared version.")
 
     def _format_age(self, updated: float) -> str:
         # An unknown/unset timestamp (0 or None) must not be rendered as a date —
@@ -8900,7 +5982,7 @@ class ProxyRunner:
             return False
         if not getattr(self.state, "backend_session_id", None):
             return False
-        text = _strip_ansi(self.last_child_output_sample.decode(errors="replace"))
+        text = strip_ansi(self.last_child_output_sample.decode(errors="replace"))
         return bool(_FORK_HINT_RE.search(text))
 
     def _format_backend_exit_notice(self) -> str | None:
@@ -8930,7 +6012,7 @@ class ProxyRunner:
             notice += f"\nExit code: {exit_code}"
 
         raw = self.last_child_output_sample
-        text = _strip_ansi(raw.decode(errors="replace"))
+        text = strip_ansi(raw.decode(errors="replace"))
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         if lines:
             tail = "\n".join("  " + line for line in lines[-20:])
@@ -9570,43 +6652,52 @@ class ProxyRunner:
             submit = self._forwarded_submits(forwarded)
             self._update_passthrough_prompt(forwarded)
             submitted_prompt = ""
-            if submit:
-                submitted_prompt = self.passthrough_prompt.decode(errors="ignore").strip()
-                if submitted_prompt.startswith("/compact"):
-                    self._handle_pre_compaction()
-                # Submit-time commits touch the foreground worktree's index, the same
-                # one the git worker commits the agent's turn into — take the pipeline
-                # lock so the two never run at once (draining dialogs while we wait).
-                self._acquire_pipeline_lock_from_main()
-                try:
-                    if not self._pre_agent_commit_if_needed(submitted_prompt):
-                        self.pending_forwarded = [chunk for chunk in forwarded if chunk in {b"\r", b"\n"}]
-                        self.pending_prompt_text = submitted_prompt
-                        forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
-                        submit = False
-                finally:
-                    self._pipeline_lock.release()
-            if submit:
-                self.passthrough_prompt.clear()
-                self.passthrough_escape = None
-            if forwarded:
+            # Everything below is the SUBMIT PATH, and it is on the clock: the user is
+            # watching for their prompt to be sent. It asks the same handful of read-only
+            # git questions through several independent helpers — five `rev-parse
+            # --abbrev-ref HEAD`, three `diff --quiet`, three `ls-files --others` for one
+            # Enter — and on Windows a process spawn is ~38 ms, so those repeats WERE the
+            # latency (740 ms measured, 100% of it in git). One scope de-duplicates them;
+            # any command that writes drops the cache from under itself, and the pipeline
+            # lock's boundaries drop it too (see git/repo.py's read_cache).
+            with git_read_cache():
                 if submit:
-                    self._begin_agent_turn()
-                    if submitted_prompt:
-                        # Flush the previous turn's deferred integration first, then
-                        # put this new prompt on its own branch (same shared index as
-                        # the worker → under the pipeline lock).
-                        self._acquire_pipeline_lock_from_main()
-                        try:
-                            self._integrate_committed_turn_before_new_turn()
-                            self._ensure_turn_branch()
-                        finally:
-                            self._pipeline_lock.release()
-                        # Drop the previous turn's "created & merged" status line so
-                        # it doesn't linger into — and read as belonging to — the
-                        # new turn (which would show "created" before "summarizing").
-                        self._set_session_notice(self._session_label(), None)
-                self.active.process.write(b"".join(forwarded))
+                    submitted_prompt = self.passthrough_prompt.decode(errors="ignore").strip()
+                    if submitted_prompt.startswith("/compact"):
+                        self._handle_pre_compaction()
+                    # Submit-time commits touch the foreground worktree's index, the same
+                    # one the git worker commits the agent's turn into — take the pipeline
+                    # lock so the two never run at once (draining dialogs while we wait).
+                    self._acquire_pipeline_lock_from_main()
+                    try:
+                        if not self._pre_agent_commit_if_needed(submitted_prompt):
+                            self.pending_forwarded = [chunk for chunk in forwarded if chunk in {b"\r", b"\n"}]
+                            self.pending_prompt_text = submitted_prompt
+                            forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
+                            submit = False
+                    finally:
+                        self._pipeline_lock.release()
+                if submit:
+                    self.passthrough_prompt.clear()
+                    self.passthrough_escape = None
+                if forwarded:
+                    if submit:
+                        self._begin_agent_turn()
+                        if submitted_prompt:
+                            # Flush the previous turn's deferred integration first, then
+                            # put this new prompt on its own branch (same shared index as
+                            # the worker → under the pipeline lock).
+                            self._acquire_pipeline_lock_from_main()
+                            try:
+                                self._integrate_committed_turn_before_new_turn()
+                                self._ensure_turn_branch()
+                            finally:
+                                self._pipeline_lock.release()
+                            # Drop the previous turn's "created & merged" status line so
+                            # it doesn't linger into — and read as belonging to — the
+                            # new turn (which would show "created" before "summarizing").
+                            self._set_session_notice(self._session_label(), None)
+                    self.active.process.write(b"".join(forwarded))
         if command:
             self._run_command(command)
             # An "exit"/"quit" command runs the same finalize-and-teardown flow as
@@ -10500,9 +7591,14 @@ class ProxyRunner:
         for match in _PAGE_KEY_RE.finditer(data):
             delta += page if match.group(1) == b"5" else -page
         data = _PAGE_KEY_RE.sub(b"", data)
+        selection_moved = False
         if b"\x1b[<" in data:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
-                delta += self._mouse_scroll_delta(int(match.group(1)))
+                button = int(match.group(1))
+                delta += self._mouse_scroll_delta(button)
+                selection_moved |= self._track_selection(
+                    button, int(match.group(2)), int(match.group(3)), match.group(4)
+                )
             data = _SGR_MOUSE_RE.sub(b"", data)
         if b"\x1b[M" in data:
             # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
@@ -10514,27 +7610,76 @@ class ProxyRunner:
             data = _X10_MOUSE_RE.sub(b"", data)
         if delta:
             self._scroll(delta)
+        elif selection_moved:
+            # ONE frame for the whole chunk, for the same reason the wheel coalesces above: a
+            # drag arrives as a run of motion reports in a single read, and painting each of
+            # them is hundreds of full frames — the repaint storm that starves the stdin
+            # reader (see AGENTS.md, "Scrolling and repaint budget"). Skipped entirely when
+            # the view also scrolled, since `_scroll` already paints.
+            self._render()
         return data
 
     @staticmethod
     def _mouse_scroll_delta(button: int) -> int:
         """How far this mouse report scrolls the view: 3 lines per wheel notch, 0 for
-        anything else.
-
-        Only the wheel is aGiTrack's to act on (history scrollback for a backend that doesn't
-        drive the mouse itself, e.g. Claude). Left-button press/drag/release are deliberately
-        left alone so the TERMINAL owns text selection.
-
-        aGiTrack used to drag-select-and-copy here, but that path only ever ran in terminals
-        that forward a plain drag to the application (mouse mode 1000), and there it both
-        SUPPRESSED the terminal's native selection and popped an unwanted "Copied N char(s)
-        to clipboard" message (#112). Terminals that select natively never forward the drag,
-        so they never hit this code and are unaffected; dropping it removes only the harmful
-        case. The mouse bytes are still stripped from the input forwarded to the backend by
-        _intercept_scroll."""
+        anything else. Selection is handled separately, by :meth:`_track_selection`."""
         if not button & 64:  # not the wheel
             return 0
         return -3 if button & 1 else 3
+
+    def _track_selection(self, button: int, col: int, row: int, kind: bytes) -> bool:
+        """Drag-select on the rendered screen, copying to the clipboard on release.
+
+        Returns whether the selection CHANGED, so the caller can paint one frame for a whole
+        chunk of motion reports rather than one per report.
+
+        **Receiving these events at all is the proof that this is needed.** aGiTrack turns on
+        mouse reporting (``?1000h``) so the wheel scrolls its history, and a terminal that
+        honours that mode stops doing its OWN selection and forwards the drag to us instead —
+        so in exactly the terminals this code runs in, aGiTrack's copy is the ONLY copy the
+        user has. A terminal that keeps selecting natively (which is what the reporter of #112
+        was using) never forwards a plain left drag, so it never reaches here and nothing about
+        it changes: no highlight, no "Copied ..." message, native selection as before.
+
+        This was removed with #112 on the reasoning that dropping it "removes only the harmful
+        case". That was half right: it also removed the only way to copy text out of aGiTrack
+        in every terminal that DOES forward the drag — the common case on Linux (VTE/gnome-
+        terminal, konsole, xterm, alacritty, foot), where selecting text stopped working
+        altogether. Neither the terminal nor aGiTrack was copying.
+
+        Only the plain left button drives this. The wheel is scrollback, and a drag with a
+        modifier held is left alone — that is the chord terminals use for their own
+        selection-while-tracking override. A press-and-release without movement is a CLICK,
+        not a selection: it copies nothing and shows no message.
+        """
+        if button & 64:  # wheel; scrollback's business, not selection's
+            return False
+        if button & 0b11:  # not the left button
+            return False
+        if button & 0b11100:  # Shift (4) / Alt (8) / Ctrl (16) held — not a plain drag
+            return False
+        y = max(0, min(row - 1, max(self.rows - 2, 0)))
+        x = max(0, min(col - 1, self.cols - 1))
+        motion = bool(button & 32)
+        if kind == b"M" and not motion:  # press
+            self.sel_active = True
+            self.sel_anchor = self.sel_point = (y, x)
+            return False  # nothing is highlighted yet: a press alone selects no cells
+        if kind == b"M" and motion and self.sel_active:  # drag (terminals that report motion)
+            if self.sel_point == (y, x):
+                return False  # same cell, unchanged highlight — do not ask for a repaint
+            self.sel_point = (y, x)
+            return True
+        if kind == b"m" and self.sel_active:  # release
+            # Capture the release point even from a terminal that reports no motion at all:
+            # press + release coordinates are enough to know what was swept over.
+            self.sel_point = (y, x)
+            if self.sel_anchor != self.sel_point:  # a drag, not a plain click
+                self._copy_selection()
+            self.sel_active = False
+            self.sel_anchor = self.sel_point = None
+            return True  # the highlight has to come off the screen
+        return False
 
     def _selection_ranges(self) -> dict[int, tuple[int, int]]:
         return ScreenRenderer.selection_ranges(self, self.cols)
@@ -10544,15 +7689,47 @@ class ProxyRunner:
             self, self.rows, self.cols, self._copy_to_clipboard, lambda msg, **kw: self._set_message(msg, **kw)
         )
 
+    # Native clipboard writers, in the order they are tried, per platform. macOS has exactly
+    # one; LINUX HAS THREE AND IS GUARANTEED NONE OF THEM — a Wayland session needs `wl-copy`,
+    # an X11 one `xclip` or `xsel`, and a bare container or an SSH login has neither, which is
+    # why the OSC 52 path below is not a fallback but a companion (see _copy_to_clipboard).
+    _CLIPBOARD_COMMANDS: dict[str, tuple[list[str], ...]] = {
+        "darwin": (["pbcopy"],),
+        "linux": (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]),
+        "win32": (["clip"],),
+    }
+
     def _copy_to_clipboard(self, text: str) -> None:
+        """Put *text* on the clipboard, by every route that might work.
+
+        BOTH a native helper AND OSC 52 are used, deliberately, rather than stopping at the
+        first success. They reach DIFFERENT clipboards over SSH: a native helper sets the
+        clipboard of the machine aGiTrack runs on, which over a remote session is not the one
+        the user is about to paste into, while OSC 52 travels back down the terminal connection
+        to the local one. Locally they are the same clipboard and the same text, so writing
+        twice costs a process spawn and changes nothing. Whichever is meaningless in the
+        current setup is silently ignored by whatever receives it.
+        """
+        from agitrack.proc import console_isolation_kwargs
+
         payload = text.encode("utf-8", errors="replace")
-        if shutil.which("pbcopy"):
+        for command in self._CLIPBOARD_COMMANDS.get(sys.platform, ()):
+            if not shutil.which(command[0]):
+                continue
             try:
-                subprocess.run(["pbcopy"], input=payload, check=False)
-                return
+                # `clip.exe` interprets its stdin using the console codepage, which is only
+                # UTF-8 if something set it that way — so an accented or CJK character would
+                # land mangled. UTF-16LE is the encoding it recognises regardless of codepage
+                # (verified on Windows 11: `héllo-wörld-你好` round-trips exactly).
+                data = text.encode("utf-16-le", errors="replace") if command[0] == "clip" else payload
+                # console_isolation_kwargs for the same reason every other short-lived child
+                # gets it: aGiTrack holds the host console in raw mode, and a helper that
+                # inherits it can call SetConsoleMode and leave input echoing as escape codes
+                # (see proc.py). detach_stdin=False — the text is fed through `input=`.
+                subprocess.run(command, input=data, check=False, **console_isolation_kwargs(detach_stdin=False))
+                break
             except OSError:
-                pass
-        # OSC 52 clipboard fallback for terminals that support it.
+                continue
         encoded = base64.b64encode(payload).decode("ascii")
         try:
             os.write(sys.stdout.fileno(), b"\x1b]52;c;" + encoded.encode("ascii") + b"\x07")
@@ -13330,6 +10507,8 @@ class ProxyRunner:
             # returns early on a clean tree / absent latent tip, so genuine user-only edits (no turn
             # owed) still fall through to the offer below.
             self._auto_fold_latent_pending(force=True)
+        if not self._tree_is_dirty(self.repo):
+            return False  # cheap, and free inside the submit's read scope (see _tree_is_dirty)
         if not self.actions.has_pre_agent_user_changes():
             return False
         if getattr(self.active, "live_background_task_ids", None):
@@ -13481,6 +10660,27 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"applying pre-compaction summary failed: {error!r}")
 
+    @staticmethod
+    def _tree_is_dirty(repo: GitRepo) -> bool:
+        """Whether ``git status`` reports anything at all in *repo*'s working tree.
+
+        A ONE-DIRECTIONAL pre-check in front of the precise "does the user have changes"
+        questions, which cost three git subprocesses each (`ls-files --others`, `diff --quiet`,
+        `diff --cached --quiet`). An EMPTY status is conclusive — no tracked edit and no
+        untracked file can exist without appearing in it — so the expensive checks are skipped
+        outright. A NON-empty status is NOT conclusive (it also lists things those checks
+        deliberately exclude, such as aGiTrack's own `.agitrack/`), so it only means "keep
+        asking", never "yes". That asymmetry is what makes this safe to put in front of them.
+
+        Free on the submit path: `_pre_agent_commit_if_needed` has already read this status,
+        and the surrounding `git_read_cache()` scope serves it from that read. On a clean tree —
+        the common case when submitting a prompt — this turns six git spawns into none.
+        """
+        try:
+            return bool(repo.status_short().strip())
+        except Exception:
+            return True  # unreadable status: fall through to the precise checks
+
     def _base_user_edits_pending(self) -> bool:
         # The user's own edits land in the BASE repo's working tree (the session
         # worktree is the agent's sandbox), so the worktree-side pre-agent check
@@ -13494,6 +10694,8 @@ class ProxyRunner:
         base = self.base_repo
         if base is None or self.worktree is None:
             return False
+        if not self._tree_is_dirty(base):
+            return False  # nothing uncommitted anywhere: skip the three precise checks
         try:
             # Any uncommitted work counts: a tracked-file edit, OR a new untracked
             # (added-but-unstaged) file — `untracked_files()` lists those (and already
@@ -13548,6 +10750,10 @@ class ProxyRunner:
     def _resume_pending_prompt_if_ready(self) -> None:
         if self.pending_forwarded is None:
             return
+        with git_read_cache():  # the held prompt's release repeats the submit path's reads
+            self._resume_pending_prompt_now()
+
+    def _resume_pending_prompt_now(self) -> None:
         finished = self._finish_agent_parse_if_ready(quiet=True)
         if finished is None:
             if self.agent_parse_thread and self.agent_parse_thread.is_alive():

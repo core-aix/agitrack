@@ -677,8 +677,13 @@ def test_run_bounded_io_cancel_kills_and_captures(tmp_path):
 
 
 def test_run_bounded_io_captures_stderr_on_completion(tmp_path):
+    # Driven through `sys.executable`, not `sh -c`: native Windows has no POSIX shell on PATH
+    # (Git for Windows keeps its own out of the way), so the shell spelling failed with
+    # FileNotFoundError on a Windows dev machine while passing in CI, whose runner happens to
+    # expose one. The interpreter running the suite is the one program guaranteed to exist.
     repo = _init_repo(tmp_path)
-    code, stderr = repo._run_bounded_io(["sh", "-c", "echo oops 1>&2; exit 3"], timeout=5)
+    script = "import sys; sys.stderr.write('oops\\n'); sys.exit(3)"
+    code, stderr = repo._run_bounded_io([sys.executable, "-c", script], timeout=30)
     assert code == 3
     assert "oops" in stderr
 
@@ -2255,7 +2260,7 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch, shared_bac
     # Active backend is Claude, but the shared entry belongs to another backend: it must be
     # imported and resumed by a freshly-built agent of THAT backend, not by Claude. Handing a
     # foreign transcript to the active agent imports nothing and resumes an empty session.
-    from agitrack.proxy import runner as runner_module
+    from agitrack.proxy import sharing as sharing_module
 
     active = _StubBackend()  # name == "claude"
     runner, repo = _runner_with_store(tmp_path, monkeypatch, active)
@@ -2279,7 +2284,11 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch, shared_bac
         built.append(name)
         return other_agent
 
-    monkeypatch.setattr(runner_module, "make_proxy_agent", fake_make)
+    # Patched on `proxy.sharing`, where the shared-resume path lives, not on `proxy.runner`:
+    # ProxyRunner's sharing half is a mixin defined in its own module, so that is the module
+    # global the call resolves through. `runner_module.make_proxy_agent` still exists and is
+    # still the right target for the runner's OWN backend construction (session switch, spawn).
+    monkeypatch.setattr(sharing_module, "make_proxy_agent", fake_make)
     resumed: list = []
     runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]

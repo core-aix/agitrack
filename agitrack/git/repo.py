@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from agitrack.proc import console_isolation_kwargs
@@ -12,6 +14,77 @@ from agitrack.proc import console_isolation_kwargs
 
 class GitError(RuntimeError):
     pass
+
+
+# --- short-lived read cache -------------------------------------------------------------
+#
+# WHY THIS EXISTS: A SINGLE ENTER COSTS 19 GIT SUBPROCESSES, and five of them ask the same
+# question. Measured through the real reactor on native Windows, on an empty repo with a clean
+# tree: `rev-parse --abbrev-ref HEAD` five times, `diff --quiet` three times, `diff --cached
+# --quiet` three times, `ls-files --others` three times — 740 ms, which was 100% of the delay
+# between pressing Enter and the prompt reaching the backend. Nothing was slow; there were just
+# a lot of process spawns, and a process spawn costs ~38 ms on Windows against ~5 ms on
+# macOS/Linux. That is the whole reason "Enter takes a long time" is a Windows report: the same
+# path costs about 120 ms there and passes for instant.
+#
+# The submit path asks its questions through half a dozen collaborating helpers
+# (`_pre_agent_commit_if_needed`, `has_pre_agent_user_changes`, `_base_user_edits_pending`,
+# `_begin_agent_turn`, `_integrate_committed_turn_before_new_turn`, `_ensure_turn_branch`), and
+# threading one answer through all of them would couple every one of them to the caller. So the
+# de-duplication lives at the single choke point every one of them goes through instead.
+#
+# WHAT MAKES IT SAFE:
+#   * It is OFF unless a caller explicitly opens a `read_cache()` scope, and those scopes are
+#     milliseconds long. Nothing outside one ever sees a cached answer.
+#   * Only unambiguously read-only plumbing is cached (below). Anything else — every commit,
+#     stage, switch, merge, fetch — DROPS the whole cache as it runs, so a read that follows a
+#     write in the same scope always re-runs. That is the invariant the callers depend on:
+#     `_offer_pre_agent_user_commit` commits, and everything after it must see the new tree.
+#   * It is THREAD-LOCAL, but invalidation is PROCESS-WIDE. The git worker thread commits and
+#     merges on the very repos the reactor is reading, and a thread-local clear could never see
+#     that. So every write anywhere in the process bumps a counter, and a cached answer is only
+#     reused while that counter is unchanged — which makes "the worker committed while the
+#     submit path was mid-flight" a cache miss rather than a stale answer.
+_read_cache_state = threading.local()
+
+# Bumped by every git command that can write, on any thread, for any repo. Read on every cache
+# hit. A single counter (rather than one per repo) because git writes are not confined to the
+# repo they run in: a commit in a worktree moves refs the base repo reads, and vice versa.
+_write_epoch = 0
+_write_epoch_lock = threading.Lock()
+
+
+def _bump_write_epoch() -> None:
+    global _write_epoch
+    with _write_epoch_lock:
+        _write_epoch += 1
+
+
+# Read-only git subcommands. Deliberately a short list of ones that CANNOT write, rather than
+# everything that happens to be a read today: `branch`, `symbolic-ref`, `stash` and friends all
+# mutate depending on their arguments, and a cache is the wrong place to be clever about that.
+_CACHEABLE_SUBCOMMANDS = frozenset(
+    {"cat-file", "diff", "for-each-ref", "log", "ls-files", "merge-base", "rev-list", "rev-parse", "show-ref", "status"}
+)
+
+
+@contextlib.contextmanager
+def read_cache() -> Iterator[None]:
+    """De-duplicate repeated read-only git commands for the duration of the block.
+
+    Re-entrant: nested scopes share the outermost one, and the cache is dropped when the
+    outermost exits, so nothing survives the block.
+    """
+    depth = getattr(_read_cache_state, "depth", 0)
+    if depth == 0:
+        _read_cache_state.entries = {}
+    _read_cache_state.depth = depth + 1
+    try:
+        yield
+    finally:
+        _read_cache_state.depth -= 1
+        if _read_cache_state.depth == 0:
+            _read_cache_state.entries = None
 
 
 # Machine-managed scaffolding directories aGiTrack must never surface as untracked changes to
@@ -856,6 +929,7 @@ class GitRepo:
         (a ``threading.Event``-like object with ``is_set()``) is set, or *timeout*
         elapses. The process is terminated (then killed) so the network work really
         stops. Returns the exit code, or 124 when cancelled/timed out."""
+        _bump_write_epoch()  # fetch/push moves refs; no earlier read can be trusted after it
         # Discard output: callers only use the exit code, and piping a long fetch's
         # progress (stderr) without reading it would fill the pipe buffer and wedge
         # the process — the opposite of "bounded".
@@ -936,6 +1010,7 @@ class GitRepo:
         would. Returns ``(exit_code, stderr)``; ``(124, partial-stderr)`` when
         cancelled or timed out. Retrying ``communicate`` after a ``TimeoutExpired``
         does not lose output (documented behaviour), so the poll loop is safe."""
+        _bump_write_epoch()  # a push moves refs; no earlier read can be trusted after it
         process = subprocess.Popen(
             command,
             cwd=self.repo,
@@ -1065,6 +1140,31 @@ class GitRepo:
         # is NOT honoured for a ``git log --numstat`` walk (it still fetches every blob), whereas
         # the env var reliably keeps the walk to local objects. The config is set too, as a
         # harmless second line of defence on git builds where it does take effect.
+
+        # De-duplicate repeated reads, and invalidate on anything that can write. Off unless a
+        # caller opened a `read_cache()` scope; see the module header for why the Enter path
+        # needs it. Only the plain form is cacheable — a call carrying stdin, a custom env or a
+        # timeout is doing something specific enough that it should just run.
+        cache_key: tuple | None = None
+        cacheable_read = (
+            input_text is None
+            and not env
+            and timeout is None
+            and len(command) >= 2
+            and command[0] == "git"
+            and command[1] in _CACHEABLE_SUBCOMMANDS
+        )
+        if not cacheable_read:
+            # Everything else invalidates. That over-invalidates slightly — a read carrying a
+            # custom env or a timeout is not a write — and it is the right direction to err in:
+            # the cost is one repeated read, where the cost of the opposite mistake is acting on
+            # a tree that has changed.
+            _bump_write_epoch()
+        elif getattr(_read_cache_state, "depth", 0):
+            cache_key = (str(self.repo), tuple(command), check, allow_lazy_fetch)
+            epoch, cached = (_read_cache_state.entries or {}).get(cache_key, (None, None))
+            if cached is not None and epoch == _write_epoch:
+                return cached
         extra_env: dict[str, str] = dict(env) if env else {}
         flags: list[str] = []
         if command and command[0] == "git":
@@ -1132,4 +1232,8 @@ class GitRepo:
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()
             raise GitError(f"Command failed: {' '.join(command)}\n{detail}")
+        if cache_key is not None and _read_cache_state.entries is not None:
+            # Stamped with the epoch AFTER the read, so a write that landed while git was
+            # running invalidates this answer rather than being papered over by it.
+            _read_cache_state.entries[cache_key] = (_write_epoch, process)
         return process

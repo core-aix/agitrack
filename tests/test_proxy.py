@@ -1,3 +1,4 @@
+import base64
 import errno
 import os
 import re
@@ -3732,18 +3733,32 @@ def test_pageup_pagedown_scroll_history():
     assert runner.scroll_back == 0
 
 
-def test_mouse_drag_does_not_copy_or_hijack_selection():
-    # Text selection is the terminal's job. A left-button drag must NOT trigger aGiTrack's
-    # own copy: that only ran in terminals that forward the drag to the app (mouse mode
-    # 1000), where it suppressed native selection and popped an unwanted "Copied N char(s)
-    # to clipboard" message (#112). aGiTrack now ignores left-button events entirely.
-    runner = _history_runner()
+def _selection_runner():
+    """A runner with a screen holding 'hello world', ready to receive mouse reports."""
     import pyte
 
+    runner = _history_runner()
     runner.screen = pyte.HistoryScreen(20, 4, history=50, ratio=0.5)
     pyte.ByteStream(runner.screen).feed(b"hello world\r\n")
+    runner.rows, runner.cols = 5, 20
     runner.sel_active = False
     runner.sel_anchor = runner.sel_point = None
+    return runner
+
+
+def test_mouse_drag_copies_the_selection():
+    """A left drag must put the swept text on the clipboard.
+
+    THE REGRESSION THIS GUARDS: aGiTrack enables mouse reporting (?1000h) for wheel
+    scrollback, and a terminal that honours it stops doing its OWN selection and forwards the
+    drag here instead. #112 removed this handler on the reasoning that the terminal owns
+    selection — true only in terminals that never forward the drag. In every terminal that
+    DOES (the common case on Linux: VTE/gnome-terminal, konsole, xterm, alacritty, foot),
+    selecting text stopped working altogether: the terminal had stood down and aGiTrack was
+    no longer copying either. Receiving these events at all is the proof the terminal is not
+    selecting for us.
+    """
+    runner = _selection_runner()
     copied: list[str] = []
     messages: list[str] = []
     runner._copy_to_clipboard = lambda text: copied.append(text)
@@ -3752,9 +3767,134 @@ def test_mouse_drag_does_not_copy_or_hijack_selection():
     runner._intercept_scroll(b"\x1b[<0;1;1M")  # press at col 1, row 1
     runner._intercept_scroll(b"\x1b[<32;5;1M")  # drag to col 5
     runner._intercept_scroll(b"\x1b[<0;5;1m")  # release at a different cell (a real drag)
-    assert copied == []  # nothing was copied
-    assert messages == []  # no "Copied N chars" popup
-    assert runner.sel_active is False  # aGiTrack never started a selection
+
+    assert copied == ["hello"]
+    assert messages and "Copied" in messages[0]
+    assert runner.sel_active is False  # the selection is released, not left armed
+    assert runner.sel_anchor is None
+
+
+def test_mouse_drag_copies_even_when_the_terminal_reports_no_motion():
+    # Mouse mode 1000 reports press and release but NOT motion, so a drag arrives as two
+    # events with different coordinates and nothing in between. The release point alone is
+    # enough to know what was swept; keying the copy on having seen motion would mean no
+    # copy at all in exactly the mode aGiTrack asks the terminal for.
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<0;1;1M")
+    runner._intercept_scroll(b"\x1b[<0;5;1m")
+
+    assert copied == ["hello"]
+
+
+def test_a_drag_paints_one_frame_per_read_not_one_per_report():
+    """A drag arrives as a RUN of motion reports in one read; the highlight is painted once.
+
+    Same budget the wheel already respects: one read can hold dozens of reports, and a full
+    repaint per report is the storm that holds the GIL and starves the stdin reader (AGENTS.md,
+    "Scrolling and repaint budget"). Counted, not timed, so it holds on any machine.
+    """
+    runner = _selection_runner()
+    frames: list[int] = []
+    runner._render = lambda: frames.append(1)
+    runner._copy_to_clipboard = lambda text: None
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<0;1;1M")  # press
+    frames.clear()
+    runner._intercept_scroll(b"".join(b"\x1b[<32;%d;1M" % col for col in range(2, 18)))  # 16 motion reports
+
+    assert frames == [1], f"one frame per read, got {len(frames)}"
+
+
+def test_a_plain_click_copies_nothing():
+    # Press and release on the SAME cell is a click, not a selection. Copying there is what
+    # made the "Copied N char(s) to clipboard" popup appear unbidden (#112).
+    runner = _selection_runner()
+    copied: list[str] = []
+    messages: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda msg, **k: messages.append(msg)
+
+    runner._intercept_scroll(b"\x1b[<0;3;1M")
+    runner._intercept_scroll(b"\x1b[<0;3;1m")
+
+    assert copied == []
+    assert messages == []
+
+
+def test_a_modified_drag_is_left_to_the_terminal():
+    # Shift+drag is the chord terminals use for their own selection while an application is
+    # tracking the mouse. aGiTrack must not also select on it, or the user gets two
+    # selections at once.
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<4;1;1M")  # button 0 + Shift (4)
+    runner._intercept_scroll(b"\x1b[<4;5;1m")
+
+    assert copied == []
+    assert runner.sel_active is False
+
+
+def test_the_wheel_scrolls_without_starting_a_selection():
+    # The wheel and selection share the report format; scrollback must not arm a selection
+    # (a later click would then "release" one that was never dragged).
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+
+    assert runner.sel_active is False
+    assert copied == []
+
+
+def test_copy_to_clipboard_always_emits_osc52(monkeypatch):
+    """OSC 52 goes out even when a native clipboard tool ran.
+
+    They reach DIFFERENT clipboards over SSH — the native helper sets the one on the machine
+    aGiTrack runs on, OSC 52 travels back to the terminal the user will paste into — so
+    stopping at the first success silently copies to the wrong machine on a remote session,
+    which is where a TUI most often runs.
+    """
+    import agitrack.proxy.runner as runner_module
+
+    runner = _selection_runner()
+    ran: list[list[str]] = []
+    written: list[bytes] = []
+    monkeypatch.setattr(runner_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda cmd, **kw: ran.append(list(cmd)))
+    monkeypatch.setattr(runner_module.os, "write", lambda fd, data: written.append(data) or len(data))
+
+    runner._copy_to_clipboard("hello")
+
+    assert len(ran) == 1, f"only the first available helper should run, got {ran}"
+    assert b"\x1b]52;c;" in written[0]
+    assert base64.b64encode(b"hello") in written[0]
+
+
+def test_linux_clipboard_falls_through_to_the_next_tool(monkeypatch):
+    # Linux ships none of wl-copy/xclip/xsel by default and which one exists depends on
+    # Wayland vs X11, so the list must be tried in order rather than assuming one.
+    import agitrack.proxy.runner as runner_module
+
+    runner = _selection_runner()
+    ran: list[list[str]] = []
+    monkeypatch.setattr(runner_module.sys, "platform", "linux")
+    monkeypatch.setattr(runner_module.shutil, "which", lambda name: "/usr/bin/xclip" if name == "xclip" else None)
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda cmd, **kw: ran.append(list(cmd)))
+    monkeypatch.setattr(runner_module.os, "write", lambda fd, data: len(data))
+
+    runner._copy_to_clipboard("hello")
+
+    assert ran == [["xclip", "-selection", "clipboard"]]
 
 
 def test_mouse_events_are_stripped_from_forwarded_input():

@@ -21,11 +21,14 @@ Real repo, real git, real ``ProxyRunner.__init__``, real ``run()``. Only the thr
 platform boundaries are faked, and they are faked at the SAME seam production uses — the
 ``agitrack.proxy.platform`` factories — so the runner cannot tell the difference:
 
-* :class:`FakeChildProcess` for ``make_child_process`` — a real ``os.pipe()`` pair, so the
-  reactor's ``select``/``os.read`` path is the production one. Records the spawn argv.
-* :class:`FakeHostTerminal` for ``make_host_terminal`` — a real pipe for stdin, so
+* :class:`FakeChildProcess` for ``make_child_process`` — a real socket channel, so the
+  reactor's ``select``/read path is the production one. Records the spawn argv.
+* :class:`FakeHostTerminal` for ``make_host_terminal`` — a real channel for stdin, so
   keystrokes are delivered exactly as a terminal delivers them; records mode transitions.
-* The real ``make_waker`` is kept (a self-pipe works fine headless).
+* The real ``make_waker`` is kept (it picks the right primitive per platform on its own).
+
+Both channels are ``socketpair``s rather than pipes, which is what lets these tests run on
+Windows as well as POSIX — see :func:`_channel`.
 
 Both fakes satisfy the ``runtime_checkable`` Protocols in ``proxy/platform/base.py``, and
 :func:`test_fakes_satisfy_the_platform_protocols` asserts it — so a contract change breaks
@@ -37,12 +40,33 @@ Nothing here sleeps on wall-clock time. The reactor is bounded by iteration coun
 
 from __future__ import annotations
 
-import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
 from agitrack.git import GitRepo
+
+
+# --- a select-able byte channel --------------------------------------------
+
+
+def _channel() -> tuple[socket.socket, socket.socket]:
+    """``(reader, writer)`` for a byte stream the reactor's ``select`` can watch.
+
+    A ``socketpair``, NOT ``os.pipe()``, and the difference is the whole reason the
+    composition layer used to be untested on Windows: Windows ``select`` accepts ONLY
+    sockets — a pipe fd raises there — so a pipe-based fake made every test in
+    ``test_startup_composition`` skip on the one platform whose reactor wiring is most
+    unusual. Production already solved this the same way (``NtWaker``, ``NtHostTerminal``
+    and ``NtChildProcess`` all bridge their native handles through a ``socketpair``), so
+    using one here matches what the runner really selects on. A socketpair is fully
+    equivalent on POSIX — same fd semantics, same EOF-on-close-of-writer — so this is one
+    primitive for both platforms rather than a Windows special case.
+    """
+    reader, writer = socket.socketpair()
+    reader.setblocking(False)
+    return reader, writer
 
 
 # --- real git repo ---------------------------------------------------------
@@ -65,17 +89,18 @@ def init_repo(path: Path) -> GitRepo:
 class FakeChildProcess:
     """A backend child that never execs anything, over a real pipe.
 
-    ``master_fd`` is the read end of a real ``os.pipe()``, so ``select.select`` and
-    ``os.read`` behave exactly as they do against a PTY master. :meth:`emit` is the test's
-    way to play the backend: whatever it writes is what the reactor drains.
+    ``master_fd`` is the read end of a real socket channel, so ``select.select`` behaves
+    exactly as it does against a PTY master (POSIX) or the ConPTY output bridge (Windows).
+    :meth:`emit` is the test's way to play the backend: whatever it writes is what the
+    reactor drains.
     """
 
     def __init__(self, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> None:
         self.command = list(command)
         self.cwd = cwd
         self.extra_env = dict(extra_env or {})
-        self._read_fd, self._write_fd = os.pipe()
-        self.master_fd: int | None = self._read_fd
+        self._reader, self._writer = _channel()
+        self.master_fd: int | None = self._reader.fileno()
         self.child_pid: int | None = 4242  # a pid-shaped value; nothing signals it
         self.written = bytearray()  # everything the runner sent toward the backend
         self.resizes: list[tuple[int, int]] = []
@@ -88,13 +113,13 @@ class FakeChildProcess:
     def emit(self, data: bytes) -> None:
         """Play backend output. The reactor sees it on the next select."""
         if not self._closed:
-            os.write(self._write_fd, data)
+            self._writer.sendall(data)
 
     def close_output(self) -> None:
         """EOF on the child's PTY — how the reactor learns the backend is gone."""
         if not self._closed:
             self._closed = True
-            os.close(self._write_fd)
+            self._writer.close()
 
     def exit(self, code: int = 0) -> None:
         self._exit_code = code
@@ -110,11 +135,10 @@ class FakeChildProcess:
         # Getting that backwards fakes a backend exit, so it is worth mirroring precisely.
         if self.master_fd is None:
             return None
-        os.set_blocking(self.master_fd, False)
         chunks: list[bytes] = []
         while True:
             try:
-                chunk = os.read(self.master_fd, 65536)
+                chunk = self._reader.recv(65536)
             except BlockingIOError:
                 break
             except OSError:
@@ -150,7 +174,7 @@ class FakeChildProcess:
         self.close_output()
         if self.master_fd is not None:
             try:
-                os.close(self.master_fd)
+                self._reader.close()
             except OSError:
                 pass
             self.master_fd = None
@@ -163,16 +187,17 @@ class FakeChildProcess:
 
 
 class FakeHostTerminal:
-    """The host terminal, over a real pipe instead of fd 0.
+    """The host terminal, over a real socket channel instead of fd 0.
 
-    ``stdin_fileno`` is a real pipe read end so the reactor's ``select`` on stdin is the
-    production path; :meth:`type` is the test's keyboard. Mode transitions are recorded in
-    :attr:`modes` so a startup test can assert the terminal was actually put into raw mode
-    and restored — the two things that strand a user's shell when they regress.
+    ``stdin_fileno`` is a real channel read end so the reactor's ``select`` on stdin is the
+    production path — the same shape the Windows host uses, where the console is bridged to a
+    socket for exactly this reason. :meth:`type` is the test's keyboard. Mode transitions are
+    recorded in :attr:`modes` so a startup test can assert the terminal was actually put into
+    raw mode and restored — the two things that strand a user's shell when they regress.
     """
 
     def __init__(self, rows: int = 24, cols: int = 80) -> None:
-        self._read_fd, self._write_fd = os.pipe()
+        self._reader, self._writer = _channel()
         self.rows = rows
         self.cols = cols
         self.modes: list[str] = []
@@ -184,12 +209,12 @@ class FakeHostTerminal:
     # -- test-facing ------------------------------------------------------
     def type(self, data: bytes) -> None:
         """Deliver keystrokes to the reactor."""
-        os.write(self._write_fd, data)
+        self._writer.sendall(data)
 
     def close(self) -> None:
-        for fd in (self._write_fd, self._read_fd):
+        for sock in (self._writer, self._reader):
             try:
-                os.close(fd)
+                sock.close()
             except OSError:
                 pass
 
@@ -228,12 +253,12 @@ class FakeHostTerminal:
         return (self.rows, self.cols)
 
     def stdin_fileno(self) -> int:
-        return self._read_fd
+        return self._reader.fileno()
 
     def read_stdin(self, length: int) -> bytes:
         try:
-            return os.read(self._read_fd, length)
-        except OSError:
+            return self._reader.recv(length)
+        except (BlockingIOError, OSError):
             return b""
 
     def write_stdout(self, data: bytes) -> None:
