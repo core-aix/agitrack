@@ -295,7 +295,7 @@ def _host_bg_known(host) -> bool:
 
     ``_host_bg_is_dark`` has to return a bool for accent contrast, so it guesses dark when the
     answer is missing. A guess is fine for picking a highlight colour and wrong for deciding
-    whether to repaint the user's whole screen — see the abstain branch in ``update_canvas``.
+    what to report to the backend as the terminal's background — see ``_answer_terminal_queries``.
     """
     raw = getattr(host, "host_bg_value", None)
     if not raw:
@@ -329,61 +329,40 @@ def _host_bg_is_dark(host) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Agent-theme adaptation ("canvas")
+# Agent background ("canvas")
 # ---------------------------------------------------------------------------
 #
 # aGiTrack draws every cell itself, and a cell the backend left at the terminal's DEFAULT
-# background is emitted as such — so it shows the host terminal's background. That is right
-# when the agent's colour scheme matches the terminal, and wrong when it doesn't: a Claude
-# session set to a dark theme inside a light terminal paints dark backgrounds where it draws
-# panels and leaves everything else white, which is the "mixed dark and white screen" that is
-# hard to read. The agent's theme is the one the user chose for the agent, so aGiTrack adapts
-# to IT: when the two disagree, aGiTrack fills the unpainted cells with a background matching
-# the agent's scheme (and a contrasting default foreground), making the agent's area uniform.
+# background is emitted as such — so it shows the host terminal's background. That is the
+# behaviour: **the terminal's own colours are the default and the fallback.** aGiTrack never
+# decides on its own to repaint the user's screen in some other scheme.
 #
-# The agent never announces its theme, so it is inferred from what the agent actually paints:
-# light text and/or dark fills mean it assumes a dark background, and vice versa. The decision
-# is sampled on a timer and has to repeat before it takes effect, so a transient screen (a
-# diff block, a coloured banner) can't flip the canvas.
+# The one exception is an explicit `agent_background` of "dark" or "light". The user has then
+# said which background they want behind the agent, so aGiTrack fills every unpainted cell
+# (and its own chrome — status bar, popups — via `reset_sgr`) with that colour and a
+# contrasting default foreground, AND reports that colour to the backend in place of the
+# terminal's when it asks (`forced_canvas_osc_values`), so a self-theming backend paints to
+# match it. The canvas is then a pure function of the setting: it is computed once, at startup
+# and whenever the setting is edited, and nothing on screen can ever change it.
+#
+# aGiTrack USED to infer the agent's own light/dark scheme from the pixels it painted — dark
+# fills and light text meaning "this agent expects a dark background" — and repaint the
+# terminal to match. That is removed, and it cannot come back in this shape. It read the
+# CONTENT of the screen, so the decision moved with the content: a turn that printed a code
+# block (its own dark fill) voted dark, the plain prose after it voted light, and the whole
+# background flipped back and forth every couple of seconds for as long as the session ran.
+# Mid-tone terminals made it worse — Terminal.app's "Novel" (cream, #dfdbc3) and "Silver
+# Aerogel" (#808080, exactly the 50% the comparison was against) sit on the threshold, so the
+# "does the agent disagree with the terminal?" half of the rule was a coin toss too. There is
+# no content-derived signal that fixes this: any rule read off the screen changes when the
+# screen does, and no per-backend tuning of minimums, majorities or which glyphs count changes
+# that. Backends that theme themselves already ask the terminal what background they are on
+# (OSC 11), and aGiTrack answers truthfully — including from the platform when the terminal
+# itself will not answer (`host_background.py`) — so those backends agree with the terminal by
+# construction and there is nothing left to adapt to.
 
-_CANVAS_DARK = ("1c1c1c", "d0d0d0")  # (background, default foreground) for a dark agent theme
-_CANVAS_LIGHT = ("ffffff", "1c1c1c")  # …and for a light one
-
-# Perceived luminance (0-255) of the named colours pyte reports. Only used to classify a
-# colour as dark or light, so the mid-range hues never decide anything on their own.
-_NAMED_LUMINANCE: dict[str, float] = {
-    "black": 0.0,
-    "red": 54.0,
-    "green": 128.0,
-    "brown": 128.0,
-    "yellow": 128.0,
-    "blue": 29.0,
-    "magenta": 74.0,
-    "cyan": 150.0,
-    "white": 192.0,
-    "grey": 192.0,
-    "gray": 192.0,
-    "brightblack": 96.0,
-    "brightred": 105.0,
-    "brightgreen": 200.0,
-    "brightbrown": 226.0,
-    "brightyellow": 226.0,
-    "brightblue": 58.0,
-    "brightmagenta": 145.0,
-    "brightcyan": 217.0,
-    "brightwhite": 255.0,
-}
-
-
-def _luminance(color: str) -> float | None:
-    """Perceived brightness (0-255) of a pyte colour, or None when it has none (``default``,
-    or a name aGiTrack doesn't know — both must not vote on the agent's theme)."""
-    if not color or color == "default":
-        return None
-    if len(color) == 6 and all(char in _HEX_DIGITS for char in color):
-        red, green, blue = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
-        return 0.299 * red + 0.587 * green + 0.114 * blue
-    return _NAMED_LUMINANCE.get(color)
+_CANVAS_DARK = ("1c1c1c", "d0d0d0")  # (background, default foreground) for a forced dark background
+_CANVAS_LIGHT = ("ffffff", "1c1c1c")  # …and for a forced light one
 
 
 def _osc_color_value(color: str) -> bytes:
@@ -397,10 +376,10 @@ def forced_canvas_osc_values(host) -> tuple[bytes, bytes] | None:
     user FORCED a background ("dark"/"light"), or None to relay the host terminal's own.
 
     Only the forced settings answer with something other than the terminal's real colours:
-    a backend that themes itself from the reported background (OpenCode) then matches the
-    canvas aGiTrack paints. Under "auto" the relay stays truthful — the canvas there is
-    inferred FROM what the backend paints, so feeding it back could make the two chase
-    each other."""
+    a backend that themes itself from the reported background (codex, opencode) then matches
+    the canvas aGiTrack paints. Otherwise the relay is truthful, which is the whole reason no
+    adaptation is needed: the backend is told exactly what the user's terminal is drawing on
+    (from the platform, if the terminal itself will not say) and themes to it."""
     setting = getattr(host, "agent_background", "auto")
     if setting not in {"dark", "light"}:
         return None
