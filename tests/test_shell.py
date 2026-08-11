@@ -62,7 +62,7 @@ class FakeBackend:
     name = "claude"
     runs: list[str] = []
 
-    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None, **kwargs):
         self.repo = Path(repo)
         self.launch_command = list(launch_command or [])
 
