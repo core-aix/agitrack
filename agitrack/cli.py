@@ -148,7 +148,30 @@ def _ensure_git_identity() -> None:
         print("git identity is still incomplete; aGiTrack's commits may fail until name and email are set.")
 
 
+def _make_console_output_lossy() -> None:
+    """Never let an unencodable character turn console output into a crash.
+
+    ``agitrack --help`` died with a UnicodeEncodeError on a cp1252 console because one help
+    string contained ``↔`` (#233). The character is gone and a test keeps the help text
+    encodable, but the class of bug is wider than the help text: a repo path, a branch name,
+    a backend's error or a commit subject can all carry something the console's legacy code
+    page cannot represent, and none of those are ours to sanitize. Degrading to ``?`` for one
+    glyph is always better than losing the whole message and the exit code with it.
+
+    Best-effort by design: under pytest's capture (and anywhere else stdout is not a real
+    ``TextIOWrapper``) there is nothing to reconfigure, and that is fine."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) in ("replace", "backslashreplace"):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # a stream that refuses; keep the original behaviour
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_console_output_lossy()
     parser = argparse.ArgumentParser(
         description="Interactive agent + git commit orchestration.",
         add_help=False,
@@ -227,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{backend_phrase()} transcripts alone — even if you have never used aGiTrack here, and even if "
         "the directory is not a git repo. It reads the sessions that ran in this directory (or a "
         "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
-        "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
+        "models, lines changed, and the full user-agent trace behind each change) marked clearly as "
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
         "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
         "(it keeps running, surviving this terminal, until `--backtrace stop`); `status` reports it; "
@@ -437,6 +460,25 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--autostart-on-change",
+        action="store_true",
+        # Internal: entry point of the Claude Code `Stop` hook that background mode installs.
+        # Starts the tracker when a finished turn left changes in the tree and nothing is
+        # tracking yet, so tracking resumes on new CODE rather than only on the next commit.
+        # Called by Claude Code, not by hand.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--claude-session-note",
+        action="store_true",
+        # Internal: the body of the Claude Code SessionStart hook that background mode
+        # installs (backends/claude_settings.py). Prints the commit-guidance note in the
+        # hook's JSON envelope, so the agent knows aGiTrack commits for it even though
+        # aGiTrack never spawned it and could not pass --append-system-prompt. Called by
+        # Claude Code, not by hand.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dashboard-serve",
         action="store_true",
         # Internal: run the metrics dashboard HTTP server in the foreground (this
@@ -512,6 +554,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.help:
         parser.print_help()
         return 0
+
+    # The Claude Code hook body. Answered before ANY repo discovery, config load or privacy
+    # prompt: this runs on every Claude session start in a tracked repo, so it must be cheap
+    # and must never prompt — a hook that blocks would hang the user's agent.
+    if args.claude_session_note:
+        from agitrack.backends.claude_settings import print_session_note
+
+        return print_session_note()
 
     # Print the version and exit. Kept simple and side-effect-free (no repo
     # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
@@ -781,6 +831,18 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.git import hooks as git_hooks
 
         removed = git_hooks.remove_all_installed_hooks(rh_repo.hooks_dir())
+        # The documented full opt-out has to cover the AGENT-side hooks too, or "removed every
+        # hook it installed" would be false: the Claude Code entries (the session note and the
+        # turn-end auto-start) would keep running after the user opted out.
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.remove_autostart_hook(rh_repo.repo):
+                removed.append("claude Stop")
+            if claude_settings.remove_commit_guidance_hook(rh_repo.repo):
+                removed.append("claude SessionStart")
+        except Exception:
+            pass
         # Persist the opt-out so a later aGiTrack run doesn't silently reinstall the auto-track hook.
         try:
             rh_config = GlobalConfig()
@@ -806,6 +868,18 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.proxy.background import precommit_sync
 
         return precommit_sync(sync_repo)
+
+    if args.autostart_on_change:
+        # Internal: the Claude Code `Stop` hook. Same contract as the pre-commit hook above —
+        # fast, best-effort, never fails — but triggered by a finished turn rather than a
+        # commit, so tracking resumes on new CODE instead of waiting for the user to commit.
+        try:
+            change_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError):
+            return 0
+        from agitrack.proxy.background import autostart_on_change
+
+        return autostart_on_change(change_repo)
 
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
@@ -1034,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
                     backend=args.backend,
                     new_session=args.new_session,
                     manual_commits=manual_commits,
+                    commit_guidance=commit_guidance,
                     backend_command=backend_command,
                     log_file=log_file_spec,
                     _lock=management_lock,
@@ -1055,6 +1130,11 @@ def main(argv: list[str] | None = None) -> int:
             child_args.append("--manual-commits" if manual_commits else "--auto-commit")
             if args.new_session:
                 child_args.append("--new-session")
+            # Same reasoning as the commit mode above: the opt-out is a property of THIS
+            # invocation, and the daemon is the process that installs the guidance hook, so it
+            # has to be told rather than left to re-derive it from a config that may differ.
+            if not commit_guidance:
+                child_args.append("--no-commit-guidance")
             if args.verbose:
                 child_args.append("--verbose")
             if args.backend_command:

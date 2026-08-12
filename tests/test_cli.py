@@ -1213,6 +1213,38 @@ def test_help_shows_only_agitrack_options(monkeypatch, capsys):
     assert calls == []  # the backend CLI was never invoked for help
 
 
+def test_help_survives_a_legacy_code_page_console(monkeypatch, capsys):
+    """`agitrack --help` must be printable on a cp1252 console (#233).
+
+    It was not: one help string described the "user↔agent trace", and U+2194 has no cp1252
+    representation, so `--help` — the first command anyone runs — died with a
+    UnicodeEncodeError on a default Windows console. Asserting on the whole rendered help
+    rather than on that one string is the point: any future arrow, box-drawing character or
+    emoji added to an option's help fails here instead of on a user's terminal.
+    """
+    _no_backend_spawn(monkeypatch)
+
+    assert cli.main(["--help"]) == 0
+
+    help_text = capsys.readouterr().out
+    help_text.encode("cp1252")  # raises UnicodeEncodeError if an unrepresentable char is back
+
+
+def test_console_output_degrades_instead_of_crashing(monkeypatch):
+    """The second line of defence: paths, branch names and backend errors are not ours to
+    sanitize, and any of them can carry a character the console's code page lacks."""
+    import io
+
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(cli.sys, "stdout", stream)
+
+    cli._make_console_output_lossy()
+
+    stream.write("user↔agent")  # would raise UnicodeEncodeError under errors="strict"
+    stream.flush()
+    assert stream.errors == "replace"
+
+
 def test_help_short_flag_shows_only_agitrack_options(monkeypatch, capsys):
     calls = _no_backend_spawn(monkeypatch)
 

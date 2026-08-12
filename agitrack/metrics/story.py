@@ -2078,8 +2078,9 @@ __BACKEND_OPTIONS__
         <button class="btn" id="e-save">save</button>
         <span class="hint" id="e-msg" style="margin-top:0"></span>
       </div>
-      <div class="hint">Saved in this repo as <code>learning_backend</code> / <code>learning_model</code> in
-        <code>.agitrack/config.json</code>, the same pair the learn page uses, so one choice covers both.
+      <div class="hint">Saved as <code>learning_backend</code> / <code>learning_model</code> in
+        <code>~/.agitrack/config.json</code> (or this repo's <code>.agitrack/config.json</code>, if it already
+        pins them), the same pair the learn page uses, so one choice covers both.
         A bigger model tells a better story; a smaller one is quicker and cheaper.</div>
     </div>
   </details>
@@ -2839,6 +2840,14 @@ async function saveEngine(){
 
 function renderEngine(){
   const e = (state.data && state.data.engine) || {};
+  // A backend that cannot be resolved is fixable right here — open the panel that fixes it
+  // rather than leaving the note as the only sign (#233).
+  if (e.needs_choice) {
+    $("engine").open = true;
+    if ($("e-backend").dataset.touched !== "1" && !$("e-backend").value) {
+      $("e-backend").value = (e.installed || [])[0] || "";
+    }
+  }
   if ($("e-backend").dataset.touched !== "1") {
     $("e-backend").value = e.backend_source === "config" ? (e.backend || "") : "";
     if ($("e-model").dataset.filled !== "1") {

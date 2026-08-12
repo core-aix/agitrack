@@ -38,7 +38,20 @@ jobs:
           git config --global user.name "aGiTrack CI"
 
       # Official action installs uv cross-platform (Linux, macOS, Windows).
+      #
+      # RETRIED ONCE, DELIBERATELY. This step downloads from the network, and a macOS runner
+      # failed it with "self-signed certificate" — a TLS error from the runner's own network
+      # path, before a single test had run. Nothing about the commit was wrong, but the run
+      # was red and the only cure was a human pressing re-run. A step that can fail for
+      # reasons unrelated to the code under test should retry itself; `continue-on-error`
+      # keeps the first attempt from failing the job, and the outcome check reruns it.
       - name: Install uv
+        id: setup-uv
+        uses: astral-sh/setup-uv@v4
+        continue-on-error: true
+
+      - name: Install uv (retry after a transient network failure)
+        if: steps.setup-uv.outcome == 'failure'
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
