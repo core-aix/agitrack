@@ -207,8 +207,16 @@ def _page(tmp_path: Path = Path(".")) -> str:
     return story.story_html(tmp_path)
 
 
+# Generous, because this bounds a HANG, it does not measure anything: every one of these
+# requests is a loopback call to a server running in this same process, so the only thing a
+# tight deadline can catch is a loaded runner. It caught one — the Windows CI job (4 cores,
+# `-n auto`, ~3500 tests) started failing two of these with TimeoutError after an unrelated
+# batch of tests was added. A real hang still fails, 30s later.
+_HTTP_TIMEOUT = 30
+
+
 def _get(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=5) as response:
+    with urllib.request.urlopen(url, timeout=_HTTP_TIMEOUT) as response:
         return response.read().decode("utf-8")
 
 
@@ -216,7 +224,7 @@ def _post(url: str, payload: dict) -> dict:
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

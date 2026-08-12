@@ -269,3 +269,59 @@ def test_commit_raises_catchable_giterror_on_failing_pre_commit_hook(tmp_path: P
 
     staged = repo._run(["git", "diff", "--cached", "--name-only"]).stdout
     assert "f.txt" in staged  # changes left staged, not lost
+
+
+def test_the_untracked_popup_defaults_to_leaving_files_alone():
+    """The TUI re-asked the untracked-files question the console pass had just asked, and
+    offered the OPPOSITE default: it led with "Stage all", so a bare Enter swept the user's own
+    untracked files into the commit — the one outcome that is hard to undo, on the most
+    reflexive keypress there is. The console pass defaults to No (`[y/N]`)."""
+    import inspect
+
+    from agitrack.proxy.runner import ProxyRunner
+
+    source = inspect.getsource(ProxyRunner._review_untracked_popup)
+    options = source.split("self._select_popup(")[1].split("detail=")[0]
+    assert options.index("Leave them unstaged") < options.index("stage_label"), options
+
+
+def test_the_merge_menu_does_not_offer_a_destination_it_will_refuse():
+    """The "Merge into which branch?" popup listed `Current branch (main)` for a session whose
+    merge branch is `feature`; picking it produced the cross-branch warning and did nothing. The
+    guard reads the worktree's RECORDED merge branch, which `_merge_active_into` never updated —
+    so a destination chosen from a menu was treated as an automatic cross-branch merge."""
+    import inspect
+
+    from agitrack.proxy.runner import ProxyRunner
+
+    merge = inspect.getsource(ProxyRunner._merge_active_into)
+    assert "self.state.merge_branch = target" in merge, "the guard's own record is still not updated"
+
+    picker = inspect.getsource(ProxyRunner._choose_merge_target)
+    # When the two differ, the session's own branch is offered FIRST and the other is labelled
+    # as what it actually does.
+    assert picker.index("Session's branch") < picker.index("re-targets this session")
+
+
+def test_the_stall_threshold_sits_below_the_smallest_reported_symptom():
+    """E1's stalls measured 0.96 s and 2.71 s, so a 2.0 s floor recorded ONE of them and left
+    the other invisible. An intermittent latency bug cannot be reproduced on demand, so the
+    threshold has to sit below the smallest symptom anyone has reported — a keystroke taking
+    half a second to reach the agent is already a user-visible freeze (bare codex over the same
+    PTY answers in 0.25-0.44 MILLIseconds)."""
+    from agitrack.proxy.runner import ProxyRunner
+
+    assert ProxyRunner.STALL_WARN_SECONDS <= 0.5
+
+
+def test_a_stall_note_records_sub_second_precision(tmp_path):
+    """`{seconds:.1f}` rounded a 0.96 s stall to "1.0s" and a 0.5 s one to "0.5s" — too coarse to
+    tell a render from a git call when reading the artifact afterwards."""
+    from agitrack.proxy.crash import write_stall_note
+
+    write_stall_note(tmp_path, "timers", 0.9612)
+
+    notes = list((tmp_path / ".agitrack").rglob("*"))
+    text = "".join(p.read_text(encoding="utf-8") for p in notes if p.is_file())
+    assert "0.961" in text
+    assert "phase timers" in text

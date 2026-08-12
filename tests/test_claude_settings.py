@@ -231,6 +231,88 @@ def test_the_autostart_hook_command_is_quoted_too(monkeypatch):
     assert command == r'"C:\Users\dev\python.exe" "-m" "agitrack" "--autostart-on-change"'
 
 
+def test_removal_gives_an_UNTRACKED_settings_file_its_own_bytes_back(tmp_path):
+    """The half `git checkout` cannot reach.
+
+    ``_restore_committed_bytes`` restores a file git has a commit of, which is the case that
+    shows up in `git status`. But `.local` says most repos ignore this file, and aGiTrack is
+    just as much a guest in one git will never restore — there its reformatting simply stays
+    forever. The install-time snapshot covers those, and this is a directory with no git at all.
+    """
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write", "Edit"], "defaultMode": "acceptEdits"}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+    assert path.read_text(encoding="utf-8") != original  # the hook really did go in
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+
+def test_the_bytes_come_back_only_after_the_LAST_hook_is_removed(tmp_path):
+    """The two hooks have different lifetimes; the daemon takes the session note away on
+    teardown while the auto-start hook stays. Restoring the original then would delete a
+    hook that is supposed to outlive the daemon."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write"]}}\n'
+    path.write_text(original, encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+    claude_settings.install_commit_guidance_hook(tmp_path)
+
+    claude_settings.remove_commit_guidance_hook(tmp_path)
+
+    assert claude_settings.hook_is_installed(tmp_path, claude_settings.AUTOSTART_HOOK) is True
+    assert path.read_text(encoding="utf-8") != original
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_an_edit_the_user_made_meanwhile_wins_over_the_snapshot(tmp_path):
+    """The snapshot is how the file LOOKED when aGiTrack arrived, not a licence to roll the
+    user back. A setting added while the tracker ran must survive stopping it."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"permissions": {"allow": ["Write"]}}\n', encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["permissions"]["allow"].append("Edit")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"permissions": {"allow": ["Write", "Edit"]}}
+
+
+def test_the_snapshot_lives_in_the_self_ignoring_state_dir(tmp_path):
+    """It is aGiTrack's own working state, so it must land in `.agitrack/` — which carries a
+    `.gitignore` of `*` — and never as a stray file in the user's tree."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+    assert (tmp_path / ".agitrack" / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+
+
+def test_a_settings_file_agitrack_created_itself_leaves_no_snapshot(tmp_path):
+    """Nothing to restore, so nothing to remember — and the file is deleted outright."""
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert not _settings(tmp_path).exists()
+
+
 def test_removing_our_hook_restores_the_users_own_formatting(tmp_path):
     """D3 (second half): aGiTrack rewrites this file with its own canonical
     `json.dumps(indent=2)`. On a repo that TRACKS settings.local.json that reformatting is a
@@ -266,6 +348,48 @@ def test_removing_our_hook_restores_the_users_own_formatting(tmp_path):
         check=True,
     ).stdout
     assert porcelain == "", f"left a diff the user never made: {porcelain!r}"
+
+
+def test_removing_our_hook_is_clean_under_crlf_conversion(tmp_path):
+    """The same guarantee on a repo whose line endings git converts — the default on Git for
+    Windows (`core.autocrlf`), where LF is stored and CRLF is checked out.
+
+    Restoring the COMMITTED BYTES is not the same as restoring the FILE. Writing the blob
+    verbatim leaves a working tree whose content hashes identically to HEAD — `git diff` empty,
+    `git hash-object` matching — while `git status` still reports ` M`, because those are not the
+    bytes a checkout would produce and the index's stat entry never got refreshed. Exactly the
+    "diff the user never made" this is supposed to prevent, one layer down. Only reproduced on
+    Windows, where autocrlf is on by default; this pins it everywhere by setting it explicitly."""
+    import subprocess
+
+    from agitrack.backends import claude_settings
+
+    repo = tmp_path / "proj"
+    (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=repo, check=True)
+    settings = repo / ".claude" / "settings.local.json"
+    # CRLF in the working tree, as a Windows editor writes it; git stores LF.
+    original = '{\r\n  "permissions": { "allow": ["Bash(ls:*)"] }\r\n}\r\n'
+    settings.write_bytes(original.encode("utf-8"))
+    subprocess.run(["git", "add", "-f", ".claude/settings.local.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "team settings"], cwd=repo, check=True)
+
+    assert claude_settings.install_autostart_hook(repo)
+    assert claude_settings.remove_autostart_hook(repo)
+
+    porcelain = subprocess.run(
+        ["git", "-c", "core.excludesFile=/dev/null", "status", "--porcelain"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert porcelain == "", f"left a diff the user never made: {porcelain!r}"
+    # And the file really is back to what a checkout produces, not merely hash-equal.
+    assert subprocess.run(["git", "update-index", "--refresh"], cwd=repo, capture_output=True).returncode == 0
 
 
 def test_a_user_edit_since_the_commit_is_never_reverted(tmp_path):

@@ -3,12 +3,11 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
-from agitrack.console import ask, progress_ticker
+from agitrack.console import ask, progress_ticker, stdin_is_interactive, stdout_is_interactive
 from agitrack.proc import resolve_subprocess_command, which_executable
 
 # Per-backend facts used to build a single install hint that covers macOS, Linux, AND
@@ -245,7 +244,7 @@ def _offer_path_for(
             output_fn=output_fn,
             # Editing the user's profile needs their consent, so without a terminal to ask
             # on (a scripted/piped run) it only prints what to do by hand.
-            interactive=sys.stdin.isatty() and sys.stdout.isatty(),
+            interactive=stdin_is_interactive() and stdout_is_interactive(),
         )
     except Exception as error:  # a PATH convenience must never break the install it follows
         output_fn(f"  (could not check your PATH: {error})\n")
@@ -343,7 +342,8 @@ def select_default_backend(
     """First-run backend setup. Lists each agent backend ONCE with its install status, then asks
     which to use as the DEFAULT in a single prompt. The number selects the default coding agent;
     a not-yet-installed choice is installed first (if that install is declined or fails it stays
-    the default and the launch-time gate offers to install it before the agent starts). Pressing
+    the default; the launch-time gate then offers to SWITCH to an installed backend or prints
+    manual instructions — it does not install, see ensure_installed_backend). Pressing
     Enter accepts the default — the first installed backend, or the first listed when none is
     installed yet (then installed at launch). Saves and returns the chosen default, then explains
     how to change it later."""

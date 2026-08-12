@@ -12,8 +12,11 @@ from agitrack import daemons
 
 
 class _Info:
-    def __init__(self, pid: int, function: str = "repo dashboard", repo_name: str = "proj"):
+    def __init__(self, pid: int, function: str = "repo dashboard", repo_name: str = "proj", kind: str = "dashboard"):
         self.pid, self.function, self.repo_name = pid, function, repo_name
+        # `kind` decides whether `--daemons stop` may act on it at all: an interactive session is
+        # LISTED but never signalled (daemons._STOPPABLE_KINDS).
+        self.kind = kind
         self.repo, self.url, self.cmd = f"/tmp/{repo_name}", "", []
 
 
@@ -168,7 +171,7 @@ def test_the_listing_says_how_to_stop_them_all(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "agitrack --daemons stop" in out
-    assert "all 3 of them" in out  # the count, so the reach is concrete
+    assert "all 3 background daemon(s)" in out  # the count, so the reach is concrete
     assert "in every repository" in out  # ...and that it is not scoped to this project
     assert "asks first" in out
 
@@ -262,3 +265,49 @@ def test_the_process_scan_stands_down_under_an_isolated_config_dir(monkeypatch, 
 
     assert daemons._scan_daemon_processes() == []
     assert daemons.list_running() == []
+
+
+def test_an_interactive_session_is_listed_but_never_stopped(monkeypatch, capsys):
+    """`--daemons list` showed only detached daemons, so someone asking "what is aGiTrack
+    running?" — usually because something is holding a repo lock — got half the answer, and no
+    mention of the very session holding it. Listing it is the point; terminating someone's live
+    conversation from a bulk sweep is not."""
+    from agitrack import cli
+
+    running = [_Info(11), _Info(22, "interactive session", kind="session")]
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: list(running))
+
+    assert cli.main(["--daemons"]) == 0
+
+    out = capsys.readouterr().out
+    assert "interactive session" in out
+    assert "quit it in its own terminal" in out
+    assert "never touches one" in out
+    assert "all 1 background daemon(s)" in out  # the session is not counted as stoppable
+
+
+def test_a_session_is_not_shown_in_the_about_to_stop_listing(monkeypatch, capsys):
+    from agitrack import cli
+
+    _cli_registry(monkeypatch, [_Info(11), _Info(22, "interactive session", kind="session")], tty=False)
+    monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: (1, []))
+
+    assert cli.main(["--daemons", "stop", "--yes"]) == 0
+
+    out = capsys.readouterr().out
+    assert "About to stop 1 aGiTrack daemon(s)" in out
+
+
+def test_stop_all_skips_sessions_even_if_one_reaches_it(monkeypatch):
+    """Belt and braces at the library level, not only in the CLI listing."""
+    signalled: list[int] = []
+    monkeypatch.setattr(daemons, "list_running", lambda **kw: [_Info(11), _Info(22, kind="session")])
+    monkeypatch.setattr(daemons, "terminate_pid", lambda pid: signalled.append(pid))
+    monkeypatch.setattr(daemons, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(daemons, "deregister", lambda pid=None: None)
+    monkeypatch.setattr(daemons, "_signal_targets", lambda infos: infos)
+
+    stopped, _survivors = daemons.stop_all(exclude_pid=999)
+
+    assert signalled == [11]
+    assert stopped == 1

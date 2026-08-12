@@ -97,6 +97,112 @@ def _never_touch_real_daemons(monkeypatch):
     monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])
 
 
+# PIDs of daemons tests started, collected as each test ends and killed ONCE when the session
+# does. Collect-now-kill-later on purpose: killing during the run means signalling a process
+# while another test may still be inside a call that waits on it, and doing that per-test hung a
+# full run at 98% with a reader thread blocked forever on a pipe the dead daemon's children still
+# held open. The leak this exists to fix is daemons surviving the whole RUN, so session end is
+# both sufficient and the only safe moment.
+_LEAKED_DAEMON_PIDS: set[int] = set()
+
+
+def collect_registered_daemons(config_dir: str | os.PathLike[str]) -> list[int]:
+    """Note (and de-register) every daemon recorded under ``config_dir``. Returns their pids.
+
+    Tests that exercise `-b` spawn REAL detached daemons and nothing stopped them: a full suite
+    run left 60 alive on Windows and several on macOS, still polling long-deleted
+    `pytest-of-…/pytest-NNN` temp dirs, indefinitely. Scoped by config dir — which the autouse
+    isolation fixture gives every test its own — so this can only ever see what the tests
+    started, never the developer's own daemons.
+    """
+    import json
+
+    # os.path, not pathlib: a test that stages `os.name = "nt"` turns Path into WindowsPath,
+    # which cannot be instantiated here — and teardown must never be the thing that fails.
+    registry = os.path.join(str(config_dir), "daemons")
+    if not os.path.isdir(registry):
+        return []
+    found: list[int] = []
+    for name in sorted(os.listdir(registry)):
+        if not name.endswith(".json"):
+            continue
+        entry = os.path.join(registry, name)
+        try:
+            with open(entry, encoding="utf-8") as handle:
+                pid = json.load(handle).get("pid")
+        except (OSError, ValueError):
+            pid = None
+        if isinstance(pid, int) and pid != os.getpid():
+            found.append(pid)
+        try:
+            os.unlink(entry)
+        except OSError:
+            pass
+    return found
+
+
+def reap_daemon_pids(pids) -> int:
+    """SIGTERM then SIGKILL each pid, and reap it. Returns how many were still alive.
+
+    The whole GROUP is signalled: aGiTrack detaches daemons with ``start_new_session=True``, so
+    each is its own group leader, and killing only the leader leaves its children holding the
+    write end of a pipe someone may be reading. Guarded so it can never reach the test runner's
+    own group."""
+    import signal
+    import time
+
+    killed = 0
+    for pid in sorted(set(pids)):
+        for sig in (getattr(signal, "SIGTERM", 15), getattr(signal, "SIGKILL", 9)):
+            try:
+                group = os.getpgid(pid)
+            except (OSError, AttributeError):
+                group = None
+            try:
+                mine = os.getpgid(0)
+            except (OSError, AttributeError):
+                mine = None
+            try:
+                if group is not None and group != mine and hasattr(os, "killpg"):
+                    os.killpg(group, sig)
+                else:
+                    os.kill(pid, sig)
+            except OSError:
+                break  # already gone
+            killed += 1
+            time.sleep(0.05)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        try:  # reap the zombie if it was our child
+            os.waitpid(pid, os.WNOHANG)
+        except (OSError, ChildProcessError):
+            pass
+    return killed
+
+
+@pytest.fixture(autouse=True)
+def _note_daemons_a_test_started():
+    """Record (and de-register) any daemon this test leaves behind; the session kills them.
+
+    Defined after the config-dir fixture so ``AGITRACK_CONFIG_DIR`` is still the test's own when
+    this tears down."""
+    yield
+    from agitrack.env import getenv_compat
+
+    config_dir = getenv_compat("CONFIG_DIR")
+    if config_dir:
+        _LEAKED_DAEMON_PIDS.update(collect_registered_daemons(config_dir))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kill_leaked_daemons_at_the_end():
+    """One sweep, after every test has finished. See ``_LEAKED_DAEMON_PIDS``."""
+    yield
+    reap_daemon_pids(_LEAKED_DAEMON_PIDS)
+
+
 @pytest.fixture(autouse=True)
 def _never_really_self_update(monkeypatch):
     """No test may install an aGiTrack update for real.

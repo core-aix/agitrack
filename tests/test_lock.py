@@ -256,3 +256,23 @@ def test_acquire_gives_up_when_the_lock_is_genuinely_held(tmp_path, monkeypatch)
     started = _time.monotonic()
     assert lock.acquire(retry_seconds=0.3) is False
     assert 0.25 <= _time.monotonic() - started < 3.0
+
+
+def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
+    """`release()` truncates the file for a daemon that shuts itself down, but on Windows
+    `-b stop` is TerminateProcess, so the teardown never runs and the file kept its owner
+    record: on disk a clean stop was indistinguishable from a crash, and the next reader saw a
+    plausible-looking dead owner."""
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+    assert lock.acquire()
+    assert lock.owner_pid() == os.getpid()
+
+    # A DIFFERENT process (the one that ran `-b stop`) clears the record it left behind.
+    RepoLock(tmp_path / ".agitrack" / "lock").clear_owner_record()
+
+    assert RepoLock(tmp_path / ".agitrack" / "lock").owner_pid() is None
+    lock.release()
+
+
+def test_clearing_a_missing_lock_file_is_harmless(tmp_path):
+    RepoLock(tmp_path / "nope" / "lock").clear_owner_record()  # must not raise
