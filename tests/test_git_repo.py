@@ -493,6 +493,33 @@ def test_a_repo_that_really_is_a_partial_clone_keeps_its_settings(tmp_path):
     assert kept == "blob:none"  # the user's own value, restored
 
 
+def test_tree_diff_names_lists_what_a_snapshot_adds_over_head(tmp_path):
+    """The index-free counterpart of ``staged_paths``: no ``--no-worktree`` commit ever
+    stages, so "what will this commit carry?" has to be answered by comparing trees."""
+    repo = _init_repo(tmp_path)
+    (tmp_path / "new1.txt").write_text("a\n")
+    (tmp_path / "new2.txt").write_text("b\n")
+    (tmp_path / "f.txt").write_text("edited\n")
+
+    names = repo.tree_diff_names(repo.comparable_tree("HEAD"), repo.snapshot_worktree_tree())
+
+    assert sorted(names) == ["f.txt", "new1.txt", "new2.txt"]
+
+
+def test_tree_diff_names_is_empty_for_an_unchanged_tree(tmp_path):
+    repo = _init_repo(tmp_path)
+
+    assert repo.tree_diff_names(repo.comparable_tree("HEAD"), repo.snapshot_worktree_tree()) == []
+
+
+def test_tree_diff_names_answers_nothing_known_for_an_unreadable_rev(tmp_path):
+    """Best-effort by contract: its only caller uses it to say MORE in a commit message, so a
+    bad rev must cost that sentence, never the commit."""
+    repo = _init_repo(tmp_path)
+
+    assert repo.tree_diff_names("not-a-rev", "HEAD") == []
+
+
 def test_discover_accepts_a_plain_string_path(tmp_path):
     """The annotation says Path, but `cwd=` accepted a plain string for years so callers and
     scripts pass one. The existence guards added for the `--repo` message are Path methods, and
