@@ -1875,3 +1875,134 @@ def test_a_non_claude_backend_is_left_alone(tmp_path):
     runner._install_commit_guidance()
 
     assert not (tmp_path / ".claude").exists()
+
+
+# --- auto-start on new changes ----------------------------------------------
+
+
+def test_a_finished_turn_that_changed_code_starts_the_tracker(tmp_path, monkeypatch):
+    """Auto-start used to be reachable only through the git pre-commit hook, so tracking
+    resumed when the user COMMITTED — and an agent that edits for an hour without committing
+    is exactly the work aGiTrack exists to record. No git hook can see a plain file edit
+    (they fire on git operations, not on writes), so the trigger is the agent's own turn-end
+    hook: a turn finished and the tree is not what HEAD says it is.
+    """
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    assert background_module.autostart_on_change(repo) == 0
+
+    assert spawned and "--backend" in spawned[0]
+
+
+def test_a_turn_that_changed_nothing_starts_nothing(tmp_path, monkeypatch):
+    # A question-and-answer turn ends like any other. Starting a daemon for it would mean a
+    # tracker (and its commit hooks) appearing because someone asked what a function does.
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned == []
+
+
+def test_auto_start_never_creates_a_second_writer(tmp_path, monkeypatch):
+    """The rule the whole design rests on: one git-editing aGiTrack per repo.
+
+    This hook fires on every turn end, including turns of a session an interactive aGiTrack is
+    already driving. That process holds the repo's single-writer lock, so a daemon started
+    beside it would be a second writer committing into the same branch.
+    """
+    from agitrack.git import RepoLock
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+    holder = RepoLock(tmp_path / ".agitrack" / "lock")
+    assert holder.acquire()
+    try:
+        background_module.autostart_on_change(repo)
+    finally:
+        holder.release()
+
+    assert spawned == []
+
+
+def test_auto_start_respects_the_opt_out(tmp_path, monkeypatch):
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    config.set("autotrack_hook", "off", scope="repo")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned == []
+
+
+def test_stop_disarms_every_way_tracking_could_restart(tmp_path):
+    """`-b stop` means stop.
+
+    Two things would otherwise keep acting after the user asked aGiTrack to stop: the
+    auto-start hooks would bring the tracker back on the next commit or the next agent turn,
+    and the session note would keep telling the agent that aGiTrack is committing for it —
+    false with no tracker running, and it stops the agent committing at all.
+    """
+    from agitrack.backends import claude_settings
+    from agitrack.git import hooks as git_hooks
+    from agitrack.proc import agitrack_invocation
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(repo.repo), version="9.9.9"
+    )
+    claude_settings.install_autostart_hook(repo.repo)
+    claude_settings.install_commit_guidance_hook(repo.repo)
+
+    assert background_module.stop_background(repo) == 0
+
+    assert not git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")
+    assert claude_settings.hook_is_installed(repo.repo, claude_settings.AUTOSTART_HOOK) is False
+    assert claude_settings.hook_is_installed(repo.repo, claude_settings.SESSION_NOTE_HOOK) is False
+
+
+def test_stop_does_not_revoke_the_users_standing_auto_start_choice(tmp_path):
+    # Disarming now is not the same as opting out forever: the next `agitrack -b` re-arms it.
+    # Only `--remove-hooks` turns the preference itself off.
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+
+    background_module.stop_background(repo)
+
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    assert config.autotrack_hook == "auto"

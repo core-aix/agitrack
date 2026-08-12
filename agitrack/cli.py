@@ -460,6 +460,15 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--autostart-on-change",
+        action="store_true",
+        # Internal: entry point of the Claude Code `Stop` hook that background mode installs.
+        # Starts the tracker when a finished turn left changes in the tree and nothing is
+        # tracking yet, so tracking resumes on new CODE rather than only on the next commit.
+        # Called by Claude Code, not by hand.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--claude-session-note",
         action="store_true",
         # Internal: the body of the Claude Code SessionStart hook that background mode
@@ -822,6 +831,18 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.git import hooks as git_hooks
 
         removed = git_hooks.remove_all_installed_hooks(rh_repo.hooks_dir())
+        # The documented full opt-out has to cover the AGENT-side hooks too, or "removed every
+        # hook it installed" would be false: the Claude Code entries (the session note and the
+        # turn-end auto-start) would keep running after the user opted out.
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.remove_autostart_hook(rh_repo.repo):
+                removed.append("claude Stop")
+            if claude_settings.remove_commit_guidance_hook(rh_repo.repo):
+                removed.append("claude SessionStart")
+        except Exception:
+            pass
         # Persist the opt-out so a later aGiTrack run doesn't silently reinstall the auto-track hook.
         try:
             rh_config = GlobalConfig()
@@ -847,6 +868,18 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.proxy.background import precommit_sync
 
         return precommit_sync(sync_repo)
+
+    if args.autostart_on_change:
+        # Internal: the Claude Code `Stop` hook. Same contract as the pre-commit hook above —
+        # fast, best-effort, never fails — but triggered by a finished turn rather than a
+        # commit, so tracking resumes on new CODE instead of waiting for the user to commit.
+        try:
+            change_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError):
+            return 0
+        from agitrack.proxy.background import autostart_on_change
+
+        return autostart_on_change(change_repo)
 
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
