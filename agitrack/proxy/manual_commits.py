@@ -297,6 +297,28 @@ class ManualCommitsMixin(RunnerHost):
         self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
         return self._manual_allow_unchanged
 
+    def _manual_changed_paths(self) -> list[str]:
+        """The paths this turn's latent record will carry.
+
+        Read against the same baseline the gate uses — the latent tip, or HEAD when the chain
+        is empty — so it is this TURN's contribution and not everything since HEAD. Runs after
+        ``_manual_gate`` has cached the snapshot, which is the tree ``_manual_record`` commits.
+
+        Used only for the interrupted-turn note (see ``message._interrupted_changes_sentence``):
+        a cancelled turn's trace stops at the agent's "I'll do X" and cannot account for the
+        diff, so the commit has to state its own contents. Best-effort — an empty list simply
+        leaves the note without its file list."""
+        tree = getattr(self, "_manual_pending_tree", None)
+        if tree is None:
+            return []
+        tip = self.repo.ref_sha(self._manual_ref())
+        try:
+            base = self.repo.comparable_tree(tip or "HEAD")
+        except Exception as error:
+            self._debug(f"latent baseline tree failed: {error!r}")
+            return []
+        return self.repo.tree_diff_names(base, tree)
+
     def _manual_record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
         commit-tree it onto the latent tip, and advance ONLY the latent ref — HEAD and the

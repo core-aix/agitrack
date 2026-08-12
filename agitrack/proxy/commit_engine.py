@@ -271,6 +271,7 @@ class CommitEngine:
         backend_commits: list[str] | None = None,
         manual_gate_fn: Callable[[], bool] | None = None,
         manual_record_fn: Callable[[str], str | None] | None = None,
+        changed_paths_fn: Callable[[], list[str]] | None = None,
         summarize_fn: Callable[[str], tuple[str, list[str]] | None] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
@@ -523,8 +524,16 @@ class CommitEngine:
         # commit DELIVERS was cut short, and that is decided by the turn it ends on; an earlier
         # interrupted turn is still visible as itself in the interaction trace.
         interrupted = bool(turns) and bool(getattr(turns[-1], "interrupted", False))
+        # What the commit actually carries, read off the index that is about to become it.
+        # Only for an interrupted turn: that is the one case where the trace demonstrably
+        # cannot account for the diff (see message._interrupted_changes_sentence), and every
+        # other commit keeps the trace as the summarizer's sole input, by design.
+        changed_paths = self._changed_paths(changed_paths_fn) if interrupted else None
         trace_text = render_interaction_trace(
-            self.state.pending_trace(), self.state.trace_turn_limit, interrupted=interrupted
+            self.state.pending_trace(),
+            self.state.trace_turn_limit,
+            interrupted=interrupted,
+            changed_paths=changed_paths,
         )
         summary_text: str | None = None
         summary_metadata: list[str] | None = None
@@ -557,6 +566,7 @@ class CommitEngine:
             origin_event=origin_event,
             capabilities=capability_metadata,
             interrupted=interrupted,
+            changed_paths=changed_paths,
         )
         if manual_record_fn is not None:
             # Manual-commit mode: record the turn as a hidden latent commit on the side
@@ -617,6 +627,24 @@ class CommitEngine:
         if full and turn.agent_messages:
             return [message for message in turn.agent_messages if message]
         return [turn.final_response] if turn.final_response else []
+
+    def _changed_paths(self, changed_paths_fn: Callable[[], list[str]] | None) -> list[str]:
+        """The paths the pending commit will carry.
+
+        Two sources, because the two commit paths differ. The classic path stages into the
+        index and commits it, so the index is the answer — read AFTER staging, so it is the
+        commit's own content and not a guess. Every ``--no-worktree`` mode instead records a
+        hidden LATENT commit from a working-tree snapshot and never touches the index at all,
+        which is why reading only the index came back empty for the mode most people run (and
+        left the interrupted note without its file list where it was needed most); those
+        callers pass their own ``changed_paths_fn``.
+
+        Never fatal: any failure leaves the note as it was before, without a file list."""
+        try:
+            return changed_paths_fn() if changed_paths_fn is not None else self.repo.staged_paths()
+        except Exception as error:
+            self._debug(f"changed path listing failed: {error!r}")
+            return []
 
     def _short_sha(self, sha: str) -> str:
         """Short display form of *sha* (falls back to a 7-char prefix when the

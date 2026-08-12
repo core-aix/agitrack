@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
 
-from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, detach_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, detach_kwargs, fs_path
 
 import agitrack
 
@@ -178,7 +178,7 @@ def detect_source_repo() -> Path | None:
     result = _git(["rev-parse", "--show-toplevel"], root)
     if result.returncode != 0:
         return None
-    return Path(result.stdout.strip())
+    return fs_path(result.stdout.strip())  # git printed UTF-8; see proc.fs_path
 
 
 class Updater:
