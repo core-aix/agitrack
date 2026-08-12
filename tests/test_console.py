@@ -62,3 +62,47 @@ def test_progress_ticker_stops_ticking_after_the_block():
     count = len(lines)
     time.sleep(0.05)
     assert len(lines) == count  # the thread stopped with the block
+
+
+# --------------------------------------------------------------------------------------
+# "Is there a human here?" — the guard behind every prompt-or-refuse decision.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_windows_nul_device_is_not_an_interactive_stdin():
+    """On Windows ``isatty()`` is ``GetFileType() == FILE_TYPE_CHAR`` and ``NUL`` IS a character
+    device, so ``sys.stdin.isatty()`` returns **True** for a process whose stdin is ``NUL`` —
+    which is how a detached process, a scheduled task, a service, or ``agitrack … < NUL`` gets
+    its stdin. Every "is anyone there to answer?" guard built on the bare call therefore fell
+    open on Windows; `--daemons stop` reached ``input()``, got EOF, and reported "Cancelled.
+    Nothing was stopped." with exit 0, naming neither `--yes` nor a failure."""
+    import os
+    import sys
+
+    with open(os.devnull) as devnull:
+        if sys.platform == "win32":
+            assert devnull.isatty() is True, "the premise: NUL claims to be a terminal"
+            assert console._is_windows_nul(devnull) is True
+        else:
+            assert console._is_windows_nul(devnull) is False  # POSIX /dev/null is not a tty
+
+
+def test_a_pipe_or_file_stdin_is_left_to_isatty(tmp_path):
+    """Only a character device that is NOT a console is rejected. A pipe, a file or a redirected
+    fd must fall straight through, or the check would start second-guessing streams it has no
+    business overruling."""
+    path = tmp_path / "in.txt"
+    path.write_text("hello\n", encoding="utf-8")
+    with path.open() as handle:
+        assert console._is_windows_nul(handle) is False
+
+
+def test_the_interactive_checks_never_raise_on_a_broken_stream(monkeypatch):
+    class Broken:
+        def isatty(self):
+            raise OSError("no tty here")
+
+    monkeypatch.setattr(console.sys, "stdin", Broken())
+    monkeypatch.setattr(console.sys, "stdout", Broken())
+    assert console.stdin_is_interactive() is False
+    assert console.stdout_is_interactive() is False
