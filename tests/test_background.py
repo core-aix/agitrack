@@ -2314,3 +2314,31 @@ def test_a_failed_serve_start_records_a_traceback(tmp_path, monkeypatch, capsys)
     assert "Traceback (most recent call last)" in out  # the actual stack, not just the message
     assert "cli.py" in out and "test_background.py" in out  # ...naming both frames
     assert bg is not None
+
+
+def test_a_daemon_is_registered_before_it_finishes_starting(tmp_path, monkeypatch):
+    """The registry is what `--daemons`, a self-update restart, and the test suite's own sweep
+    all read. It used to be written by `_write_handshake`, which runs LAST — so for the whole of
+    startup (hooks, git work: seconds) the process existed and nothing could see it. Any sweep in
+    that window missed it, and the daemon outlived the run.
+
+    Findability and readiness are different claims: the registry says "this process exists, here
+    is how to stop it" and must be true immediately; the handshake says "up and armed" and must
+    not be published early."""
+    from agitrack.git import hooks as git_hooks
+
+    seen: list[str] = []
+    monkeypatch.setattr("agitrack.daemons.register", lambda kind, path, **kw: seen.append(f"register:{kind}"))
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    monkeypatch.setattr(runner, "_loop", lambda: None)
+    monkeypatch.setattr(runner, "_teardown", lambda **kw: None)
+    monkeypatch.setattr(runner, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    real_hook = runner._install_autotrack_hook
+    monkeypatch.setattr(runner, "_install_autotrack_hook", lambda: (seen.append("hooks"), real_hook())[1])
+
+    runner.run()
+
+    assert seen[0] == "register:background", f"registered too late: {seen}"
+    assert "hooks" in seen  # ...and the slow startup work really did come after it
+    assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")

@@ -864,6 +864,11 @@ class BackgroundRunner:
         if not backend_installed(self.state.backend):
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
+        # FIRST, before any of the startup work below: from this point on the process is
+        # findable and stoppable by `--daemons`, by a self-update, and by the test suite's
+        # sweep. Everything after it can take seconds, and a daemon nobody can see for seconds
+        # is a daemon that gets left behind.
+        self._register_daemon()
         self.state.ensure_local_ignore()  # git-ignore .agitrack/ before we write any state there
         # Keep git's comment char off '#', or editing any commit we write (amend, rebase reword)
         # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
@@ -1059,11 +1064,25 @@ class BackgroundRunner:
             )
         except OSError as error:
             self._debug(f"handshake write failed: {error!r}")
-        # Also record it in the global daemon registry, so `agitrack --daemons` lists it and a
-        # self-update can restart it. Best-effort; never blocks the tracker.
-        from agitrack import daemons
+        self._register_daemon()
 
-        daemons.register("background", self.repo.repo)
+    def _register_daemon(self) -> None:
+        """Record this process in the global daemon registry, so `agitrack --daemons` lists it,
+        a self-update can restart it, and the test suite's session reaper can find it.
+
+        Deliberately SEPARATE from the handshake, and called much earlier. The two answer
+        different questions: the registry says "this process exists, here is how to reach and
+        stop it", while the handshake says "I am up, hooks armed, tracking" — which is why the
+        handshake has to come last. Registering with it meant a daemon was UNFINDABLE for the
+        whole of its startup: nothing could list it, and the suite's per-test sweep (which reads
+        this registry) missed any daemon that had not finished starting, so it was never reaped
+        and outlived the run. Idempotent; best-effort — never blocks the tracker."""
+        try:
+            from agitrack import daemons
+
+            daemons.register("background", self.repo.repo)
+        except Exception as error:
+            self._debug(f"daemon registry write failed: {error!r}")
 
     def _remove_handshake(self) -> None:
         try:
