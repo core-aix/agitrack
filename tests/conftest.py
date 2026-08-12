@@ -160,8 +160,16 @@ def reap_daemon_pids(pids) -> int:
     import signal
     import time
 
+    pids = sorted(set(pids))
+    if not pids:
+        return 0  # nothing to verify, and the scan below is expensive — see next comment
+
     from agitrack import daemons
 
+    # One process-table scan, and only when there is actually something to signal. On Windows
+    # this shells out to PowerShell (`Get-CimInstance Win32_Process`), which costs seconds; under
+    # xdist it would otherwise run once per WORKER teardown — sixteen of them per run, almost
+    # always to verify an empty list.
     verified = daemons._live_agitrack_pids()
     if verified is not None:
         pids = [pid for pid in pids if pid in verified]

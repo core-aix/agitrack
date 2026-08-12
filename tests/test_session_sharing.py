@@ -1450,6 +1450,7 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
     runner.sessions = []  # not live
     runner._resume_conversation = lambda name, sid, **k: None
     runner._prompt_session_name = lambda title, *, default: default  # accept the local name (#71)
+
     # First popup selects the session; the second is the conflict choice, where we want Replace.
     # Picked by LABEL, not by index: the destructive option is deliberately no longer first (a
     # bare Enter used to discard the user's own conversation), and pinning this to options[0]
