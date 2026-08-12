@@ -852,9 +852,9 @@ def main(argv: list[str] | None = None) -> int:
             pass
         if removed:
             print(f"Removed aGiTrack git hook(s): {', '.join(removed)}. Any chained project hooks were restored.")
-            print("Auto-start on commit is now off for this repo. Re-enable it in Ctrl-G → settings or `agitrack -b`.")
+            print("Auto-start is now off for this repo. Re-enable it in Ctrl-G → settings or `agitrack -b`.")
         else:
-            print("No aGiTrack git hooks were installed in this repository. Auto-start on commit is now off.")
+            print("No aGiTrack hooks were installed in this repository. Auto-start is now off.")
         return 0
 
     if args.precommit_sync:
@@ -1113,9 +1113,13 @@ def main(argv: list[str] | None = None) -> int:
                     log_file=log_file_spec,
                     _lock=management_lock,
                 ).run()
-            # Explain the persistent pre-commit hook and let the user decide (once per repo)
-            # whether to keep it after this tracker exits — before we spawn anything.
-            _maybe_prompt_background_hook(config, scripted=scripted)
+            # Explain the auto-start hooks and let the user decide (once per repo) whether to
+            # keep them after this tracker exits — before we spawn anything. The backend is
+            # resolved first because only Claude Code gets the turn-end hook, and the prompt has
+            # to describe what will actually be installed on THIS user's machine.
+            _maybe_prompt_background_hook(
+                config, scripted=scripted, backend=_autostart_backend(repo, args.backend, config)
+            )
             # Launcher: spawn the tracker as a DETACHED daemon (like `agitrack -d`) so the
             # terminal is freed, then return to the shell. The child re-execs aGiTrack with
             # --background-serve and takes its own lock, so release ours first (the child owns
@@ -1606,12 +1610,35 @@ def _run_gh_login() -> None:
         print(f"Could not run `gh auth login`: {error}")
 
 
-def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> None:
-    """When starting `agitrack -b`, explain the persistent auto-track pre-commit hook and let the
-    user decide whether to enable it. When enabled (the default), a `git commit` made while aGiTrack
-    isn't running folds the AI trace into that commit AND auto-starts the tracker (in the same commit
-    mode as the last run) for the turns that follow. Sets the repo-scoped ``autotrack_hook``
-    ("auto"/"off"). Never blocks automation (no-TTY / scripted → default on)."""
+def _autostart_backend(repo, requested: str | None, config: GlobalConfig) -> str | None:
+    """The backend the tracker being started will actually use, resolved the way the daemon
+    resolves it: this run's ``--backend``, else the one this repo last recorded, else the
+    global default. Used only to describe the hooks accurately — see below."""
+    if requested:
+        return requested
+    try:
+        from agitrack.config import AgitrackState
+
+        recorded = AgitrackState(repo.repo).data.get("backend")
+    except Exception:
+        recorded = None
+    return recorded or getattr(config, "default_backend", None)
+
+
+def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool, backend: str | None = None) -> None:
+    """When starting `agitrack -b`, explain the auto-start hooks and let the user decide whether
+    to enable them. When enabled (the default), a `git commit` made while aGiTrack isn't running
+    folds the AI trace into that commit AND auto-starts the tracker (in the same commit mode as
+    the last run) for the turns that follow; on Claude Code a turn-end hook additionally starts
+    it as soon as a turn leaves changes behind, without waiting for a commit. Sets the
+    repo-scoped ``autotrack_hook`` ("auto"/"off"). Never blocks automation (no-TTY / scripted →
+    default on).
+
+    ``backend`` decides WHICH of those the prompt describes. Only Claude Code exposes a turn-end
+    hook, so telling a Codex or OpenCode user about a ``.claude/settings.local.json`` that will
+    never be written is worse than saying nothing: it describes an install that does not happen,
+    and it hides the limitation that actually applies to them — nothing is picked up until they
+    commit."""
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
     try:
@@ -1623,24 +1650,51 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> No
             return
     except Exception:
         return
+    commit_hook = (
+        "  * a git pre-commit hook: when you `git commit` later with aGiTrack down, that commit's\n"
+        "    AI work is recorded INTO the commit, and tracking restarts (in the same auto/manual\n"
+        "    mode as your last run) for the turns that follow.\n"
+    )
+    if backend == "claude":
+        detail = (
+            "\naGiTrack can keep tracking this repo when it isn't running, by installing two hooks —\n"
+            "so tracking survives you closing the terminal, or a reboot:\n"
+            "\n"
+            + commit_hook
+            + "  * a turn-end hook for Claude Code, in this repo's .claude/settings.local.json: when a\n"
+            "    turn leaves changes behind and nothing is tracking, tracking starts right then,\n"
+            "    without waiting for a commit.\n"
+        )
+        switches = (
+            "`agitrack -b stop` turns both off until you start again;\n"
+            "`agitrack --remove-hooks` disables them for good."
+        )
+    else:
+        detail = (
+            "\naGiTrack can keep tracking this repo when it isn't running, by installing a hook —\n"
+            "so tracking survives you closing the terminal, or a reboot:\n"
+            "\n" + commit_hook + "\n"
+            "Tracking then resumes at your next COMMIT. Only Claude Code exposes a turn-end hook,\n"
+            "so on this backend an agent that edits without committing is picked up when you commit.\n"
+        )
+        switches = (
+            "`agitrack -b stop` turns it off until you start again;\n`agitrack --remove-hooks` disables it for good."
+        )
     print(
-        "\naGiTrack installs a persistent git pre-commit hook in this repo. When you `git commit`\n"
-        "later and aGiTrack isn't running, it records that commit's AI work into the commit AND\n"
-        "auto-starts background tracking (in the same auto/manual commit mode as your last run) for\n"
-        "the turns that follow — so tracking survives you closing the terminal or a reboot. Your\n"
-        "commit stays your own; a purely human commit (no AI work) is left untouched. Disable it\n"
-        "anytime with `agitrack --remove-hooks`."
+        detail + "\n"
+        "Your commit stays your own; a purely human commit (no AI work) is left untouched, and\n"
+        "nothing aGiTrack writes is ever staged.\n" + switches
     )
     try:
-        answer = _ask("Enable this auto-start hook? [Y/n]: ").strip().lower()
+        answer = _ask("Enable auto-start? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
     if answer.startswith("n"):
         config.set("autotrack_hook", "off", scope="repo")
-        print("\naGiTrack: auto-start hook off — tracking runs only while `agitrack -b` is up.")
+        print("\naGiTrack: auto-start off — tracking runs only while `agitrack -b` is up.")
     else:
         config.set("autotrack_hook", "auto", scope="repo")
-        print("\naGiTrack: auto-start hook enabled. Disable it anytime with `agitrack --remove-hooks`.")
+        print("\naGiTrack: auto-start enabled. Disable it anytime with `agitrack --remove-hooks`.")
 
 
 def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:
