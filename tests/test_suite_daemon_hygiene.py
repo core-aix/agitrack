@@ -20,8 +20,12 @@ from conftest import collect_registered_daemons, reap_daemon_pids
 def test_a_registered_daemon_is_killed_and_deregistered(tmp_path):
     registry = tmp_path / "daemons"
     registry.mkdir()
-    # A real process standing in for a leaked daemon.
-    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    # A real process standing in for a leaked daemon. It has to CARRY `--background-serve`:
+    # the reaper now demands proof from the process table that a pid really is an aGiTrack
+    # daemon before signalling it (the registry alone is not identity — see reap_daemon_pids),
+    # so a stand-in that does not look like one is correctly left alone. The flag is inert for
+    # `python -c` beyond landing in sys.argv, which is exactly where the scan reads it.
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "--background-serve"])
     (registry / f"{victim.pid}.json").write_text(
         json.dumps({"pid": victim.pid, "kind": "background", "repo": str(tmp_path)}), encoding="utf-8"
     )
@@ -71,3 +75,29 @@ def test_reaping_happens_once_at_session_end_not_after_every_test():
     # The per-test fixture only NOTES pids; the one that kills is session-scoped.
     assert conftest._note_daemons_a_test_started._fixture_function_marker.scope == "function"
     assert conftest._kill_leaked_daemons_at_the_end._fixture_function_marker.scope == "session"
+
+
+def test_the_reaper_never_kills_a_pid_that_is_not_a_daemon(tmp_path):
+    """A registry entry outlives the process that wrote it, and Windows reassigns PIDs briskly,
+    so "the registry says this number was a daemon" is not evidence that it still is.
+
+    This is not hypothetical here: under xdist each worker runs this teardown when IT finishes
+    while its siblings are still working, so an unverified kill reaches another worker. That is
+    what `[gw0] node down: Not properly terminated` at 97% of a run was — the session ended with
+    no summary, and the coverage total for the whole run went with it."""
+    registry = tmp_path / "daemons"
+    registry.mkdir()
+    # An innocent process whose pid a stale entry claims. Nothing about it says "aGiTrack".
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        (registry / f"{bystander.pid}.json").write_text(
+            json.dumps({"pid": bystander.pid, "kind": "background", "repo": str(tmp_path)}), encoding="utf-8"
+        )
+
+        reap_daemon_pids(collect_registered_daemons(tmp_path))
+
+        time.sleep(0.3)
+        assert bystander.poll() is None, "the reaper killed a process that was never a daemon"
+    finally:
+        bystander.kill()
+        bystander.wait(timeout=10)
