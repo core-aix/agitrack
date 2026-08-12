@@ -57,9 +57,14 @@ def fs_path(printed: str) -> Path:
     the filesystem encoding already is UTF-8 — always on Windows and macOS, and on Linux
     unless someone has explicitly opted out — this is the identity.
     """
-    if codecs.lookup(sys.getfilesystemencoding()).name == "utf-8":
+    encoding = sys.getfilesystemencoding()
+    if codecs.lookup(encoding).name == "utf-8":
         return Path(printed)
-    return Path(os.fsdecode(printed.encode("utf-8", "surrogateescape")))
+    # ``os.fsdecode`` would be the obvious call, but it binds its codec at import time, so it
+    # cannot be reasoned about (or tested) against the encoding in force now. This is the same
+    # conversion, spelled out: git's bytes, decoded the way the filesystem layer will re-encode
+    # them. ``surrogateescape`` is what makes that re-encoding lossless.
+    return Path(printed.encode("utf-8", "surrogateescape").decode(encoding, "surrogateescape"))
 
 
 def agitrack_invocation() -> list[str]:

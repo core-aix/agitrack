@@ -9319,6 +9319,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # ``backend_commits`` only feeds the recorded body's ``covered_commits`` metadata.
             manual_gate_fn=self._manual_gate if use_latent else None,
             manual_record_fn=self._manual_record if use_latent else None,
+            # The latent path never stages, so the engine cannot read the commit's contents
+            # off the index; this reports them from the snapshot instead (interrupted turns).
+            changed_paths_fn=self._manual_changed_paths if use_latent else None,
             backend_commits=uncovered,
         )
         if committed and uncovered and self._latent_tracking:

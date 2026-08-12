@@ -229,3 +229,84 @@ def test_the_autostart_hook_command_is_quoted_too(monkeypatch):
     command = claude_settings.hook_command(claude_settings.AUTOSTART_FLAG)
 
     assert command == r'"C:\Users\dev\python.exe" "-m" "agitrack" "--autostart-on-change"'
+
+
+def test_removal_gives_a_tracked_settings_file_its_own_bytes_back(tmp_path):
+    """`-b` then `-b stop` on a repo that TRACKS settings.local.json must leave no diff.
+
+    Re-serializing preserves the user's settings in meaning but not in bytes, so a compact
+    file came back one-key-per-line: the hooks were correctly gone and `git status` still
+    showed the whole file rewritten, for a file aGiTrack does not own.
+    """
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write", "Edit"], "defaultMode": "acceptEdits"}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+    assert path.read_text(encoding="utf-8") != original  # the hook really did go in
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+
+def test_the_bytes_come_back_only_after_the_LAST_hook_is_removed(tmp_path):
+    """The two hooks have different lifetimes; the daemon takes the session note away on
+    teardown while the auto-start hook stays. Restoring the original then would delete a
+    hook that is supposed to outlive the daemon."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write"]}}\n'
+    path.write_text(original, encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+    claude_settings.install_commit_guidance_hook(tmp_path)
+
+    claude_settings.remove_commit_guidance_hook(tmp_path)
+
+    assert claude_settings.hook_is_installed(tmp_path, claude_settings.AUTOSTART_HOOK) is True
+    assert path.read_text(encoding="utf-8") != original
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_an_edit_the_user_made_meanwhile_wins_over_the_snapshot(tmp_path):
+    """The snapshot is how the file LOOKED when aGiTrack arrived, not a licence to roll the
+    user back. A setting added while the tracker ran must survive stopping it."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"permissions": {"allow": ["Write"]}}\n', encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["permissions"]["allow"].append("Edit")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"permissions": {"allow": ["Write", "Edit"]}}
+
+
+def test_the_snapshot_lives_in_the_self_ignoring_state_dir(tmp_path):
+    """It is aGiTrack's own working state, so it must land in `.agitrack/` — which carries a
+    `.gitignore` of `*` — and never as a stray file in the user's tree."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+    assert (tmp_path / ".agitrack" / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+
+
+def test_a_settings_file_agitrack_created_itself_leaves_no_snapshot(tmp_path):
+    """Nothing to restore, so nothing to remember — and the file is deleted outright."""
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert not _settings(tmp_path).exists()

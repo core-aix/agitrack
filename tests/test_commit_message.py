@@ -877,3 +877,68 @@ class TestCarriesAiHistory:
     def test_a_real_user_commit_from_the_wild_is_not_history(self):
         """The exact block that made `--backtrace commit` dead-end on a fresh repo."""
         assert carries_ai_history(build_user_commit_message(message="Ini", agitrack_session_id="s-1")) is False
+
+
+def _interrupted_trace():
+    # What a cancelled turn actually leaves behind: the request, and the agent's opening
+    # statement of INTENT. The tool calls that followed are not in the transcript.
+    return [
+        {"role": "user", "content": "Create ten files named f1.txt through f10.txt."},
+        {"role": "agent", "content": "I'll create the ten files one at a time."},
+    ]
+
+
+def test_an_interrupted_turn_names_the_files_its_commit_actually_carries():
+    """The trace of a cancelled turn cannot account for the diff, and the summarizer's only
+    input is the trace: it read "I'll create the ten files" plus a note saying the changes
+    made so far were recorded here, and produced `(interrupted) Requested creation of
+    f1.txt–f10.txt was interrupted before any writes` — on a commit adding f1.txt..f8.txt.
+    """
+    rendered = render_interaction_trace(
+        _interrupted_trace(),
+        trace_turn_limit=10,
+        interrupted=True,
+        changed_paths=["f1.txt", "f2.txt", "f3.txt"],
+    )
+
+    assert "NOT completed" in rendered  # the interruption itself, as before
+    unwrapped = " ".join(rendered.replace("> ", "").split())
+    assert "it changes f1.txt, f2.txt, f3.txt." in unwrapped
+    assert rendered.index("this commit itself") < rendered.index("## User")  # a lead-in note
+
+
+def test_a_long_change_list_is_counted_rather_than_dumped():
+    paths = [f"f{i}.txt" for i in range(20)]
+
+    rendered = render_interaction_trace(
+        _interrupted_trace(), trace_turn_limit=10, interrupted=True, changed_paths=paths
+    )
+
+    unwrapped = " ".join(rendered.replace("> ", "").split())
+    assert "f11.txt" in unwrapped and "f12.txt" not in unwrapped  # 12 shown
+    assert "and 8 more" in unwrapped
+
+
+def test_the_change_list_is_only_for_interrupted_turns():
+    """Every other commit keeps the trace as the summarizer's sole input, by design."""
+    rendered = render_interaction_trace(
+        _interrupted_trace(), trace_turn_limit=10, interrupted=False, changed_paths=["only_in_the_diff.txt"]
+    )
+
+    assert "only_in_the_diff.txt" not in rendered
+
+
+def test_an_interrupted_turn_with_no_readable_change_list_still_says_it_was_interrupted():
+    rendered = render_interaction_trace(_interrupted_trace(), trace_turn_limit=10, interrupted=True)
+
+    assert "NOT completed" in rendered
+    assert "this commit itself" not in rendered
+
+
+def test_the_commit_body_carries_the_same_change_list_as_the_summarizer_input():
+    """One note, both readers — the human reading `git show` and the summarizer."""
+    message = _base_message(interrupted=True, changed_paths=["a.txt", "b.txt"])
+
+    unwrapped = " ".join(message.replace("> ", "").split())
+    assert "it changes a.txt, b.txt." in unwrapped
+    assert message.index("a.txt, b.txt") < message.index("## User")

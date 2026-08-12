@@ -457,6 +457,20 @@ class GitRepo:
             )
             return self._run(["git", "write-tree"], env=env).stdout.strip()
 
+    def tree_diff_names(self, base: str, tree: str) -> list[str]:
+        """The paths that differ between two trees (or revs), in git's own order.
+
+        The counterpart of :meth:`staged_paths` for the commit paths that never touch the
+        index: every ``--no-worktree`` mode records its turn as a latent commit built from a
+        working-tree snapshot, so "what will this commit carry?" has to be answered by
+        comparing trees. Never raises — an unreadable rev answers "nothing known", which
+        callers treat as "say less" rather than as an error."""
+        try:
+            output = self._run(["git", "diff", "--name-only", base, tree], check=False).stdout
+        except Exception:
+            return []
+        return [line for line in output.splitlines() if line]
+
     def commit_tree(self, tree: str, *, parents: list[str], message: str) -> str:
         """Create a commit object for ``tree`` with the given ``parents`` and return its
         FULL SHA. Unlike ``commit``/``cover_commit`` this moves no ref and touches neither
