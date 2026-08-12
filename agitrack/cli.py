@@ -1243,9 +1243,26 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # second one. (It was a read-only probe before, so no lock was held during startup and
     # the extension couldn't yet see the session.)
     management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
-    if not management_lock.acquire():
+    # A `--background-serve` child is a DAEMON TAKING OVER, not a second writer asking
+    # permission: it is spawned either by the `-b` launcher (which released the lock first) or
+    # by a tracker restarting itself onto new code (which now does too). Either way its
+    # predecessor may still be dying with the lock held — on Windows a byte-range lock outlives
+    # the process by the time the kernel tears its handles down — so asking once loses a race it
+    # should always win. Without this the successor concluded a live tracker was already there,
+    # exited 0, and the repo was left with nothing tracking it.
+    if not management_lock.acquire(retry_seconds=5.0 if args.background_serve else 0.0):
         owner_pid = management_lock.owner_pid()
         replaced = False
+        if args.background_serve:
+            # Never the launcher's "already running — left in place": that branch exists to stop
+            # a SECOND tracker starting, and this process IS the tracker. Reporting success here
+            # is what turned a lost handoff into a silently untracked repo.
+            print(
+                f"aGiTrack background tracker could not take this repo's single-writer lock "
+                f"(held by PID {owner_pid}); not starting.",
+                flush=True,
+            )
+            return 1
         if background:
             # `agitrack -b` over a live background tracker replaces it (like re-running
             # `-d`/`--backtrace`): stop the old daemon cleanly and take over — so a rerun
@@ -1296,17 +1313,38 @@ def _dispatch(argv: list[str] | None = None) -> int:
             if args.background_serve:
                 # We ARE the detached daemon child: run the tracker loop in the foreground of
                 # this (already-detached) process, holding the repo lock for our whole run.
-                return BackgroundRunner(
-                    repo,
-                    verbose=args.verbose,
-                    backend=args.backend,
-                    new_session=args.new_session,
-                    manual_commits=manual_commits,
-                    commit_guidance=commit_guidance,
-                    backend_command=backend_command,
-                    log_file=log_file_spec,
-                    _lock=management_lock,
-                ).run()
+                #
+                # Every exit from here goes through the log, including the ones that raise. This
+                # process has no terminal — its stdout IS .agitrack/background.log — and a
+                # daemon that died on the way up used to leave that log holding a bare
+                # "aGiTrack is starting..." and nothing else: no reason, no traceback, no exit
+                # code. A restart that strands a repo untracked is bad; one that leaves no
+                # evidence of why is worse, because it cannot be diagnosed after the fact.
+                try:
+                    code = BackgroundRunner(
+                        repo,
+                        verbose=args.verbose,
+                        backend=args.backend,
+                        new_session=args.new_session,
+                        manual_commits=manual_commits,
+                        commit_guidance=commit_guidance,
+                        backend_command=backend_command,
+                        log_file=log_file_spec,
+                        _lock=management_lock,
+                    ).run()
+                except BaseException as error:
+                    # BaseException, not Exception: a KeyboardInterrupt or a SystemExit raised
+                    # mid-startup ends the daemon just as dead, and is just as worth recording.
+                    import traceback
+
+                    print(
+                        f"aGiTrack background tracker FAILED to start: {error!r}\n{traceback.format_exc()}",
+                        flush=True,
+                    )
+                    raise
+                if code != 0:
+                    print(f"aGiTrack background tracker exited with code {code}.", flush=True)
+                return code
             # Explain the auto-start hooks and let the user decide (once per repo) whether to
             # keep them after this tracker exits — before we spawn anything. The backend is
             # resolved first because only Claude Code gets the turn-end hook, and the prompt has

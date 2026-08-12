@@ -2199,3 +2199,108 @@ def test_stop_without_a_log_file_writes_nothing_anywhere(tmp_path, monkeypatch):
 
     assert background_module.stop_background(repo) == 0
     assert not list(tmp_path.glob("*.log"))
+
+
+# --- a dead tracker must not stay dead -------------------------------------
+
+
+def test_a_commit_with_no_ai_work_still_revives_a_dead_tracker(tmp_path, monkeypatch):
+    """Auto-start used to sit behind `if not synced: return 0` — "no AI work in this commit, no
+    footprint, no nag". That made a stopped tracker PERMANENT: with nothing running, no agent
+    turn can be recorded, so `synced` is False on the next commit too, and on every commit after
+    it, so the one hook that could bring the tracker back never even looked. Observed in the
+    wild — the tracker stopped during a failed restart and none of the commits that followed
+    restarted it, because none of them had pending AI work to fold.
+
+    `agitrack -s` has always advertised this as "on a commit", unqualified. Now it is."""
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()  # no session ⇒ no pending AI work, the whole point
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\njust me\n", encoding="utf-8")  # a purely human commit
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned, "a commit made with no tracker running must start one"
+
+
+def test_a_commit_does_not_start_a_second_tracker(tmp_path, monkeypatch):
+    """The other half: reviving a DEAD tracker must not mean racing a LIVE one."""
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    monkeypatch.setattr(bg, "_live_background_pid", lambda r: 4242)  # one is already running
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\njust me\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned == []
+
+
+# --- the restart handoff: a successor must win the lock, and a loss must be loud ---------
+
+
+def test_a_serve_child_waits_for_the_lock_instead_of_declaring_success(tmp_path, monkeypatch, capsys):
+    """A `--background-serve` child is a DAEMON TAKING OVER, not a second writer asking
+    permission. Its predecessor may still be dying with the repo lock held — on Windows a
+    byte-range lock outlives the process while the kernel tears its handles down — and the
+    child's first `acquire()` had no retry.
+
+    So it lost the race, took the LAUNCHER's branch ("already running (PID N, current version)
+    — left in place"), and exited **0**. The predecessor then exited too. Nothing tracked the
+    repo, and the exit code said everything was fine. Reproduced live before this fix."""
+    from agitrack import cli
+    from agitrack.git import RepoLock
+
+    repo = _init_repo(tmp_path)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: True)
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert holder.acquire() is True
+    try:
+        code = cli.main(
+            ["--repo", str(tmp_path), "--background", "--background-serve", "--skip-privacy-ack", "--backend", "claude"]
+        )
+    finally:
+        holder.release()
+
+    out = capsys.readouterr().out
+    assert code == 1, "a serve child that cannot take the lock must FAIL, not report success"
+    assert "could not take this repo's single-writer lock" in out
+    assert "left in place" not in out  # never the launcher's message
+
+
+def test_a_failed_serve_start_records_a_traceback(tmp_path, monkeypatch, capsys):
+    """A daemon has no terminal — its stdout IS .agitrack/background.log. One that died on the
+    way up left that log holding a bare "aGiTrack is starting..." and nothing else: no reason, no
+    traceback, no exit code, which is why the original failure could not be diagnosed after the
+    fact."""
+    from agitrack import cli
+    from agitrack.proxy import background as bg
+
+    _init_repo(tmp_path)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: True)
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("the new code does not import")
+
+    monkeypatch.setattr(cli, "BackgroundRunner", _Boom)
+
+    code = cli.main(
+        ["--repo", str(tmp_path), "--background", "--background-serve", "--skip-privacy-ack", "--backend", "claude"]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAILED to start" in out
+    assert "the new code does not import" in out
+    assert "Traceback (most recent call last)" in out  # the actual stack, not just the message
+    assert "cli.py" in out and "test_background.py" in out  # ...naming both frames
+    assert bg is not None
