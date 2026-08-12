@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import json
 import os
 import subprocess
@@ -78,9 +80,16 @@ class ClaudeBackend:
         verbose: bool = False,
         backend_args: list[str] | None = None,
         launch_command: list[str] | None = None,
+        console_stream=None,
     ) -> None:
         self.repo = repo
         self.verbose = verbose
+        # Where this backend echoes the agent's streamed output. Defaults to stdout, which is
+        # right for a terminal — but under `--json-events`/`--ui-bridge` stdout carries ONLY
+        # protocol lines, and a raw echo there is a non-JSON line in the middle of the stream
+        # (the live test saw exactly that: a bare "OK" between `ready` and `response`). The
+        # shell hands us its own prose stream so the echo follows the rest of the prose.
+        self._console = console_stream if console_stream is not None else sys.stdout
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
         # Command that launches the backend, replacing the "claude" executable with a user
         # wrapper (e.g. ["somewrapper", "claude"]); empty ⇒ run "claude" directly.

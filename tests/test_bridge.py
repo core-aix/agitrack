@@ -91,7 +91,7 @@ def test_wait_answer_skips_stale_answers():
 class FakeBackend:
     name = "claude"
 
-    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None, **kwargs):
         self.repo = Path(repo)
         self.launch_command = list(launch_command or [])
 
@@ -302,3 +302,49 @@ def test_an_unknown_message_type_is_reported_not_silently_dropped():
     notices = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
     assert any(n.get("type") == "notice" and "unknown type" in n.get("message", "") for n in notices)
     assert any("JSON-RPC" in n.get("message", "") for n in notices)
+
+
+def test_the_bridge_stream_carries_no_raw_prose(tmp_path, monkeypatch, capsys):
+    """Found live on macOS: driving `--ui-bridge` produced two NON-JSON lines mixed into the
+    protocol — the backend's own streamed echo (a bare "OK") and aGiTrack's "No code changes
+    were made" notice. In bridge mode the driver frames every message itself, so any raw byte on
+    stdout is a protocol violation: a `json.loads(line)` client throws on it."""
+    import json
+    import subprocess
+
+    from agitrack.git import GitRepo
+    from agitrack.shell.runner import AgitrackShell
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    shell = AgitrackShell(GitRepo.discover(root), ui_bridge=True)
+
+    # Everything the two leaks went through.
+    shell._say("No code changes were made; the interaction trace remains pending.")
+    print("a raw echo from the backend", file=shell._backend_console())
+
+    out = capsys.readouterr().out
+    for line in out.splitlines():
+        if line.strip():
+            json.loads(line)  # every stdout line must parse as one protocol frame
+    assert "a raw echo" not in out
+
+
+def test_json_events_mode_keeps_the_backend_echo_on_stderr(tmp_path, capsys):
+    """Not bridge mode: the echo is still wanted, just not on the JSON stream."""
+    import subprocess
+
+    from agitrack.git import GitRepo
+    from agitrack.shell.runner import AgitrackShell
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    shell = AgitrackShell(GitRepo.discover(root), json_events=True)
+
+    print("streamed agent text", file=shell._backend_console())
+
+    captured = capsys.readouterr()
+    assert "streamed agent text" in captured.err
+    assert "streamed agent text" not in captured.out

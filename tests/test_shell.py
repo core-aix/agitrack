@@ -62,7 +62,7 @@ class FakeBackend:
     name = "claude"
     runs: list[str] = []
 
-    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None, **kwargs):
         self.repo = Path(repo)
         self.launch_command = list(launch_command or [])
 
@@ -433,16 +433,24 @@ def test_claude_headless_gets_a_permission_mode_for_coding_runs(tmp_path):
         captured["command"] = command
         return _Proc()
 
+    def _text(command):
+        # On Windows, resolve_subprocess_command hands subprocess a fully-quoted command LINE
+        # (a str) so cmd.exe can run the npm `claude.cmd` shim; everywhere else it is an argv
+        # list. `list()` on the Windows form yields one item PER CHARACTER, so the assertions
+        # below were reading a list of letters. Flatten to one string either way — which also
+        # makes this check stronger, since the flag and its value have to be adjacent.
+        return command if isinstance(command, str) else " ".join(command)
+
     claude_mod.subprocess.run = _spy
     try:
         backend.run("do it", model=None, session_id=None)
-        coding = list(captured["command"])
+        coding = _text(captured["command"])
         backend.run("summarize", model=None, session_id=None, bare=True, system_prompt="be brief")
-        summarizing = list(captured["command"])
+        summarizing = _text(captured["command"])
     finally:
         claude_mod.subprocess.run = original
 
-    assert "--permission-mode" in coding and "acceptEdits" in coding
+    assert "--permission-mode acceptEdits" in coding
     # The summarizer must never be allowed to touch files.
     assert "--permission-mode" not in summarizing
 

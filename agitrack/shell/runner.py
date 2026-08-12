@@ -4,6 +4,7 @@ import json
 import sys
 
 from agitrack.commits import AgitrackActions
+from agitrack.console import stdin_is_interactive
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agitrack.backends import headless_backends
 from agitrack.git import GitRepo
@@ -14,6 +15,20 @@ from agitrack.shell.ui import AgitrackPrompt, PromptState
 
 
 AGITRACK_PREFIX = ":"
+
+
+class _DevNull:
+    """A write sink for a stream that must produce nothing. Used in bridge mode, where the
+    driver frames every message itself and any raw byte on stdout is a protocol violation."""
+
+    def write(self, _text: str) -> int:
+        return 0
+
+    def flush(self) -> None:
+        return None
+
+
+_NULL_STREAM = _DevNull()
 
 # The headless adapters, from the single registry in agitrack.backends — so a newly registered
 # backend is drivable from shell mode without editing this module. Kept as a module-level dict
@@ -73,7 +88,7 @@ class AgitrackShell:
         self.prompts = list(prompts) if prompts is not None else None
         # Bridge mode is interactive even though stdin isn't a TTY — questions are
         # answered by the editor over the bridge rather than by a terminal user.
-        self.interactive = self._ui_bridge or (self.prompts is None and sys.stdin.isatty())
+        self.interactive = self._ui_bridge or (self.prompts is None and stdin_is_interactive())
         self.global_config = GlobalConfig()
         # An explicit --backend seeds the state's default so a brand-new repo (no stored
         # backend) resolves to it rather than to the configured default, which may be unset
@@ -108,7 +123,9 @@ class AgitrackShell:
                 self.state.new_agitrack_session_id()
         self.verbose = verbose
         self.prompt = AgitrackPrompt(self._prompt_state, human_stream=self._human)
-        self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui)
+        self.actions = AgitrackActions(
+            repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui, human_stream=self._human
+        )
         self.management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
         # --log-file used to be parsed, passed to the background tracker and the proxy runner,
         # and then simply DROPPED here: this constructor took no log_file argument at all, so
@@ -528,7 +545,7 @@ class AgitrackShell:
             # genuinely ran and the agent genuinely answered — "changed nothing" is a legitimate
             # outcome for a question, and the `no_changes` event plus this line are what make it
             # visible. A turn that FAILED still returns non-zero, above.
-            print("No code changes were made; the interaction trace remains pending.", file=self._human)
+            self._say("No code changes were made; the interaction trace remains pending.")
 
     def _launch_command(self) -> list[str]:
         # Command that launches the current backend, replacing its executable with a user
@@ -548,7 +565,20 @@ class AgitrackShell:
             verbose=self.verbose,
             backend_args=self.backend_args,
             launch_command=self._launch_command() or None,
+            # Keep the backend's streamed echo off a machine-readable stdout (see the backends'
+            # `console_stream`). In bridge mode this is stdout too, so suppress it entirely there:
+            # the bridge frames every message itself, and a raw echo is a protocol violation.
+            console_stream=self._backend_console(),
         )
+
+    def _backend_console(self):
+        """The stream the backend echoes streamed agent output to.
+
+        Terminal: stdout, as always. `--json-events`: the prose stream (stderr), so the echo is
+        still readable but never lands on the machine-readable stdout. `--ui-bridge`: nowhere —
+        the bridge frames every message itself and the driver parses each stdout line as one
+        frame, so a raw echo is a protocol violation, not merely untidy."""
+        return _NULL_STREAM if self._ui_bridge else self._human
 
     def _summarizer_backend(self):
         # Summarizer calls run from a scratch cwd, never the repo: a headless

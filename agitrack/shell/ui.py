@@ -6,6 +6,8 @@ from shutil import get_terminal_size
 from dataclasses import dataclass
 from pathlib import Path
 
+from agitrack.console import stdin_is_interactive, stdout_is_interactive
+
 
 AGITRACK_COMMANDS = {
     ":help": "show aGiTrack commands",
@@ -50,7 +52,7 @@ class AgitrackPrompt:
         # because their streamed reply happened to terminate the line first.
         self._human = human_stream if human_stream is not None else sys.stdout
         self.session: Any = None
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if stdin_is_interactive() and stdout_is_interactive():
             try:
                 from prompt_toolkit import PromptSession
 

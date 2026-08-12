@@ -2601,7 +2601,11 @@ def test_the_project_post_commit_hook_runs_on_an_ORDINARY_commit(tmp_path):
     hooks_dir.mkdir(exist_ok=True)
     ran = tmp_path / "project-hook-ran.txt"
     existing = hooks_dir / "post-commit"
-    existing.write_text(f"#!/bin/sh\necho ran >> {ran}\n", encoding="utf-8")
+    # as_posix(): git hooks run under sh even on Windows, where a WindowsPath interpolates as
+    # C:\Users\...\project-hook-ran.txt and sh eats the backslashes as escapes — the hook then
+    # runs (which is what this asserts) but writes to a mangled path, so the test failed for a
+    # reason that has nothing to do with hook chaining.
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran.as_posix()}\n", encoding="utf-8")
     existing.chmod(0o755)
 
     assert git_hooks.install_manual_commit_hooks(hooks_dir)
@@ -2623,7 +2627,7 @@ def test_the_project_post_commit_hook_still_runs_on_a_folded_commit(tmp_path):
     hooks_dir.mkdir(exist_ok=True)
     ran = tmp_path / "project-hook-ran.txt"
     existing = hooks_dir / "post-commit"
-    existing.write_text(f"#!/bin/sh\necho ran >> {ran}\n", encoding="utf-8")
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran.as_posix()}\n", encoding="utf-8")  # as_posix: see above
     existing.chmod(0o755)
 
     assert git_hooks.install_manual_commit_hooks(hooks_dir)

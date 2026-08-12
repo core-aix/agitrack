@@ -518,3 +518,12 @@ def test_tree_diff_names_answers_nothing_known_for_an_unreadable_rev(tmp_path):
     repo = _init_repo(tmp_path)
 
     assert repo.tree_diff_names("not-a-rev", "HEAD") == []
+
+
+def test_discover_accepts_a_plain_string_path(tmp_path):
+    """The annotation says Path, but `cwd=` accepted a plain string for years so callers and
+    scripts pass one. The existence guards added for the `--repo` message are Path methods, and
+    without a coercion they turned a working call into `AttributeError: 'str' object has no
+    attribute 'exists'` — a worse failure than the one they were added to fix."""
+    repo = _init_repo(tmp_path)
+    assert GitRepo.discover(str(repo.repo)).repo == repo.repo

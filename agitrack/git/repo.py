@@ -128,7 +128,12 @@ class GitRepo:
         self._run(["git", "rev-parse", "--show-toplevel"])
 
     @classmethod
-    def discover(cls, path: Path) -> "GitRepo":
+    def discover(cls, path: Path | str) -> "GitRepo":
+        # Coerce first: the annotation says Path, but `cwd=` accepted a plain string for years,
+        # so callers (and scripts) pass one. The existence checks below are Path methods, and
+        # without this they turned a working call into `AttributeError: 'str' object has no
+        # attribute 'exists'` — a worse failure than the one they were added to fix.
+        path = Path(path)
         # Check the path OURSELVES before handing it to git as `cwd`. A missing directory made
         # subprocess raise FileNotFoundError, and a file made it raise NotADirectoryError (on
         # Windows both arrive as `[WinError 267] The directory name is invalid`) — raw OSErrors
