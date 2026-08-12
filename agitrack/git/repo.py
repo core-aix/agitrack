@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, fs_path
+from agitrack.proc import _IS_WINDOWS, UTF8_TEXT, console_isolation_kwargs, fs_path
 
 
 class GitError(RuntimeError):
@@ -1315,6 +1315,18 @@ class GitRepo:
             # tokens. Any agent that creates a file with an accented or CJK name hit this. Turning
             # quoting off makes git emit the real UTF-8 bytes, which round-trip.
             flags += ["-c", "core.quotePath=false"]
+            if _IS_WINDOWS:
+                # WINDOWS LONG PATHS. Without `core.longpaths` — the state every real user is in,
+                # since aGiTrack never set it — git refuses any path over MAX_PATH, and aGiTrack
+                # read those refusals as "nothing there": `-d text` printed a confident
+                # `branch master, 0 commits` / 0% coverage and exit 0 on a 3-commit repo, while
+                # git on the same repo said `Filename too long` / `fatal: bad object HEAD`. A
+                # silently EMPTY report is the worst possible answer.
+                #
+                # Passed per-invocation with `-c` rather than written into the user's config:
+                # aGiTrack does not get to change how the user's own `git` behaves, only how the
+                # git IT runs behaves.
+                flags += ["-c", "core.longpaths=true"]
         if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
             flags += ["-c", "core.commitGraph=false"]
             if not allow_lazy_fetch or not _git_read_needs_blobs(command):

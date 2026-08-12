@@ -202,6 +202,20 @@ class RepoLock:
             pass
         self._fd = None
 
+    def clear_owner_record(self) -> None:
+        """Truncate the lock FILE without holding the lock — for a process that stopped another
+        one and knows it is gone.
+
+        ``release()`` does this for a daemon that shuts itself down, but on Windows `-b stop` is
+        ``TerminateProcess``, so the daemon's teardown never runs and the file kept its owner
+        record: on disk a clean stop was indistinguishable from a crash, and the next reader saw
+        a plausible-looking dead owner."""
+        try:
+            with open(self.path, "r+b") as handle:
+                handle.truncate(0)
+        except OSError:
+            pass
+
     def owner_pid(self) -> int | None:
         pid = self._read_info().get("pid")
         return pid if isinstance(pid, int) else None

@@ -170,6 +170,33 @@ def _same_prompt(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
+# Answers to a BACKEND'S OWN dialog, which the backend records as a user message.
+#
+# Claude and Codex both ask a trust question ("Do you trust the files in this folder?") whose
+# answer is a single keystroke, and that keystroke lands in the transcript as a turn whose user
+# prompt is `1`. aGiTrack then copied it into the commit's interaction trace, so every
+# --no-worktree commit carried a stray `## User` / `1` — permanently, in history, seen across
+# three independent live scenarios. The dialog also overlaps aGiTrack's own startup popup, so
+# whatever is typed in that window is committed forever.
+#
+# Deliberately narrow: ONE character, from the set a menu answer can be, and only when the turn
+# produced no agent reply and no edits. A real prompt that short does not exist, and a turn that
+# the agent actually answered is never discarded whatever it says.
+_DIALOG_KEYSTROKES = frozenset("0123456789yYnN")
+
+
+def _is_dialog_keystroke(turn) -> bool:
+    """Whether *turn* is a backend dialog answer rather than something the user asked for."""
+    prompt = (getattr(turn, "user_prompt", "") or "").strip()
+    if len(prompt) != 1 or prompt not in _DIALOG_KEYSTROKES:
+        return False
+    if (getattr(turn, "final_response", "") or "").strip():
+        return False
+    if getattr(turn, "agent_messages", None) or getattr(turn, "edits", None):
+        return False
+    return True
+
+
 def _prompt_covered_by(pending: str, prompt: str) -> bool:
     """True when *pending* is already represented WITHIN *prompt*. A single turn's ``user_prompt``
     can aggregate several messages — a base prompt plus the follow-ups the user QUEUED while the
@@ -313,7 +340,7 @@ class CommitEngine:
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
-                if turn.user_prompt:
+                if turn.user_prompt and not _is_dialog_keystroke(turn):
                     self.state.append_trace("user", turn.user_prompt)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
@@ -340,7 +367,7 @@ class CommitEngine:
             subject_prompts: list[str] = []
             entries: list[tuple[str, str]] = []
             for turn in turns:
-                if turn.user_prompt:
+                if turn.user_prompt and not _is_dialog_keystroke(turn):
                     subject_prompts.append(turn.user_prompt)
                     entries.append(("user", turn.user_prompt))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent

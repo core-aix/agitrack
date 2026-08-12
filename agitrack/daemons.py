@@ -33,7 +33,20 @@ KIND_LABELS = {
     "dashboard": "repo dashboard",
     "backtrace": "backtrace dashboard",
     "background": "background mode",
+    "session": "interactive session",
 }
+
+# Kinds `--daemons stop` and the update-restart may act on. An INTERACTIVE SESSION is listed but
+# never signalled: `--daemons list` showed only detached daemons, so someone asking "what is
+# aGiTrack running?" — usually because something holds a repo lock — got half the answer and no
+# mention of the very session holding it. Listing it is the point; terminating someone's live
+# conversation from a bulk sweep is not.
+_STOPPABLE_KINDS = frozenset({"dashboard", "backtrace", "background"})
+
+
+def _stoppable(infos: "list[DaemonInfo]") -> "list[DaemonInfo]":
+    return [info for info in infos if info.kind in _STOPPABLE_KINDS]
+
 
 # The internal serve flag unique to each detached daemon child — the fingerprint used to find a
 # daemon directly in the OS process table (so one that never registered, e.g. started by a version
@@ -284,7 +297,7 @@ def restart_all(*, exclude_pid: int | None = None, log=lambda message: None) -> 
     env = {**os.environ, "PYTHONSAFEPATH": "1"}
     home = str(Path.home())
     restarted = 0
-    for info in _signal_targets([i for i in list_running() if i.pid != skip and i.cmd]):
+    for info in _signal_targets(_stoppable([i for i in list_running() if i.pid != skip and i.cmd])):
         if info.pid == skip or not info.cmd:
             continue
         try:
@@ -328,7 +341,7 @@ def stop_all(
     skip = exclude_pid if exclude_pid is not None else os.getpid()
     stopped = 0
     survivors: list[str] = []
-    for info in _signal_targets([i for i in list_running(repo=repo) if i.pid != skip]):
+    for info in _signal_targets(_stoppable([i for i in list_running(repo=repo) if i.pid != skip])):
         if info.pid == skip:
             continue
         try:

@@ -1818,6 +1818,84 @@ def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):
     assert state.pending_token_usage()["output"] == 30
 
 
+def test_a_backend_dialog_keystroke_never_enters_the_commit_trace():
+    """Claude and Codex both ask a trust question whose answer is a single keystroke, and the
+    backend records that keystroke as a user message. aGiTrack copied it into the interaction
+    trace, so every --no-worktree commit carried a stray `## User` / `1` — permanently, in
+    history, across three independent live scenarios. The dialog also overlaps aGiTrack's own
+    startup popup, so anything typed in that window was committed forever."""
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import SessionTurn
+
+    answer = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="",
+        user_prompt="1",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(answer) is True
+
+
+def test_a_real_prompt_is_never_mistaken_for_a_dialog_answer():
+    from agitrack.backends.base import TokenUsage
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.transcripts.types import SessionTurn
+
+    # A short prompt the agent actually answered.
+    answered = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="a1",
+        user_prompt="1",
+        final_response="Done.",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(answered) is False
+
+    # Anything longer than one character.
+    real = SessionTurn(
+        user_message_id="u2",
+        assistant_message_id="",
+        user_prompt="go",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(real) is False
+
+    # A single character that is not a menu answer.
+    other = SessionTurn(
+        user_message_id="u3",
+        assistant_message_id="",
+        user_prompt="?",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(other) is False
+
+
+def test_a_keystroke_turn_that_produced_edits_is_kept():
+    """Whatever it says, a turn the agent acted on is never discarded."""
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import FileEdit, SessionTurn
+
+    turn = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="",
+        user_prompt="2",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+        edits=[FileEdit(path="a.txt", insertions=1, deletions=0, patch="")],
+    )
+    assert _is_dialog_keystroke(turn) is False
+
+
 class _RepoWithIndex(_Repo):
     """A _Repo that can answer ``staged_paths()`` the way GitRepo does.
 

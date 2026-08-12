@@ -123,8 +123,10 @@ def _backtrace_commit_locked(repo, root: Path, new_branch: str, *, _input=input)
     new_branch = (new_branch or "").strip()
     if not new_branch:
         print(
-            "The reconstruction rewrites history, so it is placed on its own NEW branch and your "
-            "current branch is left untouched."
+            "The reconstruction rewrites history, so it is placed on its own NEW branch. Your "
+            "current branch keeps every commit it has now — but aGiTrack DOES check the new "
+            "branch out at the end, so you will be standing on it (it tells you how to switch "
+            "back)."
         )
         try:
             new_branch = (_input("Name for the new branch (blank to cancel): ") or "").strip()
@@ -203,7 +205,9 @@ def _backtrace_commit_locked(repo, root: Path, new_branch: str, *, _input=input)
         + already_line
         + f"  • {len(commits) - len(ai_map)} will be kept verbatim as user commits.\n\n"
         "This REWRITES history: every commit gets a new hash, so the new branch is NOT a "
-        "fast-forward of your current branch. Your current branch is left untouched."
+        "fast-forward of your current branch. Your current branch keeps every commit it has "
+        "now — nothing on it is changed or lost — but your CHECKOUT moves: aGiTrack switches "
+        "you onto the new branch at the end, and prints how to switch back."
     )
     # Guarded exactly like the branch-name prompt above: run from a script, a CI job or any
     # pipeline (`agitrack --backtrace commit --branch x < /dev/null`) `input()` raises EOFError,
