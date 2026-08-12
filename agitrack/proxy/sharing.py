@@ -1249,11 +1249,17 @@ class SessionSharingMixin(RunnerHost):
                     opts.append("Keep both (fetch the older shared copy as a separate session)")
                 opts.append(f"Replace my local copy with the OLDER shared version (updated {age})")
             else:
+                # THE HIGHLIGHTED OPTION IS NEVER THE DESTRUCTIVE ONE. This led with "Replace my
+                # local copy", so the popup's default — what a bare Enter picks — discarded the
+                # user's own conversation irreversibly. "Keep both" gets them the shared copy
+                # AND keeps theirs, so it is the right default whenever it is available; the
+                # sibling branch above already ordered itself this way.
                 header = f"You already have a local copy of {entry.display}.\nWhich do you want to continue?"
-                opts = [f"Replace my local copy with the shared version (updated {age})"]
+                opts = []
                 if keep_both_id:
                     opts.append("Keep both (fetch the shared copy as a separate session)")
                 opts.append("Keep my local copy")
+                opts.append(f"Replace my local copy with the shared version (updated {age})")
             pick = self._select_popup(header, opts)
             if pick is None:  # Esc → up one level to the sessions menu
                 return self._MENU_UP

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 from agitrack.git import GitRepo, read_cache
 
@@ -493,6 +494,33 @@ def test_a_repo_that_really_is_a_partial_clone_keeps_its_settings(tmp_path):
     assert kept == "blob:none"  # the user's own value, restored
 
 
+def test_tree_diff_names_lists_what_a_snapshot_adds_over_head(tmp_path):
+    """The index-free counterpart of ``staged_paths``: no ``--no-worktree`` commit ever
+    stages, so "what will this commit carry?" has to be answered by comparing trees."""
+    repo = _init_repo(tmp_path)
+    (tmp_path / "new1.txt").write_text("a\n")
+    (tmp_path / "new2.txt").write_text("b\n")
+    (tmp_path / "f.txt").write_text("edited\n")
+
+    names = repo.tree_diff_names(repo.comparable_tree("HEAD"), repo.snapshot_worktree_tree())
+
+    assert sorted(names) == ["f.txt", "new1.txt", "new2.txt"]
+
+
+def test_tree_diff_names_is_empty_for_an_unchanged_tree(tmp_path):
+    repo = _init_repo(tmp_path)
+
+    assert repo.tree_diff_names(repo.comparable_tree("HEAD"), repo.snapshot_worktree_tree()) == []
+
+
+def test_tree_diff_names_answers_nothing_known_for_an_unreadable_rev(tmp_path):
+    """Best-effort by contract: its only caller uses it to say MORE in a commit message, so a
+    bad rev must cost that sentence, never the commit."""
+    repo = _init_repo(tmp_path)
+
+    assert repo.tree_diff_names("not-a-rev", "HEAD") == []
+
+
 def test_discover_accepts_a_plain_string_path(tmp_path):
     """The annotation says Path, but `cwd=` accepted a plain string for years so callers and
     scripts pass one. The existence guards added for the `--repo` message are Path methods, and
@@ -500,3 +528,50 @@ def test_discover_accepts_a_plain_string_path(tmp_path):
     attribute 'exists'` — a worse failure than the one they were added to fix."""
     repo = _init_repo(tmp_path)
     assert GitRepo.discover(str(repo.repo)).repo == repo.repo
+
+
+def test_windows_long_paths_are_opted_into(monkeypatch):
+    """B11: with `core.longpaths` unset — the state every real user is in, since aGiTrack never
+    set it — git refuses any path over MAX_PATH, and aGiTrack read those refusals as "nothing
+    there": `-d text` printed a confident `branch master, 0 commits` / 0% coverage and exit 0 on
+    a 3-commit repo. `\\\\?\\` and `core.longpaths` appeared nowhere in the source, so this was an
+    application opt-in gap, not a platform wall."""
+    from agitrack.git import repo as repo_mod
+
+    seen: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(repo_mod, "_IS_WINDOWS", True)
+    monkeypatch.setattr(repo_mod.subprocess, "run", lambda command, **kw: (seen.append(command), _Result())[1])
+
+    handle = GitRepo.__new__(GitRepo)
+    handle.repo = Path(".")
+    handle._run(["git", "status", "--porcelain"], check=False)
+
+    assert seen, "no git command was issued"
+    assert "core.longpaths=true" in seen[0]
+
+
+def test_long_paths_are_not_forced_off_windows(monkeypatch):
+    """It is a Windows-only limit; adding the flag elsewhere is noise in every git invocation."""
+    from agitrack.git import repo as repo_mod
+
+    seen: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(repo_mod, "_IS_WINDOWS", False)
+    monkeypatch.setattr(repo_mod.subprocess, "run", lambda command, **kw: (seen.append(command), _Result())[1])
+
+    handle = GitRepo.__new__(GitRepo)
+    handle.repo = Path(".")
+    handle._run(["git", "status", "--porcelain"], check=False)
+
+    assert "core.longpaths=true" not in seen[0]

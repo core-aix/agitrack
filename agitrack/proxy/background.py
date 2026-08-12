@@ -118,6 +118,9 @@ def stop_background(repo: GitRepo) -> int:
     """Stop the background tracker running on this repo (`agitrack -b stop`). Sends SIGTERM and
     waits briefly for a clean shutdown (it records any final turn and removes its hooks)."""
     pid = _live_background_pid(repo)
+    # Read the daemon's record BEFORE terminating it: on POSIX its own teardown deletes the
+    # handshake, and the `--log-file` it was started with lives nowhere else.
+    running = _read_handshake(repo) or {}
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
         _disarm_tracking(repo)  # a tracker that died without tearing down may have left it armed
@@ -130,24 +133,47 @@ def stop_background(repo: GitRepo) -> int:
     # The stopping process knows the repo, so it can do the cleanup the killed one could not —
     # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
     disarmed = _disarm_tracking(repo)
+    # Reap the stopped daemon's REGISTRY entry too. `-b stop` reaped the handshake and left the
+    # registry file, so dead-pid entries accumulated across kill/restart cycles (1 → 6 over three)
+    # and were only ever pruned lazily, on the next read by something else.
+    try:
+        from agitrack import daemons
+        from agitrack.git import RepoLock
+
+        daemons.deregister(pid)
+        # ...and the lock file's owner record, for the same reason: on Windows the terminated
+        # daemon's own release() never ran, so a clean stop looked exactly like a crash on disk.
+        RepoLock(repo.repo / ".agitrack" / "lock").clear_owner_record()
+    except Exception:
+        pass
     # Also from HERE for the same reason as the disarm above: the daemon emits `daemon-stop` in
     # its own teardown, which never runs when it was TerminateProcess'd. `daemon-start` was
     # therefore the only event a `--log-file` reader ever saw across a full -b lifecycle.
-    _emit_stop_event(repo)
+    _emit_stop_event(repo, log_file=running.get("log_file"))
     print("Stopped the aGiTrack background tracker.")
     if disarmed:
         print("Auto-start is off for this repo until you run `agitrack -b` again.")
     return 0
 
 
-def _emit_stop_event(repo: GitRepo) -> None:
-    """Append ``daemon-stop`` to the configured event log, best-effort. Idempotent enough: the
-    daemon's own teardown emits it too on POSIX, and one duplicate line is far better than the
-    silence a Windows stop produced."""
+def _emit_stop_event(repo: GitRepo, *, log_file: str | None = None) -> None:
+    """Append ``daemon-stop`` to the event log the RUNNING daemon was using, best-effort.
+
+    Idempotent enough: the daemon's own teardown emits it too on POSIX, and one duplicate line
+    is far better than the silence a Windows stop produced.
+
+    The daemon's log path comes from the handshake first and the config only as a fallback,
+    because ``--log-file`` is a command-line flag that is never persisted: a tracker started as
+    ``agitrack -b --log-file events.log`` had no ``log_file`` in config, so this read None and
+    emitted nothing. On Windows — where `-b stop` is a ``TerminateProcess`` and the daemon's own
+    teardown never runs — ``daemon-start`` was therefore the only line a ``--log-file`` reader
+    ever saw across a full ``-b`` lifecycle, which is the very thing this function exists to
+    prevent."""
     try:
         from agitrack.config import GlobalConfig
 
-        log = EventLog(resolve_log_path(getattr(GlobalConfig(), "log_file", None), repo.repo))
+        spec = log_file or (_read_handshake(repo) or {}).get("log_file")
+        log = EventLog(resolve_log_path(spec or getattr(GlobalConfig(), "log_file", None), repo.repo))
         log.emit("daemon-stop")
     except Exception:
         pass
@@ -840,7 +866,6 @@ class BackgroundRunner:
         # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
         self.repo.ensure_comment_char_preserves_headings()
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
-        self._write_handshake()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
         self._manual.setup()
@@ -853,6 +878,14 @@ class BackgroundRunner:
             )
         self._install_autotrack_hook()
         self._install_commit_guidance()
+        # LAST, not first. The handshake is what `agitrack -b` waits on before printing "daemon
+        # live" and returning the shell, so anything written after it is a race the user can
+        # lose: `agitrack -b && agitrack -s` reported "Auto-start: not armed — no aGiTrack hook
+        # is installed in this repo yet. Run `agitrack` or `agitrack -b` once" ~0.6s after a
+        # successful `agitrack -b`, and a script that started and stopped the tracker left
+        # nothing armed at all. Publishing it only once the repo really is in the advertised
+        # state costs the launcher that fraction of a second and makes every reading true.
+        self._write_handshake()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
@@ -896,12 +929,13 @@ class BackgroundRunner:
             )
             self._restart_cmd = None
             self._stop.clear()
-            # Undo the teardown: visibility (handshake + --daemons registry, both via
-            # _write_handshake) and the commit hooks come back before tracking resumes.
-            self._write_handshake()
+            # Undo the teardown: the commit hooks first, then visibility (handshake +
+            # --daemons registry, both via _write_handshake) — same order as startup, so the
+            # handshake never advertises a state the repo has not reached.
             self._clear_stale_worktree_guard()
             self._manual.setup()
             self._install_autotrack_hook()
+            self._write_handshake()
 
     def _clear_stale_worktree_guard(self) -> None:
         """Drop a worktree base-commit guard left in the base repo by a crashed WORKTREE run.
@@ -966,6 +1000,11 @@ class BackgroundRunner:
                         # new code). Without this, every rerun tore the daemon down and respawned it —
                         # the churn that made the tracker appear to "quit" on unrelated invocations.
                         "version": __version__,
+                        # The event log THIS daemon writes to, so `-b stop` can append
+                        # `daemon-stop` to it after a Windows TerminateProcess has denied the
+                        # daemon its own teardown. `--log-file` is a flag and is never persisted
+                        # to config, so the stopping process has no other way to learn it.
+                        "log_file": str(self.events.path) if self.events.path else None,
                     }
                 ),
                 encoding="utf-8",

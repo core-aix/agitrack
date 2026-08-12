@@ -5,6 +5,7 @@ resolution, the Claude transcript import/export, and a push/fetch round-trip
 through a local bare remote.
 """
 
+import inspect
 import json
 import os
 import random
@@ -3521,3 +3522,20 @@ def test_redact_never_leaves_a_dangling_backslash_escape():
     out = redact_transcript(raw)
     assert json.loads(out)["p"] == "[PATH]"
     assert json.loads(out)["q"] == "tail"
+
+
+def test_the_resume_shared_popup_never_defaults_to_replacing_local_work():
+    """The "You already have a local copy" popup led with "Replace my local copy", so the
+    popup's default — what a bare Enter picks — discarded the user's own conversation
+    irreversibly. The sibling branch (shared copy older) already ordered itself safely.
+
+    Asserted on the OPTION ORDER the modal is handed, because "the default" in a select popup is
+    literally its first entry."""
+    from agitrack.proxy import sharing
+
+    source = inspect.getsource(sharing.SessionSharingMixin._resume_shared_session_menu)
+    # The branch built when the SHARED copy is the newer one.
+    branch = source.split("Which do you want to continue?")[1].split("pick = ")[0]
+    order = [line for line in branch.splitlines() if "opts" in line and ("=" in line or "append" in line)]
+    rendered = " | ".join(order)
+    assert rendered.index("Keep") < rendered.index("Replace"), rendered

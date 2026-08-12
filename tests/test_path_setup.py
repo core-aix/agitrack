@@ -390,7 +390,9 @@ def test_a_piped_run_prints_instructions_instead_of_prompting(monkeypatch, tmp_p
     from agitrack.backends.setup import install_backend
 
     monkeypatch.setattr("agitrack.backends.setup.os.name", "posix")
-    monkeypatch.setattr("agitrack.backends.setup.sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)}))
+    # "is there a terminal?" is asked through agitrack.console, which owns the question — a bare
+    # sys.stdin.isatty() is wrong on Windows (NUL claims to be a tty), so no module asks directly.
+    monkeypatch.setattr("agitrack.backends.setup.stdin_is_interactive", lambda: False)
     monkeypatch.setattr("agitrack.backends.setup._installed_bin_dir", lambda name: str(tmp_path / "bin"))
     seen: list[bool] = []
     monkeypatch.setattr(

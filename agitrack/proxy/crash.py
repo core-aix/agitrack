@@ -73,7 +73,7 @@ def write_stall_note(root: Path, phase: str, seconds: float) -> None:
         path = directory / _STALL_LOG
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{stamp} reactor stalled {seconds:.1f}s in phase {phase} (v{_version()})\n")
+            handle.write(f"{stamp} reactor stalled {seconds:.3f}s in phase {phase} (v{_version()})\n")
         lines = path.read_text(encoding="utf-8").splitlines()
         if len(lines) > _MAX_STALL_LINES:  # keep the file from growing forever
             path.write_text("\n".join(lines[-_MAX_STALL_LINES:]) + "\n", encoding="utf-8")

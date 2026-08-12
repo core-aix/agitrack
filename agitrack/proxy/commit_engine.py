@@ -170,6 +170,33 @@ def _same_prompt(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
+# Answers to a BACKEND'S OWN dialog, which the backend records as a user message.
+#
+# Claude and Codex both ask a trust question ("Do you trust the files in this folder?") whose
+# answer is a single keystroke, and that keystroke lands in the transcript as a turn whose user
+# prompt is `1`. aGiTrack then copied it into the commit's interaction trace, so every
+# --no-worktree commit carried a stray `## User` / `1` — permanently, in history, seen across
+# three independent live scenarios. The dialog also overlaps aGiTrack's own startup popup, so
+# whatever is typed in that window is committed forever.
+#
+# Deliberately narrow: ONE character, from the set a menu answer can be, and only when the turn
+# produced no agent reply and no edits. A real prompt that short does not exist, and a turn that
+# the agent actually answered is never discarded whatever it says.
+_DIALOG_KEYSTROKES = frozenset("0123456789yYnN")
+
+
+def _is_dialog_keystroke(turn) -> bool:
+    """Whether *turn* is a backend dialog answer rather than something the user asked for."""
+    prompt = (getattr(turn, "user_prompt", "") or "").strip()
+    if len(prompt) != 1 or prompt not in _DIALOG_KEYSTROKES:
+        return False
+    if (getattr(turn, "final_response", "") or "").strip():
+        return False
+    if getattr(turn, "agent_messages", None) or getattr(turn, "edits", None):
+        return False
+    return True
+
+
 def _prompt_covered_by(pending: str, prompt: str) -> bool:
     """True when *pending* is already represented WITHIN *prompt*. A single turn's ``user_prompt``
     can aggregate several messages — a base prompt plus the follow-ups the user QUEUED while the
@@ -244,6 +271,7 @@ class CommitEngine:
         backend_commits: list[str] | None = None,
         manual_gate_fn: Callable[[], bool] | None = None,
         manual_record_fn: Callable[[str], str | None] | None = None,
+        changed_paths_fn: Callable[[], list[str]] | None = None,
         summarize_fn: Callable[[str], tuple[str, list[str]] | None] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
@@ -312,7 +340,7 @@ class CommitEngine:
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
-                if turn.user_prompt:
+                if turn.user_prompt and not _is_dialog_keystroke(turn):
                     self.state.append_trace("user", turn.user_prompt)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
@@ -339,7 +367,7 @@ class CommitEngine:
             subject_prompts: list[str] = []
             entries: list[tuple[str, str]] = []
             for turn in turns:
-                if turn.user_prompt:
+                if turn.user_prompt and not _is_dialog_keystroke(turn):
                     subject_prompts.append(turn.user_prompt)
                     entries.append(("user", turn.user_prompt))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
@@ -496,8 +524,16 @@ class CommitEngine:
         # commit DELIVERS was cut short, and that is decided by the turn it ends on; an earlier
         # interrupted turn is still visible as itself in the interaction trace.
         interrupted = bool(turns) and bool(getattr(turns[-1], "interrupted", False))
+        # What the commit actually carries, read off the index that is about to become it.
+        # Only for an interrupted turn: that is the one case where the trace demonstrably
+        # cannot account for the diff (see message._interrupted_changes_sentence), and every
+        # other commit keeps the trace as the summarizer's sole input, by design.
+        changed_paths = self._changed_paths(changed_paths_fn) if interrupted else None
         trace_text = render_interaction_trace(
-            self.state.pending_trace(), self.state.trace_turn_limit, interrupted=interrupted
+            self.state.pending_trace(),
+            self.state.trace_turn_limit,
+            interrupted=interrupted,
+            changed_paths=changed_paths,
         )
         summary_text: str | None = None
         summary_metadata: list[str] | None = None
@@ -530,6 +566,7 @@ class CommitEngine:
             origin_event=origin_event,
             capabilities=capability_metadata,
             interrupted=interrupted,
+            changed_paths=changed_paths,
         )
         if manual_record_fn is not None:
             # Manual-commit mode: record the turn as a hidden latent commit on the side
@@ -590,6 +627,24 @@ class CommitEngine:
         if full and turn.agent_messages:
             return [message for message in turn.agent_messages if message]
         return [turn.final_response] if turn.final_response else []
+
+    def _changed_paths(self, changed_paths_fn: Callable[[], list[str]] | None) -> list[str]:
+        """The paths the pending commit will carry.
+
+        Two sources, because the two commit paths differ. The classic path stages into the
+        index and commits it, so the index is the answer — read AFTER staging, so it is the
+        commit's own content and not a guess. Every ``--no-worktree`` mode instead records a
+        hidden LATENT commit from a working-tree snapshot and never touches the index at all,
+        which is why reading only the index came back empty for the mode most people run (and
+        left the interrupted note without its file list where it was needed most); those
+        callers pass their own ``changed_paths_fn``.
+
+        Never fatal: any failure leaves the note as it was before, without a file list."""
+        try:
+            return changed_paths_fn() if changed_paths_fn is not None else self.repo.staged_paths()
+        except Exception as error:
+            self._debug(f"changed path listing failed: {error!r}")
+            return []
 
     def _short_sha(self, sha: str) -> str:
         """Short display form of *sha* (falls back to a 7-char prefix when the

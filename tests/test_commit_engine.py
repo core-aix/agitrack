@@ -1816,3 +1816,194 @@ def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):
     fresh = SessionTurn("u9", "a9", "new", "done", TokenUsage(output=30), None, started_at=5100, ended_at=5200)
     engine._add_turn_usage(fresh)
     assert state.pending_token_usage()["output"] == 30
+
+
+def test_a_backend_dialog_keystroke_never_enters_the_commit_trace():
+    """Claude and Codex both ask a trust question whose answer is a single keystroke, and the
+    backend records that keystroke as a user message. aGiTrack copied it into the interaction
+    trace, so every --no-worktree commit carried a stray `## User` / `1` — permanently, in
+    history, across three independent live scenarios. The dialog also overlaps aGiTrack's own
+    startup popup, so anything typed in that window was committed forever."""
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import SessionTurn
+
+    answer = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="",
+        user_prompt="1",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(answer) is True
+
+
+def test_a_real_prompt_is_never_mistaken_for_a_dialog_answer():
+    from agitrack.backends.base import TokenUsage
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.transcripts.types import SessionTurn
+
+    # A short prompt the agent actually answered.
+    answered = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="a1",
+        user_prompt="1",
+        final_response="Done.",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(answered) is False
+
+    # Anything longer than one character.
+    real = SessionTurn(
+        user_message_id="u2",
+        assistant_message_id="",
+        user_prompt="go",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(real) is False
+
+    # A single character that is not a menu answer.
+    other = SessionTurn(
+        user_message_id="u3",
+        assistant_message_id="",
+        user_prompt="?",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+    )
+    assert _is_dialog_keystroke(other) is False
+
+
+def test_a_keystroke_turn_that_produced_edits_is_kept():
+    """Whatever it says, a turn the agent acted on is never discarded."""
+    from agitrack.proxy.commit_engine import _is_dialog_keystroke
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import FileEdit, SessionTurn
+
+    turn = SessionTurn(
+        user_message_id="u1",
+        assistant_message_id="",
+        user_prompt="2",
+        final_response="",
+        tokens=TokenUsage(),
+        model=None,
+        edits=[FileEdit(path="a.txt", insertions=1, deletions=0, patch="")],
+    )
+    assert _is_dialog_keystroke(turn) is False
+
+
+class _RepoWithIndex(_Repo):
+    """A _Repo that can answer ``staged_paths()`` the way GitRepo does.
+
+    The base fake uses that name for a plain list of what ``stage_paths`` recorded, which is
+    a different thing; this subclass models the real method — the index the commit will take.
+    """
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__(staged=True)
+        self._index = list(paths)
+        # The base sets `staged_paths` as an INSTANCE attribute, which would shadow the
+        # method below (instance attributes win over class ones); drop it so it does not.
+        del self.staged_paths
+
+    def staged_paths(self) -> list[str]:  # type: ignore[override]
+        return list(self._index)
+
+
+def test_commit_turns_tells_an_interrupted_commit_what_it_carries(tmp_path):
+    """The trace of a cancelled turn stops at the agent's "I'll do X" and never reaches the
+    edits, so the summarizer read the commit as having written nothing — over a diff of
+    eight files. The commit states its own contents instead."""
+    repo = _RepoWithIndex(["f1.txt", "f2.txt"])
+    engine = CommitEngine(repo, AgitrackState(tmp_path))
+
+    engine.commit_turns(
+        turns=[
+            SessionTurn(
+                "u1",
+                "a1",
+                "Create ten files",
+                "I'll create them one at a time.",
+                TokenUsage(total=1, output=1),
+                None,
+                complete=True,
+                interrupted=True,
+            )
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    unwrapped = " ".join(repo.message.replace("> ", "").split())
+    assert "it changes f1.txt, f2.txt." in unwrapped
+
+
+def test_commit_turns_leaves_a_completed_turn_message_alone(tmp_path):
+    """Only the interrupted case reads the index; every other commit keeps the interaction
+    trace as the summarizer's sole input."""
+    repo = _RepoWithIndex(["f1.txt"])
+    engine = CommitEngine(repo, AgitrackState(tmp_path))
+
+    engine.commit_turns(
+        turns=[_turn("Create a file", "Created it.")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None and "f1.txt" not in repo.message
+
+
+def test_a_repo_that_cannot_list_its_index_still_commits(tmp_path):
+    """Best-effort: the note simply loses its file list rather than the commit failing."""
+    engine, repo, _state = _engine(tmp_path)  # base _Repo: staged_paths is a list, not callable
+
+    engine.commit_turns(
+        turns=[
+            SessionTurn(
+                "u1", "a1", "do it", "starting", TokenUsage(total=1, output=1), None, complete=True, interrupted=True
+            )
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None and "NOT completed" in repo.message
+
+
+def test_the_latent_path_reports_its_own_changes_not_the_index(tmp_path):
+    """Every `--no-worktree` mode records a hidden latent commit from a working-tree snapshot
+    and never stages anything, so reading the index answered "nothing changed" for the mode
+    most people run — and the interrupted note lost its file list exactly where it mattered."""
+    repo = _RepoWithIndex([])  # nothing staged: the latent path never touches the index
+    engine = CommitEngine(repo, AgitrackState(tmp_path))
+    recorded: list[str] = []
+
+    engine.commit_turns(
+        turns=[
+            SessionTurn(
+                "u1", "a1", "do it", "starting", TokenUsage(total=1, output=1), None, complete=True, interrupted=True
+            )
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+        manual_gate_fn=lambda: True,
+        manual_record_fn=lambda message: (recorded.append(message), "abc1234")[1],
+        changed_paths_fn=lambda: ["latent1.txt", "latent2.txt"],
+    )
+
+    assert recorded, "the turn should have been recorded latently"
+    unwrapped = " ".join(recorded[0].replace("> ", "").split())
+    assert "it changes latent1.txt, latent2.txt." in unwrapped

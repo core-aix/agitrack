@@ -1823,3 +1823,111 @@ def test_a_required_tool_install_still_defaults_to_yes(monkeypatch):
 
     assert cli._maybe_install_tool("git", required=True) is True
     assert installed == ["git"]
+
+
+def test_yes_makes_the_startup_prompts_non_interactive(monkeypatch):
+    """`agitrack -b` on a fresh config blocked on three startup questions whenever it ran ON a
+    terminal — despite -b being the documented "no TUI, returns to your shell" path — so a
+    scripted or CI use inside a terminal simply hung. There was no --yes at all, and `-b status`
+    skipping the wizard made the two inconsistent."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name == "claude")
+    monkeypatch.setattr(
+        cli, "select_default_backend", lambda *a, **k: pytest.fail("--yes must not open the backend chooser")
+    )
+    monkeypatch.setattr(
+        cli,
+        "select_default_summarizer_model",
+        lambda *a, **k: pytest.fail("--yes must not open the summarizer chooser"),
+    )
+
+    assert cli.main(["--yes"]) == 0
+    assert captured["backend"] == "claude"
+
+
+def test_without_yes_a_terminal_still_gets_the_first_run_prompts(monkeypatch):
+    """--yes is opt-in: an ordinary interactive first run must still be walked through setup."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    asked: list[str] = []
+    monkeypatch.setattr(cli, "select_default_backend", lambda *a, **k: asked.append("backend") or "claude")
+    monkeypatch.setattr(cli, "select_default_summarizer_model", lambda *a, **k: asked.append("model"))
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+
+    cli.main([])
+
+    assert asked == ["backend", "model"]
+
+
+def _fake_repo(tmp_path):
+    return type("R", (), {"repo": tmp_path})()
+
+
+def test_share_sessions_without_a_terminal_refuses_and_says_so_in_its_exit_code(tmp_path, monkeypatch, capsys):
+    """A CI job that asked to publish its conversations and got exit 0 back would report
+    success having published nothing. `--daemons stop` already makes this split; the refusal
+    for want of a terminal is an error, the user answering "no" at the prompt is not."""
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 1
+
+    out = capsys.readouterr().out
+    assert "--yes" in out  # and it names the way to do it deliberately
+
+
+def test_share_sessions_answered_no_at_the_prompt_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "_ask", lambda *a, **k: "n")
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 0
+
+
+# --------------------------------------------------------------------------------------
+# A git failure is never a traceback.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_unhandled_git_failure_is_a_message_not_a_traceback(monkeypatch, capsys):
+    """Every command guards the ``GitRepo.discover()`` that OPENS the repository, but nothing
+    guarded the git commands that follow — and git can fail long after discovery succeeds. On a
+    Windows box with neither ``core.longpaths`` nor the OS long-path opt-in, a repository whose
+    path passes MAX_PATH opens fine and then fails on the first read of ``.git/packed-refs``:
+    ``agitrack --repo <deep path> -d text`` printed a raw traceback ending in
+    ``agitrack.git.repo.GitError: … fatal: couldn't read .git/packed-refs: Filename too long``."""
+    from agitrack.git import GitError
+
+    def _explode(argv=None):
+        raise GitError("Command failed: git for-each-ref\nfatal: couldn't read .git/packed-refs: Filename too long")
+
+    monkeypatch.setattr(cli, "_dispatch", _explode)
+
+    assert cli.main(["-d", "text"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Filename too long" in out
+    assert "Traceback" not in out
+    # ...and on Windows, where this has a cause aGiTrack can name, it names the two things that
+    # actually fix it. `core.longpaths` is a Windows-only git setting and ENAMETOOLONG elsewhere
+    # is the filesystem's own far larger limit, so the advice is deliberately not offered there.
+    assert ("core.longpaths" in out and "MAX_PATH" in out) is (sys.platform == "win32")
+
+
+def test_an_ordinary_git_failure_gets_no_long_path_advice(monkeypatch, capsys):
+    """The hint is only right for one cause. Offering `core.longpaths` for an unrelated git
+    error would send the user to change a setting that has nothing to do with it."""
+    from agitrack.git import GitError
+
+    monkeypatch.setattr(cli, "_dispatch", lambda argv=None: (_ for _ in ()).throw(GitError("fatal: bad object HEAD")))
+
+    assert cli.main(["-s"]) == 1
+
+    out = capsys.readouterr().out
+    assert "bad object HEAD" in out
+    assert "core.longpaths" not in out
