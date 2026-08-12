@@ -85,6 +85,14 @@ def _live_background_pid(repo: GitRepo) -> int | None:
     return None
 
 
+def background_tracker_is_running(repo: GitRepo) -> bool:
+    """Whether a background tracker is alive on this repo. Public because the Claude session
+    hook asks it on every session start: the note it prints ("aGiTrack commits for you") is
+    only TRUE while a tracker is running, so a hook left behind by a daemon that was killed
+    rather than stopped must stay silent instead of misleading the agent."""
+    return _live_background_pid(repo) is not None
+
+
 def background_status(repo: GitRepo) -> int:
     """Report whether a background tracker is running on this repo (`agitrack -b status`)."""
     pid = _live_background_pid(repo)
@@ -108,12 +116,27 @@ def stop_background(repo: GitRepo) -> int:
     pid = _live_background_pid(repo)
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
+        _clear_commit_guidance(repo)  # a tracker that died without tearing down may have left it
         return 0
     if not _terminate_and_wait(pid):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
         return 1
+    # Also from HERE, not only from the daemon's own teardown: Windows has no SIGTERM
+    # delivery, so `-b stop` calls TerminateProcess and the daemon's finally block never runs.
+    # The stopping process knows the repo, so it can do the cleanup the killed one could not —
+    # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
+    _clear_commit_guidance(repo)
     print("Stopped the aGiTrack background tracker.")
     return 0
+
+
+def _clear_commit_guidance(repo: GitRepo) -> None:
+    try:
+        from agitrack.backends import claude_settings
+
+        claude_settings.remove_commit_guidance_hook(repo.repo)
+    except Exception:
+        pass
 
 
 def handshake_is_manual(info: dict | None) -> bool:
@@ -536,6 +559,7 @@ class BackgroundRunner:
         backend: str | None = None,
         new_session: bool = False,
         manual_commits: bool = False,  # background defaults to AUTO commits (like the interactive TUI)
+        commit_guidance: bool = True,
         backend_command: list[str] | None = None,
         log_file: str | None = None,
         poll_seconds: float | None = None,
@@ -547,6 +571,7 @@ class BackgroundRunner:
         self.base_repo = repo  # background mode is always no-worktree
         self.verbose = verbose
         self._manual_commits = manual_commits
+        self._commit_guidance = commit_guidance
         self._backend_command = list(backend_command or [])
         self.events = EventLog(resolve_log_path(log_file, repo.repo))
         self._poll_seconds = poll_seconds if poll_seconds is not None else self.POLL_SECONDS
@@ -664,6 +689,7 @@ class BackgroundRunner:
                 "changes are no longer uncommitted, so they had nothing left to attribute."
             )
         self._install_autotrack_hook()
+        self._install_commit_guidance()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
@@ -744,6 +770,11 @@ class BackgroundRunner:
             except Exception as error:
                 self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
+        # Kept across an update restart: the replacement daemon takes over immediately, and
+        # removing then reinstalling would leave a window where a session starting mid-swap
+        # gets no note at all.
+        if not restarting:
+            self._remove_commit_guidance()
         self._remove_handshake()
         from agitrack import daemons
 
@@ -873,6 +904,40 @@ class BackgroundRunner:
             )
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")
+
+    def _install_commit_guidance(self) -> None:
+        """Tell the agent that aGiTrack commits for it — the thing proxy mode does with
+        ``--append-system-prompt`` and background mode cannot, because it never spawns the
+        agent. Claude Code is the only backend with a channel for it that does not touch the
+        user's source tree (see backends/claude_settings.py), so the others are simply left
+        alone rather than given a half-measure.
+
+        Skipped when the user opted out with ``--no-commit-guidance``: that flag means "do
+        not tell the agent what to do about commits", and which mechanism carries the note is
+        an implementation detail the flag should not have to know about.
+
+        UNLIKE THE AUTOTRACK HOOK, this one IS removed on teardown. That hook exists to keep
+        tracking working while aGiTrack is NOT running; this one would be a lie in the same
+        situation — with no tracker watching, nothing is committing for the agent and it
+        should behave normally again."""
+        if not self._commit_guidance or self.state.backend != "claude":
+            return
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.install_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook installed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook install failed: {error!r}")
+
+    def _remove_commit_guidance(self) -> None:
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.remove_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook removed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook removal failed: {error!r}")
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):
