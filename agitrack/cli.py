@@ -148,7 +148,30 @@ def _ensure_git_identity() -> None:
         print("git identity is still incomplete; aGiTrack's commits may fail until name and email are set.")
 
 
+def _make_console_output_lossy() -> None:
+    """Never let an unencodable character turn console output into a crash.
+
+    ``agitrack --help`` died with a UnicodeEncodeError on a cp1252 console because one help
+    string contained ``↔`` (#233). The character is gone and a test keeps the help text
+    encodable, but the class of bug is wider than the help text: a repo path, a branch name,
+    a backend's error or a commit subject can all carry something the console's legacy code
+    page cannot represent, and none of those are ours to sanitize. Degrading to ``?`` for one
+    glyph is always better than losing the whole message and the exit code with it.
+
+    Best-effort by design: under pytest's capture (and anywhere else stdout is not a real
+    ``TextIOWrapper``) there is nothing to reconfigure, and that is fine."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) in ("replace", "backslashreplace"):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # a stream that refuses; keep the original behaviour
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_console_output_lossy()
     parser = argparse.ArgumentParser(
         description="Interactive agent + git commit orchestration.",
         add_help=False,
@@ -227,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{backend_phrase()} transcripts alone — even if you have never used aGiTrack here, and even if "
         "the directory is not a git repo. It reads the sessions that ran in this directory (or a "
         "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
-        "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
+        "models, lines changed, and the full user-agent trace behind each change) marked clearly as "
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
         "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
         "(it keeps running, surviving this terminal, until `--backtrace stop`); `status` reports it; "
