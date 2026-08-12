@@ -460,6 +460,16 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--claude-session-note",
+        action="store_true",
+        # Internal: the body of the Claude Code SessionStart hook that background mode
+        # installs (backends/claude_settings.py). Prints the commit-guidance note in the
+        # hook's JSON envelope, so the agent knows aGiTrack commits for it even though
+        # aGiTrack never spawned it and could not pass --append-system-prompt. Called by
+        # Claude Code, not by hand.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dashboard-serve",
         action="store_true",
         # Internal: run the metrics dashboard HTTP server in the foreground (this
@@ -535,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.help:
         parser.print_help()
         return 0
+
+    # The Claude Code hook body. Answered before ANY repo discovery, config load or privacy
+    # prompt: this runs on every Claude session start in a tracked repo, so it must be cheap
+    # and must never prompt — a hook that blocks would hang the user's agent.
+    if args.claude_session_note:
+        from agitrack.backends.claude_settings import print_session_note
+
+        return print_session_note()
 
     # Print the version and exit. Kept simple and side-effect-free (no repo
     # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
@@ -1057,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
                     backend=args.backend,
                     new_session=args.new_session,
                     manual_commits=manual_commits,
+                    commit_guidance=commit_guidance,
                     backend_command=backend_command,
                     log_file=log_file_spec,
                     _lock=management_lock,
@@ -1078,6 +1097,11 @@ def main(argv: list[str] | None = None) -> int:
             child_args.append("--manual-commits" if manual_commits else "--auto-commit")
             if args.new_session:
                 child_args.append("--new-session")
+            # Same reasoning as the commit mode above: the opt-out is a property of THIS
+            # invocation, and the daemon is the process that installs the guidance hook, so it
+            # has to be told rather than left to re-derive it from a config that may differ.
+            if not commit_guidance:
+                child_args.append("--no-commit-guidance")
             if args.verbose:
                 child_args.append("--verbose")
             if args.backend_command:

@@ -238,6 +238,8 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |
 | Daemon / proxy write a user event log (`--log-file` / `log_file`): daemon-start, ai-change-detected, commit | `test_background_writes_event_log`, `tests/test_events.py::*` | real-git + unit |
 | `agitrack --status` / `-s` reports the running mode (background / interactive / not running; auto/manual; worktree/no-worktree) | `test_repo_status_reports_each_mode`, `test_proxy_status_write_and_clear` | real-git |
+| Commit guidance in `-b`: the daemon installs a Claude Code SessionStart hook into `.claude/settings.local.json` (the note proxy mode passes with `--append-system-prompt`, which has no spawn to attach to here) and removes it on stop; `--no-commit-guidance` installs nothing; a non-Claude backend is left alone; every part of the hook command is quoted so a Windows path survives the shell Claude runs hooks through; the hook stays silent when no tracker is running | `test_the_daemon_installs_and_removes_the_commit_guidance_hook`, `test_no_commit_guidance_installs_nothing`, `test_a_non_claude_backend_is_left_alone`, `tests/test_claude_settings.py::*` | real-git + unit |
+| The user's own `.claude/settings.local.json` survives install and removal: other hooks and settings kept, unparsable JSON never rewritten, no empty file or directory left behind | `test_install_keeps_every_other_setting_and_hook`, `_a_settings_file_that_is_not_json_is_never_touched`, `_remove_leaves_no_litter_in_a_repo_that_had_no_claude_dir` | unit |
 
 ## 9c. Persistent auto-track pre-commit hook (remind / auto-start on commit)
 | Sequence | Test(s) | Kind |

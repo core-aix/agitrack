@@ -1820,3 +1820,58 @@ def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
 
     assert repo.ref_sha(runner._manual.ref()) in (None, repo.rev_parse("HEAD"))
     assert runner._manual.pending_count() == 0
+
+
+# --- commit guidance in background mode -------------------------------------
+
+
+def _guidance_runner(tmp_path, *, backend="claude", guidance=True):
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend=backend)
+    gc = GlobalConfig(path=tmp_path / "gc.json")
+    runner = BackgroundRunner(repo, commit_guidance=guidance, _global_config=gc, _state=state)
+    runner.backend = FakeBackend()
+    return runner, repo
+
+
+def test_the_daemon_installs_and_removes_the_commit_guidance_hook(tmp_path):
+    """The -b answer to "why did the agent commit that itself?".
+
+    Proxy mode tells the agent aGiTrack is committing for it with
+    --append-system-prompt. Background mode never spawns the agent, so the note has to
+    reach it another way; Claude Code's SessionStart hook is that way. It is REMOVED on
+    teardown, unlike the auto-track hook: with no tracker running, nothing is committing
+    for the agent and the note would be false.
+    """
+    from agitrack.backends import claude_settings
+
+    runner, repo = _guidance_runner(tmp_path)
+
+    runner._install_commit_guidance()
+    assert claude_settings.hook_is_installed(repo.repo) is True
+
+    runner._remove_commit_guidance()
+    assert claude_settings.hook_is_installed(repo.repo) is False
+
+
+def test_no_commit_guidance_installs_nothing(tmp_path):
+    # The flag means "do not tell the agent what to do about commits" — which mechanism
+    # carries the note is an implementation detail it should not have to know about.
+    from agitrack.backends import claude_settings
+
+    runner, repo = _guidance_runner(tmp_path, guidance=False)
+
+    runner._install_commit_guidance()
+
+    assert claude_settings.hook_is_installed(repo.repo) is False
+
+
+def test_a_non_claude_backend_is_left_alone(tmp_path):
+    # Codex's only lever REPLACES its base instructions and OpenCode's CLI has none at all,
+    # so neither gets a half-measure — and neither gets a stray .claude/ directory either.
+    runner, repo = _guidance_runner(tmp_path, backend="opencode")
+    runner.state.backend = "opencode"
+
+    runner._install_commit_guidance()
+
+    assert not (tmp_path / ".claude").exists()
