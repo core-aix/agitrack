@@ -1453,10 +1453,12 @@ def test_repo_status_reports_each_mode(tmp_path, capsys):
     agit = repo.repo / ".agitrack"
     agit.mkdir(exist_ok=True)
 
-    # Not running — and it reports the auto-start (autotrack_hook) state.
+    # Not running — and it reports the auto-start (autotrack_hook) state. Not "on commit":
+    # auto-start also fires when an agent turn leaves changes behind, so a status line that
+    # says "on commit" tells the user tracking will wait for something it will not wait for.
     assert bg.repo_status(repo) == 0
     out = capsys.readouterr().out.lower()
-    assert "not running" in out and "auto-start on commit:" in out
+    assert "not running" in out and "auto-start:" in out
 
     # Background daemon (live pid via our own pid) with a manual-commit handshake.
     bg.background_handshake_path(repo).write_text(

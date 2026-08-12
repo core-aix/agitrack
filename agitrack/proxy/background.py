@@ -331,11 +331,11 @@ def repo_status(repo: GitRepo) -> int:
         config = GlobalConfig()
         config.load_repo_overlay(repo.repo)
         if config.autotrack_hook == "off":
-            print("Auto-start on commit: off (`agitrack -b` or Ctrl-G → settings to enable).")
+            print("Auto-start: off (`agitrack -b` or Ctrl-G → settings to enable).")
         else:
             last = read_background_mode(repo)
             mode = "manual-commit" if last else "auto-commit" if last is not None else "last-run"
-            print(f"Auto-start on commit: on ({mode} mode; disable with `agitrack --remove-hooks`).")
+            print(f"Auto-start: on ({mode} mode; on a commit, or when an agent turn leaves changes).")
     except Exception:
         pass
     reminder = update_reminder_line(repo.repo)
