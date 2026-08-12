@@ -4,6 +4,7 @@ import json
 import sys
 
 from agitrack.commits import AgitrackActions
+from agitrack.console import stdin_is_interactive
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agitrack.backends import headless_backends
 from agitrack.git import GitRepo
@@ -87,7 +88,7 @@ class AgitrackShell:
         self.prompts = list(prompts) if prompts is not None else None
         # Bridge mode is interactive even though stdin isn't a TTY — questions are
         # answered by the editor over the bridge rather than by a terminal user.
-        self.interactive = self._ui_bridge or (self.prompts is None and sys.stdin.isatty())
+        self.interactive = self._ui_bridge or (self.prompts is None and stdin_is_interactive())
         self.global_config = GlobalConfig()
         # An explicit --backend seeds the state's default so a brand-new repo (no stored
         # backend) resolves to it rather than to the configured default, which may be unset
