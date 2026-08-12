@@ -175,10 +175,20 @@ def reap_daemon_pids(pids) -> int:
                 os.kill(pid, 0)
             except OSError:
                 break
-        try:  # reap the zombie if it was our child
-            os.waitpid(pid, os.WNOHANG)
-        except (OSError, ChildProcessError):
-            pass
+        # Reap the zombie if it was our child. POSIX only: `os.WNOHANG` does not exist on
+        # Windows, and there are no zombies there — a terminated process is gone once its
+        # handles close. Guarded with hasattr rather than caught, because AttributeError is
+        # raised while building the ARGUMENTS, so the `except (OSError, ChildProcessError)`
+        # below never saw it: every Windows run raised out of this loop on the FIRST pid,
+        # leaving every daemon after it alive (the 60-alive-on-Windows leak this function
+        # exists to fix), and taking the session-teardown fixture down with it — which is
+        # what made whole runs end without a summary and their coverage totals swing by ten
+        # points between identical runs.
+        if hasattr(os, "WNOHANG"):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except (OSError, ChildProcessError):
+                pass
     return killed
 
 
