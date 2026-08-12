@@ -12,6 +12,7 @@ from agitrack.backends.setup import backend_installed, select_default_backend, s
 from agitrack.backends.proxy_agents import available_backends, backend_phrase
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+from agitrack.console import stdin_is_interactive, stdout_is_interactive
 from agitrack.config import GlobalConfig, settings
 from agitrack.shell import AgitrackShell
 
@@ -91,7 +92,7 @@ def _maybe_install_tool(name: str, *, required: bool) -> bool:
     installer, not by aGiTrack at runtime. A pip/source install still offers it (any OS)."""
     if _installed_via_msi():
         return False
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (stdin_is_interactive() and stdout_is_interactive()):
         return False
     from agitrack.system_tools import can_install_tool, install_system_tool
 
@@ -181,6 +182,44 @@ def _make_console_output_lossy() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Turns an unhandled ``GitError`` into a message and exit 1.
+
+    Every command guards the ``GitRepo.discover()`` that OPENS the repository, but nothing
+    guarded the git commands that follow, and git can fail long after discovery succeeds. The
+    reproducible case is Windows: on a box with neither ``core.longpaths`` nor the OS long-path
+    opt-in, a repository whose path passes MAX_PATH opens fine and then fails on the first read
+    of ``.git/packed-refs`` — ``agitrack --repo <deep path> -d text`` printed a raw traceback
+    (``fatal: couldn't read .git/packed-refs: Filename too long``) rather than saying so. A
+    traceback is never the right answer to "git could not do that", whatever the cause."""
+    try:
+        return _dispatch(argv)
+    except GitError as error:
+        print(error)  # _dispatch made the console lossy on its first line, so this cannot crash
+        if _looks_like_a_long_path_failure(str(error)):
+            print(
+                "\nThis is Windows' MAX_PATH limit: git cannot reach a file whose path is longer\n"
+                "than 260 characters. aGiTrack cannot fix it for you — the setting is git's and\n"
+                "the OS's — but either of these does:\n"
+                "  git config --global core.longpaths true\n"
+                "  ...or move the repository somewhere with a shorter path."
+            )
+        return 1
+
+
+def _looks_like_a_long_path_failure(message: str) -> bool:
+    """Whether a git failure is really Windows' MAX_PATH limit. git says "Filename too long";
+    the OS error underneath is ``ENAMETOOLONG``. Both spellings are matched because the message
+    reaches us from git's stderr in one case and from Python in the other.
+
+    Windows only: ``core.longpaths`` is a Windows-only git setting, and ENAMETOOLONG elsewhere
+    is the filesystem's own (much larger) limit, which that advice would not fix."""
+    if sys.platform != "win32":
+        return False
+    lowered = message.lower()
+    return "filename too long" in lowered or "enametoolong" in lowered
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     _make_console_output_lossy()
     parser = argparse.ArgumentParser(
         # `prog` explicitly, or Python 3.14 on Windows derives it from sys.argv[0] and the usage
@@ -651,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
         for info in doomed:
             print(f"  {info.pid:>7}  {info.function:<20}  {_abbreviate_home(info.repo)}")
         if not args.yes:
-            if not sys.stdin.isatty():
+            if not stdin_is_interactive():
                 # Previously the confirmation was simply skipped without a tty, so a script or CI
                 # job silently killed every daemon on the machine — including the developer's own
                 # live session — while `--daemons list` still advertised "(lists them and asks
@@ -1061,7 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
     # fails with "Author identity unknown", and aGiTrack commits each turn. Prompt for any
     # missing value on an interactive launch; the MSI bundle defers this to the installer,
     # and scripted/json runs are left clean (those users have git configured).
-    if args.mode == "proxy" and not _installed_via_msi() and sys.stdin.isatty() and sys.stdout.isatty():
+    if args.mode == "proxy" and not _installed_via_msi() and stdin_is_interactive() and stdout_is_interactive():
         _ensure_git_identity()
 
     # Make the global config self-documenting: write any settings still missing from
@@ -1075,7 +1114,7 @@ def main(argv: list[str] | None = None) -> int:
     # runs (no way to answer) and when the user turned update checks off. If the
     # user accepts, aGiTrack updates and re-execs immediately — no sessions are
     # running yet at startup, so there is nothing to finalize first.
-    if not scripted and sys.stdin.isatty() and sys.stdout.isatty():
+    if not scripted and stdin_is_interactive() and stdout_is_interactive():
         _check_for_update_at_startup(config)
 
     # First-run backend setup. Runs whenever no default backend is configured (and one wasn't
@@ -1090,8 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
         and not config.has_default_backend()
         and not scripted
         and not _installed_via_msi()
-        and sys.stdin.isatty()
-        and sys.stdout.isatty()
+        and stdin_is_interactive()
+        and stdout_is_interactive()
     ):
         chosen_backend = select_default_backend(config)
         # First run also picks the default summarizer model, saved to the global config.
@@ -1437,7 +1476,7 @@ def _confirm_backend_command_mismatch(backend: str, backend_command: list[str], 
         f"that runs a different backend will break session/transcript tracking. Pass "
         f"--backend {others[0]} (or set default_backend) if that's what you meant."
     )
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return True  # can't prompt here; proceed with the warning rather than hang automation
     try:
         # _ask drains injected input first so a stray newline can't auto-confirm (same
@@ -1621,7 +1660,7 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False, 
     if skip:
         return True
     print(_privacy_warning(), file=stream or sys.stdout)
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return True
     # _ask discards anything already sitting in the terminal's input queue before reading, so
     # a stray newline can't auto-acknowledge this. Editors that host aGiTrack in a terminal
@@ -1648,7 +1687,7 @@ def _offer_backtrace_for_untracked_repo(repo: GitRepo, *, scripted: bool = False
     through aGiTrack the condition is false forever after. Never blocks automation (no TTY or
     scripted ⇒ silent), and never blocks startup: declining just continues into the TUI.
     """
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return False
     from agitrack.metrics.suggest import STARTUP_HINT, should_show_backtrace
 
@@ -1690,7 +1729,7 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     own in-TUI gh notice. Never blocks automation — without an interactive TTY (or in
     scripted mode) it does nothing and returns ``(True, False)``. The MSI bundle also does
     nothing — gh setup/login there is the installer's job; a pip/source install still does it."""
-    if _installed_via_msi() or scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if _installed_via_msi() or scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return (True, False)
     from agitrack.metrics.github import commit_url_base, gh_status
 
@@ -1759,7 +1798,7 @@ def _confirm_bulk_share(repo: "GitRepo", *, overwrite: bool, assume_yes: bool = 
     print("\n".join(notice))
     if assume_yes:
         return True
-    if not sys.stdin.isatty():
+    if not stdin_is_interactive():
         print("\nNot sharing: there is no terminal to confirm on. Re-run with --yes to share anyway.")
         return False
     try:
@@ -1855,7 +1894,7 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool, backe
     never be written is worse than saying nothing: it describes an install that does not happen,
     and it hides the limitation that actually applies to them — nothing is picked up until they
     commit."""
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return
     try:
         # Skip only when auto-start is ALREADY enabled for this repo (an explicit repo-scoped
@@ -1922,7 +1961,7 @@ def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:
     Returns True to proceed, False to abort. A changed key is persisted to the global
     config (which the runner re-reads). Never blocks automation — without an interactive
     TTY, or in scripted mode, it does nothing and returns True."""
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
         return True
     key = config.menu_key
     conflict = settings.detect_menu_key_conflict(key, os.environ)
@@ -2165,7 +2204,7 @@ def _discover_or_init(path: Path) -> GitRepo | None:
         return repo
     except GitError:
         pass
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not (stdin_is_interactive() and stdout_is_interactive()):
         print(f"Not a Git repository: {path}\naGiTrack requires a Git repository to run.")
         return None
     try:

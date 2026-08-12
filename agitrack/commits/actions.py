@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from typing import Protocol
 
 from agitrack.commits.message import build_user_commit_message
@@ -37,6 +39,7 @@ class AgitrackActions:
         verbose: bool = False,
         interactive: bool = True,
         ui: InteractiveUI | None = None,
+        human_stream=None,
     ) -> None:
         self.repo = repo
         self.state = state
@@ -48,6 +51,16 @@ class AgitrackActions:
         # editor as menus/popups instead of the terminal. A BridgeUI-shaped object
         # exposing select/multiselect/text/confirm/info; None keeps terminal I/O.
         self.ui = ui
+        # WHERE PROSE GOES. Under --json-events stdout carries one JSON object per line and
+        # nothing else, so these notices ("Staged untracked files: …", "Created user commit.")
+        # have to follow the shell's own prose stream rather than being printed straight to
+        # stdout — one of them landing there is enough to break a driver's json.loads(line).
+        self._out = human_stream if human_stream is not None else sys.stdout
+
+    def _say(self, *args, **kwargs) -> None:
+        """print() onto this run's prose stream (stdout normally, stderr under --json-events)."""
+        kwargs.setdefault("file", self._out)
+        print(*args, **kwargs)
 
     def _staged_paths(self) -> list[str]:
         """The staged files this commit would contain, for showing before the message
@@ -85,7 +98,7 @@ class AgitrackActions:
         self.review_untracked(include_declined=False)
         if not self.repo.has_staged_changes():
             if self.verbose:
-                print("No staged user changes to commit.")
+                self._say("No staged user changes to commit.")
             restore_index()
             return False
         # Show WHAT is about to be committed before asking for a message: the answer is a
@@ -123,8 +136,8 @@ class AgitrackActions:
         else:
             message = "" if self.interactive else "Save user changes"
             if self.interactive and staged:
-                print(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
-                print(listing)
+                self._say(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
+                self._say(listing)
             # An explicit word, not an empty line, is the way out. Empty deliberately re-prompts
             # (a stray Enter must never be read as "don't commit my work"), so without a
             # sentinel this loop had no exit at all — which is how a --no-worktree start became
@@ -136,22 +149,22 @@ class AgitrackActions:
                 try:
                     message = input(prompt)
                 except (EOFError, KeyboardInterrupt):
-                    print()  # no usable stdin, or interrupted: end cleanly rather than spinning
+                    self._say()  # no usable stdin, or interrupted: end cleanly rather than spinning
                     restore_index()
                     return False
                 if allow_skip and message.strip().lower() == _SKIP_WORD:
-                    print("Continuing without committing.")
+                    self._say("Continuing without committing.")
                     restore_index()
                     return False
                 if not message.strip():
-                    print(
+                    self._say(
                         "User commit message is required."
                         if allow_skip
                         else f"User commit message is required — {skip_hint}."
                     )
         self.repo.commit(build_user_commit_message(message=message, agitrack_session_id=self.state.session_id))
         self.state.clear_trace()
-        print("Created user commit.")
+        self._say("Created user commit.")
         return True
 
     def create_agent_commit_from_turns(
@@ -176,7 +189,7 @@ class AgitrackActions:
 
         def on_commit_fn(sha, _trace, _is_cover):
             if not quiet:
-                print("Created <aGiTrack> commit.")
+                self._say("Created <aGiTrack> commit.")
 
         # Imported lazily: agitrack.proxy's package __init__ imports runner, which
         # imports this module — a top-level import here is circular and breaks
@@ -209,12 +222,12 @@ class AgitrackActions:
             # agent's work instead of silently dropping it.
             self.repo.stage_paths(candidates)
             self.state.remove_declined(candidates)
-            print("Staged untracked files: " + ", ".join(candidates))
+            self._say("Staged untracked files: " + ", ".join(candidates))
             return
 
-        print("Untracked files:")
+        self._say("Untracked files:")
         for index, path in enumerate(candidates, start=1):
-            print(f"  {index}. {path}")
+            self._say(f"  {index}. {path}")
         answer = input("Stage untracked files? [y/N/select]: ").strip().lower()
         if answer in {"y", "yes"}:
             self.repo.stage_paths(candidates)

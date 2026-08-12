@@ -221,19 +221,34 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
     if not hooks:
         data.pop("hooks", None)
     try:
-        # The snapshot first: our hooks are out, so if what remains is what the user had, give
-        # them their own bytes back rather than aGiTrack's reformatting of them. While our OTHER
-        # hook is still installed the two differ and this falls through — the restore happens
-        # when the last one goes.
-        if _restore_original(path, data):
-            pass
-        elif data:
-            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        if data:
+            # Put the user's OWN FORMATTING back when what remains is their file again.
+            #
+            # aGiTrack rewrites this file with its own canonical `json.dumps(indent=2)`. On a repo
+            # that TRACKS settings.local.json that reformatting is a real, permanent diff: after
+            # `-b stop` removed every aGiTrack entry, `git status` still showed
+            # ` M .claude/settings.local.json` — the file re-indented and never restored — so the
+            # user was left holding a change they never made, forever. Measured on this exact
+            # case: bytes differ, JSON identical.
+            #
+            # TWO SOURCES, git first. `git checkout` is the better restore where it applies: it
+            # writes what a checkout would write (eol conversion, index refresh) rather than raw
+            # bytes. But it can only reach a file that is COMMITTED and unmodified-since — and
+            # aGiTrack is just as much a guest in a settings file that is git-ignored (the common
+            # case, which git cannot restore at all) or that already carried an uncommitted edit
+            # when aGiTrack arrived (where checkout would be the wrong content). The snapshot
+            # taken at install time covers exactly those, so it is the fallback rather than a
+            # second mechanism competing with the first.
+            if _restore_committed_bytes(path, data):
+                _discard_original(path)  # git got there first; the snapshot has nothing left to do
+            elif not _restore_original(path, data):
+                path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         elif _is_tracked_by_git(path):
             # Emptied but COMMITTED: some repos do track this file. Deleting it would show up
             # as a staged-able deletion of the user's own file, which is a far worse trace to
             # leave than an empty object.
             path.write_text("{}\n", encoding="utf-8")
+            _discard_original(path)
         else:
             # The file existed only to carry our hook: remove it, and the directory too when
             # it was ours alone. Claude Code recreates either on demand.
@@ -248,6 +263,78 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
             debug(f"could not update claude settings at {path}: {error!r}")
         return False
     return True
+
+
+def _restore_committed_bytes(path: Path, data: dict) -> bool:
+    """Put ``path`` back to its COMMITTED content when ``data`` is semantically identical to it.
+    Returns True when that happened.
+
+    This is what makes hook removal a true no-op on a repo that tracks the file: aGiTrack's own
+    formatting is undone, not merely its entries. Deliberately conservative — the file is
+    restored ONLY when the remaining JSON parses equal to the committed JSON, so a user edit made
+    since that commit is never reverted (in that case the caller falls back to writing our own
+    formatting, which is the best we can do).
+
+    ``git checkout`` does the writing, rather than us writing the blob's bytes ourselves, because
+    the blob is not what belongs in the working tree. Under ``core.autocrlf`` / ``core.eol`` /
+    an ``eol=`` attribute — the default on Git for Windows — git stores LF and checks out CRLF,
+    so writing the blob verbatim leaves a file whose CONTENT hashes identically to HEAD (``git
+    diff`` is empty) while ``git status`` still reports ` M`, because the bytes are not the ones
+    a checkout would produce. That is the very "a diff the user never made" this function exists
+    to prevent, just moved one layer down. Letting git write it applies whatever conversion this
+    repo is configured for, on every platform. The byte-writing fallback is kept for the case
+    where checkout itself fails."""
+    committed = _committed_text(path)
+    if committed is None:
+        return False
+    try:
+        if json.loads(committed) != data:
+            return False
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not _git_checkout_file(path):
+        path.write_text(committed, encoding="utf-8", newline="")
+    return True
+
+
+def _git_checkout_file(path: Path) -> bool:
+    """``git checkout HEAD -- <path>``: restore the file exactly as a checkout would write it.
+    Safe here only because the caller has already proved the remaining JSON equals the committed
+    JSON, so there is nothing of the user's left to discard."""
+    import subprocess
+
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+
+    try:
+        result = subprocess.run(
+            ["git", "checkout", "HEAD", "--", f"./{path.name}"],
+            cwd=path.parent,
+            capture_output=True,
+            **UTF8_TEXT,
+            **console_isolation_kwargs(),
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _committed_text(path: Path) -> str | None:
+    """``git show HEAD:<path>`` for this file, or None when it is untracked/unreadable."""
+    import subprocess
+
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:./{path.name}"],
+            cwd=path.parent,
+            capture_output=True,
+            **UTF8_TEXT,
+            **console_isolation_kwargs(),
+        )
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def _is_tracked_by_git(path: Path) -> bool:

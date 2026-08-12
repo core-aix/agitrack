@@ -414,8 +414,12 @@ def test_a_backend_installed_off_path_is_found(tmp_path, monkeypatch):
 
     bindir = tmp_path / "offpath-bin"
     bindir.mkdir()
-    shim = bindir / "claude"
-    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    # The shim has to be one the HOST can actually launch, because that is exactly what
+    # detection checks: `which_executable` deliberately ignores an extensionless file on
+    # Windows (a half-installed npm package leaves one, and CreateProcess cannot run it), so a
+    # bare `claude` here made the test assert the opposite of the behaviour it is guarding.
+    shim = bindir / ("claude.cmd" if os.name == "nt" else "claude")
+    shim.write_text("@exit /b 0\n" if os.name == "nt" else "#!/bin/sh\nexit 0\n", encoding="utf-8")
     shim.chmod(0o755)
 
     monkeypatch.setenv("PATH", "/nonexistent")
