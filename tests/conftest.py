@@ -7,6 +7,8 @@ for convenience.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +26,42 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from proxy_helpers import make_runner as _make_runner  # noqa: E402,F401 – re-exported below
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _keep_console_windows_off_the_desktop():
+    """Windows: stop the SUITE's own subprocesses from flashing console windows.
+
+    These tests are real-git by policy, so a full run spawns git a few thousand times. Under a
+    console-less parent — a CI runner, or any harness that pipes the output — Windows gives
+    every one of those children a console window of its own, and running the tests carpet-bombs
+    the desktop with windows that appear and vanish. Product code avoids this with
+    ``proc.console_isolation_kwargs()``; 200-odd direct spawns across the suite's own helpers
+    cannot each be relied on to remember, so it is patched in once, here, at the one place they
+    all pass through.
+
+    This does NOT paper over a missing flag in PRODUCT code: that is enforced separately and
+    statically by ``tests/test_console_isolation.py``, which reads the source rather than the
+    runtime, so a product spawn that forgets still fails the suite.
+    """
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name != "nt" or not no_window:
+        yield
+        return
+    original_init = subprocess.Popen.__init__
+
+    def _init(self, *args, **kwargs):
+        # Only when the caller expressed no preference: a spawn that sets creationflags or
+        # startupinfo (detach_kwargs, the console-sharing self-update re-exec) means it.
+        if not kwargs.get("creationflags") and not kwargs.get("startupinfo"):
+            kwargs["creationflags"] = no_window
+        return original_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _init
+    try:
+        yield
+    finally:
+        subprocess.Popen.__init__ = original_init
 
 
 @pytest.fixture(autouse=True)

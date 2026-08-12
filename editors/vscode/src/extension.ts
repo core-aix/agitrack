@@ -172,6 +172,10 @@ function runRecovery(folderPath: string, opts: { detached: boolean }): void {
     const child = spawn(configuredExe(), ["--repo", folderPath, "--recover"], {
       detached: opts.detached,
       stdio: "ignore",
+      // The extension host is a GUI process with no console, so on Windows every console
+      // child it starts gets a console WINDOW unless this says otherwise - a black box that
+      // appears and vanishes on the user's desktop for each probe or recovery run.
+      windowsHide: true,
     });
     child.on("error", () => undefined); // not installed / not runnable — nothing to do
     if (opts.detached) {
@@ -219,7 +223,7 @@ async function signalAndWait(folderPath: string, timeoutMs: number): Promise<voi
     // Last resort on Windows: nothing acknowledged the sentinel in time, and there's no
     // graceful signal to fall back on — force-terminate so the lock is freed.
     try {
-      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }).unref();
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).unref();
     } catch {
       // already gone
     }
@@ -1185,7 +1189,7 @@ async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
  * covers the UAC wait plus the install. */
 function runMsiInstaller(msiPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile("msiexec", ["/i", msiPath, "/passive", "/norestart"], { timeout: 600_000 }, (err) => {
+    execFile("msiexec", ["/i", msiPath, "/passive", "/norestart"], { timeout: 600_000, windowsHide: true }, (err) => {
       const code = (err as { code?: number } | null)?.code;
       if (!err || code === 3010) {
         resolve();
@@ -1381,7 +1385,7 @@ function execCapture(cmd: string, args: string[], timeout: number): Promise<stri
 /** As `execCapture`, but run in `cwd` (used for repo-scoped probes like `git remote -v`). */
 function execCaptureIn(cmd: string, args: string[], cwd: string | undefined, timeout: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout, cwd }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout, cwd, windowsHide: true }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(((stderr || "") + (err.message || "")).trim() || "command failed"));
       } else {
