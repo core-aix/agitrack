@@ -231,6 +231,88 @@ def test_the_autostart_hook_command_is_quoted_too(monkeypatch):
     assert command == r'"C:\Users\dev\python.exe" "-m" "agitrack" "--autostart-on-change"'
 
 
+def test_removal_gives_an_UNTRACKED_settings_file_its_own_bytes_back(tmp_path):
+    """The half `git checkout` cannot reach.
+
+    ``_restore_committed_bytes`` restores a file git has a commit of, which is the case that
+    shows up in `git status`. But `.local` says most repos ignore this file, and aGiTrack is
+    just as much a guest in one git will never restore — there its reformatting simply stays
+    forever. The install-time snapshot covers those, and this is a directory with no git at all.
+    """
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write", "Edit"], "defaultMode": "acceptEdits"}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+    assert path.read_text(encoding="utf-8") != original  # the hook really did go in
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+
+def test_the_bytes_come_back_only_after_the_LAST_hook_is_removed(tmp_path):
+    """The two hooks have different lifetimes; the daemon takes the session note away on
+    teardown while the auto-start hook stays. Restoring the original then would delete a
+    hook that is supposed to outlive the daemon."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{"permissions": {"allow": ["Write"]}}\n'
+    path.write_text(original, encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+    claude_settings.install_commit_guidance_hook(tmp_path)
+
+    claude_settings.remove_commit_guidance_hook(tmp_path)
+
+    assert claude_settings.hook_is_installed(tmp_path, claude_settings.AUTOSTART_HOOK) is True
+    assert path.read_text(encoding="utf-8") != original
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_an_edit_the_user_made_meanwhile_wins_over_the_snapshot(tmp_path):
+    """The snapshot is how the file LOOKED when aGiTrack arrived, not a licence to roll the
+    user back. A setting added while the tracker ran must survive stopping it."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"permissions": {"allow": ["Write"]}}\n', encoding="utf-8")
+    claude_settings.install_autostart_hook(tmp_path)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["permissions"]["allow"].append("Edit")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"permissions": {"allow": ["Write", "Edit"]}}
+
+
+def test_the_snapshot_lives_in_the_self_ignoring_state_dir(tmp_path):
+    """It is aGiTrack's own working state, so it must land in `.agitrack/` — which carries a
+    `.gitignore` of `*` — and never as a stray file in the user's tree."""
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+    assert (tmp_path / ".agitrack" / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+
+
+def test_a_settings_file_agitrack_created_itself_leaves_no_snapshot(tmp_path):
+    """Nothing to restore, so nothing to remember — and the file is deleted outright."""
+    claude_settings.install_autostart_hook(tmp_path)
+
+    assert not (tmp_path / claude_settings.ORIGINAL_RELPATH).exists()
+
+    claude_settings.remove_autostart_hook(tmp_path)
+
+    assert not _settings(tmp_path).exists()
+
+
 def test_removing_our_hook_restores_the_users_own_formatting(tmp_path):
     """D3 (second half): aGiTrack rewrites this file with its own canonical
     `json.dumps(indent=2)`. On a repo that TRACKS settings.local.json that reformatting is a

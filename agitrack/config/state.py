@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agitrack.fileio import atomic_write_text, merge_json_for_save
-from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, fs_path
 
 # The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
 # (see AgitrackState._exclude_path) instead of spawning `git rev-parse` on every save/ensure.
@@ -247,7 +247,7 @@ class AgitrackState:
             return fallback
         if process.returncode != 0:
             return fallback
-        path = Path(process.stdout.strip())
+        path = fs_path(process.stdout.strip())  # git printed UTF-8; see proc.fs_path
         return path if path.is_absolute() else self.repo / path
 
     @property

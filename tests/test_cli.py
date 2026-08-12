@@ -1825,6 +1825,29 @@ def test_a_required_tool_install_still_defaults_to_yes(monkeypatch):
     assert installed == ["git"]
 
 
+def _fake_repo(tmp_path):
+    return type("R", (), {"repo": tmp_path})()
+
+
+def test_share_sessions_without_a_terminal_refuses_and_says_so_in_its_exit_code(tmp_path, monkeypatch, capsys):
+    """A CI job that asked to publish its conversations and got exit 0 back would report
+    success having published nothing. `--daemons stop` already makes this split; the refusal
+    for want of a terminal is an error, the user answering "no" at the prompt is not."""
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 1
+
+    out = capsys.readouterr().out
+    assert "--yes" in out  # and it names the way to do it deliberately
+
+
+def test_share_sessions_answered_no_at_the_prompt_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "_ask", lambda *a, **k: "n")
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 0
+
+
 # --------------------------------------------------------------------------------------
 # A git failure is never a traceback.
 # --------------------------------------------------------------------------------------
