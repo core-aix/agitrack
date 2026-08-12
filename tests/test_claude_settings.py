@@ -203,3 +203,29 @@ def test_a_settings_file_the_repo_TRACKS_is_never_deleted(tmp_path):
             ["git", "status", "--porcelain", "--", str(path)], cwd=tmp_path, capture_output=True, text=True
         ).stdout
     )
+
+
+def test_the_two_hooks_are_independent(tmp_path):
+    """They have different LIFETIMES, which is why they are separate entries.
+
+    The session note is true only while a tracker runs, so the daemon takes it away on
+    teardown. The auto-start hook exists to run when aGiTrack is NOT running, so it has to
+    survive that same teardown — removing one must never take the other with it.
+    """
+    claude_settings.install_commit_guidance_hook(tmp_path)
+    claude_settings.install_autostart_hook(tmp_path)
+
+    claude_settings.remove_commit_guidance_hook(tmp_path)
+
+    assert claude_settings.hook_is_installed(tmp_path, claude_settings.SESSION_NOTE_HOOK) is False
+    assert claude_settings.hook_is_installed(tmp_path, claude_settings.AUTOSTART_HOOK) is True
+    data = json.loads(_settings(tmp_path).read_text(encoding="utf-8"))
+    assert "SessionStart" not in data["hooks"] and data["hooks"]["Stop"]
+
+
+def test_the_autostart_hook_command_is_quoted_too(monkeypatch):
+    monkeypatch.setattr("agitrack.proc.agitrack_invocation", lambda: [r"C:\Users\dev\python.exe", "-m", "agitrack"])
+
+    command = claude_settings.hook_command(claude_settings.AUTOSTART_FLAG)
+
+    assert command == r'"C:\Users\dev\python.exe" "-m" "agitrack" "--autostart-on-change"'

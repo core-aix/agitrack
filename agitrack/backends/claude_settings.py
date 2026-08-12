@@ -34,17 +34,28 @@ import json
 from pathlib import Path
 from typing import Any
 
-# The flag whose presence identifies OUR hook entry. Matching on the command string rather
-# than on a marker key of our own keeps the entry to the shape Claude Code documents — an
+# The flags whose presence identifies OUR hook entries. Matching on the command string rather
+# than on a marker key of our own keeps each entry to the shape Claude Code documents — an
 # unknown key risks being rejected by its settings validation, which would take the user's
 # whole settings file down with it.
 HOOK_FLAG = "--claude-session-note"
+AUTOSTART_FLAG = "--autostart-on-change"
+
+# The two hooks, each as (event, flag). They have DIFFERENT lifetimes, which is the whole
+# reason they are separate entries rather than one:
+#   SessionStart/--claude-session-note  — the commit-guidance note. True only while a tracker
+#       is running, so the daemon removes it on teardown.
+#   Stop/--autostart-on-change          — starts the tracker when a turn leaves changes behind.
+#       Must OUTLIVE the daemon (that is its whole job), so it is persistent and only
+#       `-b stop` / `--remove-hooks` take it away.
+SESSION_NOTE_HOOK = ("SessionStart", HOOK_FLAG)
+AUTOSTART_HOOK = ("Stop", AUTOSTART_FLAG)
 
 SETTINGS_RELPATH = Path(".claude") / "settings.local.json"
 
 
-def hook_command() -> str:
-    """The shell command Claude Code runs at session start to obtain the note.
+def hook_command(flag: str = HOOK_FLAG) -> str:
+    """The shell command Claude Code runs for one of aGiTrack's hooks.
 
     Built from ``agitrack_invocation()`` — the same self-reference the git hooks use — rather
     than the bare name ``agitrack``: the hook runs in whatever environment the user's editor
@@ -60,7 +71,7 @@ def hook_command() -> str:
     backslash is literal, so quoting is what makes a Windows path survive the shell."""
     from agitrack.proc import agitrack_invocation
 
-    return " ".join(f'"{part}"' for part in [*agitrack_invocation(), HOOK_FLAG])
+    return " ".join(f'"{part}"' for part in [*agitrack_invocation(), flag])
 
 
 def session_note_payload(note: str) -> str:
@@ -89,41 +100,40 @@ def _load(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _entries(data: dict[str, Any]) -> list:
+def _entries(data: dict[str, Any], event: str) -> list:
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return []
-    entries = hooks.get("SessionStart")
+    entries = hooks.get(event)
     return entries if isinstance(entries, list) else []
 
 
-def _is_ours(entry: Any) -> bool:
+def _is_ours(entry: Any, flag: str) -> bool:
     if not isinstance(entry, dict):
         return False
-    return any(
-        isinstance(hook, dict) and HOOK_FLAG in str(hook.get("command", "")) for hook in entry.get("hooks") or []
-    )
+    return any(isinstance(hook, dict) and flag in str(hook.get("command", "")) for hook in entry.get("hooks") or [])
 
 
-def install_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
-    """Register the SessionStart hook in ``<repo>/.claude/settings.local.json``.
+def install_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
+    """Register one of aGiTrack's hooks in ``<repo>/.claude/settings.local.json``.
 
-    Idempotent: an existing aGiTrack entry is refreshed in place (the command carries an
-    absolute path, which a reinstall of aGiTrack can move), and everything else in the file
-    is preserved byte-for-byte in meaning. Returns True when the file ends up carrying the
-    hook."""
+    Idempotent: an existing aGiTrack entry for this event is refreshed in place (the command
+    carries an absolute path, which a reinstall of aGiTrack can move), and everything else in
+    the file is preserved byte-for-byte in meaning. Returns True when the file ends up
+    carrying the hook."""
+    event, flag = hook
     path = Path(repo) / SETTINGS_RELPATH
     data = _load(path)
     if data is None:
         if debug:
             debug(f"claude settings at {path} are not usable JSON; leaving them alone")
         return False
-    entry = {"hooks": [{"type": "command", "command": hook_command()}]}
+    entry = {"hooks": [{"type": "command", "command": hook_command(flag)}]}
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         return False
-    kept = [item for item in _entries(data) if not _is_ours(item)]
-    hooks["SessionStart"] = [*kept, entry]
+    kept = [item for item in _entries(data, event) if not _is_ours(item, flag)]
+    hooks[event] = [*kept, entry]
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -134,25 +144,26 @@ def install_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
     return True
 
 
-def remove_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
-    """Take our hook back out, leaving any settings the user has of their own.
+def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
+    """Take one of our hooks back out, leaving any settings the user has of their own.
 
     Empty containers are pruned so stopping the tracker leaves no trace: a lingering
     ``"hooks": {"SessionStart": []}`` in a file aGiTrack created would be litter in the
     user's repo. Returns True when something was removed."""
+    event, flag = hook
     path = Path(repo) / SETTINGS_RELPATH
     data = _load(path)
     if not data:
         return False
-    entries = _entries(data)
-    kept = [item for item in entries if not _is_ours(item)]
+    entries = _entries(data, event)
+    kept = [item for item in entries if not _is_ours(item, flag)]
     if len(kept) == len(entries):
         return False
     hooks = data["hooks"]
     if kept:
-        hooks["SessionStart"] = kept
+        hooks[event] = kept
     else:
-        hooks.pop("SessionStart", None)
+        hooks.pop(event, None)
     if not hooks:
         data.pop("hooks", None)
     try:
@@ -199,11 +210,32 @@ def _is_tracked_by_git(path: Path) -> bool:
     return result.returncode == 0
 
 
-def hook_is_installed(repo: Path) -> bool:
+def hook_is_installed(repo: Path, hook: tuple[str, str] = SESSION_NOTE_HOOK) -> bool:
+    event, flag = hook
     data = _load(Path(repo) / SETTINGS_RELPATH)
     if not data:
         return False
-    return any(_is_ours(entry) for entry in _entries(data))
+    return any(_is_ours(entry, flag) for entry in _entries(data, event))
+
+
+def install_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
+    return install_hook(repo, SESSION_NOTE_HOOK, debug=debug)
+
+
+def remove_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
+    return remove_hook(repo, SESSION_NOTE_HOOK, debug=debug)
+
+
+def install_autostart_hook(repo: Path, *, debug=None) -> bool:
+    """The Stop hook that starts the tracker once a turn has left changes behind.
+
+    PERSISTENT, unlike the guidance hook: its entire purpose is to run when aGiTrack is not.
+    Only `-b stop` and `--remove-hooks` take it away."""
+    return install_hook(repo, AUTOSTART_HOOK, debug=debug)
+
+
+def remove_autostart_hook(repo: Path, *, debug=None) -> bool:
+    return remove_hook(repo, AUTOSTART_HOOK, debug=debug)
 
 
 def print_session_note(cwd: Path | None = None) -> int:

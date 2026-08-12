@@ -657,3 +657,38 @@ def test_a_genuinely_tracked_agent_commit_is_still_left_alone(repo_ai_commit_at_
     assert "Nothing to add: every agent-made commit here is already tracked" in capsys.readouterr().out
     assert "recon" not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
     assert _git(repo, "log", "-1", "--format=%B").stdout.count("tokens_since_last_commit_output:") == 1
+
+
+def test_backtrace_commit_refuses_while_another_agitrack_holds_the_repo(repo_with_history, capsys):
+    """One git-editing aGiTrack per repo, and this is the heaviest writer there is.
+
+    It replays every commit onto a new branch and switches to it. Beside a live tracker or a
+    TUI that means a reconstruction built from a tree the tracker is still committing into, or
+    a `git switch` under a session mid-commit. It was the one writing path that took no lock;
+    read-only paths (the dashboards, `--backtrace` serving) still take none.
+    """
+    from agitrack.git import RepoLock
+
+    before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+    holder = RepoLock(repo_with_history / ".agitrack" / "lock")
+    assert holder.acquire()
+    try:
+        rc = backtrace_commit(repo_with_history, "reconstructed", _input=lambda _prompt: "y")
+    finally:
+        holder.release()
+
+    assert rc == 1
+    assert "already" in capsys.readouterr().out.lower()
+    assert _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split() == before
+
+
+def test_backtrace_commit_takes_the_lock_and_gives_it_back(repo_with_history):
+    # Held for the whole run, released at the end: a command that kept the lock would block
+    # every later aGiTrack on the repo, which is the same failure in the other direction.
+    from agitrack.git import RepoLock
+
+    assert backtrace_commit(repo_with_history, "reconstructed", _input=lambda _prompt: "y") == 0
+
+    lock = RepoLock(repo_with_history / ".agitrack" / "lock")
+    assert lock.acquire()
+    lock.release()
