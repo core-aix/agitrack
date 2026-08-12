@@ -1232,7 +1232,6 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # a detached daemon (like `agitrack -d`), so it keeps running after aGiTrack
         # quits — and after the terminal closes — until `agitrack -d stop`.
         # None until first started; the handle only powers the "already running" fast path.
-        self._dashboard_proc: "subprocess.Popen[bytes] | None" = None
         self._dashboard_url: str | None = None
         # The port the dashboard child actually bound, so the remote-access hint can name it
         # in a copy-pasteable `ssh -L` command even when we're only reusing a running daemon.
@@ -1543,7 +1542,6 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 "_exit_aborted": False,
                 "_pending_switch_copy_offer": None,
                 "_switch_offer_parse_started": False,
-                "_dashboard_proc": None,
                 "_dashboard_url": None,
                 "_dashboard_port": 0,
                 "_exit_requested": False,
@@ -8700,156 +8698,61 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         return "saved"
 
     def _handle_dashboard_command(self) -> None:
-        """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
-        open it in the browser. The dashboard is read-only and runs as a separate
-        background process (#110) — keeping its git-log work and energy use off the TUI
-        process — a detached daemon exactly like `agitrack -d`: it keeps running after
-        aGiTrack quits (and after the terminal closes) until `agitrack -d stop`. A popup
-        says so the first time it starts."""
-        from agitrack.metrics import (
-            clear_handshake,
-            log_path,
-            open_dashboard_in_browser,
-            remote_browser_hint,
-            running_handshake,
-            spawn_dashboard_daemon,
-            wait_for_handshake,
-        )
+        """Ctrl-G → "dashboard": open this repo on aGiTrack's dashboard.
 
-        if self._dashboard_proc is not None and self._dashboard_proc.poll() is None:
-            url = self._dashboard_url or ""
-            opened = open_dashboard_in_browser(url)
-            self._set_message(
-                f"Dashboard already running at {url}."
-                if opened
-                else f"Dashboard running. {remote_browser_hint(url, self._dashboard_port)}"
-            )
-            self._render()
-            return
-        # A dashboard daemon may already be running for this repo from elsewhere — an
-        # `agitrack -d`, or a prior TUI session whose process handle we no longer hold.
-        # Reuse it (just open the browser at its URL) instead of clobbering its handshake
-        # and spawning a duplicate. We don't own it, so we don't track it as our proc and
-        # won't stop it on exit; its own owner-death watchdog handles its lifecycle.
-        running = running_handshake(self.base_repo)
-        if running is not None:
-            url = str(running.get("url", ""))
-            self._dashboard_url = url
-            port = running.get("port", 0)
-            self._dashboard_port = int(port) if isinstance(port, int) else 0
-            opened = open_dashboard_in_browser(url)
-            self._set_message(
-                # No "opening in your browser": open_dashboard_in_browser has ALREADY run by
-                # the time this is painted, so announcing it as about to happen is wrong.
-                f"Dashboard already running at {url}."
-                if opened
-                else f"Dashboard already running. {remote_browser_hint(url, int(port) if isinstance(port, int) else 0)}"
-            )
-            self._render()
-            return
-        # Nothing tracked yet, but the backends' own transcripts hold history we can
-        # reconstruct? Serve THAT rather than an empty page (see metrics.suggest). The probe
-        # costs one `git log` once anything is tracked, which is the overwhelmingly common case.
-        if self._start_backtrace_instead_of_empty_dashboard():
-            return
+        One hub serves every repository on one port (agitrack/metrics/hub.py), so this no longer
+        spawns or owns anything: it makes sure the hub is up, remembers this repo so the hub's
+        switcher offers it, and opens the path for it. Which VIEW opens (aGiTrack's own tracking,
+        or the reconstruction from local transcripts) is the hub's decision — a repo with nothing
+        tracked yet opens on the backtrace rather than on an empty page.
+
+        The hub is a detached daemon: it keeps serving after aGiTrack quits and after this
+        terminal closes, until `agitrack -d stop`. A popup says so the first time it starts.
+        """
+        from agitrack.metrics import open_dashboard_in_browser, remote_browser_hint
+        from agitrack.metrics.hub import ensure_hub_for, log_path, running_hub
+        from agitrack.repos import BACKTRACE
+
+        was_running = running_hub() is not None
         try:
-            clear_handshake(self.base_repo)  # drop any record from a dead earlier daemon
-            # No owner pid: the dashboard is a free-standing daemon (exactly like
-            # `agitrack -d`) that keeps serving after aGiTrack quits, until stopped.
-            proc = spawn_dashboard_daemon(self.base_repo, email_logins=self._dashboard_email_logins())
-            record = wait_for_handshake(self.base_repo, pid=proc.pid, timeout=5.0)
-            if record is None:
-                # The child died before binding, or never published. Reap it and point
-                # the user at its log so a startup failure isn't swallowed silently.
-                if proc.poll() is None:
-                    proc.terminate()
-                self._set_message(f"Could not start the dashboard. See {log_path(self.base_repo)}.")
-                self._render()
-                return
-            url = str(record.get("url", ""))
-            port = int(record.get("port", 0))
-            self._dashboard_proc = proc
-            self._dashboard_url = url
-            self._dashboard_port = port
-            # Only open a browser when it would land on THIS machine; on a remote/SSH/
-            # Mosh host, tell the user how to reach the forwarded URL from their own
-            # machine instead of opening a (headless) browser on the remote.
-            opened = open_dashboard_in_browser(url)
-            self._select_popup(
-                f"Dashboard live at {url}",
-                ["ok"],
-                detail=[
-                    "The dashboard runs as its own daemon: it KEEPS RUNNING after you quit aGiTrack",
-                    "(even after this terminal closes). Stop it any time with: agitrack -d stop",
-                ]
-                + ([] if opened else [remote_browser_hint(url, port)]),
-            )
-            self._set_message(
-                f"Dashboard live at {url}." if opened else f"Dashboard live. {remote_browser_hint(url, port)}"
-            )
+            # The reconstruction can take minutes to build, but it is built inside the hub on
+            # first request, so nothing here blocks the reactor: the browser waits, not the TUI.
+            url, view = ensure_hub_for(self.base_repo.repo)
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
+            self._render()
+            return
+        if not url:
+            self._set_message(f"Could not start the dashboard. See {log_path()}.")
+            self._render()
+            return
+        record = running_hub() or {}
+        port = record.get("port", 0)
+        port = int(port) if isinstance(port, int) else 0
+        self._dashboard_url = url
+        self._dashboard_port = port
+        opened = open_dashboard_in_browser(url)
+        label = "Backtrace view" if view == BACKTRACE else "Dashboard"
+        if was_running:
+            # No "opening in your browser": the browser has ALREADY been opened by the time this
+            # is painted, so announcing it as about to happen is wrong.
+            self._set_message(f"{label} at {url}." if opened else f"{label} ready. {remote_browser_hint(url, port)}")
+            self._render()
+            return
+        detail = [
+            "The dashboard runs as its own daemon: it KEEPS RUNNING after you quit aGiTrack",
+            "(even after this terminal closes). Stop it any time with: agitrack -d stop",
+            "It serves every repository aGiTrack knows, switchable from the page header.",
+        ]
+        if view == BACKTRACE:
+            from agitrack.metrics.suggest import SUBSTITUTION_NOTICE
+
+            detail = SUBSTITUTION_NOTICE.splitlines() + [""] + detail
+        self._select_popup(
+            f"{label} live at {url}", ["ok"], detail=detail + ([] if opened else [remote_browser_hint(url, port)])
+        )
+        self._set_message(f"{label} live at {url}." if opened else f"{label} live. {remote_browser_hint(url, port)}")
         self._render()
-
-    # How long the Ctrl-G path waits for a freshly spawned backtrace daemon to publish its URL.
-    # Deliberately short: the reconstruction exports every local session (OpenCode shells out per
-    # session) and can take MINUTES, and the reactor must never be blocked for that — the daemon is
-    # detached and keeps building either way, so a slow one just means we hand over the command
-    # to check on it instead of the URL.
-    BACKTRACE_URL_WAIT = 3.0
-
-    def _start_backtrace_instead_of_empty_dashboard(self) -> bool:
-        """Serve the reconstruction when the live dashboard would be empty and it would not.
-
-        True when it took over, so the caller stops. Someone who has been coding with Claude or
-        OpenCode before adopting aGiTrack has no tracked commits yet, and showing them an empty
-        dashboard says "nothing to see" when their own transcripts say otherwise."""
-        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
-
-        try:
-            if not should_show_backtrace(self.base_repo):
-                return False
-            from agitrack.metrics import open_dashboard_in_browser
-            from agitrack.metrics.backtrace import (
-                _running_handshake,
-                _spawn_backtrace_child,
-                _read_handshake,
-            )
-
-            directory = self.base_repo.repo
-            record = _running_handshake(directory)  # one may already be up — reuse, never restart
-            if record is None:
-                _spawn_backtrace_child(directory)
-                deadline = time.monotonic() + self.BACKTRACE_URL_WAIT
-                while time.monotonic() < deadline and record is None:
-                    time.sleep(0.1)
-                    record = _read_handshake(directory)
-            detail = SUBSTITUTION_NOTICE.splitlines()
-            if record is None or not record.get("url"):
-                # Still reconstructing. It is detached, so it carries on without us.
-                self._select_popup(
-                    "Reconstructing your history from local sessions…",
-                    ["ok"],
-                    detail=detail
-                    + [
-                        "",
-                        "It is still building (this can take a few minutes for a big directory).",
-                        "Check on it with:  agitrack --backtrace status",
-                    ],
-                )
-                self._set_message("Backtrace view is building in the background.")
-            else:
-                url = str(record.get("url", ""))
-                open_dashboard_in_browser(url)
-                self._select_popup(f"Backtrace view live at {url}", ["ok"], detail=detail)
-                # No "opening in your browser": the browser was opened above, before this is
-                # painted, so announcing it as about to happen is wrong.
-                self._set_message(f"Backtrace view live at {url}.")
-        except Exception as error:
-            self._debug(f"backtrace substitution failed: {error!r}")
-            return False  # never let this block the dashboard the user actually asked for
-        self._render()
-        return True
 
     def _dashboard_email_logins(self) -> dict[str, str]:
         """Map the current user's git email → their GitHub login, so the dashboard can

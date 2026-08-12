@@ -1011,7 +1011,7 @@ def test_update_check_runs_under_a_tty(monkeypatch):
     ran = {"checked": False}
     monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
 
-    cli.main([])  # plain interactive proxy launch
+    cli.main(["-i"])  # plain interactive proxy launch (bare `agitrack` on a tty shows the menu)
 
     assert ran["checked"] is True
     assert captured  # launch still proceeded
@@ -1139,7 +1139,7 @@ def test_backend_command_invalid_value_fails_fast(monkeypatch, capsys):
 
 def test_backend_command_mismatch_warns(monkeypatch, capsys):
     captured = _stub_launch(monkeypatch)
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "Warning" in out and "opencode" in out and "claude" in out
@@ -1156,7 +1156,7 @@ def test_backend_command_mismatch_aborts_when_declined(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 1
     out = capsys.readouterr().out
     assert "Warning" in out and "not started" in out
@@ -1171,7 +1171,7 @@ def test_backend_command_mismatch_proceeds_when_confirmed(monkeypatch):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 0
     assert captured["backend_command"] == ["wrap", "opencode"]
 
@@ -1861,7 +1861,7 @@ def test_without_yes_a_terminal_still_gets_the_first_run_prompts(monkeypatch):
     monkeypatch.setattr(cli, "select_default_summarizer_model", lambda *a, **k: asked.append("model"))
     monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
 
-    cli.main([])
+    cli.main(["-i"])  # a mode is named, so the bare-`agitrack` menu stays out of the way
 
     assert asked == ["backend", "model"]
 

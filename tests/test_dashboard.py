@@ -837,7 +837,7 @@ def test_build_server_accepts_email_logins_hint(tmp_path):
     server = build_server(repo, email_logins={"Someone@Example.com": "octocat"})
     try:
         # Emails are lowercased so the hint matches git's lowercased author email.
-        assert server.RequestHandlerClass.email_logins == {"someone@example.com": "octocat"}
+        assert server.RequestHandlerClass.scope.email_logins == {"someone@example.com": "octocat"}
     finally:
         server.server_close()
 
@@ -1794,40 +1794,49 @@ def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, 
 # --- CLI -----------------------------------------------------------------------
 
 
-def test_cli_dashboard_html_is_default_and_starts_daemon(tmp_path, monkeypatch):
-    _demo_repo(tmp_path)
-    started: dict[str, object] = {}
+def _capture_hub(monkeypatch) -> dict:
+    """Record what the CLI asks the dashboard hub to open, without starting one."""
+    from agitrack.metrics import hub
 
-    def fake_start(repo, **kwargs):
-        started["repo"] = repo
-        started["owner_pid"] = kwargs.get("owner_pid")
+    seen: dict = {}
+
+    def fake_open(directory, *, view="", open_browser=True, quiet=False):
+        seen["directory"] = directory
+        seen["view"] = view
         return 0
 
-    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
-
-    # Bare --dashboard now means html, which starts the background daemon.
-    rc = cli.main(["--dashboard", "--repo", str(tmp_path)])
-
-    assert rc == 0
-    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
-    # Free-standing: no owner pid, so the daemon survives the launching terminal and
-    # runs until `agitrack -d stop` (or an update self-restart).
-    assert started["owner_pid"] is None
+    monkeypatch.setattr(hub, "open_dashboard", fake_open)
+    return seen
 
 
-def test_cli_dashboard_shorthand_d_starts_daemon_like_dashboard(tmp_path, monkeypatch):
+def test_cli_dashboard_html_is_default_and_opens_this_repo_on_the_hub(tmp_path, monkeypatch):
     _demo_repo(tmp_path)
-    started: dict[str, GitRepo] = {}
+    seen = _capture_hub(monkeypatch)
 
-    def fake_start(repo, **kwargs):
-        started["repo"] = repo
-        return 0
+    # Bare --dashboard means html, which opens this repo on the shared dashboard.
+    assert cli.main(["--dashboard", "--repo", str(tmp_path)]) == 0
+    assert seen["directory"] == GitRepo.discover(tmp_path).repo
+    # No view is forced: which one opens is the repo's own state to decide (hub.preferred_view),
+    # so a repo with nothing tracked yet lands on the backtrace rather than an empty page.
+    assert seen["view"] == ""
 
-    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
 
-    # `-d` is shorthand for `--dashboard`; bare form defaults to html (start daemon).
+def test_cli_dashboard_shorthand_d_opens_the_hub_like_dashboard(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    seen = _capture_hub(monkeypatch)
+
+    # `-d` is shorthand for `--dashboard`; bare form defaults to html.
     assert cli.main(["-d", "--repo", str(tmp_path)]) == 0
-    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert seen["directory"] == GitRepo.discover(tmp_path).repo
+
+
+def test_cli_backtrace_opens_the_backtrace_view_on_the_same_hub(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    seen = _capture_hub(monkeypatch)
+
+    # Asking for the reconstruction IS the flag, so unlike `-d` it names the view outright.
+    assert cli.main(["--backtrace", "--repo", str(tmp_path)]) == 0
+    assert seen["view"] == "backtrace"
 
 
 def test_cli_dashboard_stop_stops_daemon(tmp_path, monkeypatch):
@@ -1839,16 +1848,16 @@ def test_cli_dashboard_stop_stops_daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(metrics, "stop_dashboard_daemon", lambda repo: stopped.__setitem__("repo", repo) or 0)
 
     assert cli.main(["-d", "stop", "--repo", str(tmp_path)]) == 0
+    # A pre-hub per-repo daemon is still stopped, so an upgrade does not strand one...
     assert stopped["repo"].repo == GitRepo.discover(tmp_path).repo
 
 
-def test_cli_dashboard_status_reports_daemon(tmp_path, monkeypatch):
+def test_cli_dashboard_status_reports_the_hub(tmp_path, monkeypatch, capsys):
     _demo_repo(tmp_path)
-    queried: dict[str, GitRepo] = {}
-    monkeypatch.setattr(metrics, "dashboard_daemon_status", lambda repo: queried.__setitem__("repo", repo) or 0)
 
+    # One dashboard serves every repository, so its status is the hub's, not this repo's.
     assert cli.main(["-d", "status", "--repo", str(tmp_path)]) == 0
-    assert queried["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert "dashboard is not running" in capsys.readouterr().out
 
 
 def test_cli_dashboard_shorthand_d_accepts_text(tmp_path, capsys, monkeypatch):
@@ -1995,19 +2004,19 @@ def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch)
     real_build = server_mod.build_dashboard
     monkeypatch.setattr(server_mod, "build_dashboard", lambda *a, **k: (builds.append(1), real_build(*a, **k))[1])
     try:
-        # A handler instance without the request cycle: BaseHTTPRequestHandler.__init__ IS
-        # the request, so it is skipped and only the class attributes (repo, caches) are used.
-        probe = type("Probe", (handler,), {"__init__": lambda self: None})()
-        first = probe._dashboard()
-        again = probe._dashboard()
+        # The scope owns the repo and the caches, with no socket involved, so the question can
+        # be asked directly instead of faking a request cycle.
+        scope = handler.scope
+        first = scope._dashboard()
+        again = scope._dashboard()
         assert again is first and len(builds) == 1  # the second request reused it
 
         _write_lines(repo, "later.txt", 3)
         repo.commit("something new")
-        after = probe._dashboard()
+        after = scope._dashboard()
         assert after is not first and len(builds) == 2  # ...and a new commit rebuilds it
     finally:
-        handler._dash_cache.clear()
+        scope._dash_cache.clear()
         server.server_close()
 
 

@@ -219,8 +219,83 @@ def _looks_like_a_long_path_failure(message: str) -> bool:
     return "filename too long" in lowered or "enametoolong" in lowered
 
 
+# Bare-word commands aGiTrack answers, as opposed to flags. Kept deliberately tiny: everything
+# else is a flag, and every word promoted to a command is one that can no longer be the first
+# word of a bare prompt (`agitrack "stop the retry loop"` still works — see _split_command).
+_COMMANDS = ("stop",)
+
+
+def _split_command(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Peel a leading bare command verb off ``argv``, returning ``(command, rest)``.
+
+    Only the FIRST token counts. `agitrack stop` has to be the way to stop this repo's tracking
+    whatever mode it runs in, but aGiTrack also forwards unrecognized arguments to the backend as
+    a prompt, so a word promoted to a command is a word stolen from every prompt that starts with
+    it. Restricting it to position 0 keeps the theft to exactly the phrase the user typed as a
+    command, and `agitrack -- stop …` (or any prompt with a word in front of it) is untouched."""
+    if argv and argv[0] in _COMMANDS:
+        return argv[0], argv[1:]
+    return None, argv
+
+
+# Every parsed option that, on its own, says what aGiTrack should DO. If none of them is set and
+# no backend arguments were forwarded, the user asked for nothing in particular — which is when
+# the mode menu appears. Kept as a list of attribute names rather than a hand-written condition so
+# a new mode is one entry, and forgetting it shows up as "the menu appears when it shouldn't"
+# rather than as a mode that silently launches the TUI.
+_MODE_OPTIONS = (
+    "interactive",
+    "background",
+    "dashboard",
+    "backtrace",
+    "status",
+    "daemons",
+    "json_mode",
+    "prompts",
+    "ui_bridge",
+    "share_sessions",
+    "remove_hooks",
+    "recover",
+    # Internal entry points (hooks and detached children). They never reach a terminal, so the
+    # menu would not fire for them anyway, but naming them keeps the intent explicit.
+    "dashboard_serve",
+    "backtrace_serve",
+    "background_serve",
+    "autostart_on_change",
+    "claude_session_note",
+    "precommit_sync",
+)
+
+
+def _no_mode_requested(args: argparse.Namespace, backend_args: list[str]) -> bool:
+    """True when nothing on the command line picked a mode.
+
+    Backend arguments count as a request: `agitrack -- "fix the bug"` is someone naming a task
+    for the agent, and answering that with a menu would be obtuse. `--mode json`, the deprecated
+    alias, counts too, and so does `--yes` — it means "never ask me a question", which a menu is."""
+    if backend_args or getattr(args, "mode", "proxy") == "json" or getattr(args, "yes", False):
+        return False
+    return not any(getattr(args, name, None) for name in _MODE_OPTIONS)
+
+
+def _choose_mode() -> list[str] | None:
+    """Show the mode menu and return the argv the choice stands for, or None to quit.
+
+    The menu itself lives in :mod:`agitrack.modes`, where the modes are enumerated as data —
+    the same table the docs and the website quote, so a mode cannot be added in one place and
+    forgotten in the other."""
+    from agitrack.modes import choose
+
+    # Whatever the user pressed while an earlier startup step ran would otherwise be delivered
+    # to the menu the instant it appears, choosing a mode nobody looked at.
+    _drain_terminal_input()
+    mode = choose()
+    return list(mode.argv) if mode is not None else None
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     _make_console_output_lossy()
+    command, argv = _split_command(list(sys.argv[1:] if argv is None else argv))
     parser = argparse.ArgumentParser(
         # `prog` explicitly, or Python 3.14 on Windows derives it from sys.argv[0] and the usage
         # line becomes `usage: python.exe C:\Users\<name>\AppData\Local\Python\...\Scripts\agitrack`
@@ -239,6 +314,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         "--help",
         action="store_true",
         help="show this help message and exit",
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="interactive mode: run the coding agent inside aGiTrack's TUI, which commits each "
+        "agent turn for you. This is the mode `agitrack` used to start with no arguments; a bare "
+        "`agitrack` on a terminal now asks which mode you want instead, and `-i` is how you say "
+        "'this one' up front.",
     )
     parser.add_argument(
         "-b",
@@ -574,6 +658,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--hub-serve",
+        action="store_true",
+        # Internal: the detached dashboard hub. ONE per user: it binds a single port and serves
+        # every repository aGiTrack knows about, switched by URL path (agitrack/metrics/hub.py).
+        # `agitrack -d` and `agitrack --backtrace` spawn it and then just open the right path.
+        # Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dashboard-serve",
         action="store_true",
         # Internal: run the metrics dashboard HTTP server in the foreground (this
@@ -629,6 +722,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.epilog = (
+        "Commands: `agitrack stop` stops whatever aGiTrack is running for this repository, in "
+        "any mode (the background tracker, an interactive session, this repo's dashboard). Run "
+        "`agitrack` with no arguments on a terminal to pick a mode from a menu.\n\n"
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
         f"({' / '.join(available_backends())}), e.g. `agitrack --backend opencode --port 12345`. Use "
         "`--` to forward arguments that aGiTrack also defines or a bare prompt, e.g. "
@@ -640,6 +736,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # argparse leaves a single leading "--" separator in the remainder; drop it.
     if backend_args and backend_args[0] == "--":
         backend_args = backend_args[1:]
+    # `agitrack --repo <path> stop` — the command after its options, which is how half of all
+    # CLIs are typed. `_split_command` only claims position 0 (so a prompt starting with the word
+    # is safe), and everything else falls through to the backend as a prompt; a lone leftover
+    # word that IS a command, with no `--` separator asking for it to be forwarded, is one.
+    if command is None and len(backend_args) == 1 and backend_args[0] in _COMMANDS and "--" not in argv:
+        command, backend_args = backend_args[0], []
     # `--repo` parses as None when absent so the two cases stay distinguishable (see its help);
     # from here on it is the plain path every other reader expects.
     repo_given = args.repo is not None
@@ -671,6 +773,41 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
         print(__version__)
         return 0
+
+    if args.hub_serve:
+        # Internal entry point: the detached dashboard hub. Answered early and without touching a
+        # repository, because it serves ALL of them and belongs to no single one.
+        from agitrack.metrics.hub import run_hub_daemon
+
+        return run_hub_daemon(port=args.dashboard_port)
+
+    if command == "stop":
+        # `agitrack stop`: stop aGiTrack for THIS repository, whatever mode it is running in.
+        # One command instead of three mode-specific ones (`-b stop`, `-d stop`, quitting the
+        # TUI by hand), because the user asking for it usually does not know, or care, which
+        # mode is holding the repo. No privacy prompt, no repo init, no update check.
+        try:
+            stop_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.stop import stop_everything
+
+        return stop_everything(stop_repo, assume_yes=args.yes)
+
+    # Bare `agitrack` on a terminal: ASK which mode, rather than silently starting the one that
+    # happened to be the historical default. aGiTrack has several modes that look nothing alike
+    # (a TUI that runs the agent, a headless tracker, two dashboards) and nothing on the command
+    # line said so. Interactive mode is now requested explicitly with `-i`; the menu is what you
+    # get when you request nothing. Without a terminal there is no one to ask, so the historical
+    # default (launch the TUI) stands — scripts and editor front-ends are unaffected.
+    if _no_mode_requested(args, backend_args) and stdin_is_interactive() and stdout_is_interactive():
+        chosen = _choose_mode()
+        if chosen is None:
+            return 0
+        # Re-enter with the chosen mode PLUS whatever the user already typed (--repo, --backend,
+        # …), so the menu only ever adds the one thing that was missing.
+        return _dispatch([*chosen, *argv])
 
     if args.daemons == "stop":
         # Stop aGiTrack daemons: every one anywhere, or — with --repo — only that repository's.
@@ -802,13 +939,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(render_backtrace_text(directory))
             return 0
         if args.backtrace == "stop":
+            # The backtrace is a VIEW of a repository on the shared dashboard now, not a daemon of
+            # its own, so stopping it means "stop showing this repository" — the same thing
+            # `agitrack stop` and `-d stop` mean. A pre-hub standalone daemon is still stopped.
             from agitrack.metrics.backtrace import stop_backtrace_daemon
+            from agitrack.metrics.hub import unmount_repo
 
-            return stop_backtrace_daemon(directory)
+            unmounted = unmount_repo(directory)
+            code = stop_backtrace_daemon(directory) if not unmounted else 0
+            if unmounted:
+                print("The dashboard is no longer showing this directory.")
+            return code
         if args.backtrace == "status":
-            from agitrack.metrics.backtrace import backtrace_daemon_status
+            from agitrack.metrics.hub import hub_status
 
-            return backtrace_daemon_status(directory)
+            return hub_status()
         if args.backtrace == "commit":
             # `parse_known_args` funnels unknown flags to the backend, which the backtrace path
             # never launches — so they would vanish without a word. Say so rather than leave the
@@ -822,9 +967,13 @@ def _dispatch(argv: list[str] | None = None) -> int:
             from agitrack.metrics.backtrace_commit import backtrace_commit
 
             return backtrace_commit(directory, args.backtrace_branch or "")
-        from agitrack.metrics.backtrace import start_backtrace_daemon
+        # Bare `--backtrace`: open this directory's BACKTRACE view on the shared dashboard. The
+        # view is explicit here (unlike `-d`, which lets the repo's state decide), because asking
+        # for the reconstruction is exactly what this flag is.
+        from agitrack.metrics.hub import open_dashboard
+        from agitrack.repos import BACKTRACE
 
-        return start_backtrace_daemon(directory)
+        return open_dashboard(directory, view=BACKTRACE)
 
     # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
     # Check once, up front, so a missing git gives a clear, actionable message instead of a
@@ -892,13 +1041,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 )
             return 0
         if args.dashboard == "stop":
+            # One dashboard serves every repository, so `-d stop` stops the whole thing — which
+            # is what the flag has always meant, and is now visibly wider than it was. Use
+            # `agitrack stop` to drop only this repository from it.
             from agitrack.metrics import stop_dashboard_daemon
+            from agitrack.metrics.hub import stop_hub
 
-            return stop_dashboard_daemon(dashboard_repo)
+            stop_dashboard_daemon(dashboard_repo)  # a pre-hub per-repo daemon, if one survives
+            return stop_hub()
         if args.dashboard == "status":
-            from agitrack.metrics import dashboard_daemon_status
+            from agitrack.metrics.hub import hub_status
 
-            return dashboard_daemon_status(dashboard_repo)
+            return hub_status()
         if args.dashboard == "export":
             from agitrack.metrics.export import ExportTargetError, export_static_demo
 
@@ -923,22 +1077,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
             print(f"Static demo dashboard written to {out_dir}")
             print("Serve the directory with any static web host (or open index.html directly).")
             return 0
-        # Bare `-d` / `-d html`: start the live dashboard as a detached background
-        # daemon (#110). It is NOT bound to this terminal: it keeps serving until
-        # `agitrack -d stop`, and restarts itself after aGiTrack updates.
-        # An empty live dashboard is the worst answer available when the backends' own
-        # transcripts hold history we could reconstruct, so show that instead (see
-        # metrics.suggest). The probe is skipped entirely once anything is tracked.
-        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE, should_show_backtrace
+        # Bare `-d` / `-d html`: open this repository on the shared dashboard, starting the hub
+        # if it is not up. It is NOT bound to this terminal: it keeps serving until
+        # `agitrack -d stop`, and restarts itself after aGiTrack updates. Which VIEW opens is
+        # decided by the repo's own state (hub.preferred_view) — an empty live dashboard is the
+        # worst answer available when the backends' transcripts hold history we could
+        # reconstruct, so a repo with nothing tracked yet opens on the backtrace instead.
+        from agitrack.metrics.hub import open_dashboard, preferred_view
+        from agitrack.metrics.suggest import SUBSTITUTION_NOTICE
+        from agitrack.repos import BACKTRACE
 
-        if should_show_backtrace(dashboard_repo):
-            from agitrack.metrics.backtrace import start_backtrace_daemon
-
+        if preferred_view(dashboard_repo.repo) == BACKTRACE:
             print(SUBSTITUTION_NOTICE)
-            return start_backtrace_daemon(dashboard_repo.repo)
-        from agitrack.metrics import start_dashboard_daemon
-
-        return start_dashboard_daemon(dashboard_repo)
+        return open_dashboard(dashboard_repo.repo)
 
     if args.background in ("stop", "status"):
         # `agitrack -b stop` / `-b status`: signal or report the background tracker running on
@@ -1399,6 +1550,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # Forward a per-run --log-file (a configured log_file the child reads itself).
             if args.log_file:
                 child_args += ["--log-file", args.log_file]
+            # The dashboard shows up when aGiTrack starts on a repo, in EVERY mode — including
+            # this one, where there is no TUI to reach it from.
+            _open_dashboard_on_start(repo, config, scripted=scripted)
             return start_background_daemon(repo, extra_args=child_args)
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
@@ -1438,9 +1592,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
-            # Nothing tracked here yet, but their own agent transcripts hold history
-            # aGiTrack can reconstruct — say so while there is still a shell to run it from.
-            _offer_backtrace_for_untracked_repo(repo, scripted=scripted)
+            # The dashboard shows up when aGiTrack starts on a repo, in every mode. It opens on
+            # the view that fits the repo, so a project with nothing tracked yet gets the
+            # reconstruction of its past agent sessions rather than an empty page — which is what
+            # the old "shall I open the backtrace?" question was asking, without asking.
+            _open_dashboard_on_start(repo, config, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -1737,40 +1893,30 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False, 
     return True
 
 
-def _offer_backtrace_for_untracked_repo(repo: GitRepo, *, scripted: bool = False) -> bool:
-    """Before the TUI takes over: if this repo has no aGiTrack history but the backends' own
-    transcripts do, offer to open the reconstruction. Returns True if it was started.
+def _open_dashboard_on_start(repo: GitRepo, config, *, scripted: bool = False) -> None:
+    """Open this repository's dashboard as aGiTrack starts on it, whatever mode it starts in.
 
-    Shown only in the one situation where it is useful — someone who has been coding with an
-    agent here BEFORE adopting aGiTrack — so it is not a recurring nag: the moment they commit
-    through aGiTrack the condition is false forever after. Never blocks automation (no TTY or
-    scripted ⇒ silent), and never blocks startup: declining just continues into the TUI.
-    """
-    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
-        return False
-    from agitrack.metrics.suggest import STARTUP_HINT, should_show_backtrace
+    The dashboard is where aGiTrack's work becomes visible, and until now you only saw it if you
+    knew to ask (`-d`, or Ctrl-G inside the TUI). Since one hub serves every repository on one
+    port, opening it costs a browser tab rather than a new server, and which VIEW opens is the
+    repo's own state to decide: a project with nothing tracked yet lands on the reconstruction of
+    its past sessions instead of on an empty page.
 
+    Never for a scripted or non-interactive run: a CI job or an editor front-end has no browser to
+    open, and a background daemon spawning one would be a surprise. Off entirely via
+    ``open_dashboard_on_start`` in config."""
+    if scripted or not stdout_is_interactive():
+        return
+    if not getattr(config, "open_dashboard_on_start", True):
+        return
     try:
-        if not should_show_backtrace(repo):
-            return False
+        from agitrack.metrics.hub import open_dashboard
+
+        # quiet: the launch banner for the mode being started is the message that matters here,
+        # and three lines about the dashboard in front of it would bury it.
+        open_dashboard(repo.repo, quiet=True)
     except Exception:
-        return False  # a probe failure must never delay or block a normal start
-    print()
-    print(STARTUP_HINT)
-    try:
-        # Default YES: we only ask when the reconstruction is the ONLY view with history in it.
-        answer = _ask("Open the backtrace view now? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    if answer in {"n", "no"}:
-        return False
-    from agitrack.metrics.backtrace import start_backtrace_daemon
-
-    # Runs here, in cooked mode, where its progress bar and URL are readable — the reconstruction
-    # can take minutes, and inside the full-screen TUI there would be nowhere to show that.
-    start_backtrace_daemon(repo.repo)
-    return True
+        pass  # a dashboard that will not open must never stop the mode the user asked for
 
 
 def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bool, bool]:

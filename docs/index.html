@@ -283,10 +283,15 @@ footer .sha{font-size:12px}
           <p>Reconstruct the history you didn't track from day one.</p>
           <a class="go more" href="readmore.html#backtrace">read more &rarr;</a>
         </div>
-        <div class="branch cmd" data-ref="agitrack [-b] [-m]">
-          <h3>Four modes</h3>
-          <p>TUI or background, auto or manual commits. Switch freely.</p>
+        <div class="branch cmd" data-ref="agitrack">
+          <h3>It asks which mode</h3>
+          <p>Background or TUI, worktree or not, auto or manual commits. Run it bare and pick from the menu.</p>
           <a class="go more" href="readmore.html#modes">read more &rarr;</a>
+        </div>
+        <div class="branch cmd" data-ref="one port, every repo">
+          <h3>One dashboard for all</h3>
+          <p>Every project on a single port, switched by path, opened for you when tracking starts.</p>
+          <a class="go more" href="readmore.html#dashboard-hub">read more &rarr;</a>
         </div>
         <div class="branch" data-ref="native agent backends">
           <h3>Your agent, your choice</h3>
@@ -314,16 +319,18 @@ footer .sha{font-size:12px}
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
-          <div class="note">launches your coding agent's TUI under aGiTrack's watch</div>
+          <div class="note">asks which mode you want: arrow keys, Enter</div>
         </div></div>
         <div class="step"><div>
-          <code>Ctrl-G</code>
-          <div class="note">opens the aGiTrack menu</div>
+          <code>your dashboard opens</code>
+          <div class="note">automatically, whichever mode you picked</div>
         </div></div>
       </div>
-      <p style="margin-top:18px">Then <span class="p">agitrack -d</span> shows your tracked commits in the
-      dashboard, and <span class="p">agitrack --backtrace</span> recovers previous agentic coding sessions
-      if you already have some.</p>
+      <p style="margin-top:18px">Know what you want already? <span class="p">agitrack -b</span> tracks the agent
+      you drive yourself, <span class="p">agitrack -i</span> runs it in aGiTrack's TUI,
+      <span class="p">agitrack -d</span> opens the dashboard, and <span class="p">agitrack --backtrace</span>
+      recovers previous agentic coding sessions if you already have some. One
+      <span class="p">agitrack stop</span> stops whatever is running here.</p>
     </section>
 
     <section class="commit agent">

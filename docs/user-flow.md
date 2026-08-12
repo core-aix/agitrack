@@ -84,7 +84,15 @@ Everything that must resolve before the backend TUI appears.
 
 ```mermaid
 flowchart TD
-  start(["Run agitrack"]) --> priv{"Privacy notice acknowledged before?"}
+  start(["Run agitrack"]) --> mode{"Did the command line name a mode?"}
+  mode -->|"No, and a terminal is attached"| menu[/"Mode menu: arrow keys, Enter.<br/>background+auto is the default;<br/>each row shows the command it stands for"/]
+  menu -->|"q / Ctrl-C"| quit
+  menu -->|"Chooses a mode"| priv
+  mode -->|"stop"| stopcmd[["agitrack stop: stop the background tracker,<br/>any interactive session, and this repo's dashboard"]]
+  stopcmd --> quit
+  mode -->|"-i / -b / -d / --backtrace / -s / a prompt,<br/>or no terminal to ask on"| priv
+
+  priv{"Privacy notice acknowledged before?"}
   priv -->|No| privask[/"Show privacy notice, ask to acknowledge"/]
   privask -->|Declines| quit(["Exit"])
   privask -->|Acknowledges| lock
@@ -112,7 +120,14 @@ flowchart TD
   updq -->|No, non-TTY, or disabled| sess
   updoffer --> sess
 
-  sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> spawn["Spawn backend TUI in its worktree under the sandbox"] --> ready(["Ready for input"])
+  sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> dash
+
+  dash{"open_dashboard_on_start, and a terminal attached?"}
+  dash -->|Yes| opendash[["Remember this repo, start the dashboard hub if needed,<br/>open this repo's view in the browser (see Dashboard)"]]
+  opendash --> spawn
+  dash -->|"No, or scripted"| spawn
+
+  spawn["Spawn backend TUI in its worktree under the sandbox"] --> ready(["Ready for input"])
 
 ```
 
@@ -762,7 +777,7 @@ flowchart TD
   exp --> map[["Map each turn → a virtual commit: model, tokens, timings, per-file diff, and the user↔agent trace (final response only, exactly as a real aGiTrack commit)"]]
   map --> mode{mode}
   mode -->|text| txt[["Print a one-shot report"]]
-  mode -->|html / bare| serve[["Serve the same dashboard as a background daemon (frozen 'BACKTRACE — not live' banner); dies with the terminal or via --backtrace stop"]]
+  mode -->|html / bare| serve[["Mount this directory's BACKTRACE view on the shared dashboard at /b/&lt;repo&gt;/ (frozen 'BACKTRACE, not live' banner); the header's tracked/backtrace toggle and repo switcher move between views and projects"]]
   mode -->|commit| commit
   subgraph commit["--backtrace commit --backtrace-branch NEW"]
     g1{git repo?} -->|no| gi[["Instruct: git init + commit, then re-run"]]
@@ -781,8 +796,12 @@ flowchart TD
   is built once and cached (re-exporting per poll would be far too slow). Committer chrome and the
   commit hash are hidden — a reconstructed turn has no committer and no real commit — and only the
   agent's **final response** is shown, matching what a real aGiTrack commit records.
-- **`stop` / `status`**: manage the background daemon (per-directory handshake in a temp dir, so it
-  works in non-git folders and never collides with the `-d` dashboard daemon).
+- **`stop` / `status`**: `status` reports the shared dashboard and what it serves; `stop` drops this
+  directory from it (the same thing `agitrack stop` does), and a pre-hub standalone backtrace daemon
+  is still stopped so an upgrade never strands one.
+- **Which view opens** is decided per repository, not per command: a repo with nothing tracked opens
+  here, and the first time it has a commit carrying token counts it switches to the tracked view,
+  once. See [Dashboard](#15-dashboard-one-port-every-repository).
 - **`commit`**: the only writing path. It is deliberately gated — git repo required, clean tree
   required, a new branch required — and it never touches the current branch. AI-vs-user attribution
   is by file overlap: a commit whose changed files an agent turn edited is AI (annotated); a commit
@@ -838,6 +857,66 @@ flowchart TD
 
 Implementation: `agitrack/metrics/learn.py` (service + page), routes in `agitrack/metrics/server.py`;
 tests and the flow-by-flow matrix rows in `tests/test_learn.py` / `tests/FLOW_MATRIX.md` §12b.
+
+---
+
+## 15. Dashboard: one port, every repository
+
+There is **one** dashboard process for the whole machine. It binds a single port and mounts every
+repository aGiTrack knows about under a path, so switching projects or views is a link rather than
+another daemon on another port. It opens by itself when aGiTrack starts on a repository, in any
+mode (`open_dashboard_on_start`).
+
+```mermaid
+flowchart TD
+  any(["agitrack -i / -b / -d / --backtrace,<br/>or Ctrl-G → dashboard"]) --> remember[["Remember this repo in ~/.agitrack/repos.json<br/>(path, display name, derived slug)"]]
+  remember --> up{"Is the hub already running?<br/>(~/.agitrack/dashboard.json, pid alive)"}
+  up -->|No| spawn[["Spawn it detached: binds 8765, or the next free port"]]
+  spawn --> view
+  up -->|Yes| view
+
+  view{"Which view for this repo?"}
+  view -->|"--backtrace asked for it"| bt
+  view -->|"Nothing tracked, sessions exist"| bt
+  view -->|"First commit with token counts:<br/>switch once, then never again"| act
+  view -->|"Otherwise: the view last chosen here"| remembered["/r/ or /b/, as remembered"]
+
+  act["/r/&lt;slug&gt;/ tracked view"]
+  bt["/b/&lt;slug&gt;/ backtrace view"]
+
+  act --> open
+  bt --> open
+  remembered --> open
+  open[["Open the URL in the browser<br/>(printed instead on a remote/headless host)"]]
+
+  act -.->|"header toggle"| bt
+  bt -.->|"header toggle"| act
+  act -.->|"header repo selector,<br/>keeps view and page"| other["another repo's same page"]
+```
+
+**Routes.** `/` redirects to the repository you used last, in the view that fits it.
+`/r/<slug>/…` is a repository's tracked dashboard and `/b/<slug>/…` its backtrace; each serves the
+same sub-paths a standalone daemon would (`data`, `log`, `diff`, `files`, `learn`, `story`, …),
+because every page fetches with **relative** URLs. `/repos` is what the header's switcher is built
+from. A mount reached without its trailing slash redirects, so the address bar and the page's own
+relative links never disagree.
+
+**Two views, deliberately separate.** The tracked view shows what aGiTrack recorded; the backtrace
+shows what can be inferred from the agent's transcripts. They are never merged, because a
+reconstruction is less accurate than a recording. Instead each points at the other: the backtrace
+says plainly that it is not the active tracking, and the tracked view says when the backtrace holds
+agent work no commit covers, so nothing goes quietly untracked.
+
+**Empty repositories** get a reason rather than a blank page: no tracked commits but reconstructable
+sessions opens the backtrace; no sessions at all says so and still lists the repository's own
+commits; nothing at all says there is nothing to show yet.
+
+**Stopping.** `agitrack stop` drops this repository from the dashboard (and stops the hub when
+nothing is left); `agitrack -d stop` stops the dashboard itself, for every repository.
+
+Implementation: `agitrack/metrics/hub.py` (routing + lifecycle), `agitrack/repos.py` (the repository
+registry), `agitrack/metrics/pending.py` (what one view can see that the other cannot); the shared
+header lives in `agitrack/metrics/ui.py`. Tests: `tests/test_hub.py`.
 
 ---
 

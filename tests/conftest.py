@@ -97,6 +97,24 @@ def _never_touch_real_daemons(monkeypatch):
     monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _never_spawn_the_real_dashboard(monkeypatch):
+    """No test may start the dashboard hub as a real detached process.
+
+    The hub is machine-wide by design: one process per user, serving every repository. That makes
+    it the one daemon a test can start that ISN'T contained by ``AGITRACK_CONFIG_DIR`` — the child
+    is a fresh ``python -m agitrack --hub-serve`` that outlives the test, registers itself, and
+    binds a port. A run of the CLI tests left two of them behind on 8765 and 8766, and every test
+    that reached the spawn also paid the launcher's handshake timeout, turning a fast file into a
+    ten-minute one.
+
+    A test that means to exercise the spawn binds the real function itself, as the process-scan
+    tests do above."""
+    from agitrack.metrics import hub
+
+    monkeypatch.setattr(hub, "_spawn_hub", lambda: None)
+
+
 # PIDs of daemons tests started, collected as each test ends and killed ONCE when the session
 # does. Collect-now-kill-later on purpose: killing during the run means signalling a process
 # while another test may still be inside a call that waits on it, and doing that per-test hung a
