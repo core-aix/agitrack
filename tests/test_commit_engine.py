@@ -250,6 +250,55 @@ def test_an_interrupted_turn_is_committed_as_interrupted_not_as_completed_work(t
     assert repo.message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
 
 
+def test_a_span_that_ENDS_on_a_finished_turn_is_not_marked_interrupted(tmp_path):
+    """One Esc early in a multi-turn span must not stamp the whole commit as cut short.
+
+    A commit routinely covers several turns. Marking on "any turn was interrupted" made
+    `git log --oneline` say the work was unfinished when the closing turn had run to
+    completion — seen live on a four-turn span where the user had stopped a single tool call
+    at the start and everything after it finished and was pushed. What the mark answers is
+    whether the work this commit DELIVERS was cut short, and the turn it ends on decides that.
+    """
+    engine, repo, state = _engine(tmp_path)
+    stopped = _turn("start the refactor", "I'll begin.")
+    stopped.interrupted = True
+    finished = _turn("now finish it", "Done: all call sites updated.")
+
+    assert (
+        engine.commit_turns(
+            turns=[stopped, finished],
+            backend="claude",
+            backend_session_id="s1",
+            model="m",
+            stage_untracked_fn=_noop_stage,
+        )
+        is True
+    )
+    assert not repo.message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
+    assert "interrupted: true" not in repo.message
+    assert "interrupted this turn before the agent finished" not in repo.message
+
+
+def test_a_span_that_ENDS_on_an_interrupted_turn_is_still_marked(tmp_path):
+    # The other direction, and the reason the mark exists: the work the commit closes on was
+    # cut short, so the one line most people read has to say so.
+    engine, repo, state = _engine(tmp_path)
+    finished = _turn("add the parser", "Done.")
+    stopped = _turn("now wire it up", "I'll wire it up now.")
+    stopped.interrupted = True
+
+    engine.commit_turns(
+        turns=[finished, stopped],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message.splitlines()[0].startswith("<aGiTrack> (interrupted) ")
+    assert "interrupted: true" in repo.message
+
+
 def test_the_summarizer_is_told_the_turn_was_interrupted(tmp_path):
     # The trace is the summarizer's SOLE input, so the fact has to travel in the trace
     # text itself: otherwise the subject line asserts the whole request as done.

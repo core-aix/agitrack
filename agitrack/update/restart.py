@@ -62,6 +62,8 @@ def _git_head(root: Path) -> str | None:
     (``index.lock`` present: a pull/checkout is mid-flight, nothing is settled yet)."""
     import subprocess
 
+    from agitrack.proc import console_isolation_kwargs
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--git-path", "index.lock", "HEAD"],
@@ -71,6 +73,11 @@ def _git_head(root: Path) -> str | None:
             stderr=subprocess.PIPE,
             check=False,
             timeout=10,
+            # This runs on the update watcher's tick — every CHECK_SECONDS, forever, inside a
+            # DETACHED daemon that has no console of its own. Windows then gives the child git
+            # a console window, which appears and vanishes on the user's desktop once a minute
+            # for as long as the tracker runs. Reported as "new terminals appearing over time".
+            **console_isolation_kwargs(),
         )
     except Exception:
         return None

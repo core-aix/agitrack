@@ -829,6 +829,9 @@ class Updater:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=_NET_TIMEOUT,
+                # Reached from the daemons' periodic self-update check, which runs console-less;
+                # without this each check flashes a console window (proc.py).
+                **console_isolation_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             return False
