@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - exercised only without optional depend
     Observer = None  # type: ignore[misc, assignment]
 
 from agitrack.commits import AgitrackActions, UserCommitAborted
+from agitrack.console import stdin_is_interactive, stdout_is_interactive
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.commits import (
@@ -1627,7 +1628,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         return instance
 
     def run(self) -> int:
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
+        if not stdin_is_interactive() or not stdout_is_interactive():
             raise RuntimeError("The interactive TUI requires an interactive terminal. Use --json for non-TTY use.")
         if not self._ensure_backend_available():
             return 1

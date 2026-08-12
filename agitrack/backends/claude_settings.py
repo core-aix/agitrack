@@ -199,14 +199,24 @@ def remove_hook(repo: Path, hook: tuple[str, str], *, debug=None) -> bool:
 
 
 def _restore_committed_bytes(path: Path, data: dict) -> bool:
-    """Write back the COMMITTED text of ``path`` when ``data`` is semantically identical to it.
+    """Put ``path`` back to its COMMITTED content when ``data`` is semantically identical to it.
     Returns True when that happened.
 
     This is what makes hook removal a true no-op on a repo that tracks the file: aGiTrack's own
-    formatting is undone, not merely its entries. Deliberately conservative — the committed bytes
-    are restored ONLY when the remaining JSON parses equal to the committed JSON, so a user edit
-    made since that commit is never reverted (in that case the caller falls back to writing our
-    own formatting, which is the best we can do)."""
+    formatting is undone, not merely its entries. Deliberately conservative — the file is
+    restored ONLY when the remaining JSON parses equal to the committed JSON, so a user edit made
+    since that commit is never reverted (in that case the caller falls back to writing our own
+    formatting, which is the best we can do).
+
+    ``git checkout`` does the writing, rather than us writing the blob's bytes ourselves, because
+    the blob is not what belongs in the working tree. Under ``core.autocrlf`` / ``core.eol`` /
+    an ``eol=`` attribute — the default on Git for Windows — git stores LF and checks out CRLF,
+    so writing the blob verbatim leaves a file whose CONTENT hashes identically to HEAD (``git
+    diff`` is empty) while ``git status`` still reports ` M`, because the bytes are not the ones
+    a checkout would produce. That is the very "a diff the user never made" this function exists
+    to prevent, just moved one layer down. Letting git write it applies whatever conversion this
+    repo is configured for, on every platform. The byte-writing fallback is kept for the case
+    where checkout itself fails."""
     committed = _committed_text(path)
     if committed is None:
         return False
@@ -215,8 +225,30 @@ def _restore_committed_bytes(path: Path, data: dict) -> bool:
             return False
     except (json.JSONDecodeError, ValueError):
         return False
-    path.write_text(committed, encoding="utf-8", newline="")
+    if not _git_checkout_file(path):
+        path.write_text(committed, encoding="utf-8", newline="")
     return True
+
+
+def _git_checkout_file(path: Path) -> bool:
+    """``git checkout HEAD -- <path>``: restore the file exactly as a checkout would write it.
+    Safe here only because the caller has already proved the remaining JSON equals the committed
+    JSON, so there is nothing of the user's left to discard."""
+    import subprocess
+
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+
+    try:
+        result = subprocess.run(
+            ["git", "checkout", "HEAD", "--", f"./{path.name}"],
+            cwd=path.parent,
+            capture_output=True,
+            **UTF8_TEXT,
+            **console_isolation_kwargs(),
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
 def _committed_text(path: Path) -> str | None:

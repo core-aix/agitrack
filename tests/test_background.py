@@ -5,6 +5,7 @@ as the proxy, so token/turn accounting is identical."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -2120,15 +2121,81 @@ def test_core_hookspath_is_announced_not_only_debug_logged(tmp_path, monkeypatch
     assert "NOT tracked" in out
 
 
-def test_the_repo_is_armed_before_the_daemon_announces_itself():
-    """The handshake is what makes the launcher print "daemon live (PID …)", and the hooks were
-    installed ~1.4 s AFTER it — so a kill inside that window left the repo completely unarmed
-    while the CLI had already said tracking was up. It is also what makes `-s`'s advice to a
-    never-tracked repo ("run `agitrack -b` once") true even if that first run dies early."""
-    import inspect
+# --- what `-b` publishes, and when ------------------------------------------
 
-    from agitrack.proxy.background import BackgroundRunner
 
-    source = inspect.getsource(BackgroundRunner.run)
-    assert source.index("self._install_autotrack_hook()") < source.index("self._write_handshake()")
-    assert source.index("self._install_commit_guidance()") < source.index("self._write_handshake()")
+def test_the_handshake_is_written_only_once_the_hooks_are_armed(tmp_path, monkeypatch):
+    """The handshake is what `agitrack -b` waits on before printing "daemon live" and handing
+    the shell back, so anything the daemon does AFTER writing it is a race the user can lose.
+    Arming came after, and it showed: ~0.6s after a successful `agitrack -b`, `agitrack -s`
+    reported "Auto-start: not armed — no aGiTrack hook is installed in this repo yet. Run
+    `agitrack` or `agitrack -b` once" — the exact command that had just been run. A script
+    doing `agitrack -b run` then `agitrack -b stop` armed nothing at all.
+
+    Measured on Windows, where the launcher returns fastest, but the ordering was wrong on
+    every platform."""
+    from agitrack.git import hooks as git_hooks
+
+    order: list[str] = []
+    monkeypatch.setattr("agitrack.daemons.register", lambda *a, **k: None)
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    real_handshake = runner._write_handshake
+    real_hook = runner._install_autotrack_hook
+
+    def _handshake():
+        # The hook has to be on disk BEFORE the record that says the daemon is up.
+        order.append("handshake")
+        assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit"), (
+            "the handshake went out while the repo was still unarmed"
+        )
+        real_handshake()
+
+    monkeypatch.setattr(runner, "_write_handshake", _handshake)
+    monkeypatch.setattr(runner, "_install_autotrack_hook", lambda: (order.append("hook"), real_hook())[1])
+    monkeypatch.setattr(runner, "_loop", lambda: None)
+    monkeypatch.setattr(runner, "_teardown", lambda **kw: None)
+    monkeypatch.setattr(runner, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+
+    runner.run()
+
+    assert order == ["hook", "handshake"]
+
+
+def test_stop_logs_daemon_stop_to_the_log_file_the_daemon_was_started_with(tmp_path, monkeypatch):
+    """`--log-file` is a command-line flag and is never persisted to config, but `-b stop` read
+    the log path from config alone — so a tracker started as `agitrack -b --log-file events.log`
+    got `daemon-start` and nothing else, ever. It matters most on Windows, where `-b stop` is a
+    TerminateProcess and the daemon's own teardown (which emits the event) never runs at all."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    log = tmp_path / "events.log"
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"pid": 4242, "mode": "auto commits", "backend": "claude", "log_file": str(log)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(background_module, "_live_background_pid", lambda r: 4242)
+    monkeypatch.setattr(background_module, "_terminate_and_wait", lambda pid: True)
+
+    assert background_module.stop_background(repo) == 0
+
+    assert "daemon-stop" in log.read_text(encoding="utf-8")
+
+
+def test_stop_without_a_log_file_writes_nothing_anywhere(tmp_path, monkeypatch):
+    """A tracker with no event log configured must not have one invented for it."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4242, "mode": "auto commits", "backend": "claude"}), encoding="utf-8")
+    monkeypatch.setattr(background_module, "_live_background_pid", lambda r: 4242)
+    monkeypatch.setattr(background_module, "_terminate_and_wait", lambda pid: True)
+
+    assert background_module.stop_background(repo) == 0
+    assert not list(tmp_path.glob("*.log"))

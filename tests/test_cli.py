@@ -1864,3 +1864,47 @@ def test_without_yes_a_terminal_still_gets_the_first_run_prompts(monkeypatch):
     cli.main([])
 
     assert asked == ["backend", "model"]
+
+
+# --------------------------------------------------------------------------------------
+# A git failure is never a traceback.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_unhandled_git_failure_is_a_message_not_a_traceback(monkeypatch, capsys):
+    """Every command guards the ``GitRepo.discover()`` that OPENS the repository, but nothing
+    guarded the git commands that follow — and git can fail long after discovery succeeds. On a
+    Windows box with neither ``core.longpaths`` nor the OS long-path opt-in, a repository whose
+    path passes MAX_PATH opens fine and then fails on the first read of ``.git/packed-refs``:
+    ``agitrack --repo <deep path> -d text`` printed a raw traceback ending in
+    ``agitrack.git.repo.GitError: … fatal: couldn't read .git/packed-refs: Filename too long``."""
+    from agitrack.git import GitError
+
+    def _explode(argv=None):
+        raise GitError("Command failed: git for-each-ref\nfatal: couldn't read .git/packed-refs: Filename too long")
+
+    monkeypatch.setattr(cli, "_dispatch", _explode)
+
+    assert cli.main(["-d", "text"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Filename too long" in out
+    assert "Traceback" not in out
+    # ...and on Windows, where this has a cause aGiTrack can name, it names the two things that
+    # actually fix it. `core.longpaths` is a Windows-only git setting and ENAMETOOLONG elsewhere
+    # is the filesystem's own far larger limit, so the advice is deliberately not offered there.
+    assert ("core.longpaths" in out and "MAX_PATH" in out) is (sys.platform == "win32")
+
+
+def test_an_ordinary_git_failure_gets_no_long_path_advice(monkeypatch, capsys):
+    """The hint is only right for one cause. Offering `core.longpaths` for an unrelated git
+    error would send the user to change a setting that has nothing to do with it."""
+    from agitrack.git import GitError
+
+    monkeypatch.setattr(cli, "_dispatch", lambda argv=None: (_ for _ in ()).throw(GitError("fatal: bad object HEAD")))
+
+    assert cli.main(["-s"]) == 1
+
+    out = capsys.readouterr().out
+    assert "bad object HEAD" in out
+    assert "core.longpaths" not in out
