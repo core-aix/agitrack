@@ -147,9 +147,24 @@ def reap_daemon_pids(pids) -> int:
     The whole GROUP is signalled: aGiTrack detaches daemons with ``start_new_session=True``, so
     each is its own group leader, and killing only the leader leaves its children holding the
     write end of a pipe someone may be reading. Guarded so it can never reach the test runner's
-    own group."""
+    own group.
+
+    Every pid is checked against the process table FIRST — the same proof-of-identity the
+    product's own signalling paths require (``daemons._signal_targets``, the PID-reuse fix).
+    A registry entry outlives the process that wrote it, and Windows reassigns PIDs briskly, so
+    "the registry says this number was a daemon" is not evidence that it still is. Under xdist
+    each worker runs this teardown when IT finishes, while its siblings are still working — so
+    an unverified kill here reaches another worker, which is exactly what
+    ``[gw0] node down: Not properly terminated`` at 97% was: the run died with no summary, and
+    the coverage total for the whole session went with it."""
     import signal
     import time
+
+    from agitrack import daemons
+
+    verified = daemons._live_agitrack_pids()
+    if verified is not None:
+        pids = [pid for pid in pids if pid in verified]
 
     killed = 0
     for pid in sorted(set(pids)):
