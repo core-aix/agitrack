@@ -2967,7 +2967,7 @@ def test_a_reactor_stall_is_recorded_without_debug_being_enabled(tmp_path):
 
     runner._note_phase("timers", time.monotonic() - 30.0)  # the reported symptom
     logged = (tmp_path / ".agitrack" / "stalls.log").read_text(encoding="utf-8")
-    assert "30.0s" in logged and "timers" in logged
+    assert "30.000s" in logged and "timers" in logged  # ms precision: see STALL_WARN_SECONDS
     assert runner._stall_worst >= 30.0  # and it reaches a crash report's context
 
 
@@ -8535,13 +8535,22 @@ def _base_edit_runner(tmp_path, answers):
         return scripted.pop(0) if scripted else None
 
     def select(title, options, **kwargs):
-        # Option questions are selections; a scripted "y" picks the affirmative option
-        # (always first), anything else picks the second.
+        # Option questions are selections; a scripted "y" picks the AFFIRMATIVE option and
+        # anything else the other one.
+        #
+        # By meaning, not by position. This used to assume "affirmative is always first",
+        # which stopped being true when the untracked-files popup was reordered to lead with
+        # "Leave them unstaged" — a bare Enter there must not sweep the user's own files into
+        # the commit. A positional stub silently answered the OPPOSITE question and the tests
+        # still "passed" until the behaviour changed under them.
         runner.prompts.append((title, options))
         answer = scripted.pop(0) if scripted else None
         if answer is None:
             return None
-        return options[0] if str(answer).strip().lower() in {"y", "yes"} else options[1]
+        affirmative = next((option for option in options if option.startswith(("Stage", "Yes", "Commit"))), options[0])
+        if str(answer).strip().lower() in {"y", "yes"}:
+            return affirmative
+        return next(option for option in options if option != affirmative)
 
     runner._prompt_popup = prompt
     runner._select_popup = select
@@ -11682,7 +11691,10 @@ def test_untracked_files_prompt_is_a_selection():
 
     def _select(title, options, *, detail=None):
         asked.update(title=title, options=options, detail=detail)
-        return options[1]  # "Leave them unstaged"
+        # By NAME, not by index: the safe option leads the list now (a bare Enter must not
+        # stage the user's own untracked files), so an index here would silently test the
+        # opposite answer.
+        return next(option for option in options if option.startswith("Leave"))
 
     runner._select_popup = _select
     runner._prompt_popup = lambda *a, **k: pytest.fail("an option question must not be typed")

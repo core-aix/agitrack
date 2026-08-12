@@ -1825,6 +1825,47 @@ def test_a_required_tool_install_still_defaults_to_yes(monkeypatch):
     assert installed == ["git"]
 
 
+def test_yes_makes_the_startup_prompts_non_interactive(monkeypatch):
+    """`agitrack -b` on a fresh config blocked on three startup questions whenever it ran ON a
+    terminal — despite -b being the documented "no TUI, returns to your shell" path — so a
+    scripted or CI use inside a terminal simply hung. There was no --yes at all, and `-b status`
+    skipping the wizard made the two inconsistent."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name == "claude")
+    monkeypatch.setattr(
+        cli, "select_default_backend", lambda *a, **k: pytest.fail("--yes must not open the backend chooser")
+    )
+    monkeypatch.setattr(
+        cli,
+        "select_default_summarizer_model",
+        lambda *a, **k: pytest.fail("--yes must not open the summarizer chooser"),
+    )
+
+    assert cli.main(["--yes"]) == 0
+    assert captured["backend"] == "claude"
+
+
+def test_without_yes_a_terminal_still_gets_the_first_run_prompts(monkeypatch):
+    """--yes is opt-in: an ordinary interactive first run must still be walked through setup."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    asked: list[str] = []
+    monkeypatch.setattr(cli, "select_default_backend", lambda *a, **k: asked.append("backend") or "claude")
+    monkeypatch.setattr(cli, "select_default_summarizer_model", lambda *a, **k: asked.append("model"))
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+
+    cli.main([])
+
+    assert asked == ["backend", "model"]
+
+
 def _fake_repo(tmp_path):
     return type("R", (), {"repo": tmp_path})()
 

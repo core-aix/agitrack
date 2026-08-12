@@ -133,6 +133,19 @@ def stop_background(repo: GitRepo) -> int:
     # The stopping process knows the repo, so it can do the cleanup the killed one could not —
     # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
     disarmed = _disarm_tracking(repo)
+    # Reap the stopped daemon's REGISTRY entry too. `-b stop` reaped the handshake and left the
+    # registry file, so dead-pid entries accumulated across kill/restart cycles (1 → 6 over three)
+    # and were only ever pruned lazily, on the next read by something else.
+    try:
+        from agitrack import daemons
+        from agitrack.git import RepoLock
+
+        daemons.deregister(pid)
+        # ...and the lock file's owner record, for the same reason: on Windows the terminated
+        # daemon's own release() never ran, so a clean stop looked exactly like a crash on disk.
+        RepoLock(repo.repo / ".agitrack" / "lock").clear_owner_record()
+    except Exception:
+        pass
     # Also from HERE for the same reason as the disarm above: the daemon emits `daemon-stop` in
     # its own teardown, which never runs when it was TerminateProcess'd. `daemon-start` was
     # therefore the only event a `--log-file` reader ever saw across a full -b lifecycle.

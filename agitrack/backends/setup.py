@@ -342,7 +342,8 @@ def select_default_backend(
     """First-run backend setup. Lists each agent backend ONCE with its install status, then asks
     which to use as the DEFAULT in a single prompt. The number selects the default coding agent;
     a not-yet-installed choice is installed first (if that install is declined or fails it stays
-    the default and the launch-time gate offers to install it before the agent starts). Pressing
+    the default; the launch-time gate then offers to SWITCH to an installed backend or prints
+    manual instructions — it does not install, see ensure_installed_backend). Pressing
     Enter accepts the default — the first installed backend, or the first listed when none is
     installed yet (then installed at launch). Saves and returns the chosen default, then explains
     how to change it later."""
