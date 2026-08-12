@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aGiTrack in depth: how agent turns become traced Git commits, insights, and a coach</title>
-<meta name="description" content="The full story of aGiTrack: why agent code needs provenance, what an aGiTrack commit carries (trace, model, token cost), the live dashboard and efficiency insights, the coach that teaches you from your own sessions, backtrace, the four run modes, and how to install.">
+<meta name="description" content="The full story of aGiTrack: why agent code needs provenance, what an aGiTrack commit carries (trace, model, token cost), the live dashboard and efficiency insights, the coach that teaches you from your own sessions, backtrace, the run modes, the one-port dashboard, and how to install.">
 <link rel="canonical" href="https://agitrack.core-aix.org/readmore.html">
 <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
 <meta name="author" content="core-aix">
@@ -17,7 +17,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="aGiTrack">
 <meta property="og:title" content="aGiTrack in depth: how agent turns become traced Git commits, insights, and a coach">
-<meta property="og:description" content="Why agent code needs provenance, what an aGiTrack commit carries, the live dashboard and efficiency insights, the coach, backtrace, and the four run modes.">
+<meta property="og:description" content="Why agent code needs provenance, what an aGiTrack commit carries, the live dashboard and efficiency insights, the coach, backtrace, and the run modes.">
 <meta property="og:url" content="https://agitrack.core-aix.org/readmore.html">
 <meta property="og:image" content="https://agitrack.core-aix.org/images/dashboard-v6.png">
 <meta property="og:image:alt" content="The aGiTrack dashboard: agent commits, token usage, and efficiency insights.">
@@ -370,7 +370,7 @@ Added --version using the package metadata; prints and exits.
       <p style="margin-top:22px">Transcripts only live on the machine that recorded them, so a plain backtrace shows
       <strong>one laptop's</strong> view. Run <span class="p">agitrack --share-sessions</span> and everyone's sessions go
       to the repo's remote in one pass; the backtrace then pulls them all back and reconstructs the
-      <strong>whole project</strong> — attributing each turn to the GitHub id that shared it, which a transcript alone
+      <strong>whole project</strong>, attributing each turn to the GitHub id that shared it, which a transcript alone
       can never tell you. A fresh clone with no local transcripts rebuilds the entire history.
       <a href="docs.html#across-machines-and-teammates">Details in the docs.</a></p>
     </section>
@@ -395,29 +395,66 @@ Added --version using the package metadata; prints and exits.
         <span class="sha">a11m0de</span>
         <span class="subject">pick your workflow</span>
       </div>
-      <h2>Four ways to run it, your call.</h2>
-      <p><strong>TUI or background</strong>, <strong>auto or manual commits</strong>: four modes, the same
-      per-turn trace, switch freely.</p>
+      <h2>Several ways to run it, and it asks.</h2>
+      <p>Run <span class="p">agitrack</span> with no arguments and it shows you the modes: arrow keys to move,
+      Enter to choose, each one with what it is for and the command that goes straight there next time.
+      Every mode produces the same per-turn trace, and you can switch freely.</p>
       <div class="branches two">
-        <div class="branch" data-ref="agitrack">
-          <h3>Interactive · Auto <span class="tag">default</span></h3>
-          <p>The agent's real TUI; every finished turn is committed from an isolated <strong>worktree</strong>. Or use with <span class="p">--no-worktree</span>.
-          Just work, get a clean traced history.</p>
-        </div>
-        <div class="branch" data-ref="agitrack -m">
-          <h3>Interactive · Manual</h3>
-          <p>Feels like plain git: <strong>you</strong> commit when ready, and pending turns fold in with the
-          full AI trace.</p>
-        </div>
         <div class="branch" data-ref="agitrack -b">
-          <h3>Background · Auto</h3>
+          <h3>Background · Auto <span class="tag">default</span></h3>
           <p>Drive the agent from <em>any</em> UI, desktop app, IDE, or chat window; aGiTrack tracks it
-          <strong>headlessly</strong> and commits each turn.</p>
+          <strong>headlessly</strong> and commits each turn. Your terminal stays yours.</p>
         </div>
         <div class="branch" data-ref="agitrack -b -m">
           <h3>Background · Manual</h3>
           <p>Headless tracking, commits on your terms. It can even start itself on
           <span class="p">git commit</span>.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -i">
+          <h3>Interactive · Worktree</h3>
+          <p>The agent's real TUI, working in an isolated <strong>worktree</strong> whose finished turns are
+          merged back, so several sessions can run at once without standing on each other.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -i --no-worktree">
+          <h3>Interactive · Your tree</h3>
+          <p>The same TUI, but the agent edits your current branch directly: every change is visible live
+          in your editor. One session at a time.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -i -m">
+          <h3>Interactive · Manual</h3>
+          <p>Feels like plain git: <strong>you</strong> commit when ready, and pending turns fold in with the
+          full AI trace.</p>
+        </div>
+        <div class="branch" data-ref="agitrack stop">
+          <h3>One way to stop</h3>
+          <p>Whatever is holding the repository, <span class="p">agitrack stop</span> stops it: the background
+          tracker, an interactive session, this repo's dashboard. No need to remember which mode you picked.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="commit" id="dashboard-hub">
+      <div class="commit-head">
+        <span class="sha">0n3p0rt</span>
+        <span class="subject">one dashboard</span>
+      </div>
+      <h2>Every repository, one port, switched by path.</h2>
+      <p>The dashboard opens by itself when you start aGiTrack on a repository, in any mode. It is a single
+      server for <em>all</em> your projects: pick another from the header, and the same page you were reading
+      (dashboard, story, or learn) opens for it. One port to remember, one
+      <span class="p">ssh -L</span> line to forward.</p>
+      <div class="branches two">
+        <div class="branch" data-ref="tracked">
+          <h3>The tracked view</h3>
+          <p>What aGiTrack <strong>recorded</strong>: each commit with the prompts, replies and token counts
+          that produced exactly those lines. It tells you when your backtrace holds agent work no commit
+          covers yet, so nothing quietly goes untracked.</p>
+        </div>
+        <div class="branch" data-ref="backtrace">
+          <h3>The backtrace view</h3>
+          <p>What can be <strong>reconstructed</strong> from your agent's own transcripts. Kept deliberately
+          separate, and labelled as inferred, because it is less accurate than the recorded history. A repo
+          with nothing tracked yet opens here, then moves to the tracked view once there is something in it.</p>
         </div>
       </div>
     </section>
@@ -435,7 +472,7 @@ Added --version using the package metadata; prints and exits.
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
-          <div class="note">launches your <a href="#backends">coding agent</a>'s TUI under aGiTrack's watch</div>
+          <div class="note">asks which mode you want, then starts it and opens the dashboard</div>
         </div></div>
         <div class="step"><div>
           <code>Ctrl-G</code>

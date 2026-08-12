@@ -244,6 +244,84 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 .diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
 .diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}"""
 
+# --------------------------------------------------------------------------- the hub bar
+#
+# One dashboard serves every repository, in either of two views, so every page needs the same two
+# controls: WHICH REPOSITORY am I looking at, and WHICH VIEW of it. They sit in one strip above
+# the page's own header, identical on the dashboard, the learn page and the storyline, because
+# they answer the same question wherever you are and moving between pages must not move them.
+#
+# The strip is built entirely from the URL plus one cheap ``/repos`` fetch, and it REMOVES ITSELF
+# when neither is available: the same page code also serves from a standalone daemon and from the
+# static export (file://), where there is no hub, no sibling repositories, and no second view to
+# switch to. A control that cannot do anything is worse than no control.
+
+HUBBAR_CSS = """.hubbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:7px 18px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12.5px}
+.hubbar .hb-label{color:var(--fg-dim);letter-spacing:.6px;text-transform:uppercase;font-size:10.5px}
+.hubbar select{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:12.5px;padding:4px 8px;max-width:min(52vw,420px)}
+.hubbar select:focus{outline:none;border-color:var(--phosphor)}
+.hubbar .hb-group{display:flex;align-items:center;gap:7px}
+/* The view toggle. Two states, both always visible: which one you are in is only legible next to
+   the one you are not in, and the pair also says the other view EXISTS, which a single button
+   labelled with the other mode never manages to. */
+.viewtoggle{display:inline-flex;border:1px solid var(--line)}
+.viewtoggle a{padding:4px 11px;color:var(--fg-dim);text-decoration:none;border-right:1px solid var(--line)}
+.viewtoggle a:last-child{border-right:0}
+.viewtoggle a:hover{color:var(--fg);background:var(--panel2);text-decoration:none}
+.viewtoggle a.on{background:var(--phosphor);color:var(--ink);font-weight:600}
+.viewtoggle a.on:hover{background:var(--phosphor);color:var(--ink)}
+/* The backtrace half is amber wherever it is the CURRENT view, matching the warning strip under
+   it: the reconstruction is the inferred view, and the page says so in one colour throughout. */
+.viewtoggle a.on.bt{background:var(--amber);color:var(--ink)}
+.viewtoggle a.on.bt:hover{background:var(--amber);color:var(--ink)}
+@media (max-width:760px){.hubbar{padding:7px 8px;gap:9px}.hubbar .hb-label{display:none}}"""
+
+HUBBAR_HTML = """<div class="hubbar" id="hubbar" hidden>
+  <div class="hb-group"><span class="hb-label">repo</span>
+    <select id="hub-repo" title="Switch to another repository aGiTrack is tracking"></select></div>
+  <div class="hb-group" id="hub-views" hidden><span class="hb-label">view</span>
+    <span class="viewtoggle">
+      <a id="hub-active" href="#" title="aGiTrack's own tracking: commits it recorded, with the conversation and tokens behind each one">tracked</a>
+      <a id="hub-backtrace" class="bt" href="#" title="Reconstructed from your local agent transcripts: inferred, not recorded">backtrace</a>
+    </span></div>
+</div>"""
+
+# ``__UI_HUBBAR_PAGE__`` is substituted per page with "", "learn" or "story", so the toggle keeps
+# you on the page you are reading instead of dropping you back on the dashboard.
+HUBBAR_JS = """// Where am I? The hub mounts every repository at /<r|b>/<slug>/, and the page's own sub-path
+// follows. Anything else (a standalone daemon, the static export) has no hub, and the bar hides.
+const HUB = (() => {
+  const m = /^\\/(r|b)\\/([^/]+)\\//.exec(location.pathname);
+  if(!m) return null;
+  return {view: m[1] === "b" ? "backtrace" : "active", slug: m[2], page: "__UI_HUBBAR_PAGE__"};
+})();
+function hubUrl(view, slug){
+  return "/" + (view === "backtrace" ? "b" : "r") + "/" + encodeURIComponent(slug) + "/" + HUB.page;
+}
+async function initHubBar(){
+  if(!HUB) return;
+  const bar = $("hubbar"); if(!bar) return;
+  const active = $("hub-active"), backtrace = $("hub-backtrace"), views = $("hub-views");
+  active.href = hubUrl("active", HUB.slug);
+  backtrace.href = hubUrl("backtrace", HUB.slug);
+  active.classList.toggle("on", HUB.view === "active");
+  backtrace.classList.toggle("on", HUB.view === "backtrace");
+  views.hidden = false;
+  bar.hidden = false;
+  let repos = [];
+  try{ repos = (await (await fetch("/repos", {cache:"no-store"})).json()).repos || []; }catch(e){}
+  const select = $("hub-repo");
+  if(repos.length < 1){ select.parentElement.hidden = true; return; }
+  select.innerHTML = repos.map(r =>
+    `<option value="${esc(r.slug)}" ${r.slug === HUB.slug ? "selected" : ""}>${esc(r.name)} &nbsp; ${esc(r.path)}</option>`
+  ).join("");
+  // Switching repository KEEPS the current view and page: someone comparing one repo's
+  // backtrace with another's should not be dropped onto a dashboard halfway through.
+  select.onchange = () => { location.href = hubUrl(HUB.view, select.value); };
+}"""
+
 DOM_JS = """const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = n => (n||0).toLocaleString("en-US");
@@ -347,6 +425,9 @@ def render(template: str, **extra: str) -> str:
         template.replace("__UI_TOKENS__", TOKENS)
         .replace("__UI_BASE_CSS__", BASE_CSS)
         .replace("__UI_BANNER_CSS__", BANNER_CSS)
+        .replace("__UI_HUBBAR_CSS__", HUBBAR_CSS)
+        .replace("__UI_HUBBAR_HTML__", HUBBAR_HTML)
+        .replace("__UI_HUBBAR_JS__", HUBBAR_JS)
         .replace("__UI_FLASH_CSS__", FLASH_CSS)
         .replace("__UI_ENGINE_CSS__", ENGINE_CSS)
         .replace("__UI_RANGE_CSS__", RANGE_CSS)

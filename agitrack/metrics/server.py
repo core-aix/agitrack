@@ -25,6 +25,7 @@ import socket
 import sys
 import urllib.parse
 import webbrowser
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
@@ -34,6 +35,7 @@ from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
 from agitrack.metrics.github import cached_logins
+from agitrack.metrics.routing import Response, html_response, json_response
 from agitrack.metrics.web import (
     _filter_stats,
     aggregates_payload,
@@ -88,51 +90,79 @@ def _int(query: dict[str, list[str]], key: str, default: int) -> int:
     return int(raw) if raw.lstrip("-").isdigit() else default
 
 
-class _DashboardHandler(http.server.BaseHTTPRequestHandler):
-    repo: GitRepo  # set on the per-server subclass
-    email_logins: dict[str, str] = {}  # lowercased email → login hint (set on the subclass)
-    # Per-server cache of the file browser, keyed by (ref, head sha): building it scans
-    # `git log --numstat`, so it is rebuilt only when the branch's tip moves, not per poll.
-    _browser_cache: dict[tuple[str, str], FileBrowser] = {}
-    # Efficiency insights are scoped to the CURRENT FILTER (so a narrowed time range re-asks
-    # the question for that slice), hence keyed by the filter too — not just the branch tip.
-    # Bounded: cleared whenever the tip moves, and capped while a tip is current.
-    _insights_cache: dict[tuple, list[dict]] = {}
-    # The built Dashboard itself, keyed by the refs it was built from (see _dashboard).
-    _dash_cache: dict[tuple, Dashboard] = {}
+class RepoScope:
+    """One repository's LIVE dashboard: every route it answers, and the caches behind them.
 
-    def do_GET(self) -> None:  # noqa: N802 (http.server API)
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            query = urllib.parse.parse_qs(parsed.query)
-            author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
-            frm, to = _int(query, "from", 0), _int(query, "to", 0)
-            ref = self._ref(_str(query, "branch"))
-            if parsed.path in ("/", "/index.html"):
-                # Paint the page chrome instantly with no aggregates/log embedded, then
-                # let the browser fetch /data and /log behind a loading animation — so a
-                # repo with a huge history doesn't block the first paint on the git-log
-                # crunch. Warming the login cache here (a background refresh) means the
-                # resolved GitHub IDs are likely ready by the time the first /data poll
-                # lands, so committers show as their IDs almost immediately.
-                cached_logins(self.repo)
-                html = shell_html(self.repo)
-                self._respond("text/html; charset=utf-8", html.encode("utf-8"), cache_control="no-cache")
-            elif parsed.path == "/data":
-                payload = aggregates_payload(
-                    self._dashboard(ref),
-                    author=author,
-                    backend=backend,
-                    model=model,
-                    frm=frm,
-                    to=to,
-                    granularity=_str(query, "granularity"),
-                )
-                payload["shared_sessions"] = shared_sessions_for(self.repo)
-                payload["insights"] = self._insights(ref, author=author, backend=backend, model=model, frm=frm, to=to)
-                self._respond("application/json", self._json(payload))
-            elif parsed.path == "/log":
-                page = log_page(
+    This used to be a ``BaseHTTPRequestHandler`` subclass with the repo and its caches bolted on
+    as class attributes, one subclass per server. That worked exactly as long as there was one
+    repository per process. Serving every repository from one hub means the same logic has to be
+    selectable per request, so it lives here instead: a plain object that turns a path and a query
+    into a :class:`Response`, with no socket anywhere in sight.
+
+    The caches are per SCOPE (so two repositories never share a built dashboard) and keyed by
+    what they were built from, so a poll that finds no new commits recomputes nothing.
+    """
+
+    def __init__(self, repo: GitRepo, *, email_logins: dict[str, str] | None = None, pending_source=None) -> None:
+        self.repo = repo
+        # How this scope answers "what does the backtrace know that I do not?" (see
+        # agitrack/metrics/pending.py). The hub replaces it with one that reads an already-built
+        # reconstruction when there is one, for an exact count instead of the cheap estimate.
+        self._pending_source = pending_source
+        self._pending_cache: tuple[float, dict] | None = None
+        # Lowercased author email → GitHub login, supplementing `gh` for commits not yet pushed.
+        self.email_logins: dict[str, str] = {k.lower(): v for k, v in (email_logins or {}).items()}
+        # The file browser, keyed by (ref, head sha): building it scans `git log --numstat`, so it
+        # is rebuilt only when the branch's tip moves, not per poll.
+        self._browser_cache: dict[tuple[str, str], FileBrowser] = {}
+        # Efficiency insights are scoped to the CURRENT FILTER (so a narrowed time range re-asks
+        # the question for that slice), hence keyed by the filter too, not just the branch tip.
+        # Bounded: cleared whenever the tip moves, and capped while a tip is current.
+        self._insights_cache: dict[tuple, list[dict]] = {}
+        # The built Dashboard itself, keyed by the refs it was built from (see _dashboard).
+        self._dash_cache: dict[tuple, Dashboard] = {}
+
+    @property
+    def root(self) -> "Path":
+        return self.repo.repo
+
+    @property
+    def repo_name(self) -> str:
+        return str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1]
+
+    # ----------------------------------------------------------------- routes
+
+    def get(self, path: str, query: dict[str, list[str]]) -> "Response | None":
+        """Answer a GET, or None when this scope has no such route (a 404 at the edge)."""
+        author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
+        frm, to = _int(query, "from", 0), _int(query, "to", 0)
+        ref = self._ref(_str(query, "branch"))
+        if path in ("", "/", "/index.html"):
+            # Paint the page chrome instantly with no aggregates/log embedded, then let the
+            # browser fetch /data and /log behind a loading animation — so a repo with a huge
+            # history doesn't block the first paint on the git-log crunch. Warming the login
+            # cache here (a background refresh) means the resolved GitHub IDs are likely ready by
+            # the time the first /data poll lands, so committers show as their IDs almost at once.
+            cached_logins(self.repo)
+            return html_response(shell_html(self.repo))
+        if path == "/data":
+            payload = aggregates_payload(
+                self._dashboard(ref),
+                author=author,
+                backend=backend,
+                model=model,
+                frm=frm,
+                to=to,
+                granularity=_str(query, "granularity"),
+            )
+            payload["shared_sessions"] = shared_sessions_for(self.repo)
+            payload["insights"] = self._insights(ref, author=author, backend=backend, model=model, frm=frm, to=to)
+            payload["pending"] = self._pending()
+            payload["empty_state"] = self._empty_state(self._dashboard(ref))
+            return json_response(payload)
+        if path == "/log":
+            return json_response(
+                log_page(
                     self._dashboard(ref),
                     repo=self.repo,
                     author=author,
@@ -144,158 +174,147 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     limit=_int(query, "limit", 50),
                     sort=_str(query, "sort"),
                 )
-                self._respond("application/json", self._json(page))
-            elif parsed.path == "/diff":
-                # This commit's file diffs, straight from the local clone — so the dashboard
-                # shows changes without GitHub. The sha is validated as a hex id in commit_diff.
-                self._respond("application/json", self._json(commit_diff(self.repo, _str(query, "sha"))))
-            elif parsed.path == "/files":
-                # The file browser: every changed file with its per-file change history and the
-                # conversation/tokens behind each change (same view as --backtrace, real commits).
-                self._respond("application/json", self._json({"files": self._browser(ref).files_payload()}))
-            elif parsed.path == "/filelog":
-                self._respond("application/json", self._json(self._browser(ref).file_log_payload(_str(query, "path"))))
-            elif parsed.path == "/filediff":
-                self._respond(
-                    "application/json",
-                    self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
-                )
-            elif parsed.path == "/story":
-                # The storyline: the backend agent tells this branch's history as chapters
-                # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
-                self._respond(
-                    "text/html; charset=utf-8",
-                    story_page.story_html(self.repo.repo).encode("utf-8"),
-                    cache_control="no-cache",
-                )
-            elif parsed.path == "/story/state":
-                stats, sha_paths = self._story_view(ref if ref != "HEAD" else "")
-                payload = story_page.story_state(
+            )
+        if path == "/diff":
+            # This commit's file diffs, straight from the local clone — so the dashboard shows
+            # changes without GitHub. The sha is validated as a hex id in commit_diff.
+            return json_response(commit_diff(self.repo, _str(query, "sha")))
+        if path == "/files":
+            # The file browser: every changed file with its per-file change history and the
+            # conversation/tokens behind each change (same view as --backtrace, real commits).
+            return json_response({"files": self._browser(ref).files_payload()})
+        if path == "/filelog":
+            return json_response(self._browser(ref).file_log_payload(_str(query, "path")))
+        if path == "/filediff":
+            return json_response(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha")))
+        if path == "/story":
+            # The storyline: the backend agent tells this branch's history as chapters
+            # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
+            return html_response(story_page.story_html(self.repo.repo))
+        if path == "/story/state":
+            stats, sha_paths = self._story_view(ref if ref != "HEAD" else "")
+            return json_response(
+                story_page.story_state(
                     self.repo.repo,
                     stats,
                     sha_paths,
                     branch=ref if ref != "HEAD" else self.repo.current_branch(),
                     branches=self._dashboard(ref).branches or self.repo.list_branches(),
-                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
+                    repo_name=self.repo_name,
                 )
-                self._respond("application/json", self._json(payload))
-            elif parsed.path == "/learn":
-                # The learning page: the backend agent coaches the user from their own
-                # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
-                # fetches /learn/state after paint, like the dashboard shell.
-                self._respond(
-                    "text/html; charset=utf-8",
-                    learn_page.learn_html(self.repo.repo).encode("utf-8"),
-                    cache_control="no-cache",
-                )
-            elif parsed.path == "/learn/state":
-                # ``ref`` honours a ?branch= param (validated in _ref): the trace lives in
-                # commits, so the committer list and trace count are branch-dependent.
-                payload = learn_page.learn_state(self.repo.repo, self.repo)
-                dash = self._dashboard(ref)
-                payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
-                payload["branches"] = dash.branches or self.repo.list_branches()
-                payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
-                payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
-                self._respond("application/json", self._json(payload))
-            elif parsed.path == "/learn/models":
-                self._respond("application/json", self._json(learn_page.model_options(_str(query, "backend"))))
-            else:
-                self.send_error(404, "not found")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            # The browser closed the connection mid-response — a poll superseded
-            # by the next one, a refresh, or a closed tab. Harmless; don't let
-            # http.server dump a traceback to the console aGiTrack is running in.
-            pass
+            )
+        if path == "/learn":
+            # The learning page: the backend agent coaches the user from their own interaction
+            # traces (agitrack/metrics/learn.py). Chrome only; the page fetches /learn/state
+            # after paint, like the dashboard shell.
+            return html_response(learn_page.learn_html(self.repo.repo))
+        if path == "/learn/state":
+            # ``ref`` honours a ?branch= param (validated in _ref): the trace lives in commits, so
+            # the committer list and trace count are branch-dependent.
+            payload = learn_page.learn_state(self.repo.repo, self.repo)
+            dash = self._dashboard(ref)
+            payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
+            payload["branches"] = dash.branches or self.repo.list_branches()
+            payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
+            payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
+            return json_response(payload)
+        if path == "/learn/models":
+            return json_response(learn_page.model_options(_str(query, "backend")))
+        return None
 
-    def do_POST(self) -> None:  # noqa: N802 (http.server API)
-        # All POST endpoints belong to the learning page. Bodies are JSON; a beacon
-        # flush (navigator.sendBeacon) may arrive without an application/json header,
-        # so the body is parsed regardless of content type. Every handler returns a
-        # JSON payload; agent failures come back as {"error": …} rather than a 500 so
-        # the page can show them in place.
-        try:
-            parsed = urllib.parse.urlparse(self.path)
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
-            try:
-                body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
-            except json.JSONDecodeError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
-            if parsed.path.startswith("/story/"):
-                payload = story_page.handle_story_post(
-                    parsed.path,
-                    body,
-                    root=self.repo.repo,
-                    view=self._story_view,
-                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
-                )
-            else:
-                payload = learn_page.handle_learn_post(
-                    parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
-                )
-            if payload is None:
-                self.send_error(404, "not found")
-                return
-            self._respond("application/json", self._json(payload))
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
+    def post(self, path: str, body: dict) -> "Response | None":
+        """Answer a POST. All POST endpoints belong to the learning and story pages; agent
+        failures come back as ``{"error": …}`` rather than a 500, so the page can show them
+        in place."""
+        if path.startswith("/story/"):
+            payload = story_page.handle_story_post(
+                path, body, root=self.repo.repo, view=self._story_view, repo_name=self.repo_name
+            )
+        else:
+            payload = learn_page.handle_learn_post(
+                path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
+            )
+        return None if payload is None else json_response(payload)
+
+    # How long a pending-work answer is reused. The probe is a directory listing plus one
+    # `git log`, which is cheap but not free, and this rides on every dashboard poll; the answer
+    # only changes when someone commits or the agent runs, so a minute is imperceptible.
+    _PENDING_TTL_SECONDS = 60.0
+
+    def _pending(self) -> dict:
+        """Agent work the backtrace can see and the tracked history cannot (see metrics.pending)."""
+        import time as _time
+
+        from agitrack.metrics.pending import notice_text, pending_work
+
+        now = _time.monotonic()
+        if self._pending_cache is not None and now - self._pending_cache[0] < self._PENDING_TTL_SECONDS:
+            return self._pending_cache[1]
+        work = self._pending_source() if self._pending_source is not None else pending_work(self.repo.repo)
+        payload = {**work.to_dict(), "notice": notice_text(work)}
+        self._pending_cache = (now, payload)
+        return payload
+
+    def _empty_state(self, dash: Dashboard) -> dict:
+        """What to say when this dashboard has no agent work in it (see metrics.pending)."""
+        from agitrack.metrics.pending import empty_state
+
+        # "Tracked" here means the same thing the automatic view choice means by it: a commit
+        # carrying a NON-ZERO token count. A repo whose only metadata is user-commit attribution
+        # has a full coverage bar over an empty story, which is no better than an empty page.
+        tracked = any(any(v for v in (stat.tokens or {}).values()) for stat in dash.stats)
+        return empty_state(self.repo.repo, commits=len(dash.stats), tracked=tracked)
+
+    # ----------------------------------------------------------------- views
 
     def _story_view(self, branch: str) -> tuple[list, dict]:
-        """The commits (and which files each touched) the storyline is told from: this
-        branch's whole history, unfiltered. The story is about the project, not about a
-        dashboard filter, so no author/period narrowing applies here."""
+        """The commits (and which files each touched) the storyline is told from: this branch's
+        whole history, unfiltered. The story is about the project, not about a dashboard filter,
+        so no author/period narrowing applies here."""
         ref = self._ref(branch)
         dash = self._dashboard(ref)
         _files, sha_paths = context_from_browser(self._browser(ref), dash.stats)
         return dash.stats, sha_paths
 
     def _learn_view(self, author: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
-        """The filtered stats + insights + file rows the learning agent's digest is built
-        from: exactly the same slice the dashboard would show for this filter. ``branch``
-        picks the ref the trace is read from (validated like the dashboard's selector)."""
+        """The filtered stats + insights + file rows the learning agent's digest is built from:
+        exactly the same slice the dashboard would show for this filter. ``branch`` picks the ref
+        the trace is read from (validated like the dashboard's selector)."""
         ref = self._ref(branch)
         dash = self._dashboard(ref)
         stats = _filter_stats(dash, author=author, backend="", model="", frm=frm, to=to)
         insights = self._insights(ref, author=author, frm=frm, to=to)
         return stats, insights, self._browser(ref).files_payload()
 
-    @staticmethod
-    def _json(payload: dict) -> bytes:
-        return json.dumps(payload).encode("utf-8")
-
     def _ref(self, branch: str) -> str:
-        # Only an actual local branch may be viewed: an unchecked value would be
-        # interpolated straight into ``git log <ref>``, so anything not in the
-        # branch list (an option string, a bogus name, "") falls back to HEAD.
+        # Only an actual local branch may be viewed: an unchecked value would be interpolated
+        # straight into ``git log <ref>``, so anything not in the branch list (an option string,
+        # a bogus name, "") falls back to HEAD.
         return branch if branch and branch in self.repo.list_branches() else "HEAD"
 
     def _dashboard(self, ref: str = "HEAD") -> Dashboard:
-        # cached_logins never blocks: it returns the cached GitHub identities (or {}
-        # when cold) and refreshes them in the background, so polls stay fast. Resolved
-        # logins appear on a later poll. {} when gh is absent. The initial / paint warms
-        # this cache so the IDs are usually ready by the first /data poll.
+        # cached_logins never blocks: it returns the cached GitHub identities (or {} when cold)
+        # and refreshes them in the background, so polls stay fast. Resolved logins appear on a
+        # later poll. {} when gh is absent. The initial / paint warms this cache so the IDs are
+        # usually ready by the first /data poll.
         logins = cached_logins(self.repo)
-        # Reading the whole history is THE expensive thing this server does, and every
-        # request used to do it again: a poll, a log page, the story page, and every return
-        # from /learn or /story. It only changes when a ref moves, so key it on the tips we
-        # actually read (the branch, and the manual-mode latent refs the pending rows come
-        # from) plus how many identities are resolved so far.
+        # Reading the whole history is THE expensive thing this server does, and every request
+        # used to do it again: a poll, a log page, the story page, and every return from /learn
+        # or /story. It only changes when a ref moves, so key it on the tips we actually read
+        # (the branch, and the manual-mode latent refs the pending rows come from) plus how many
+        # identities are resolved so far.
         key = (ref, self._ref_state(ref), len(logins), len(self.email_logins))
-        cache = type(self)._dash_cache
-        hit = cache.get(key)
+        hit = self._dash_cache.get(key)
         if hit is not None:
             return hit
         dash = build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
-        cache.clear()  # only the current state is worth keeping
-        cache[key] = dash
+        self._dash_cache.clear()  # only the current state is worth keeping
+        self._dash_cache[key] = dash
         return dash
 
     def _ref_state(self, ref: str) -> str:
-        """A cheap fingerprint of everything the dashboard reads: the branch tip and the
-        latent (manual-mode) refs. Two git plumbing calls instead of a full history walk."""
+        """A cheap fingerprint of everything the dashboard reads: the branch tip and the latent
+        (manual-mode) refs. Two git plumbing calls instead of a full history walk."""
         try:
             head = self.repo.rev_parse(ref)
         except Exception:
@@ -309,17 +328,16 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         return head + "|" + latent.strip()
 
     def _browser(self, ref: str = "HEAD") -> FileBrowser:
-        # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll
-        # that finds no new commits reuses it; only a new commit rebuilds the numstat index.
+        # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll that
+        # finds no new commits reuses it; only a new commit rebuilds the numstat index.
         dash = self._dashboard(ref)
         head = dash.stats[-1].sha if dash.stats else ""
         key = (ref, head)
-        cache = type(self)._browser_cache
-        hit = cache.get(key)
+        hit = self._browser_cache.get(key)
         if hit is None:
             hit = git_browser(self.repo, dash.stats, ref)
-            cache.clear()  # keep only the latest tip's browser — bounded memory
-            cache[key] = hit
+            self._browser_cache.clear()  # keep only the latest tip's browser — bounded memory
+            self._browser_cache[key] = hit
         return hit
 
     _INSIGHTS_CACHE_MAX = 16
@@ -333,7 +351,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         dash = self._dashboard(ref)
         head = dash.stats[-1].sha if dash.stats else ""
         key = (ref, head, author, backend, model, frm, to)
-        cache = type(self)._insights_cache
+        cache = self._insights_cache
         hit = cache.get(key)
         if hit is None:
             if cache and next(iter(cache))[:2] != (ref, head):
@@ -346,20 +364,71 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             cache[key] = hit
         return hit
 
-    def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
-        body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        if encoding:
-            self.send_header("Content-Encoding", encoding)
-        self.send_header("Content-Length", str(len(body)))
-        # Data endpoints are always recomputed; never let the browser cache them. HTML
-        # pages pass "no-cache" instead: still revalidated on a normal load, but eligible
-        # for the browser's back/forward cache — "no-store" disables bfcache, which made
-        # returning from /learn to the dashboard a full blank-page reload (#learn).
-        self.send_header("Cache-Control", cache_control)
-        self.end_headers()
-        self.wfile.write(body)
+
+def read_json_body(handler: http.server.BaseHTTPRequestHandler) -> dict:
+    """The JSON object a POST carried, or ``{}``.
+
+    A beacon flush (``navigator.sendBeacon``) may arrive without an ``application/json`` header,
+    so the body is parsed regardless of content type; anything that is not a JSON object at all
+    becomes an empty one rather than an exception on a page the user is still looking at."""
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        return {}
+    raw = handler.rfile.read(length) if 0 < length <= 1_000_000 else b""
+    try:
+        body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def write_response(handler: http.server.BaseHTTPRequestHandler, response: "Response | None") -> None:
+    """Put a scope's :class:`Response` on the wire, or a 404 for ``None``."""
+    if response is None:
+        handler.send_error(404, "not found")
+        return
+    if response.status in (301, 302, 303, 307, 308):
+        handler.send_response(response.status)
+        for name, value in response.headers.items():
+            handler.send_header(name, value)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
+    body, encoding = maybe_gzip(response.body, handler.headers.get("Accept-Encoding", ""))
+    handler.send_response(response.status)
+    handler.send_header("Content-Type", response.content_type)
+    if encoding:
+        handler.send_header("Content-Encoding", encoding)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", response.cache_control)
+    for name, value in response.headers.items():
+        handler.send_header(name, value)
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class _DashboardHandler(http.server.BaseHTTPRequestHandler):
+    """The single-repository dashboard server: one scope, mounted at the root."""
+
+    scope: RepoScope  # set on the per-server subclass
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            write_response(self, self.scope.get(parsed.path, urllib.parse.parse_qs(parsed.query)))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The browser closed the connection mid-response — a poll superseded by the next one,
+            # a refresh, or a closed tab. Harmless; don't let http.server dump a traceback to the
+            # console aGiTrack is running in.
+            pass
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            write_response(self, self.scope.post(parsed.path, read_json_body(self)))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def log_message(self, *args: object) -> None:
         """Stay quiet: the dashboard is a foreground tool, not a web log."""
@@ -507,13 +576,9 @@ def build_server(
     handler = type(
         "DashboardHandler",
         (_DashboardHandler,),
-        {
-            "repo": repo,
-            "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()},
-            # Fresh per-server caches so two servers (different repos) never share either.
-            "_browser_cache": {},
-            "_dash_cache": {},
-        },
+        # One scope per server, carrying the repo and its own caches, so two servers (different
+        # repos) never share a built dashboard.
+        {"scope": RepoScope(repo, email_logins=email_logins)},
     )
     bind_host = default_bind_host() if host is None else host
     return bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, port)

@@ -3,124 +3,91 @@ from agitrack.proxy.runner import ProxyInput
 from tests.proxy_helpers import make_runner
 
 
-class _FakeProc:
-    """Stand-in for the detached dashboard child's Popen handle."""
-
-    def __init__(self, pid=4242):
-        self.pid = pid
-        self._alive = True
-        self.terminated = False
-        self.killed = False
-
-    def poll(self):
-        return None if self._alive else 0
-
-    def terminate(self):
-        self.terminated = True
-        self._alive = False
-
-    def wait(self, timeout=None):
-        return 0
-
-    def kill(self):
-        self.killed = True
-        self._alive = False
-
-
 def test_dashboard_is_in_the_ctrl_g_command_palette():
     assert "dashboard" in ProxyInput.COMMANDS
 
 
-def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
-    proc = _FakeProc()
-    spawned: list[dict] = []
-    opened: list[str] = []
-    monkeypatch.setattr("agitrack.metrics.running_handshake", lambda repo: None)  # none running yet
-    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
-    monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: spawned.append(kw) or proc)
-    monkeypatch.setattr(
-        "agitrack.metrics.wait_for_handshake",
-        lambda repo, **kw: {"pid": proc.pid, "url": "http://127.0.0.1:12345/", "port": 12345},
-    )
-    # The handler routes the browser through open_dashboard_in_browser (which skips
-    # opening on a remote/headless host); force "opened locally" for the test.
-    monkeypatch.setattr("agitrack.metrics.open_dashboard_in_browser", lambda url: opened.append(url) or True)
+def _repo():
+    """A stand-in repo object: the dashboard handler only needs its path."""
+    return type("R", (), {"repo": "/tmp/proj"})()
 
-    runner = make_runner(base_repo=object())
+
+def _hub(monkeypatch, *, url, view="active", running_before=False, record=None):
+    """Stand in for the dashboard hub: what it would return, without a socket or a daemon."""
+    calls: dict = {"ensure": [], "opened": []}
+    state = {"running": running_before}
+    monkeypatch.setattr(
+        "agitrack.metrics.hub.ensure_hub_for",
+        lambda directory, **kw: (state.__setitem__("running", True), calls["ensure"].append(directory), (url, view))[
+            -1
+        ],
+    )
+    monkeypatch.setattr(
+        "agitrack.metrics.hub.running_hub",
+        lambda: (record or {"pid": 4242, "url": "http://127.0.0.1:8765/", "port": 8765}) if state["running"] else None,
+    )
+    monkeypatch.setattr("agitrack.metrics.open_dashboard_in_browser", lambda u: calls["opened"].append(u) or True)
+    return calls
+
+
+def test_dashboard_command_opens_this_repo_on_the_hub(monkeypatch):
+    # One hub serves every repository, so the Ctrl-G dashboard no longer spawns anything of its
+    # own: it asks the hub for this repo's URL and opens it.
+    calls = _hub(monkeypatch, url="http://127.0.0.1:8765/r/proj-abc123/")
+
+    runner = make_runner(base_repo=_repo())
     monkeypatch.setattr(runner, "_render", lambda: None)
-    monkeypatch.setattr(runner, "_dashboard_email_logins", lambda: {})
     popups: list[tuple] = []
     monkeypatch.setattr(runner, "_select_popup", lambda title, options, **kw: popups.append((title, kw)) or "ok")
 
     runner._handle_dashboard_command()
 
-    assert runner._dashboard_proc is proc
-    assert runner._dashboard_url == "http://127.0.0.1:12345/"
-    assert opened == ["http://127.0.0.1:12345/"]
-    # A free-standing daemon, like `agitrack -d`: no owner pid, so the dashboard keeps
-    # running after aGiTrack quits (and after the terminal closes) until `-d stop`.
-    assert spawned and "owner_pid" not in spawned[0]
-    # A popup tells the user the daemon outlives aGiTrack and how to stop it.
-    assert popups and "KEEPS RUNNING" in " ".join(popups[0][1]["detail"])
-    assert "agitrack -d stop" in " ".join(popups[0][1]["detail"])
+    assert runner._dashboard_url == "http://127.0.0.1:8765/r/proj-abc123/"
+    assert calls["opened"] == ["http://127.0.0.1:8765/r/proj-abc123/"]
+    # A popup tells the user the daemon outlives aGiTrack, how to stop it, and that one
+    # dashboard covers every repository.
+    detail = " ".join(popups[0][1]["detail"])
+    assert "KEEPS RUNNING" in detail
+    assert "agitrack -d stop" in detail
+    assert "every repository" in detail
 
-    # A second invocation reuses the running process (never respawns), just reopens it.
-    monkeypatch.setattr(
-        "agitrack.metrics.spawn_dashboard_daemon",
-        lambda repo, **kw: (_ for _ in ()).throw(AssertionError("must not respawn a live daemon")),
-    )
+    # A second invocation just reopens it: the hub was already running, so no popup this time.
     runner._handle_dashboard_command()
-    assert runner._dashboard_proc is proc  # unchanged
-    assert opened == ["http://127.0.0.1:12345/", "http://127.0.0.1:12345/"]
+    assert calls["opened"] == ["http://127.0.0.1:8765/r/proj-abc123/"] * 2
     assert len(popups) == 1  # the persistence popup shows only on a fresh start
 
 
-def test_dashboard_command_reports_when_daemon_fails_to_start(monkeypatch):
-    proc = _FakeProc()
-    monkeypatch.setattr("agitrack.metrics.running_handshake", lambda repo: None)  # none running yet
-    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
-    monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: proc)
-    monkeypatch.setattr("agitrack.metrics.wait_for_handshake", lambda repo, **kw: None)  # never binds
-    monkeypatch.setattr("agitrack.metrics.log_path", lambda repo: "/tmp/dashboard.log")
+def test_dashboard_command_opens_the_backtrace_view_when_nothing_is_tracked(monkeypatch):
+    # Which view opens is the hub's decision. A repo with nothing tracked yet gets the
+    # reconstruction, and the popup explains why this is not the dashboard they asked for.
+    calls = _hub(monkeypatch, url="http://127.0.0.1:8765/b/proj-abc123/", view="backtrace")
 
-    runner = make_runner(base_repo=object())
+    runner = make_runner(base_repo=_repo())
     monkeypatch.setattr(runner, "_render", lambda: None)
-    monkeypatch.setattr(runner, "_dashboard_email_logins", lambda: {})
+    popups: list[tuple] = []
+    monkeypatch.setattr(runner, "_select_popup", lambda title, options, **kw: popups.append((title, kw)) or "ok")
 
     runner._handle_dashboard_command()
 
-    assert runner._dashboard_proc is None  # not adopted
-    assert proc.terminated  # the stillborn child was reaped, not orphaned
+    assert calls["opened"] == ["http://127.0.0.1:8765/b/proj-abc123/"]
+    assert popups and popups[0][0].startswith("Backtrace view live at")
+    assert "no recorded AI work yet" in " ".join(popups[0][1]["detail"])
 
 
-def test_dashboard_command_reuses_an_externally_running_daemon(monkeypatch):
-    # A dashboard daemon already running for this repo (e.g. from `agitrack -d`, or a
-    # prior session) is reused: the browser opens at its URL and no duplicate is spawned,
-    # nor is its handshake cleared.
-    opened: list[str] = []
-    monkeypatch.setattr(
-        "agitrack.metrics.running_handshake",
-        lambda repo: {"pid": 777, "url": "http://127.0.0.1:9999/", "port": 9999},
-    )
-    monkeypatch.setattr(
-        "agitrack.metrics.spawn_dashboard_daemon",
-        lambda repo, **kw: (_ for _ in ()).throw(AssertionError("must not spawn when one is already running")),
-    )
-    monkeypatch.setattr(
-        "agitrack.metrics.clear_handshake",
-        lambda repo: (_ for _ in ()).throw(AssertionError("must not clear another daemon's handshake")),
-    )
-    monkeypatch.setattr("agitrack.metrics.open_dashboard_in_browser", lambda url: opened.append(url) or True)
+def test_dashboard_command_reports_when_the_hub_fails_to_start(monkeypatch):
+    monkeypatch.setattr("agitrack.metrics.hub.ensure_hub_for", lambda directory, **kw: ("", "active"))
+    monkeypatch.setattr("agitrack.metrics.hub.running_hub", lambda: None)
+    monkeypatch.setattr("agitrack.metrics.hub.log_path", lambda: "/tmp/dashboard.log")
 
-    runner = make_runner(base_repo=object())
+    runner = make_runner(base_repo=_repo())
     monkeypatch.setattr(runner, "_render", lambda: None)
+    messages: list[str] = []
+    monkeypatch.setattr(runner, "_set_message", lambda text: messages.append(text))
 
     runner._handle_dashboard_command()
 
-    assert opened == ["http://127.0.0.1:9999/"]
-    assert runner._dashboard_url == "http://127.0.0.1:9999/"
-    # We don't own it, so we don't track it as our proc.
-    assert runner._dashboard_proc is None
+    # The user is pointed at the log rather than left with a dashboard that silently did not open.
+    assert messages and "/tmp/dashboard.log" in messages[0]
 
 
 def test_dashboard_is_never_stopped_by_agitrack_exit():

@@ -1562,7 +1562,9 @@ def learn_html(root: Path, *, banner_html: str = "") -> str:
         .replace("__BACKEND_OPTIONS__", _backend_option_html())
         # Same reason as the option rows: a hand-written prose list tells a user of the
         # missing backend that their sessions are unsupported.
-        .replace("__BACKEND_PHRASE__", backend_phrase())
+        .replace("__BACKEND_PHRASE__", backend_phrase()),
+        # Switching repository or view from the hub bar keeps you on the learn page.
+        __UI_HUBBAR_PAGE__="learn",
     )
 
 
@@ -1574,7 +1576,8 @@ def learn_backtrace_banner(directory: str) -> str:
     return (
         '<div class="btbanner">&#9194; BACKTRACE. This learning view is built from a reconstruction of past '
         f"coding-agent sessions in {_escape(directory)}: the coach's suggestions and lessons below are based on "
-        "that backtraced history, not aGiTrack's live repo tracking. "
+        "that backtraced history, <b>not aGiTrack's active tracking</b>. A reconstruction is inferred from "
+        "the agent's transcripts, so it is less accurate than the tracked view. "
         "Tip: run <code>agitrack --backtrace commit</code> to bake this history into your git commit messages, "
         "then launch your coding agent through <code>agitrack</code> and everything is fully tracked going "
         "forward.</div>"
@@ -1780,12 +1783,14 @@ __UI_ENGINE_CSS__
 footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 /* The backtrace notice: a frozen top strip, amber like the dashboard's, always visible. */
 __UI_BANNER_CSS__
+__UI_HUBBAR_CSS__
 footer code{color:var(--fg)}
 @media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
 </style>
 </head>
 <body>
 __PREBOOT_HTML__
+__UI_HUBBAR_HTML__
 __BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">
@@ -1947,6 +1952,7 @@ __BACKEND_OPTIONS__
 // (see web.PREBOOT_CSS). The page's own skeleton takes over from here.
 { const pb = document.getElementById("preboot"); if (pb) pb.remove(); }
 __UI_DOM_JS__
+__UI_HUBBAR_JS__
 
 const state = { me: "", source: "", branch: "", branches: [], minutes: 0, mood: "", profile: null, lesson: null,
                 sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
@@ -2757,6 +2763,7 @@ $("e-scope").addEventListener("change", () => { $("e-scope").dataset.userTouched
 $("e-save").addEventListener("click", saveEngine);
 $("sync-toggle").addEventListener("click", toggleSync);
 
+initHubBar();
 refreshState();
 </script>
 </body>

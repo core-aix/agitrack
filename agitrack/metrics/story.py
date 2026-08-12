@@ -1634,7 +1634,9 @@ def story_html(root: Path, *, banner_html: str = "") -> str:
         .replace("__FONT_LINKS__", FONT_LINKS)
         # Built from the backend registry, never hand-written: a literal option list simply
         # could not offer a newly added backend, and nothing failed to say so.
-        .replace("__BACKEND_OPTIONS__", learn_page._backend_option_html())
+        .replace("__BACKEND_OPTIONS__", learn_page._backend_option_html()),
+        # Switching repository or view from the hub bar keeps you on the storyline.
+        __UI_HUBBAR_PAGE__="story",
     )
 
 
@@ -1645,7 +1647,9 @@ def story_backtrace_banner(directory: str) -> str:
 
     return (
         '<div class="btbanner">&#9194; BACKTRACE. This story is told from a reconstruction of past '
-        f"coding-agent sessions in {_escape(directory)}, not from aGiTrack's live repo tracking. "
+        f"coding-agent sessions in {_escape(directory)}, <b>not from aGiTrack's active tracking</b>. "
+        "A reconstruction infers which conversation changed which files, so it is less accurate "
+        "than the tracked view. "
         "Tip: run <code>agitrack --backtrace commit</code> to bake this history into your git commit "
         "messages, then launch your coding agent through <code>agitrack</code> and every future "
         "moment writes itself.</div>"
@@ -1966,6 +1970,7 @@ __UI_COMMIT_CSS__
 
 /* The frozen top strips (backtrace notice, static-demo notice), matching the learn page. */
 __UI_BANNER_CSS__
+__UI_HUBBAR_CSS__
 
 footer{margin-top:40px;padding-top:14px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 footer code{color:var(--fg)}
@@ -1985,6 +1990,7 @@ footer code{color:var(--fg)}
 </head>
 <body>
 __PREBOOT_HTML__
+__UI_HUBBAR_HTML__
 __BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">
@@ -2092,6 +2098,7 @@ __BACKEND_OPTIONS__
 // The document is here and styled: drop the pre-boot overlay that covered its transfer.
 { const pb = document.getElementById("preboot"); if (pb) pb.remove(); }
 __UI_DOM_JS__
+__UI_HUBBAR_JS__
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const state = {
@@ -3083,6 +3090,7 @@ $("f-branch").addEventListener("change", () => {
 });
 window.addEventListener("hashchange", openFromHash);
 
+initHubBar();
 load().catch(() => {});   // load() reports for itself, after its retries
 // A build started from another tab (or still running from before this page loaded) keeps
 // the page live without anyone pressing anything.

@@ -210,6 +210,7 @@ class GlobalConfig:
             "learning_backend": None,
             "learning_model": None,
             "check_for_updates": True,
+            "open_dashboard_on_start": True,
             "share_max_transcript_bytes": DEFAULT_MAX_SHARED_BYTES,
             "timings": dict(DEFAULT_TIMINGS),
         }
@@ -605,6 +606,23 @@ class GlobalConfig:
     @summarization_enabled.setter
     def summarization_enabled(self, value: bool) -> None:
         self.data["summarization_enabled"] = bool(value)
+        self.save()
+
+    @property
+    def open_dashboard_on_start(self) -> bool:
+        """Whether starting aGiTrack on a repository also opens its dashboard in the browser.
+
+        On by default, and deliberately so: aGiTrack's whole point is the record it builds, and a
+        record nobody looks at may as well not exist. One dashboard serves every repository on one
+        port, so this opens a tab rather than starting yet another server. Turn it off here for a
+        machine where a browser has no business appearing (a shared box, a build agent); scripted
+        and non-interactive runs never open one regardless."""
+        value = self._raw("open_dashboard_on_start")
+        return True if value is None else bool(value)
+
+    @open_dashboard_on_start.setter
+    def open_dashboard_on_start(self, value: bool) -> None:
+        self.data["open_dashboard_on_start"] = bool(value)
         self.save()
 
     @property

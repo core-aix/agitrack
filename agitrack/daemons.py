@@ -30,6 +30,7 @@ from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, detach_kwargs, pi
 
 # Human-readable name for each daemon kind, shown in `--daemons`.
 KIND_LABELS = {
+    "hub": "dashboard (all repos)",
     "dashboard": "repo dashboard",
     "backtrace": "backtrace dashboard",
     "background": "background mode",
@@ -41,7 +42,7 @@ KIND_LABELS = {
 # aGiTrack running?" — usually because something holds a repo lock — got half the answer and no
 # mention of the very session holding it. Listing it is the point; terminating someone's live
 # conversation from a bulk sweep is not.
-_STOPPABLE_KINDS = frozenset({"dashboard", "backtrace", "background"})
+_STOPPABLE_KINDS = frozenset({"hub", "dashboard", "backtrace", "background"})
 
 
 def _stoppable(infos: "list[DaemonInfo]") -> "list[DaemonInfo]":
@@ -52,6 +53,7 @@ def _stoppable(infos: "list[DaemonInfo]") -> "list[DaemonInfo]":
 # daemon directly in the OS process table (so one that never registered, e.g. started by a version
 # before this registry existed, is still discovered).
 _SERVE_FLAGS = (
+    ("--hub-serve", "hub"),
     ("--dashboard-serve", "dashboard"),
     ("--backtrace-serve", "backtrace"),
     ("--background-serve", "background"),

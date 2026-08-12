@@ -127,23 +127,44 @@ Run in the current repository:
 agitrack
 ```
 
-By default, aGiTrack launches the AI agent's normal interface (Claude, Codex or OpenCode) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
+Run with no arguments and aGiTrack **asks which mode you want**: a menu of every mode, with a line saying what each one is for and the command that goes straight there next time. Move with the arrow keys and press Enter (a number or a mode name works too, and `q` quits). The first entry, **background tracking with automatic commits**, is the default, because it asks least of you: you keep using your coding agent exactly as you do now and aGiTrack tracks it from the outside.
+
+Whichever mode you pick, aGiTrack **opens that repository's dashboard** in your browser as it starts. See [Dashboard](#dashboard).
+
+To skip the menu, name the mode on the command line:
+
+| Command | Mode |
+| --- | --- |
+| `agitrack -b` | background tracking, automatic commits (the menu's default) |
+| `agitrack -b -m` | background tracking, commits you make |
+| `agitrack -i` | interactive TUI in an isolated worktree |
+| `agitrack -i --no-worktree` | interactive TUI on your current branch |
+| `agitrack -i -m` | interactive TUI, commits you make |
+| `agitrack -d` | open this repository's dashboard |
+| `agitrack --backtrace` | reconstruct past agent sessions |
+| `agitrack -s` | report what aGiTrack is running here |
+| `agitrack stop` | stop whatever aGiTrack is running here, in any mode |
+
+**`agitrack stop` is the one way to stop.** Whatever is holding the repository, it stops it: the background tracker, an interactive session, and this repository's dashboard. You do not have to remember which mode you started.
+
+In interactive mode (`-i`), aGiTrack launches the AI agent's normal interface (Claude, Codex or OpenCode) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
 ### Modes at a glance
 
-aGiTrack has two independent choices — **how you run it** (interactive vs background) and **when commits happen** (auto vs manual) — that combine into four modes. Every mode records the same per-turn tracking (interaction trace + token metadata); they differ only in *who drives the agent*, *who triggers the commit*, and *whether an isolated worktree is used*.
+aGiTrack has two independent choices — **how you run it** (interactive vs background) and **when commits happen** (auto vs manual) — that combine into four modes, and the interactive one splits again on **whether an isolated worktree is used**. Every mode records the same per-turn tracking (interaction trace + token metadata); they differ only in *who drives the agent*, *who triggers the commit*, and *where the agent's edits land*.
 
 | | **Auto commit** (default) | **Manual commit** (`-m` / `--manual-commits`) |
 | --- | --- | --- |
-| **Interactive** (default — aGiTrack runs the agent's TUI) | **`agitrack`** — aGiTrack proxies the agent and **commits each completed turn** for you.<br>**Worktree** by default (isolated checkout, auto-merged into the target branch); opt out with `--no-worktree`. | **`agitrack -m`** — aGiTrack proxies the agent; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always) — edits the checked-out branch directly. |
-| **Background** (`-b` / `--background` — headless, no TUI; you drive the agent from any UI) | **`agitrack -b`** — aGiTrack tracks the session you drive elsewhere and **commits each completed turn** itself.<br>**No worktree** (always). | **`agitrack -b -m`** — aGiTrack tracks the session you drive; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always). |
+| **Background** (`-b` / `--background` — headless, no TUI; you drive the agent from any UI) | **`agitrack -b`** *(the default mode)* — aGiTrack tracks the session you drive elsewhere and **commits each completed turn** itself.<br>**No worktree** (always). | **`agitrack -b -m`** — aGiTrack tracks the session you drive; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always). |
+| **Interactive** (`-i` / `--interactive` — aGiTrack runs the agent's TUI) | **`agitrack -i`** — aGiTrack proxies the agent and **commits each completed turn** for you.<br>**Worktree** by default (isolated checkout, auto-merged into the target branch); `agitrack -i --no-worktree` is the same TUI editing your current branch directly. | **`agitrack -i -m`** — aGiTrack proxies the agent; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always) — edits the checked-out branch directly. |
 
-- **Interactive vs Background.** Interactive (the default) launches the agent's native interface with aGiTrack in between. Background (`-b`) runs *without a TUI* so you can drive the same agent from any front-end — its own CLI, an IDE extension, a chat window — while aGiTrack watches the transcript and tracks it. See [Background mode](#background-mode---background---b).
+- **Interactive vs Background.** Background (`-b`, and what a bare `agitrack` offers first) runs *without a TUI* so you can drive the agent from any front-end — its own CLI, an IDE extension, a chat window — while aGiTrack watches the transcript and tracks it. See [Background mode](#background-mode---background---b). Interactive (`-i`) launches the agent's native interface with aGiTrack in between.
+- **Worktree vs your working tree** is a real choice, not a detail, which is why the menu lists the two interactive runs separately. With a worktree the agent works in an isolated checkout and its finished turns are merged back, so several sessions can run at once; without one (`--no-worktree`) it edits your current branch directly and you see every change live in your editor, one session at a time.
 - **Auto vs Manual.** Auto (the default, both interactive and background) turns each finished agent turn into a commit automatically. Manual (`-m`) leaves commits entirely up to you: turns are recorded on a hidden side ref and folded into *your* commit when you make it. See [Manual commits](#manual-commits---manual-commits---m).
-- **Worktree only applies to the interactive + auto default.** That one mode runs in an isolated [git worktree](#worktrees-and-branches) and aGiTrack integrates (merges) its commits into the target branch for you. The **other three modes always run without a worktree** (`--no-worktree`): manual and background modes are defined to operate on the branch you have checked out, editing your working directory directly. When the **agent commits on its own** in any no-worktree mode, a `prepare-commit-msg` hook folds the tracking straight into that commit (a "cover" commit is only the fallback). You can also force no-worktree on the interactive+auto default with `--no-worktree`.
-- **One instance per repo.** Whichever mode you pick, only **one** aGiTrack may run per repository (interactive *or* background — never two), so they never fight over commits. A second start is refused when an interactive session holds the repo; re-running `agitrack -b` while a *background tracker* is running replaces it with a fresh one (like re-running `agitrack -d`), so a rerun after an update always picks up the new code. Use `agitrack -b status` / `agitrack -b stop` to inspect or stop a background tracker.
+- **Worktree only applies to interactive + auto.** That one mode runs in an isolated [git worktree](#worktrees-and-branches) and aGiTrack integrates (merges) its commits into the target branch for you. The **other modes always run without a worktree** (`--no-worktree`): manual and background modes are defined to operate on the branch you have checked out, editing your working directory directly. When the **agent commits on its own** in any no-worktree mode, a `prepare-commit-msg` hook folds the tracking straight into that commit (a "cover" commit is only the fallback). You can also force no-worktree on the interactive+auto default with `--no-worktree`.
+- **One instance per repo.** Whichever mode you pick, only **one** aGiTrack may run per repository (interactive *or* background — never two), so they never fight over commits. A second start is refused when an interactive session holds the repo; re-running `agitrack -b` while a *background tracker* is running replaces it with a fresh one (like re-running `agitrack -d`), so a rerun after an update always picks up the new code. Use `agitrack -s` to see what is running, and `agitrack stop` to stop it whatever mode it is (`agitrack -b status` / `-b stop` still act on a background tracker specifically).
 
-Each mode is described in full below (`--no-worktree`, `--manual-commits`, `--background`), and every choice is also settable in config (`use_worktrees`, `manual_commits`, `background`) so it becomes your default. Switching a repo between any of these modes between runs is supported — aGiTrack cleans up or ignores the previous mode's state (hooks, side refs, background handshake) on the next launch.
+Each mode is described in full below (`--interactive`, `--no-worktree`, `--manual-commits`, `--background`), and every choice is also settable in config (`use_worktrees`, `manual_commits`, `background`) so it becomes your default. Switching a repo between any of these modes between runs is supported — aGiTrack cleans up or ignores the previous mode's state (hooks, side refs, background handshake) on the next launch.
 
 ### Repository, backend, and session
 
@@ -234,14 +255,14 @@ Once an update has **fully completed** (through pip/pipx/brew, the MSI, aGiTrack
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
 
-In interactive mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick a command from the list (or type its name):
+In interactive mode (`-i`), press `Ctrl-G` to open aGiTrack's menu, then pick a command from the list (or type its name):
 
 ```text
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (claude|codex|opencode); shows a picker
 git-unstaged              show intentionally unstaged files
 git-commit                commit your changes (folds in pending agent turns in --manual-commits mode)
-dashboard                 serve the metrics dashboard in the browser (keeps running after aGiTrack quits, until `agitrack -d stop`)
+dashboard                 open this repo on the dashboard (it keeps running after aGiTrack quits, until `agitrack -d stop`)
 settings                  view/change all config options (repo-local or global)
 update                    check for / install an aGiTrack self-update
 exit aGiTrack             quit aGiTrack (with confirmation); Esc just closes the menu
@@ -260,20 +281,31 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 ## Dashboard
 
-`agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
+`agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere. You rarely need to ask for it: **starting aGiTrack on a repository in any mode opens its dashboard for you** (turn that off with `open_dashboard_on_start` in config).
+
+**One dashboard, one port, every repository.** A single server serves all of your projects, switched by URL path: `/r/<repo>/` is a repository's tracked view and `/b/<repo>/` is its backtrace. Pick another repository from the selector in the page header and the same page you were reading (dashboard, story, or learn) opens for it. So there is one port to remember and one `ssh -L` line to forward, however many projects you have. The list of repositories it offers is every repository you have run aGiTrack in; `agitrack stop` drops one from it, `agitrack -d stop` stops the whole dashboard.
+
+**Two views, kept separate.** The header has a **tracked / backtrace** toggle that applies to the dashboard, the story page and the learn page alike, since all three read differently depending on which history they are telling:
+
+- **tracked** is what aGiTrack *recorded*: each commit with the prompts, replies and token counts that produced exactly those lines.
+- **backtrace** is what can be *reconstructed* from your agent's own transcripts. It is labelled as inferred everywhere it appears, and kept apart from the tracked view on purpose, because a reconstruction is less accurate than a recording and merging the two would quietly drag the recorded history down to the inferred one's accuracy.
+
+aGiTrack picks the view for you the first time and then gets out of the way. A repository with **nothing tracked yet but reconstructable sessions** opens on the backtrace, because an empty page is the worst possible answer when the history is sitting in the transcripts. The **first** time that repository has a commit carrying token counts, it switches to the tracked view, once; after that whichever view you last chose stands. The tracked view also tells you when the backtrace holds agent work no commit covers, so nothing goes quietly untracked, and a repository with no agent history at all says so plainly rather than drawing a coverage bar over a void.
 
 **Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release. Its [storyline](https://agitrack.core-aix.org/dashboard/story/) and [learn page](https://agitrack.core-aix.org/dashboard/learn/) are there too.
 
 ```bash
-agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
-agitrack -d stop            # stop that daemon (it keeps running otherwise, surviving the terminal)
+agitrack --dashboard        # open this repo on the dashboard (starting it if needed), then return to your shell
+agitrack -d status          # where the dashboard is running, and which repositories it serves
+agitrack stop               # stop aGiTrack here, which also drops this repo from the dashboard
+agitrack -d stop            # stop the dashboard itself, for every repository
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 agitrack -d export          # write a server-free static copy of the dashboard (see --export-dir) for any static web host
 ```
 
-Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
+Re-running `agitrack -d` while the dashboard is already up simply **opens this repository on it** (and adds it to the switcher if it was not there). The dashboard restarts itself after an aGiTrack update, so it is always serving the current build.
 
-**On a remote machine.** When you run `agitrack -d` (or `--backtrace`) in an SSH session, `localhost` would only be reachable from the remote box — not from where your browser is. So aGiTrack listens on all interfaces instead and prints the remote's own address; open it directly if your firewall allows that port, and if it doesn't, the same message gives you the exact `ssh -L` command to copy-paste on your own machine plus the `http://localhost:…` URL it creates. Ports are handed out consecutively (8765, 8766, 8767, …), so a second dashboard or backtrace lands on a predictable neighbouring URL. Prefer to keep it off the network? `AGITRACK_DASHBOARD_HOST=127.0.0.1` pins it to loopback (the SSH-forwarding instructions are then the only route, and are printed as such); the variable also accepts a specific interface address.
+**On a remote machine.** When you run `agitrack -d` (or `--backtrace`) in an SSH session, `localhost` would only be reachable from the remote box — not from where your browser is. So aGiTrack listens on all interfaces instead and prints the remote's own address; open it directly if your firewall allows that port, and if it doesn't, the same message gives you the exact `ssh -L` command to copy-paste on your own machine plus the `http://localhost:…` URL it creates. There is only ever **one** port to forward (8765 by default, or the next free one if something else holds it), however many repositories and whichever view you are looking at. Prefer to keep it off the network? `AGITRACK_DASHBOARD_HOST=127.0.0.1` pins it to loopback (the SSH-forwarding instructions are then the only route, and are printed as such); the variable also accepts a specific interface address.
 
 ![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v6.png)
 
@@ -331,13 +363,14 @@ Before anything is generated (or if no backend is configured) the page still sho
 Didn't run aGiTrack from the start? `--backtrace` **reconstructs** how your past Claude, Codex and OpenCode sessions changed a directory, purely from the transcripts already on your machine — so you can see (and even bake in) the tracked history retroactively, with no prior aGiTrack use and even in a directory that was never a git repo.
 
 ```bash
-agitrack --backtrace                 # serve the reconstructed dashboard (background daemon, opens the browser)
+agitrack --backtrace                 # open this directory's backtrace view on the dashboard
 agitrack --backtrace text            # one-shot plain-text report instead
-agitrack --backtrace stop            # stop the background backtrace daemon
+agitrack --backtrace status          # where the dashboard is running, and what it serves
+agitrack --backtrace stop            # stop showing this directory (`agitrack stop` does the same)
 agitrack --backtrace commit --backtrace-branch tracked-history   # write the reconstruction into real git commits
 ```
 
-- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a background daemon just like `-d` (it keeps running, surviving the terminal, until `--backtrace stop`), and like `-d`, re-running `--backtrace` **restarts** a daemon that is already up on the same port, so the URL is unchanged and new sessions are picked up.
+- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It is served by the **same** dashboard as everything else, at `/b/<repo>/` rather than `/r/<repo>/` (see [Dashboard](#dashboard)), so the header's **tracked / backtrace** toggle moves between the two views of a repository and its repository selector moves between projects, on one port. The reconstruction keeps up with new sessions while it is open.
 
 - **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
@@ -757,6 +790,8 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `background` (default `false`) runs aGiTrack in background (headless) mode by default — the same as starting aGiTrack with `--background` / `-b`, which applies it for a single run. In background mode aGiTrack tracks a session you drive from your own UI (no TUI), and **always runs without a worktree** (it implies `--no-worktree`). It uses **auto** commits by default (like the interactive TUI); set `manual_commits: true` (or pass `-m`) for user-triggered commits. Settable in both the global (`~/.agitrack/config.json`) and per-repo (`<repo>/.agitrack/config.json`) config files. See the `--background` notes under Usage.
 
 `autotrack_hook` (default `"auto"`, **per-repository**) controls the persistent `pre-commit` hook. `"auto"`: on a `git commit` made while aGiTrack isn't running, fold the AI trace into that commit and **auto-start** the background tracker (in the same commit mode as the last run) for the turns that follow. `"off"`: don't install it — track only while aGiTrack is running. aGiTrack asks the first time you run `agitrack -b` on a repo; `agitrack --remove-hooks` sets it to `"off"`. See [Background mode](#background-mode---background---b).
+
+`open_dashboard_on_start` (default `true`) controls whether starting aGiTrack on a repository also opens its [dashboard](#dashboard) in your browser. It is on by default because a record nobody looks at may as well not exist, and because one dashboard serves every repository, so opening it costs a browser tab rather than another server. Set it to `false` on a machine where a browser has no business appearing (a shared box, a build agent); scripted and non-interactive runs never open one regardless.
 
 `log_file` (default unset) is a path to a plain-text **event log** aGiTrack appends notable events to — an AI change detected, a commit made, an update available — in **every** mode (interactive and background, with or without `-b`), so you can `tail -f` one file and watch what aGiTrack is doing. A relative path is resolved against the repo root. Set it for a single run with `--log-file PATH`, or persist it here (`"log_file": "agitrack-events.log"`).
 
