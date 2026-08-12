@@ -158,6 +158,11 @@ def remove_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
     try:
         if data:
             path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        elif _is_tracked_by_git(path):
+            # Emptied but COMMITTED: some repos do track this file. Deleting it would show up
+            # as a staged-able deletion of the user's own file, which is a far worse trace to
+            # leave than an empty object.
+            path.write_text("{}\n", encoding="utf-8")
         else:
             # The file existed only to carry our hook: remove it, and the directory too when
             # it was ours alone. Claude Code recreates either on demand.
@@ -173,9 +178,32 @@ def remove_commit_guidance_hook(repo: Path, *, debug=None) -> bool:
     return True
 
 
+def _is_tracked_by_git(path: Path) -> bool:
+    """Whether git has this file committed. Most repos git-ignore ``settings.local.json``
+    (that is what the ``.local`` is for), but some track it, and aGiTrack must not delete a
+    file the user's history contains. Any failure answers "tracked": the cautious direction
+    is to leave a file in place rather than remove one that mattered."""
+    import subprocess
+
+    from agitrack.proc import console_isolation_kwargs
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", path.name],
+            cwd=path.parent,
+            capture_output=True,
+            **console_isolation_kwargs(),
+        )
+    except OSError:
+        return True
+    return result.returncode == 0
+
+
 def hook_is_installed(repo: Path) -> bool:
     data = _load(Path(repo) / SETTINGS_RELPATH)
-    return bool(data) and any(_is_ours(entry) for entry in _entries(data))
+    if not data:
+        return False
+    return any(_is_ours(entry) for entry in _entries(data))
 
 
 def print_session_note(cwd: Path | None = None) -> int:
