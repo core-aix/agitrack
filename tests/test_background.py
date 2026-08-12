@@ -940,6 +940,12 @@ def _precommit_env(tmp_path, monkeypatch, backend: "FakeBackend", *, autostart: 
     (cfg / "config.json").write_text(f'{{"default_backend": "claude", "autotrack_hook": "{hook}"}}', encoding="utf-8")
     monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: backend)
     monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    # Stub the spawn by DEFAULT. Auto-start is no longer gated on "did this commit carry AI
+    # work" (a dead tracker could never be revived otherwise), so every autostart=True test now
+    # reaches it — and one that had not thought about the daemon started a real detached
+    # `python -m agitrack --background-serve` that outlived the test. The tests that are ABOUT
+    # the spawn re-patch this with their own recorder, which wins.
+    monkeypatch.setattr("agitrack.proxy.background.spawn_background_daemon", lambda repo, *, extra_args: None)
 
 
 def test_precommit_sync_folds_ai_work_into_the_commit(tmp_path, monkeypatch):
@@ -1036,6 +1042,10 @@ def test_the_commit_hook_installs_as_soon_as_the_repo_state_names_a_backend(tmp_
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
     (cfg / "config.json").write_text('{"privacy_ack": true}', encoding="utf-8")  # no default_backend
     monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+    # autotrack_hook defaults to "auto" here, and auto-start is no longer gated on the commit
+    # carrying AI work, so this reaches the spawn. This test is about the HOOKS; a real detached
+    # daemon would outlive it.
+    monkeypatch.setattr("agitrack.proxy.background.spawn_background_daemon", lambda repo, *, extra_args: None)
 
     assert precommit_sync(repo) == 0  # never fails the user's commit
     assert not (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
