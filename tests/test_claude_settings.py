@@ -174,3 +174,32 @@ def test_the_hook_prints_the_note_in_the_documented_envelope(tmp_path, monkeypat
     # does not exist.
     assert "no separate worktree" in specific["additionalContext"]
     assert "Do NOT create git commits yourself" in specific["additionalContext"]
+
+
+def test_a_settings_file_the_repo_TRACKS_is_never_deleted(tmp_path):
+    """Most repos git-ignore settings.local.json — that is what the `.local` is for — but
+    some commit it. Emptying our hook out of a tracked file must not delete it: that would
+    turn stopping the tracker into a staged-able deletion of a file in the user's history.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    path = _write(tmp_path, {})
+    subprocess.run(["git", "add", "-f", str(path)], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "keep my claude settings"], cwd=tmp_path, check=True)
+    claude_settings.install_commit_guidance_hook(tmp_path)
+
+    claude_settings.remove_commit_guidance_hook(tmp_path)
+
+    assert path.exists()
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+    # Still in the index — the point of the test. (Its bytes can differ from the committed
+    # ones by our formatting; what must never happen is a DELETION showing up in git status.)
+    assert (
+        "D"
+        not in subprocess.run(
+            ["git", "status", "--porcelain", "--", str(path)], cwd=tmp_path, capture_output=True, text=True
+        ).stdout
+    )
