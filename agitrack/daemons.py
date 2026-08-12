@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agitrack import __version__
-from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
+from agitrack.proc import console_isolation_kwargs, detach_kwargs, pid_alive, terminate_pid
 
 # Human-readable name for each daemon kind, shown in `--daemons`.
 KIND_LABELS = {
@@ -202,7 +202,12 @@ def _process_command_lines() -> list[str]:
     else:
         command = ["ps", "-axww", "-o", "pid=,args="]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
+        # On Windows this scan IS a PowerShell process, and it is called from console-less
+        # daemons (the self-update path restarts the others). Without isolation it puts a
+        # PowerShell window on the user's desktop for as long as the scan takes.
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=15, check=False, **console_isolation_kwargs()
+        )
     except (OSError, subprocess.SubprocessError):
         return []
     return result.stdout.splitlines()

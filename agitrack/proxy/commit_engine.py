@@ -482,12 +482,20 @@ class CommitEngine:
         # cover path, which can't amend HEAD to attach a summary afterwards), summarize it
         # SYNCHRONOUSLY here so the commit message LEADS with the summary, just like every other
         # aGiTrack commit. Other callers (proxy, shell) pass None and keep the async amend flow.
-        # Did the user cancel (Esc) any turn this commit accounts for? A turn that was
-        # interrupted after the agent had said what it was ABOUT to do still commits (its
-        # partial edits are real), but the trace alone reads like a finished turn — and the
-        # trace is all the summarizer gets, so it described the whole request as done. Both
-        # the message and the summarizer input carry the fact.
-        interrupted = any(getattr(turn, "interrupted", False) for turn in turns)
+        # Did the user cancel (Esc) the turn this commit ENDS on? A turn that was interrupted
+        # after the agent had said what it was ABOUT to do still commits (its partial edits are
+        # real), but the trace alone reads like a finished turn — and the trace is all the
+        # summarizer gets, so it described the whole request as done. Both the message and the
+        # summarizer input carry the fact.
+        #
+        # THE LAST TURN, NOT ANY TURN. A commit routinely covers several turns, and `any` made
+        # one Esc anywhere in that span stamp "(interrupted)" on a commit whose closing turn ran
+        # to completion — `git log --oneline` then said the work was cut short when it was
+        # finished and pushed. (Live example: a span of four turns where the user had stopped a
+        # single tool call early on.) What the mark has to answer is whether the work this
+        # commit DELIVERS was cut short, and that is decided by the turn it ends on; an earlier
+        # interrupted turn is still visible as itself in the interaction trace.
+        interrupted = bool(turns) and bool(getattr(turns[-1], "interrupted", False))
         trace_text = render_interaction_trace(
             self.state.pending_trace(), self.state.trace_turn_limit, interrupted=interrupted
         )
