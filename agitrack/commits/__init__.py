@@ -1,7 +1,7 @@
 """Commit construction: message builders (with secret masking) and the
 user/agent commit helpers."""
 
-from agitrack.commits.actions import AgitrackActions
+from agitrack.commits.actions import AgitrackActions, UserCommitAborted
 from agitrack.commits.manual import ManualCommitTracker, write_lf
 from agitrack.commits.message import (
     IN_FLIGHT_MARKER,
@@ -23,6 +23,7 @@ from agitrack.commits.message import (
 
 __all__ = [
     "AgitrackActions",
+    "UserCommitAborted",
     "ManualCommitTracker",
     "write_lf",
     "IN_FLIGHT_MARKER",

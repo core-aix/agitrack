@@ -2118,3 +2118,17 @@ def test_core_hookspath_is_announced_not_only_debug_logged(tmp_path, monkeypatch
     assert "core.hooksPath" in out
     assert "myhooks" in out
     assert "NOT tracked" in out
+
+
+def test_the_repo_is_armed_before_the_daemon_announces_itself():
+    """The handshake is what makes the launcher print "daemon live (PID …)", and the hooks were
+    installed ~1.4 s AFTER it — so a kill inside that window left the repo completely unarmed
+    while the CLI had already said tracking was up. It is also what makes `-s`'s advice to a
+    never-tracked repo ("run `agitrack -b` once") true even if that first run dies early."""
+    import inspect
+
+    from agitrack.proxy.background import BackgroundRunner
+
+    source = inspect.getsource(BackgroundRunner.run)
+    assert source.index("self._install_autotrack_hook()") < source.index("self._write_handshake()")
+    assert source.index("self._install_commit_guidance()") < source.index("self._write_handshake()")

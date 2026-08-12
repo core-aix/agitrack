@@ -321,8 +321,10 @@ def main(argv: list[str] | None = None) -> int:
         "--yes",
         "-y",
         action="store_true",
-        help="answer yes to confirmations that would otherwise be asked interactively. Required "
-        "for `--daemons stop` when there is no terminal to prompt on.",
+        help="never ask a question: take the default for every startup prompt (backend choice, "
+        "summarizer model, privacy acknowledgement, auto-start hooks) and answer yes to "
+        "confirmations. Makes `agitrack -b` usable from a script or CI even when it is attached "
+        "to a terminal. Required for `--daemons stop` when there is no terminal to prompt on.",
     )
     parser.add_argument(
         "--share-sessions",
@@ -642,7 +644,9 @@ def main(argv: list[str] | None = None) -> int:
         # Show what is about to die BEFORE killing it. Unscoped, this reaches across every
         # repository the user has, so a bare "stop all" typed while thinking about one repo can
         # take down dashboards for four others; the listing is what makes that visible in time.
-        doomed = [info for info in list_running(repo=scope) if info.pid != os.getpid()]
+        # Sessions are listed by `--daemons` but never stopped by it (daemons._STOPPABLE_KINDS),
+        # so they must not appear in the "about to stop" listing either.
+        doomed = [info for info in list_running(repo=scope) if info.pid != os.getpid() and info.kind != "session"]
         if not doomed:
             where = f" for {_abbreviate_home(scope)}" if scope else ""
             print(f"No aGiTrack daemons are currently running{where}.")
@@ -710,12 +714,23 @@ def main(argv: list[str] | None = None) -> int:
         # place, and stopping five daemons one --repo at a time is the tedious way to find that
         # out. The count and the reach are spelled out: this list is every repository, not the
         # current one, so "stop them all" must not read as "stop the ones for this project".
-        print(
-            f"\nTo stop all {len(running)} of them, in every repository above:\n"
-            "  agitrack --daemons stop        (lists them and asks first)\n"
-            "To stop only one repository's, which is usually what you want:\n"
-            "  agitrack --repo <path> --daemons stop"
-        )
+        stoppable = [info for info in running if info.kind != "session"]
+        sessions = [info for info in running if info.kind == "session"]
+        if sessions:
+            # An interactive session is what usually holds a repo lock, so leaving it out of this
+            # listing answered "what is aGiTrack running?" with half the truth — and left the
+            # reader with no idea why `agitrack` was refusing to start.
+            print(
+                f"\n{len(sessions)} of these is an interactive session — quit it in its own terminal "
+                "(Ctrl-G → quit).\n`--daemons stop` never touches one."
+            )
+        if stoppable:
+            print(
+                f"\nTo stop all {len(stoppable)} background daemon(s) above, in every repository:\n"
+                "  agitrack --daemons stop        (lists them and asks first)\n"
+                "To stop only one repository's, which is usually what you want:\n"
+                "  agitrack --repo <path> --daemons stop"
+            )
         return 0
 
     # Backtrace works purely from local transcripts — no git repo AND no git binary needed —
@@ -1043,7 +1058,13 @@ def main(argv: list[str] | None = None) -> int:
     # deprecated alias. `--prompt` and `--ui-bridge` both drive that same non-interactive loop.
     if args.json_mode:
         args.mode = "json"
-    scripted = bool(args.prompts)
+    # `--yes` means "don't ask me anything" — the same contract `--prompt` already has, so it
+    # rides the same flag. Without it, `agitrack -b` on a fresh config blocked on three startup
+    # questions (backend, summarizer model, privacy acknowledgement) whenever it ran ON a
+    # terminal, despite -b being the documented "no TUI, returns to your shell" path: a scripted
+    # or CI use inside a terminal simply hung, and `-b status` skipping the wizard made the two
+    # inconsistent. Answering with the defaults is what --yes is for.
+    scripted = bool(args.prompts) or bool(getattr(args, "yes", False))
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)
     if args.ui_bridge:

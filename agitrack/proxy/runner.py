@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - exercised only without optional depend
     FileSystemEventHandler = object  # type: ignore[misc, assignment]
     Observer = None  # type: ignore[misc, assignment]
 
-from agitrack.commits import AgitrackActions
+from agitrack.commits import AgitrackActions, UserCommitAborted
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.commits import (
@@ -252,6 +252,20 @@ _HOST_TERMINAL_REPLY_RE = re.compile(
     rb"\x1b\](?:10|11|4);[^\x07\x1b]*(?:\x07|\x1b\\)"  # colour / palette reports
     rb"|\x1b\[\?[0-9;]*[cu]"  # primary device attributes; kitty keyboard flags
 )
+
+# The BEGINNING of one of those replies, with its terminator not yet read. A pty read is not
+# framed, so a slow terminal's answer arrives SPLIT — `\x1b]11;rgb:ffff/ffff` in one read and
+# `/ffff\x07` in the next. Neither half matches the pattern above, so both used to flow to the
+# key handler: the tail's BEL is 0x07, i.e. Ctrl-G, so the palette opened by itself and the rest
+# of the reply was typed at the agent — and a Ctrl-G the USER then pressed toggled it shut again,
+# which is what "my menu key sometimes types into the chat" actually is. Held and re-joined
+# instead. Deliberately as narrow as the pattern it completes: no keyboard emits `\x1b]10;` or
+# `\x1b[?`, so a real keypress is never held.
+_HOST_TERMINAL_REPLY_PREFIX_RE = re.compile(rb"(?:\x1b\](?:10|11|4);[^\x07\x1b]*|\x1b\[\?[0-9;]*)$")
+
+# Give up on a partial reply past this many bytes: a terminal that answers is not going to take
+# longer than this, and holding input forever on a truncated one would be worse than the bug.
+_MAX_HELD_REPLY_BYTES = 256
 
 
 # The claude CLI refuses to resume a session that is still held by a running
@@ -807,6 +821,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # One-shot: the hook install path runs again on every worktree-guard restore, and the
         # core.hooksPath notice must not repeat down the session.
         self._hooks_path_notice_shown = False
+        # Trailing bytes of a host-terminal reply whose terminator has not arrived yet
+        # (see _HOST_TERMINAL_REPLY_PREFIX_RE).
+        self._held_reply_prefix = bytearray()
         self._skip_privacy_ack = skip_privacy_ack
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
@@ -1634,6 +1651,14 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # teardown). The shared repo lock only carries a pid, not the mode.
         from agitrack.proxy.background import write_background_mode, write_proxy_status
 
+        # ALSO register in the global registry, so `agitrack --daemons` can answer "what is
+        # aGiTrack running?" with the whole truth. Listed, never stoppable (see daemons.py).
+        try:
+            from agitrack import daemons
+
+            daemons.register("session", self.base_repo.repo)
+        except Exception as error:
+            self._debug(f"session registry entry failed: {error!r}")
         write_proxy_status(
             self.base_repo, commits="manual" if self._manual_commits else "auto", worktree=self._use_worktrees
         )
@@ -1659,7 +1684,17 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # commits would then look like they reverted work the user never committed. Under
             # --no-worktree the agent edits this very tree, so uncommitted changes are still
             # right there and declining costs nothing.
-            self.actions.create_user_commit(allow_skip=not self._use_worktrees)
+            try:
+                self.actions.create_user_commit(allow_skip=not self._use_worktrees)
+            except UserCommitAborted:
+                # The mandatory (worktree-mode) prompt has an exit now; take it cleanly rather
+                # than launching into a worktree that is missing the user's uncommitted work.
+                print(
+                    "aGiTrack not started — the pre-agent commit was declined.\n"
+                    "Commit or stash your changes, or run `agitrack --no-worktree` to let the "
+                    "agent work in this tree as it is."
+                )
+                return 1
         # Base-merge-only: run even the first session in a worktree so the base
         # branch is only advanced by integration, never edited by a live agent.
         self._announce_diagnostics()
@@ -1841,6 +1876,12 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 from agitrack.proxy.background import clear_proxy_status
 
                 clear_proxy_status(self.base_repo)
+                try:
+                    from agitrack import daemons
+
+                    daemons.deregister()
+                except Exception:
+                    pass
             except Exception:
                 pass
             self.management_lock.release()
@@ -4782,9 +4823,16 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         session_branch = self._base_branch if name == "" else (self._dormant_merge_branch(name) or self._base_branch)
         current = self._repo_dir_branch or self.base_repo.current_branch()
         _CUSTOM = "\x00custom"
-        options: list[tuple[str, str]] = [(f"Current branch ({current})", current)]
+        options: list[tuple[str, str]] = []
+        # The session's OWN branch first when it differs: that is where this session's work
+        # already belongs, so it is both the safe default and the only one that changes nothing.
+        # Picking the repo directory's branch instead RE-TARGETS the session (see
+        # `_merge_active_into`), which is worth saying out loud rather than discovering.
         if session_branch and session_branch != current:
             options.append((f"Session's branch ({session_branch})", session_branch))
+            options.append((f"Current branch ({current}) — re-targets this session", current))
+        else:
+            options.append((f"Current branch ({current})", current))
         options.append(("A different branch…", _CUSTOM))
         choice = self._select_popup("Merge into which branch?", [label for label, _ in options])
         if choice is None:
@@ -4804,6 +4852,14 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             self._render()
             return
         self._base_branch = target  # syncs the IntegrationService to the chosen destination
+        # ...and the worktree's RECORDED merge branch with it. The cross-branch guard reads that
+        # record, not `_base_branch`, so without this the menu offered a destination it then
+        # refused: picking "Current branch (main)" for a session that merges into `feature`
+        # produced the cross-branch warning and did nothing at all. The guard is there to stop
+        # AUTOMATIC cross-branch merges; a destination the user just picked from a menu is the
+        # opposite of automatic, so it re-targets the session rather than being blocked by it.
+        if self.state is not None:
+            self.state.merge_branch = target
         self._integrate_active_session()
 
     def _dormant_merge_branch(self, name: str) -> str | None:
@@ -6451,7 +6507,13 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
     # stall. While the loop is inside a phase it is NOT reading stdin, so the terminal's ~1 KB
     # input queue fills and then DISCARDS — which is why a stall surfaces to the user as stray
     # keystrokes and half a mouse report appearing all at once when it finally unblocks.
-    STALL_WARN_SECONDS = 2.0
+    # 0.5, not 2.0: E1's stalls measured 0.96 s and 2.71 s, so the 2.0 s floor recorded ONE of
+    # them and left the other invisible — an intermittent latency bug is exactly the kind that
+    # cannot be reproduced on demand, so the threshold has to sit below the smallest symptom
+    # anyone has reported rather than above it. A keystroke that takes half a second to reach the
+    # agent is already a user-visible freeze (bare codex over the same PTY answers in 0.25-0.44
+    # MILLIseconds), and the note costs one monotonic() per phase.
+    STALL_WARN_SECONDS = 0.5
 
     def _note_phase(self, phase: str, started: float) -> None:
         """Record how long the reactor has been away from ``select`` this iteration.
@@ -6468,7 +6530,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             return  # already reported this iteration at a shorter prefix; only report growth
         self._stall_reported = elapsed
         self._stall_worst = max(self._stall_worst, elapsed)
-        self._debug(f"reactor stalled {elapsed:.1f}s through phase {phase}")
+        self._debug(f"reactor stalled {elapsed:.3f}s through phase {phase}")
         try:
             from agitrack.proxy.crash import write_stall_note
 
@@ -7269,14 +7331,27 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         """
         if not data or self._in_bracketed_paste:
             return data
+        held = bytes(self._held_reply_prefix)
+        if held:
+            # A partial reply from the previous read: re-join before matching, so a reply split
+            # across pty reads is still recognised as one.
+            self._held_reply_prefix.clear()
+            data = held + data
         if b"\x1b]" not in data and b"\x1b[?" not in data:
             return data  # cheap reject: every reply shape starts with one of these
         replies = _HOST_TERMINAL_REPLY_RE.findall(data)
-        if not replies:
-            return data
-        self._parse_host_terminal_responses(b"".join(replies))
-        self._debug(f"absorbed {len(replies)} late host-terminal reply/replies: {replies!r}")
-        return _HOST_TERMINAL_REPLY_RE.sub(b"", data)
+        remainder = _HOST_TERMINAL_REPLY_RE.sub(b"", data) if replies else data
+        # Hold a trailing INCOMPLETE reply rather than letting its bytes — the BEL above all —
+        # reach the key handler.
+        partial = _HOST_TERMINAL_REPLY_PREFIX_RE.search(remainder)
+        if partial and len(partial.group(0)) <= _MAX_HELD_REPLY_BYTES:
+            self._held_reply_prefix.extend(partial.group(0))
+            remainder = remainder[: partial.start()]
+            self._debug(f"holding a partial host-terminal reply: {partial.group(0)!r}")
+        if replies:
+            self._parse_host_terminal_responses(b"".join(replies))
+            self._debug(f"absorbed {len(replies)} late host-terminal reply/replies: {replies!r}")
+        return remainder
 
     # ------------------------------------------------------------------
     # Early capability service (spawn → reactor)
@@ -9173,9 +9248,13 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # the user misread, silently took the default. Up/Down + Enter can only ever return
         # one of the offered options (Esc still cancels).
         stage_label = f"Stage all {len(candidates)} file(s)"
+        # "Leave them unstaged" FIRST, matching the console pass's `[y/N]` default. This popup
+        # led with "Stage all", so the TUI re-asked the question the console had just asked and
+        # offered the OPPOSITE default: a bare Enter swept the user's own untracked files into
+        # the commit — the one outcome that is hard to undo, on the most reflexive keypress.
         answer = self._select_popup(
             "Untracked Files",
-            [stage_label, "Leave them unstaged"],
+            ["Leave them unstaged", stage_label],
             detail=listing.splitlines(),
         )
         if answer is None:

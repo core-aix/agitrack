@@ -130,6 +130,19 @@ def stop_background(repo: GitRepo) -> int:
     # The stopping process knows the repo, so it can do the cleanup the killed one could not —
     # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
     disarmed = _disarm_tracking(repo)
+    # Reap the stopped daemon's REGISTRY entry too. `-b stop` reaped the handshake and left the
+    # registry file, so dead-pid entries accumulated across kill/restart cycles (1 → 6 over three)
+    # and were only ever pruned lazily, on the next read by something else.
+    try:
+        from agitrack import daemons
+        from agitrack.git import RepoLock
+
+        daemons.deregister(pid)
+        # ...and the lock file's owner record, for the same reason: on Windows the terminated
+        # daemon's own release() never ran, so a clean stop looked exactly like a crash on disk.
+        RepoLock(repo.repo / ".agitrack" / "lock").clear_owner_record()
+    except Exception:
+        pass
     # Also from HERE for the same reason as the disarm above: the daemon emits `daemon-stop` in
     # its own teardown, which never runs when it was TerminateProcess'd. `daemon-start` was
     # therefore the only event a `--log-file` reader ever saw across a full -b lifecycle.
@@ -840,6 +853,14 @@ class BackgroundRunner:
         # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
         self.repo.ensure_comment_char_preserves_headings()
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
+        # ARM THE REPO BEFORE ANNOUNCING IT. The handshake below is what the launcher waits for
+        # to print "daemon live (PID …)", and the hooks used to be installed ~1.4 s AFTER it — so
+        # a kill inside that window left the repo completely unarmed while the CLI had already
+        # said tracking was up. It also matters for the "run aGiTrack once and the repo is
+        # armed" promise `-s` now makes to a never-tracked repo (C26/C27): a first run that dies
+        # early must still leave the hook behind.
+        self._install_autotrack_hook()
+        self._install_commit_guidance()
         self._write_handshake()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
@@ -851,8 +872,6 @@ class BackgroundRunner:
                 f"discarded {count} abandoned tracking {chains} from an earlier session — their "
                 "changes are no longer uncommitted, so they had nothing left to attribute."
             )
-        self._install_autotrack_hook()
-        self._install_commit_guidance()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
