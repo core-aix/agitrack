@@ -268,6 +268,48 @@ def test_removing_our_hook_restores_the_users_own_formatting(tmp_path):
     assert porcelain == "", f"left a diff the user never made: {porcelain!r}"
 
 
+def test_removing_our_hook_is_clean_under_crlf_conversion(tmp_path):
+    """The same guarantee on a repo whose line endings git converts — the default on Git for
+    Windows (`core.autocrlf`), where LF is stored and CRLF is checked out.
+
+    Restoring the COMMITTED BYTES is not the same as restoring the FILE. Writing the blob
+    verbatim leaves a working tree whose content hashes identically to HEAD — `git diff` empty,
+    `git hash-object` matching — while `git status` still reports ` M`, because those are not the
+    bytes a checkout would produce and the index's stat entry never got refreshed. Exactly the
+    "diff the user never made" this is supposed to prevent, one layer down. Only reproduced on
+    Windows, where autocrlf is on by default; this pins it everywhere by setting it explicitly."""
+    import subprocess
+
+    from agitrack.backends import claude_settings
+
+    repo = tmp_path / "proj"
+    (repo / ".claude").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "core.autocrlf", "true"], cwd=repo, check=True)
+    settings = repo / ".claude" / "settings.local.json"
+    # CRLF in the working tree, as a Windows editor writes it; git stores LF.
+    original = '{\r\n  "permissions": { "allow": ["Bash(ls:*)"] }\r\n}\r\n'
+    settings.write_bytes(original.encode("utf-8"))
+    subprocess.run(["git", "add", "-f", ".claude/settings.local.json"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "team settings"], cwd=repo, check=True)
+
+    assert claude_settings.install_autostart_hook(repo)
+    assert claude_settings.remove_autostart_hook(repo)
+
+    porcelain = subprocess.run(
+        ["git", "-c", "core.excludesFile=/dev/null", "status", "--porcelain"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert porcelain == "", f"left a diff the user never made: {porcelain!r}"
+    # And the file really is back to what a checkout produces, not merely hash-equal.
+    assert subprocess.run(["git", "update-index", "--refresh"], cwd=repo, capture_output=True).returncode == 0
+
+
 def test_a_user_edit_since_the_commit_is_never_reverted(tmp_path):
     """The restore is deliberately conservative: committed bytes go back ONLY when what remains
     parses equal to the committed JSON. An edit the user made since that commit must survive."""
