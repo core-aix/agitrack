@@ -154,24 +154,43 @@ def test_the_console_path_has_an_explicit_way_out(tmp_path, monkeypatch, capsys)
 
 def test_the_skip_word_is_not_offered_when_a_commit_is_required(tmp_path, monkeypatch):
     # In worktree mode there is no way out, so the prompt must not advertise one — and typing
-    # it must be treated as an ordinary (if odd) commit message rather than an escape.
+    # it anyway is REFUSED with the reason, never committed: a commit literally named `skip`
+    # landed on main before that fix. The user then types a real message and it goes through.
+    #
+    # The stub must vary its answer. It used to return "skip" forever while asserting the call
+    # returned True — but the code (correctly) refuses the sentinel and re-prompts, so the two
+    # disagreed and the result was not a failing assert, it was an INFINITE LOOP. That single
+    # test is what hung every full-suite run on this machine at the same point, which then
+    # looked like a killed run, a missing summary, and a coverage total that swung ten points.
     repo = _repo(tmp_path)
     (tmp_path / "f.txt").write_text("edited\n")
     prompts: list[str] = []
+    answers = iter(["skip", "a real message"])
 
     def ask(prompt=""):
         prompts.append(prompt)
-        return "skip"
+        return next(answers)
 
     monkeypatch.setattr("builtins.input", ask)
 
     assert _actions(repo).create_user_commit(allow_skip=False) is True
 
-    assert all("skip" not in prompt for prompt in prompts)
+    assert all("skip" not in prompt for prompt in prompts)  # never advertised as a way out
+    subject = subprocess.run(
+        ["git", "-C", str(tmp_path), "log", "-1", "--format=%s"], capture_output=True, text=True, check=True
+    ).stdout
+    assert "a real message" in subject and subject.strip() != "skip"  # the sentinel never lands
 
 
 def test_the_console_path_does_not_spin_when_stdin_is_gone(tmp_path, monkeypatch):
-    # EOF used to escape only by propagating; the loop must end cleanly and unstage.
+    # EOF used to escape only by propagating; the loop must end cleanly and unstage. WHICH
+    # clean end depends on whether there is a way out: where skipping is allowed, EOF means
+    # "carry on without committing"; where it is not, it means "get me out" — carrying on would
+    # drop the user into a worktree checked out from HEAD, missing the very work they were
+    # asked about. This asserted the first for BOTH cases, so it broke as soon as the second
+    # was implemented; both are checked now.
+    from agitrack.commits.actions import UserCommitAborted
+
     repo = _repo(tmp_path)
     (tmp_path / "f.txt").write_text("edited\n")
 
@@ -180,8 +199,11 @@ def test_the_console_path_does_not_spin_when_stdin_is_gone(tmp_path, monkeypatch
 
     monkeypatch.setattr("builtins.input", boom)
 
-    assert _actions(repo).create_user_commit(allow_skip=False) is False
+    with pytest.raises(UserCommitAborted):
+        _actions(repo).create_user_commit(allow_skip=False)
+    assert repo.staged_paths() == []  # the index is restored on the way out
 
+    assert _actions(repo).create_user_commit(allow_skip=True) is False
     assert repo.staged_paths() == []
 
 
