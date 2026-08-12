@@ -194,15 +194,57 @@ class LearningBackendChoice:
         return backend_class(self.backend_name)(learning_scratch_dir(), launch_command=launch)
 
 
+def unresolved_backend_message() -> str:
+    """What to tell the user when no backend could be resolved — which depends on WHY.
+
+    The old single sentence ("run an aGiTrack session in this repo first") was wrong advice
+    for the case that actually produced it: in backtrace mode the repo is one aGiTrack never
+    drove, so the suggested remedy contradicted the mode (#233). Both real causes now get
+    their own remedy, and both are reachable from the page itself."""
+    found = installed_backends()
+    if not found:
+        return (
+            f"No coding agent CLI was found on this machine. Install {backend_phrase()} and "
+            "reload, or set learning_backend in .agitrack/config.json."
+        )
+    return (
+        f"More than one coding agent CLI is installed ({', '.join(found)}), so aGiTrack cannot "
+        'pick one for you. Choose the one to learn with in the "coach engine" panel below. It '
+        "is saved as learning_backend and applies to every repo unless you scope it to this one."
+    )
+
+
+def installed_backends() -> list[str]:
+    """The known backends whose CLI is actually runnable on this machine.
+
+    ``available_backends()`` lists what aGiTrack SUPPORTS (the registry); this lists what
+    the user has. Uses ``backend_installed`` rather than a bare ``shutil.which`` so a
+    half-installed npm package that left only a shell script or a .ps1 doesn't count on
+    Windows — aGiTrack could not launch it (see backends/setup.py)."""
+    from agitrack.backends.setup import backend_installed
+
+    return [name for name in available_backends() if backend_installed(name)]
+
+
 def resolve_learning_backend(repo_root: Path) -> LearningBackendChoice:
     """Which backend/model generates learning content for this repo.
 
     Precedence: the ``learning_backend`` / ``learning_model`` config keys (repo overlay
     over global) win; otherwise the LATEST SESSION's backend and model recorded in
-    ``.agitrack/state.json``; otherwise the configured ``default_backend``. A model id
-    that belongs to the other backend's format is dropped (the backend then uses its own
-    default), exactly like the summarizer's model handling. Raises
-    :class:`LearnAgentError` when no backend can be determined at all.
+    ``.agitrack/state.json``; otherwise the configured ``default_backend``; otherwise the
+    single backend CLI installed on this machine. A model id that belongs to the other
+    backend's format is dropped (the backend then uses its own default), exactly like the
+    summarizer's model handling. Raises :class:`LearnAgentError` when no backend can be
+    determined at all.
+
+    THE DETECTION TIER EXISTS BECAUSE THE OTHERS CANNOT FIRE IN BACKTRACE MODE (#233). Every
+    tier above it needs aGiTrack to have been configured or to have run here before, and
+    backtrace mode's whole purpose is a repo aGiTrack was NOT driving — it reconstructs the
+    history from the coding agent's own transcripts. On a fresh install that made the learn
+    page fail on a machine with a perfectly good `claude` on PATH, and the remedy in the error
+    ("run a session in this repo first") contradicted the mode the user was in. Only a
+    one-of-one match is taken: with two CLIs installed there is no right answer to guess, and
+    the caller offers the picker instead.
     """
     from agitrack.config.settings import GlobalConfig
     from agitrack.config.state import AgitrackState
@@ -218,10 +260,10 @@ def resolve_learning_backend(repo_root: Path) -> LearningBackendChoice:
     if backend_name not in known:
         backend_name, backend_source = config.default_backend, "session"
     if backend_name not in known:
-        raise LearnAgentError(
-            "No coding agent backend is configured for learning content. Run an aGiTrack "
-            "session in this repo first, or set learning_backend in .agitrack/config.json."
-        )
+        found = installed_backends()
+        backend_name, backend_source = (found[0] if len(found) == 1 else None), "detected"
+    if backend_name not in known:
+        raise LearnAgentError(unresolved_backend_message())
 
     model, model_source = config.learning_model, "config"
     if not model:
@@ -934,38 +976,90 @@ def model_options(backend_name: str) -> dict[str, Any]:
     return {"backend": backend_name, "models": list_available_models(backend_name)}
 
 
-def set_learning_config(repo_root: Path, *, backend: str, model: str) -> dict[str, Any]:
-    """Persist the learn page's engine choice into the REPO config overlay
-    (``.agitrack/config.json``): the same ``learning_backend`` / ``learning_model`` keys a
-    user can set by hand, so the page and the config file are two views of one setting.
-    Empty values unset the key (back to "auto": the latest session's backend/model)."""
-    backend, model = backend.strip(), model.strip()
-    if backend and backend not in available_backends():
-        return {"error": f"Unknown backend '{backend}'."}
+_LEARNING_KEYS = ("learning_backend", "learning_model")
+
+
+def learning_pin_scope(repo_root: Path) -> str:
+    """Where the engine choice is pinned: ``"repo"``, ``"global"``, or ``""`` when nowhere.
+    The repo overlay wins when both are set, which is the precedence the resolver uses."""
     from agitrack.config.settings import GlobalConfig
 
     config = GlobalConfig()
     config.load_repo_overlay(Path(repo_root))
-    if backend:
-        config.repo_data["learning_backend"] = backend
+    if any(key in config.repo_data for key in _LEARNING_KEYS):
+        return "repo"
+    return "global" if any(key in config.data for key in _LEARNING_KEYS) else ""
+
+
+def set_learning_config(repo_root: Path, *, backend: str, model: str, scope: str = "auto") -> dict[str, Any]:
+    """Persist the learn page's engine choice as the ``learning_backend`` /
+    ``learning_model`` keys — the same pair a user can set by hand, so the page and the
+    config file are two views of one setting. Empty values unset the key (back to "auto":
+    the latest session's backend/model, then the detected one).
+
+    ``scope`` picks the file: ``"global"`` writes ``~/.agitrack/config.json``, ``"repo"``
+    writes ``<repo>/.agitrack/config.json``, and ``"auto"`` (the default) writes global
+    unless this repo already pins one of the keys — in which case the user has a per-repo
+    choice on purpose and it is respected.
+
+    IT USED TO ALWAYS WRITE THE REPO OVERLAY, which made the in-page fix not stick (#233):
+    the user who hit the "no backend configured" error fixed it, moved to the next repo, and
+    hit the identical error — while an ``.agitrack/config.json`` accumulated in every repo
+    they served, including repos aGiTrack was only reconstructing and never tracked."""
+    backend, model = backend.strip(), model.strip()
+    if backend and backend not in available_backends():
+        return {"error": f"Unknown backend '{backend}'."}
+    if scope not in ("auto", "repo", "global"):
+        return {"error": f"Unknown scope '{scope}'."}
+    from agitrack.config.settings import GlobalConfig
+
+    config = GlobalConfig()
+    config.load_repo_overlay(Path(repo_root))
+    if scope == "auto":
+        scope = "repo" if any(key in config.repo_data for key in _LEARNING_KEYS) else "global"
+    target = config.repo_data if scope == "repo" else config.data
+    for key, value in (("learning_backend", backend), ("learning_model", model)):
+        if value:
+            target[key] = value
+        else:
+            target.pop(key, None)
+    if scope == "repo":
+        config.save_repo()
     else:
-        config.repo_data.pop("learning_backend", None)
-    if model:
-        config.repo_data["learning_model"] = model
-    else:
-        config.repo_data.pop("learning_model", None)
-    config.save_repo()
-    return {"backend_info": describe_learning_backend(Path(repo_root))}
+        # A repo pin would shadow the global one the user just set, leaving the page showing
+        # a value they did not choose and no way to tell why. Clearing it is what "apply this
+        # everywhere" has to mean — but only write the overlay when there IS one to clear,
+        # so choosing a backend does not leave an .agitrack/config.json in a repo aGiTrack is
+        # merely reconstructing (half of what #233 complained about).
+        # A list, not any(): any() short-circuits and would leave the second key behind.
+        if [key for key in _LEARNING_KEYS if config.repo_data.pop(key, None) is not None]:
+            config.save_repo()
+        config.save()
+    return {"scope": scope, "backend_info": describe_learning_backend(Path(repo_root))}
 
 
 def describe_learning_backend(repo_root: Path) -> dict[str, Any]:
     """Backend/model info for the page footer: which backend generates content, which
-    model, and where each choice came from. An error string when unresolvable."""
+    model, and where each choice came from. An error string when unresolvable.
+
+    The error carries ``installed`` and ``needs_choice`` so the page can open its engine
+    picker on the spot. A terminal error with no route out of it was the second half of
+    #233: the panel that fixes this is right there on the page, and nothing pointed at it.
+
+    ``pinned_scope`` says which config file a pin (if any) currently lives in, so the
+    panel's scope control shows the truth rather than a guess."""
     try:
         choice = resolve_learning_backend(Path(repo_root))
     except LearnAgentError as exc:
-        return {"error": str(exc)}
+        found = installed_backends()
+        return {
+            "error": str(exc),
+            "installed": found,
+            "needs_choice": bool(found),
+            "pinned_scope": learning_pin_scope(Path(repo_root)),
+        }
     return {
+        "pinned_scope": learning_pin_scope(Path(repo_root)),
         "backend": choice.backend_name,
         "model": choice.model,
         "backend_source": choice.backend_source,
@@ -1399,7 +1493,12 @@ def handle_learn_post(
         if path == "/learn/sync":
             return set_sync(root, repo, bool(body.get("enabled")))
         if path == "/learn/config":
-            return set_learning_config(root, backend=str(body.get("backend") or ""), model=str(body.get("model") or ""))
+            return set_learning_config(
+                root,
+                backend=str(body.get("backend") or ""),
+                model=str(body.get("model") or ""),
+                scope=str(body.get("scope") or "auto"),
+            )
     except Exception as exc:  # surface as an in-page error, never a blank 500
         return {"error": f"{type(exc).__name__}: {exc}"}
     return None
@@ -1806,10 +1905,15 @@ __BACKEND_OPTIONS__
         </select>
         <label style="min-width:auto">model</label>
         <select id="e-model"><option value="">auto (latest session)</option></select>
+        <label style="min-width:auto">applies to</label>
+        <select id="e-scope">
+          <option value="global">all repos</option>
+          <option value="repo">this repo only</option>
+        </select>
         <button class="btn" id="e-save">save</button>
         <span class="hint" id="e-msg"></span>
       </div>
-      <div class="hint">Saved to <code>.agitrack/config.json</code> in this repo as <code>learning_backend</code> / <code>learning_model</code>. You can also edit it there, or set it globally in <code>~/.agitrack/config.json</code>.</div>
+      <div class="hint">Saved as <code>learning_backend</code> / <code>learning_model</code>: in <code>~/.agitrack/config.json</code> for all repos, or <code>.agitrack/config.json</code> in this one. You can also edit either by hand.</div>
       <div class="row"><label>progress sync</label>
         <button class="chip" id="sync-toggle">off</button>
         <span class="hint" id="sync-msg" style="margin-top:0"></span>
@@ -2092,13 +2196,31 @@ function renderProgress() {
 
 function renderBackendNote(info) {
   if (!info) return;
-  if (info.error) { $("backendnote").innerHTML = "&#9888; " + esc(info.error); return; }
+  // Show where the choice currently lives, so "applies to" states a fact rather than a
+  // default: an existing per-repo pin keeps its scope on the next save.
+  if ($("e-scope").dataset.userTouched !== "1") $("e-scope").value = info.pinned_scope || "global";
+  if (info.error) {
+    $("backendnote").innerHTML = "&#9888; " + esc(info.error);
+    // The panel that fixes this is on this page. Open it and preselect an installed backend
+    // so the remedy is one click away, instead of leaving the user with an error whose only
+    // documented cure (run a session here first) is the thing backtrace mode replaces.
+    if (info.needs_choice) {
+      $("engine").open = true;
+      if ($("e-backend").dataset.userTouched !== "1" && !$("e-backend").value) {
+        $("e-backend").value = (info.installed || [])[0] || "";
+        loadModels(null);
+      }
+    }
+    return;
+  }
   const model = info.model ? esc(info.model) : "backend default model";
-  const src = info.backend_source === "config" ? "pinned in config" : "from your latest session";
+  const src = info.backend_source === "config" ? "pinned in config"
+    : info.backend_source === "detected" ? "the only agent CLI installed here"
+    : "from your latest session";
   $("backendnote").innerHTML =
     `lessons are generated by <b>${esc(info.backend)}</b> &middot; ${model} (${src}). ` +
     `Adjust it in the "coach engine" panel above, or set <code>learning_backend</code> / ` +
-    `<code>learning_model</code> in <code>.agitrack/config.json</code>.`;
+    `<code>learning_model</code> in <code>~/.agitrack/config.json</code>.`;
   if ($("e-backend").dataset.userTouched !== "1") {
     $("e-backend").value = info.backend_source === "config" ? info.backend : "";
     loadModels(info);
@@ -2549,9 +2671,12 @@ async function loadModels(info) {
 async function saveEngine() {
   $("e-msg").textContent = "saving…";
   try {
-    const r = await post("learn/config", {backend: $("e-backend").value, model: $("e-model").value});
+    const r = await post("learn/config", {
+      backend: $("e-backend").value, model: $("e-model").value, scope: $("e-scope").value,
+    });
     if (r.error) { $("e-msg").textContent = r.error; return; }
-    $("e-msg").innerHTML = '<span class="esaved">saved &#10003;</span>';
+    const where = r.scope === "repo" ? "this repo" : "all repos";
+    $("e-msg").innerHTML = '<span class="esaved">saved &#10003;</span> for ' + esc(where);
     renderBackendNote(r.backend_info);
   } catch (e) { $("e-msg").textContent = e.message; }
 }
@@ -2609,6 +2734,7 @@ $("chat-send").addEventListener("click", sendChat);
 $("chat-input").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
 $("f-note").addEventListener("keydown", e => { if (e.key === "Enter") suggest(); });
 $("e-backend").addEventListener("change", () => { $("e-backend").dataset.userTouched = "1"; loadModels(null); });
+$("e-scope").addEventListener("change", () => { $("e-scope").dataset.userTouched = "1"; });
 $("e-save").addEventListener("click", saveEngine);
 $("sync-toggle").addEventListener("click", toggleSync);
 
