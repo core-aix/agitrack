@@ -7,6 +7,7 @@ covered on a Linux CI too, without a Windows box)."""
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -188,8 +189,16 @@ def test_which_executable_windows_honours_explicit_extension(monkeypatch):
 
 
 def test_fs_path_is_the_identity_on_a_utf8_filesystem():
-    """Which is every Windows and macOS box, and Linux unless someone opts out."""
-    assert str(proc.fs_path("/home/u/tëst_репо")) == "/home/u/tëst_репо"
+    """Which is every Windows and macOS box, and Linux unless someone opts out.
+
+    Compared as a Path, not as a string: `str(Path("/home/u/x"))` is `\\home\\u\\x` on Windows,
+    because pathlib renders separators for the host. That is pathlib's business and says nothing
+    about fs_path, but asserting on the raw string made this fail on every Windows run — the
+    identity that matters is that the CHARACTERS are untouched, which is checked explicitly."""
+    printed = "/home/u/tëst_репо"
+
+    assert proc.fs_path(printed) == Path(printed)
+    assert "tëst_репо" in proc.fs_path(printed).name  # the non-ASCII survived intact
 
 
 def _encodes_back_to(text: str, encoding: str) -> bytes:
