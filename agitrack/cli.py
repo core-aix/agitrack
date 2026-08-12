@@ -1859,7 +1859,11 @@ def _run_share_sessions(repo: "GitRepo", *, overwrite: bool = False, assume_yes:
     # never read or set `session_sharing_acknowledged`. One command, many conversations, and it
     # is exactly the bulk case where a stray secret is most likely to be in one of them.
     if not _confirm_bulk_share(repo, overwrite=overwrite, assume_yes=assume_yes):
-        return 0
+        # A refusal for want of a terminal is not "nothing to do": a CI job that asked to share
+        # and got exit 0 back would report success having published nothing. Answering "no" at
+        # the prompt IS a deliberate outcome, so that one stays 0 — the same split `--daemons
+        # stop` makes between its no-tty refusal (1) and its cancelled confirmation (0).
+        return 0 if sys.stdin.isatty() else 1
 
     print(f"Sharing local sessions for {repo.repo} to origin…")
     result = share_all(repo, progress=progress, on_result=on_result, overwrite=overwrite)

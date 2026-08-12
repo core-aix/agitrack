@@ -7332,11 +7332,14 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         """
         if not data or self._in_bracketed_paste:
             return data
-        held = bytes(self._held_reply_prefix)
+        # Lazily created: the runner is also built by test helpers and by paths that bypass
+        # __init__, and a diagnostic buffer must never be the reason a method raises.
+        pending: bytearray = self.__dict__.setdefault("_held_reply_prefix", bytearray())
+        held = bytes(pending)
         if held:
             # A partial reply from the previous read: re-join before matching, so a reply split
             # across pty reads is still recognised as one.
-            self._held_reply_prefix.clear()
+            pending.clear()
             data = held + data
         if b"\x1b]" not in data and b"\x1b[?" not in data:
             return data  # cheap reject: every reply shape starts with one of these
@@ -7346,7 +7349,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # reach the key handler.
         partial = _HOST_TERMINAL_REPLY_PREFIX_RE.search(remainder)
         if partial and len(partial.group(0)) <= _MAX_HELD_REPLY_BYTES:
-            self._held_reply_prefix.extend(partial.group(0))
+            pending.extend(partial.group(0))
             remainder = remainder[: partial.start()]
             self._debug(f"holding a partial host-terminal reply: {partial.group(0)!r}")
         if replies:
@@ -9399,6 +9402,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # ``backend_commits`` only feeds the recorded body's ``covered_commits`` metadata.
             manual_gate_fn=self._manual_gate if use_latent else None,
             manual_record_fn=self._manual_record if use_latent else None,
+            # The latent path never stages, so the engine cannot read the commit's contents
+            # off the index; this reports them from the snapshot instead (interrupted turns).
+            changed_paths_fn=self._manual_changed_paths if use_latent else None,
             backend_commits=uncovered,
         )
         if committed and uncovered and self._latent_tracking:
