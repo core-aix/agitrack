@@ -668,7 +668,6 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         return 0
     config = GlobalConfig()
     config.load_repo_overlay(repo.repo)
-    synced = False
     try:
         # manual_commits=True gives fold-into-the-user's-commit semantics: record the pending AI
         # turns latently and let THIS commit's prepare-commit-msg hook fold them in (no auto-commit).
@@ -689,13 +688,17 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
         runner._process_once()  # parse the repo's own backend session, record NEW pending turns
         runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
-        synced = bool(runner._manual.pending_bodies())  # is there AI work to fold into this commit?
     except Exception:
         return 0
     finally:
         lock.release()  # release BEFORE spawning the daemon, which takes its own lock
-    if not synced:
-        return 0  # no AI work since the last commit ⇒ no footprint, no nag
+    # Auto-start is judged on its own, BEFORE the "was there AI work in this commit" question.
+    # It used to sit behind `if not synced: return 0`, which made a dead tracker permanent: with
+    # nothing running, no agent turn can be recorded, so `synced` is False on every commit that
+    # follows, so the one hook that could restart the tracker never even looked. That is a
+    # self-sustaining dead state — the tracker stops once and no number of later commits brings
+    # it back, which is exactly what was observed. Whether THIS commit carries AI work and
+    # whether a tracker should be running from now on are different questions.
     if config.autotrack_hook != "off" and _live_background_pid(repo) is None:
         # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
         # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
@@ -908,8 +911,32 @@ class BackgroundRunner:
                 self._teardown(restarting=self._restart_cmd is not None and not self._explicit_stop)
             if self._restart_cmd is None or self._explicit_stop:
                 return 0
-            update_restart.exec_replacement(self._restart_cmd, log=self._print)
-            # Only reached when the exec FAILED: resume tracking on the current code.
+            # Hand the single-writer lock over BEFORE spawning the successor, and take it back
+            # if the successor never comes up. Teardown has already stopped tracking, so we are
+            # not using it any more — but we used to hold it until `os._exit(0)`, and on Windows
+            # a byte-range lock outlives the process that held it by the time the kernel needs to
+            # tear its handles down (measured elsewhere in this codebase at ~100 ms). The
+            # successor's first `acquire()` has no retry, so it lost that race, mistook its own
+            # dying predecessor for a live tracker, and exited — leaving NOTHING tracking the
+            # repo, with exit code 0 and no error anywhere.
+            self._release_lock()
+            update_restart.exec_replacement(
+                self._restart_cmd,
+                log=self._print,
+                verify=lambda pid: (
+                    _read_handshake(self.repo) is not None and (_read_handshake(self.repo) or {}).get("pid") == pid
+                ),
+            )
+            # Only reached when the restart FAILED: resume tracking on the current code. The
+            # lock has to come back first — without it this process would keep tracking a repo
+            # it no longer holds, and a second writer could start alongside it.
+            if not self._reacquire_lock():
+                self._print(
+                    "update restart failed AND this tracker could not take its own repo lock "
+                    "back; another aGiTrack now holds it. Stopping rather than tracking without "
+                    "the lock."
+                )
+                return 1
             self._print(
                 "update restart failed; continuing to track on the current version and "
                 "retrying. Stop with `agitrack -b stop`."
@@ -967,6 +994,27 @@ class BackgroundRunner:
         self._print(
             "background tracker restarting on the updated aGiTrack." if restarting else "background tracker stopped."
         )
+
+    def _release_lock(self) -> None:
+        """Give up the repo's single-writer lock, so a successor can take it. Best-effort:
+        a restart must not be blocked by a lock object that has already gone."""
+        try:
+            if self._lock is not None:
+                self._lock.release()
+        except Exception as error:
+            self._debug(f"lock release before restart failed: {error!r}")
+
+    def _reacquire_lock(self) -> bool:
+        """Take the repo lock back after a failed restart. The successor may still be dying
+        with the lock held, so this retries for a few seconds rather than asking once — the
+        same race, and the same answer, as `agitrack -b` replacing a tracker it just stopped."""
+        if self._lock is None:
+            return True
+        try:
+            return bool(self._lock.acquire(retry_seconds=5.0))
+        except Exception as error:
+            self._debug(f"lock re-acquire after failed restart failed: {error!r}")
+            return False
 
     def _write_handshake(self) -> None:
         # Record our pid so `agitrack -b stop`/`status` can target THIS background tracker

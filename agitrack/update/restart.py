@@ -26,11 +26,18 @@ How the swap happens differs by daemon. The dashboard and backtrace daemons do a
 SPAWN-AND-VERIFY handoff in their own serve loops: spawn the replacement, wait for its
 handshake, and only exit once it provably serves — a replacement that crashes on a
 broken update fails verification and the old daemon keeps serving and retries. The
-background tracker replaces its process with its own re-launch command via
-:func:`exec_replacement` (:func:`agitrack.daemons._daemon_command`, which also handles
-frozen builds): on POSIX ``os.execv`` — pid preserved, and file descriptors are
-close-on-exec so the repo lock releases at the boundary (a spawn-verify handoff would
-deadlock on that lock) — and on Windows a detached spawn + exit.
+background tracker replaces itself via :func:`exec_replacement`
+(:func:`agitrack.daemons._daemon_command`, which also handles frozen builds): on POSIX
+``os.execv`` — pid preserved, and file descriptors are close-on-exec so the repo lock
+releases at the boundary — and on Windows, where there is no exec, the SAME
+spawn-and-verify handoff (see ``verify`` on :func:`exec_replacement`).
+
+Windows used to be a bare ``Popen`` + ``os._exit(0)``, which is fire-and-forget: it could
+not tell a successor that took over from one that died on the way up, so a failed restart
+left the repo with no tracker at all — silently, and with a success exit code. The reason
+given for not verifying was that the old daemon held the repo lock and a handoff would
+deadlock on it; the tracker now RELEASES that lock before spawning and takes it back if the
+successor never appears, which removes the deadlock and the silence together.
 """
 
 from __future__ import annotations
@@ -209,11 +216,41 @@ def restart_command(extra_args: Iterable[str] = ()) -> list[str]:
     return command + extra
 
 
-def exec_replacement(command: list[str], log: Callable[[str], None] = print) -> None:
+# How long a spawned replacement gets to prove it is up before the old daemon concludes the
+# handoff failed and goes back to tracking. Generous: the successor has to import aGiTrack,
+# open the repo, install hooks and take the lock, on a machine that may be busy.
+VERIFY_SECONDS = 30.0
+
+
+def exec_replacement(
+    command: list[str],
+    log: Callable[[str], None] = print,
+    *,
+    verify: Callable[[int], bool] | None = None,
+    verify_seconds: float = VERIFY_SECONDS,
+) -> None:
     """Replace this process with ``command`` (called AFTER the daemon's own cleanup).
-    On success this never returns. RETURNING means the exec FAILED — every caller
+    On success this never returns. RETURNING means the restart FAILED — every caller
     treats that as "resume on the current code and retry later", so a failed restart
-    never strands a dead daemon (see the retry loops in the daemons)."""
+    never strands a dead daemon (see the retry loops in the daemons).
+
+    ``verify(pid)`` makes that contract real on Windows, where there is no exec. The old code
+    was ``Popen(...)`` followed immediately by ``os._exit(0)``: fire-and-forget. ``Popen``
+    returns as soon as the process is CREATED, which says nothing about whether it went on to
+    track anything — so this function could never "return because the restart failed", and a
+    successor that died during startup left the repo with no tracker at all, exit code 0, and
+    nothing in the log. That is a measured outcome, not a theoretical one: the successor lost
+    the race for the repo lock its dying predecessor still held, decided a live tracker was
+    already running, and exited.
+
+    With ``verify`` the Windows path becomes the same SPAWN-AND-VERIFY handoff the dashboard
+    and backtrace daemons already use: spawn, wait for the successor to prove it is up, and
+    only then exit. A successor that does not come up is terminated and this returns, so the
+    caller keeps running on the old code — which is the whole point of restarting only into an
+    install that works.
+
+    POSIX still uses ``os.execv``: the pid is preserved and the lock fd is close-on-exec, so
+    there is no handoff to verify — the process either becomes the new code or dies as itself."""
     try:
         log(f"aGiTrack updated on disk (running {RUNNING_VERSION}); restarting on the new version.")
         if os.name == "nt":
@@ -221,13 +258,50 @@ def exec_replacement(command: list[str], log: Callable[[str], None] = print) -> 
 
             from agitrack.proc import console_isolation_kwargs
 
-            subprocess.Popen(  # noqa: S603 - our own re-launch command
+            child = subprocess.Popen(  # noqa: S603 - our own re-launch command
                 command,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 **console_isolation_kwargs(),
             )
-            os._exit(0)
+            if verify is None:
+                os._exit(0)
+            if _replacement_came_up(child, verify, verify_seconds, log):
+                os._exit(0)
+            _abandon_replacement(child, log)
+            return
         os.execv(command[0], command)
     except Exception as error:
         log(f"restart after update failed: {error!r}")
+
+
+def _replacement_came_up(child, verify: Callable[[int], bool], seconds: float, log: Callable[[str], None]) -> bool:
+    """Whether the spawned successor proved it is running, within ``seconds``. A successor that
+    EXITS is a failure the moment it exits — no point waiting out the timeout for a dead pid."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            if verify(child.pid):
+                return True
+        except Exception:
+            pass  # a verify that cannot answer yet is not a failure; keep waiting
+        if child.poll() is not None:
+            log(
+                f"the replacement exited during startup (code {child.returncode}) without taking "
+                "over — see the lines above for what it reported."
+            )
+            return False
+        time.sleep(0.2)
+    log(f"the replacement did not come up within {seconds:.0f}s.")
+    return False
+
+
+def _abandon_replacement(child, log: Callable[[str], None]) -> None:
+    """Stop a successor that was spawned but never took over, so it cannot come up later and
+    race the daemon that is about to resume tracking."""
+    try:
+        if child.poll() is None:
+            child.terminate()
+    except Exception:
+        pass
+    log("keeping the current version running; will retry the restart on the next check.")
