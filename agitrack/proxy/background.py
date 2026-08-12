@@ -85,6 +85,14 @@ def _live_background_pid(repo: GitRepo) -> int | None:
     return None
 
 
+def background_tracker_is_running(repo: GitRepo) -> bool:
+    """Whether a background tracker is alive on this repo. Public because the Claude session
+    hook asks it on every session start: the note it prints ("aGiTrack commits for you") is
+    only TRUE while a tracker is running, so a hook left behind by a daemon that was killed
+    rather than stopped must stay silent instead of misleading the agent."""
+    return _live_background_pid(repo) is not None
+
+
 def background_status(repo: GitRepo) -> int:
     """Report whether a background tracker is running on this repo (`agitrack -b status`)."""
     pid = _live_background_pid(repo)
@@ -108,12 +116,53 @@ def stop_background(repo: GitRepo) -> int:
     pid = _live_background_pid(repo)
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
+        _disarm_tracking(repo)  # a tracker that died without tearing down may have left it armed
         return 0
     if not _terminate_and_wait(pid):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
         return 1
+    # Also from HERE, not only from the daemon's own teardown: Windows has no SIGTERM
+    # delivery, so `-b stop` calls TerminateProcess and the daemon's finally block never runs.
+    # The stopping process knows the repo, so it can do the cleanup the killed one could not —
+    # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
+    disarmed = _disarm_tracking(repo)
     print("Stopped the aGiTrack background tracker.")
+    if disarmed:
+        print("Auto-start is off for this repo until you run `agitrack -b` again.")
     return 0
+
+
+def _disarm_tracking(repo: GitRepo) -> bool:
+    """Everything `stop` has to mean beyond killing the process.
+
+    STOP MEANS STOP. Two things would otherwise keep acting on the user's behalf after they
+    asked aGiTrack to stop: the auto-start hooks would bring the tracker back on the next
+    commit or the next agent turn, and the Claude session note would keep telling the agent
+    that aGiTrack is committing for it — which, with no tracker running, is false and stops
+    the agent committing at all.
+
+    The ``autotrack_hook`` PREFERENCE is deliberately left alone: the user's standing choice
+    about auto-start is not revoked by one stop, so the next `agitrack -b` re-arms it. Only
+    `--remove-hooks` turns the preference itself off. Returns True when auto-start was armed
+    and is now disarmed."""
+    disarmed = False
+    try:
+        from agitrack.backends import claude_settings
+
+        claude_settings.remove_commit_guidance_hook(repo.repo)
+        disarmed |= claude_settings.remove_autostart_hook(repo.repo)
+    except Exception:
+        pass
+    try:
+        hooks_dir = repo.hooks_dir()
+        # Ask BEFORE removing: the remover is a no-op on a hook that isn't ours and reports
+        # nothing either way, so "was it armed" has to be answered while it is still there.
+        was_armed = git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
+        git_hooks.remove_autotrack_precommit_hook(hooks_dir)
+        disarmed = disarmed or was_armed
+    except Exception:
+        pass
+    return disarmed
 
 
 def handshake_is_manual(info: dict | None) -> bool:
@@ -433,6 +482,53 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     return 0
 
 
+def autostart_on_change(repo: GitRepo) -> int:
+    """Entry point of the Claude Code ``Stop`` hook (``agitrack --autostart-on-change``).
+
+    WHY A HOOK AND NOT A WATCHER. Auto-start used to be reachable only through the git
+    ``pre-commit`` hook, so tracking resumed when the user COMMITTED — and an agent that edits
+    for an hour without committing was exactly the case tracking is for. Nothing else can
+    observe a plain file edit without a process already running, which is what we do not have;
+    the agent's own turn-end hook is the one moment the editor tells us. So the trigger is
+    "a turn finished and left the tree changed", not "a file changed".
+
+    Every reason not to start is checked here rather than left to the daemon, because this
+    runs on EVERY turn end in the repo: the opt-out, an already-running tracker, any other
+    aGiTrack holding the single-writer lock, and a turn that changed nothing. Best-effort and
+    always 0 — a hook that fails or blocks would break the user's agent, which is a far worse
+    outcome than not starting a tracker."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if config.autotrack_hook == "off":
+            return 0
+        if _live_background_pid(repo) is not None:
+            return 0  # already tracking
+        # Any other aGiTrack on this repo (an interactive TUI, a `--recover`, a `--backtrace
+        # commit`) is the single writer while it runs. Starting a daemon beside it is exactly
+        # the double-writer this must never create, and the TUI is already tracking anyway.
+        from agitrack.git import RepoLock
+
+        lock = RepoLock(repo.repo / ".agitrack" / "lock")
+        if not lock.acquire():
+            return 0
+        lock.release()  # only probing: the daemon we spawn takes it for real
+        if not repo.has_changes():
+            return 0  # a question-and-answer turn leaves nothing to track
+        state = AgitrackState(repo.repo)
+        backend_name = _recorded_backend(state)
+        if not backend_name:
+            return 0
+        manual = read_background_mode(repo)
+        if manual is None:
+            manual = config.manual_commits
+        extra_args = ["--manual-commits" if manual else "--auto-commit", "--backend", backend_name]
+        spawn_background_daemon(repo, extra_args=extra_args)
+    except Exception:
+        return 0
+    return 0
+
+
 def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -> int:
     """Entry point of the persistent auto-track ``pre-commit`` hook. Best-effort; ALWAYS returns 0
     so it can never fail a commit.
@@ -536,6 +632,7 @@ class BackgroundRunner:
         backend: str | None = None,
         new_session: bool = False,
         manual_commits: bool = False,  # background defaults to AUTO commits (like the interactive TUI)
+        commit_guidance: bool = True,
         backend_command: list[str] | None = None,
         log_file: str | None = None,
         poll_seconds: float | None = None,
@@ -547,6 +644,7 @@ class BackgroundRunner:
         self.base_repo = repo  # background mode is always no-worktree
         self.verbose = verbose
         self._manual_commits = manual_commits
+        self._commit_guidance = commit_guidance
         self._backend_command = list(backend_command or [])
         self.events = EventLog(resolve_log_path(log_file, repo.repo))
         self._poll_seconds = poll_seconds if poll_seconds is not None else self.POLL_SECONDS
@@ -664,6 +762,7 @@ class BackgroundRunner:
                 "changes are no longer uncommitted, so they had nothing left to attribute."
             )
         self._install_autotrack_hook()
+        self._install_commit_guidance()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
@@ -744,6 +843,11 @@ class BackgroundRunner:
             except Exception as error:
                 self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
+        # Kept across an update restart: the replacement daemon takes over immediately, and
+        # removing then reinstalling would leave a window where a session starting mid-swap
+        # gets no note at all.
+        if not restarting:
+            self._remove_commit_guidance()
         self._remove_handshake()
         from agitrack import daemons
 
@@ -871,8 +975,62 @@ class BackgroundRunner:
                 version=__version__,
                 debug=self._debug,
             )
+            self._install_change_autostart_hook()
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")
+
+    def _install_change_autostart_hook(self) -> None:
+        """The agent-side half of auto-start: resume tracking when a TURN leaves changes, not
+        only when the user commits.
+
+        The pre-commit hook above cannot see an agent that edits for an hour without
+        committing — which is precisely the work aGiTrack exists to record. Nothing can observe
+        a plain file edit without a process already running (the situation auto-start is FOR),
+        so the trigger is the agent's own turn-end hook. Claude Code is the only backend that
+        offers one; the others keep the commit-time behaviour they have always had.
+
+        Installed under the same ``autotrack_hook`` opt-in as the git hook, and persistent for
+        the same reason — its job is to run when aGiTrack is not."""
+        if self.state.backend != "claude":
+            return
+        from agitrack.backends import claude_settings
+
+        if claude_settings.install_autostart_hook(self.repo.repo, debug=self._debug):
+            self._debug("claude change-autostart hook installed")
+
+    def _install_commit_guidance(self) -> None:
+        """Tell the agent that aGiTrack commits for it — the thing proxy mode does with
+        ``--append-system-prompt`` and background mode cannot, because it never spawns the
+        agent. Claude Code is the only backend with a channel for it that does not touch the
+        user's source tree (see backends/claude_settings.py), so the others are simply left
+        alone rather than given a half-measure.
+
+        Skipped when the user opted out with ``--no-commit-guidance``: that flag means "do
+        not tell the agent what to do about commits", and which mechanism carries the note is
+        an implementation detail the flag should not have to know about.
+
+        UNLIKE THE AUTOTRACK HOOK, this one IS removed on teardown. That hook exists to keep
+        tracking working while aGiTrack is NOT running; this one would be a lie in the same
+        situation — with no tracker watching, nothing is committing for the agent and it
+        should behave normally again."""
+        if not self._commit_guidance or self.state.backend != "claude":
+            return
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.install_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook installed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook install failed: {error!r}")
+
+    def _remove_commit_guidance(self) -> None:
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.remove_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook removed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook removal failed: {error!r}")
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):

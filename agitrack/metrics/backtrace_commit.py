@@ -66,8 +66,16 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
     Always interactive — it rewrites history, so it prompts for confirmation and has no
     skip-confirmation flag. Returns a process exit code. Prints all user-facing guidance itself
     (git-init hint, dirty-tree hint, the warning + confirmation, the progress bar, and the
-    force-replace instructions). ``_input`` is injectable only so tests can drive the prompt."""
-    from agitrack.git import GitError, GitRepo
+    force-replace instructions). ``_input`` is injectable only so tests can drive the prompt.
+
+    HOLDS THE REPO'S SINGLE-WRITER LOCK for the whole run, like every other aGiTrack path that
+    writes git. It is the heaviest writer there is — it replays every commit onto a new branch —
+    and it was the one path that took no lock, so it could run beside a live tracker or TUI. Two
+    concrete ways that ends badly: the tracker commits a turn between the clean-tree check and
+    the replay, so the reconstruction is built from a tree that no longer exists; or the replay's
+    `git switch` moves HEAD out from under a session that is mid-commit. Read-only paths (the
+    dashboards, `--backtrace` serving) take no lock and are unaffected."""
+    from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 
     directory = directory.expanduser().resolve()
 
@@ -86,6 +94,28 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         return 1
     root = repo.repo
 
+    # 1b) Take the single-writer lock before anything is inspected, so every check below and the
+    #     replay itself see one consistent repository. Acquired here rather than just before the
+    #     rewrite because the checks are part of the decision: a tree that was clean when we
+    #     looked is worthless if a tracker commits into it while the user reads the warning.
+    #     The lock file lives in `.agitrack/`, which this command's target repo has by definition
+    #     never had — so git-ignore it FIRST (in `.git/info/exclude`, not the user's `.gitignore`)
+    #     or taking the lock would itself dirty the tree that step 3 requires to be clean.
+    from agitrack.config import AgitrackState
+
+    AgitrackState(root).ensure_local_ignore()
+    lock = RepoLock(root / ".agitrack" / "lock")
+    if not lock.acquire():
+        print(already_running_message(lock.owner_pid(), repo_root=root))
+        return 1
+    try:
+        return _backtrace_commit_locked(repo, root, new_branch, _input=_input)
+    finally:
+        lock.release()
+
+
+def _backtrace_commit_locked(repo, root: Path, new_branch: str, *, _input=input) -> int:
+    """The body of :func:`backtrace_commit`, with the repo lock already held."""
     # 2) A new branch name is required (this never writes to the current branch). The command is
     #    interactive anyway, so ASK rather than exit with instructions: printing a flag and
     #    quitting was a dead end for anyone who mistyped it, because `parse_known_args` funnels an
@@ -169,7 +199,7 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         f"Reconstructing tracked history for {_abbreviate_home(str(root))}:\n"
         f"  • {len(commits)} commit(s) will be replayed onto a new branch '{new_branch}'.\n"
         f"  • {to_annotate} agent commit(s) NOT yet tracked will gain aGiTrack metadata (backend, model, "
-        f"tokens, and the user↔agent trace) from {len(turns)} reconstructed agent turn(s).\n"
+        f"tokens, and the user-agent trace) from {len(turns)} reconstructed agent turn(s).\n"
         + already_line
         + f"  • {len(commits) - len(ai_map)} will be kept verbatim as user commits.\n\n"
         "This REWRITES history: every commit gets a new hash, so the new branch is NOT a "
