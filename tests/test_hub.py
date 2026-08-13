@@ -672,3 +672,150 @@ def test_the_state_is_live_the_moment_the_launcher_returns(tmp_path, monkeypatch
     state = running_mode_for(directory)
 
     assert state["running"] is True and "background" in state["label"]
+
+
+# --- starting a tracking mode shows the tracking ------------------------------------------------
+
+
+def test_starting_a_tracker_opens_the_tracked_view_even_if_the_backtrace_was_last_seen(tmp_path, monkeypatch):
+    """`agitrack -b` is the user saying "record this from now on", and the reconstruction is
+    emphatically not that: it is the inferred history of what happened BEFORE. A remembered
+    preference for the backtrace was still winning, so starting a tracker on a fully tracked
+    repository opened the one view that could not show the work about to be recorded."""
+    _repo(tmp_path, "proj")
+    directory = tmp_path / "proj"
+    repo_registry.remember(directory)
+    repo_registry.mark_tracked_seen(directory)
+    repo_registry.set_view(directory, repo_registry.BACKTRACE)
+    monkeypatch.setattr(hub, "_has_tracked_tokens", lambda d: True)
+    monkeypatch.setattr(hub, "_has_backtrace", lambda d: True)
+
+    # Just looking still honours the remembered choice...
+    assert hub.preferred_view(directory) == repo_registry.BACKTRACE
+    # ...but starting to track overrides it, and the choice is updated to match.
+    assert hub.preferred_view(directory, starting_tracking=True) == repo_registry.ACTIVE
+    assert repo_registry.entry_for(directory).view == repo_registry.ACTIVE
+
+
+def test_starting_a_tracker_on_an_untracked_repo_still_shows_its_reconstruction(tmp_path, monkeypatch):
+    # A first-ever run on an old project has nothing to show in the tracked view yet, and its
+    # history is sitting in the transcripts. That rule is unchanged.
+    _repo(tmp_path, "old")
+    directory = tmp_path / "old"
+    repo_registry.remember(directory)
+    monkeypatch.setattr(hub, "_has_tracked_tokens", lambda d: False)
+    monkeypatch.setattr(hub, "_has_backtrace", lambda d: True)
+
+    assert hub.preferred_view(directory, starting_tracking=True) == repo_registry.BACKTRACE
+
+
+def test_a_git_failure_never_reads_as_nothing_tracked(tmp_path):
+    """A contended index.lock while the tracker commits is not an answer of "no history"."""
+    from agitrack.metrics.suggest import has_tracked_tokens
+
+    class Failing:
+        repo = tmp_path
+
+        def _run(self, *a, **k):
+            return type("R", (), {"stdout": "", "returncode": 128})()
+
+    # Answering "nothing tracked" here sends a fully tracked repository to the reconstruction.
+    assert has_tracked_tokens(Failing()) is True
+
+
+def test_gits_ordinary_no_match_is_still_an_answer(tmp_path):
+    from agitrack.metrics.suggest import has_tracked_tokens
+
+    class NoMatch:
+        repo = tmp_path
+
+        def _run(self, *a, **k):
+            return type("R", (), {"stdout": "", "returncode": 1})()
+
+    assert has_tracked_tokens(NoMatch()) is False
+
+
+def test_a_directory_that_is_not_a_repository_has_nothing_tracked(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    assert hub._has_tracked_tokens(plain) is False
+
+
+# --- one dashboard tab, not one per repository --------------------------------------------------
+
+
+def test_an_open_dashboard_tab_is_steered_instead_of_opening_another():
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "")
+    taken: list[str] = []
+
+    def tab():
+        # The page's next ping picks the navigation up.
+        taken.append(clients.ping("tab-1", "/r/one/", ""))
+
+    import threading
+
+    threading.Timer(0.05, tab).start()
+    assert clients.navigate("/r/two/") is True
+    assert taken == ["/r/two/"]
+
+
+def test_a_story_or_learn_tab_is_left_where_the_reader_put_it():
+    # Somewhere the reader chose to be, about a repository they chose. Steering it would take
+    # that away, so those get a new tab instead.
+    clients = hub._Clients()
+    clients.ping("tab-story", "/r/one/story", "story")
+    clients.ping("tab-learn", "/r/one/learn", "learn")
+
+    assert clients.navigate("/r/two/", timeout=0.2) is False
+
+
+def test_a_tab_that_has_gone_does_not_swallow_the_navigation():
+    # Queueing into a tab closed a second ago would leave the user with no window at all.
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "")
+    clients.close("tab-1")
+
+    assert clients.navigate("/r/two/", timeout=0.2) is False
+
+
+def test_a_tab_that_stopped_answering_is_given_up_on():
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "")  # registered, then never pings again
+
+    assert clients.navigate("/r/two/", timeout=0.2) is False
+    # ...and the abandoned instruction is dropped, so it cannot fire later out of context.
+    assert clients.ping("tab-1", "/r/one/", "") == ""
+
+
+def test_the_most_recently_active_dashboard_tab_is_the_one_steered():
+    clients = hub._Clients()
+    clients.ping("older", "/r/one/", "")
+    clients.ping("newer", "/r/two/", "")
+    taken: list[str] = []
+
+    import threading
+
+    threading.Timer(0.05, lambda: taken.append(clients.ping("newer", "/r/two/", ""))).start()
+    assert clients.navigate("/r/three/") is True
+    assert taken == ["/r/three/"]
+
+
+def test_a_stale_tab_is_forgotten(monkeypatch):
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "")
+    monkeypatch.setattr(hub, "_CLIENT_TTL_SECONDS", -1.0)
+
+    assert clients.snapshot() == []
+
+
+def test_the_hub_answers_the_pages_and_the_launcher(tmp_path):
+    router = hub.HubRouter()
+
+    assert json.loads(router.post("/clients", {"id": "t", "path": "/r/x/", "page": ""}).body) == {"navigate": ""}
+    assert json.loads(router.get("/clients", {}).body)["clients"] == [{"page": "", "path": "/r/x/"}]
+    # Nothing is listening for a story tab, so the launcher is told to open its own.
+    assert json.loads(router.post("/navigate", {"url": "/r/y/"}).body)["navigated"] in (True, False)
+    assert json.loads(router.post("/clients", {"id": "t", "closing": True}).body) == {"ok": True}
+    assert json.loads(router.get("/clients", {}).body)["clients"] == []

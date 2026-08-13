@@ -2031,7 +2031,10 @@ def _open_dashboard_on_start(repo: GitRepo, config, *, scripted: bool = False) -
 
         # quiet: the launch banner for the mode being started is the message that matters here,
         # and three lines about the dashboard in front of it would bury it.
-        open_dashboard(repo.repo, quiet=True)
+        # `starting_tracking`: this is `-b` or `-i`, which is the user saying "record this
+        # repository from now on". The reconstruction is the inferred history of what happened
+        # BEFORE, so it is never what to open here — asking for it has its own command.
+        open_dashboard(repo.repo, quiet=True, starting_tracking=True)
     except Exception:
         pass  # a dashboard that will not open must never stop the mode the user asked for
 

@@ -487,6 +487,42 @@ async function refreshHubState(){
   box.hidden = false;
 }
 
+// ---- "this tab is open" -------------------------------------------------------------------
+// The hub cannot see the browser, so a page that is open says so. A launcher about to show a
+// repository then steers THIS tab instead of opening yet another one on the same port. Only the
+// dashboard is ever steered: a story or learn page is somewhere the reader chose to be, about a
+// repository they chose, and moving it would take that away.
+const HUB_CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+const HUB_PING_MS = 2000;
+let hubNavigating = false;
+
+async function hubPing(){
+  if(!HUB || hubNavigating) return;
+  let answer = null;
+  try{
+    answer = await postJson("/clients", {id: HUB_CLIENT_ID, path: location.pathname, page: HUB.page});
+  }catch(e){ return; }   // no hub, or an older one: the launcher just opens a tab, as it used to
+  if(answer && answer.navigate){
+    hubNavigating = true;   // stop pinging: this tab is on its way somewhere else
+    location.href = answer.navigate;
+  }
+}
+
+function wireHubPresence(){
+  if(!HUB) return;
+  hubPing();
+  setInterval(hubPing, HUB_PING_MS);
+  // Say goodbye on the way out, so a navigation is never handed to a tab that has gone. A beacon
+  // rather than a fetch: the page is being torn down and a normal request would be cancelled.
+  window.addEventListener("pagehide", () => {
+    if(hubNavigating) return;   // a navigation WE were told to make: the new page re-registers
+    try{
+      navigator.sendBeacon("/clients", new Blob(
+        [JSON.stringify({id: HUB_CLIENT_ID, closing: true})], {type: "application/json"}));
+    }catch(e){}
+  });
+}
+
 async function initHubBar(){
   if(!HUB) return;
   const bar = $("hubbar"); if(!bar) return;
@@ -504,6 +540,7 @@ async function initHubBar(){
     modal.onclick = e => { if(e.target === modal) closeHubHelp(); };
     modal.addEventListener("keydown", e => { if(e.key === "Escape") closeHubHelp(); });
   }
+  wireHubPresence();
   refreshHubState();
   // Polled on its own clock as well as with the page's data (see below): the learn and story
   // pages have no data poll of their own, and a tracker can start or stop at any moment.

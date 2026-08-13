@@ -96,11 +96,18 @@ def split_mount(path: str) -> tuple[str, str, str] | None:
 # --------------------------------------------------------------------------- which view to show
 
 
-def preferred_view(directory: Path) -> str:
+def preferred_view(directory: Path, *, starting_tracking: bool = False) -> str:
     """The view a repository should open in.
 
-    Three rules, in order:
+    Rules, in order:
 
+    0. **Starting a tracking mode shows the tracking.** `agitrack -b` and `agitrack -i` are the
+       user saying "record this repository from now on", and the reconstruction is emphatically
+       not that: it is the inferred history of what happened BEFORE. A remembered preference for
+       the backtrace was still winning here, so starting a tracker on a fully tracked repository
+       opened the one view that could not show the work about to be recorded. Asking for the
+       reconstruction has its own command, `--backtrace`. The rules below still apply when there
+       is nothing tracked yet, so a first-ever run on an old project still gets its history.
     1. A repository with **nothing tracked** but reconstructable sessions opens on the BACKTRACE.
        An empty live dashboard is the worst possible answer when the history is sitting in the
        backends' own transcripts.
@@ -114,7 +121,7 @@ def preferred_view(directory: Path) -> str:
     entry = repo_registry.entry_for(directory)
     remembered = entry.view if entry else ""
     if _has_tracked_tokens(directory):
-        if entry is not None and not entry.tracked_seen:
+        if starting_tracking or (entry is not None and not entry.tracked_seen):
             repo_registry.mark_tracked_seen(directory)
             repo_registry.set_view(directory, repo_registry.ACTIVE)
             return repo_registry.ACTIVE
@@ -128,9 +135,16 @@ def _has_tracked_tokens(directory: Path) -> bool:
     from agitrack.metrics.suggest import has_tracked_tokens
 
     try:
-        return has_tracked_tokens(GitRepo.discover(directory))
-    except (GitError, OSError, Exception):
-        return False
+        repo = GitRepo.discover(directory)
+    except (GitError, OSError):
+        return False  # not a repository at all: there is genuinely nothing tracked here
+    try:
+        return has_tracked_tokens(repo)
+    except Exception:
+        # Anything else is a probe that did not work, and `has_tracked_tokens` is careful never
+        # to divert on one. A blanket `except: return False` here quietly threw that away and
+        # could send a fully tracked repository to the reconstruction.
+        return True
 
 
 def _has_backtrace(directory: Path) -> bool:
@@ -249,6 +263,96 @@ class _Mounts:
             self._backtrace_live.pop(slug, None)
 
 
+# --------------------------------------------------------------------------- open pages
+#
+# Every mode opens the dashboard when it starts, and on a machine where you work in several
+# repositories that meant a new browser tab each time, all showing the same dashboard on the same
+# port. The hub cannot see the browser, so the PAGES tell it they exist: each one pings while it
+# is open, and a launcher that wants to show a repository asks an already-open dashboard tab to
+# go there instead of opening another.
+
+# How long a page may go without pinging before it is presumed closed. Comfortably more than the
+# ping interval, so one slow frame never evicts a live tab.
+_CLIENT_TTL_SECONDS = 15.0
+# How long a launcher waits for an open tab to pick up a navigation before giving up and opening
+# a browser itself. Long enough for one ping to land, short enough not to be felt.
+_NAVIGATE_WAIT_SECONDS = 4.0
+
+
+class _Clients:
+    """The dashboard pages currently open, as far as they have told us.
+
+    Deliberately in-memory and best-effort: this exists to avoid a redundant browser tab, and the
+    worst outcome of getting it wrong is the extra tab we have today. Nothing depends on it being
+    right, so nothing is persisted and nothing is locked beyond this dict."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seen: dict[str, dict] = {}
+
+    def ping(self, client_id: str, path: str, page: str) -> str:
+        """Record that this page is open; return a URL it has been asked to navigate to, if any."""
+        if not client_id:
+            return ""
+        with self._lock:
+            self._expire()
+            record = self._seen.setdefault(client_id, {})
+            record.update(path=path, page=page, seen=time.monotonic())
+            target = str(record.pop("navigate", "") or "")
+            if target:
+                waiter = record.pop("waiter", None)
+                if waiter is not None:
+                    waiter.set()
+            return target
+
+    def close(self, client_id: str) -> None:
+        """A page said it is going away (a closed tab, a navigation). Drop it now rather than
+        waiting out the TTL, so a navigation is never handed to a tab that has gone."""
+        with self._lock:
+            self._seen.pop(client_id, None)
+
+    def navigate(self, url: str, *, timeout: float = _NAVIGATE_WAIT_SECONDS) -> bool:
+        """Ask an open DASHBOARD tab to go to ``url``. True once one has taken it.
+
+        Only a dashboard page qualifies. A tab showing the story or the learn page is somewhere
+        the reader chose to be, about a repository they chose; steering it to another project's
+        dashboard would take that away, so those get a new tab instead.
+
+        Waits for the page to actually pick the navigation up. A tab closed a second ago still
+        looks open here, and queueing into that would leave the user with no window at all."""
+        waiter = threading.Event()
+        with self._lock:
+            self._expire()
+            target = self._pick_dashboard()
+            if target is None:
+                return False
+            self._seen[target]["navigate"] = url
+            self._seen[target]["waiter"] = waiter
+        if waiter.wait(timeout):
+            return True
+        with self._lock:  # nobody took it: drop it so it cannot fire later, out of context
+            record = self._seen.get(target)
+            if record is not None:
+                record.pop("navigate", None)
+                record.pop("waiter", None)
+        return False
+
+    def _pick_dashboard(self) -> str | None:
+        """The most recently active open dashboard page, or None."""
+        candidates = [(record["seen"], key) for key, record in self._seen.items() if not record.get("page")]
+        return max(candidates)[1] if candidates else None
+
+    def _expire(self) -> None:
+        cutoff = time.monotonic() - _CLIENT_TTL_SECONDS
+        for key in [k for k, record in self._seen.items() if record.get("seen", 0) < cutoff]:
+            self._seen.pop(key, None)
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            self._expire()
+            return [{"page": r.get("page", ""), "path": r.get("path", "")} for r in self._seen.values()]
+
+
 # --------------------------------------------------------------------------- routing
 
 
@@ -261,12 +365,15 @@ class HubRouter:
 
     def __init__(self) -> None:
         self.mounts = _Mounts()
+        self.clients = _Clients()
 
     def get(self, path: str, query: dict[str, list[str]]) -> Response | None:
         if path in ("", "/"):
             return self._root()
         if path == "/repos":
             return json_response({"repos": self.repo_list()})
+        if path == "/clients":
+            return json_response({"clients": self.clients.snapshot()})
         chosen = split_choose(path)
         if chosen is not None:
             # Switching repository must not carry the CURRENT view across: the view that suits one
@@ -298,6 +405,18 @@ class HubRouter:
         return scope.get(subpath, query)
 
     def post(self, path: str, body: dict) -> Response | None:
+        if path == "/clients":
+            # A page saying "I am open" (and being told where to go, if anywhere).
+            if body.get("closing"):
+                self.clients.close(str(body.get("id") or ""))
+                return json_response({"ok": True})
+            target = self.clients.ping(
+                str(body.get("id") or ""), str(body.get("path") or ""), str(body.get("page") or "")
+            )
+            return json_response({"navigate": target})
+        if path == "/navigate":
+            # A launcher asking an already-open dashboard tab to show a repository.
+            return json_response({"navigated": self.clients.navigate(str(body.get("url") or ""))})
         mount = split_mount(path)
         if mount is None:
             return None
@@ -552,14 +671,14 @@ def start_hub(*, timeout: float = 20.0) -> dict[str, Any] | None:
     return None
 
 
-def ensure_hub_for(directory: Path, *, view: str = "") -> tuple[str, str]:
+def ensure_hub_for(directory: Path, *, view: str = "", starting_tracking: bool = False) -> tuple[str, str]:
     """Remember ``directory``, make sure the hub is up, and return ``(url, view)`` for it.
 
     This is the single entry point every mode uses: `-d`, `--backtrace`, the TUI's dashboard
     shortcut and the background tracker all want the same thing, which is "the page for this
     repository, wherever the hub happens to be"."""
     entry = repo_registry.remember(directory)
-    chosen = view or preferred_view(directory)
+    chosen = view or preferred_view(directory, starting_tracking=starting_tracking)
     record = start_hub()
     if record is None:
         return "", chosen
@@ -567,7 +686,14 @@ def ensure_hub_for(directory: Path, *, view: str = "") -> tuple[str, str]:
     return base + mount_path(entry.slug, chosen), chosen
 
 
-def open_dashboard(directory: Path, *, view: str = "", open_browser: bool = True, quiet: bool = False) -> int:
+def open_dashboard(
+    directory: Path,
+    *,
+    view: str = "",
+    open_browser: bool = True,
+    quiet: bool = False,
+    starting_tracking: bool = False,
+) -> int:
     """`agitrack -d` and `agitrack --backtrace`: show this repository's dashboard.
 
     Both commands do the same three things now — remember the repository, make sure the one hub is
@@ -578,7 +704,7 @@ def open_dashboard(directory: Path, *, view: str = "", open_browser: bool = True
     from agitrack.metrics.server import exposure_note, open_dashboard_in_browser, remote_access_help
 
     was_running = running_hub() is not None
-    url, chosen = ensure_hub_for(directory, view=view)
+    url, chosen = ensure_hub_for(directory, view=view, starting_tracking=starting_tracking)
     if not url:
         if not quiet:
             # Two failures reach here and they need different answers: a port nobody can bind,
@@ -604,11 +730,43 @@ def open_dashboard(directory: Path, *, view: str = "", open_browser: bool = True
             + f"One dashboard serves every repository, switchable from the page header.{others}\n"
             "It runs in the background (surviving this terminal) until `agitrack -d stop`."
         )
+    # Before opening anything: is a dashboard tab already open? Steering it beats stacking up a
+    # tab per repository, all of them the same dashboard on the same port.
+    if open_browser and _steer_open_tab(record, url):
+        if not quiet:
+            print("  (switched the dashboard tab you already had open)")
+        return 0
     if open_browser and not open_dashboard_in_browser(url) and not quiet:
         help_text = remote_access_help(url, int(record.get("port", 0) or 0), bind_host=str(record.get("host", "")))
         if help_text:
             print(help_text)
     return 0
+
+
+def _steer_open_tab(record: dict, url: str) -> bool:
+    """Ask the hub to send an already-open dashboard tab to ``url``. True once one has gone there.
+
+    Best-effort by construction: any failure (no hub, an old hub without the endpoint, a browser
+    with nothing open) just answers False and the caller opens a tab, which is what it did before
+    this existed. The hub does the waiting, so this returns only once a real page has taken it."""
+    base = str(record.get("url") or "").rstrip("/")
+    if not base:
+        return False
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(
+            f"{base}/navigate",
+            data=_json.dumps({"url": url}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=_NAVIGATE_WAIT_SECONDS + 3.0) as response:
+            return bool(_json.loads(response.read().decode("utf-8")).get("navigated"))
+    except Exception:
+        return False
 
 
 def unmount_repo(directory: Path | str) -> bool:

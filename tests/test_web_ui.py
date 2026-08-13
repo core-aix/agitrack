@@ -418,3 +418,35 @@ def test_the_status_refresh_is_optional_on_a_page_without_the_hub_bar():
     from agitrack.metrics.web import _TEMPLATE
 
     assert 'typeof refreshHubState === "function"' in _TEMPLATE
+
+
+def test_every_page_tells_the_hub_it_is_open():
+    # The hub cannot see the browser, so an open page says so; a launcher then steers this tab
+    # rather than opening yet another on the same port.
+    for name, html in _hub_pages().items():
+        assert "HUB_CLIENT_ID" in html, name
+        assert "wireHubPresence" in html, name
+        assert '"/clients"' in html, name
+
+
+def test_a_page_follows_a_navigation_it_is_given():
+    html = _hub_pages()["dashboard"]
+
+    assert "answer.navigate" in html
+    assert "location.href = answer.navigate" in html
+
+
+def test_a_closing_page_says_goodbye_so_it_cannot_swallow_a_navigation():
+    html = _hub_pages()["dashboard"]
+
+    # A beacon, not a fetch: the page is being torn down and a normal request would be cancelled.
+    assert "navigator.sendBeacon" in html
+    assert '"pagehide"' in html
+    # ...but not when WE told it to navigate: the page it lands on re-registers.
+    assert "if(hubNavigating) return;" in html
+
+
+def test_presence_stops_once_the_tab_is_on_its_way_elsewhere():
+    html = _hub_pages()["dashboard"]
+
+    assert "if(!HUB || hubNavigating) return;" in html

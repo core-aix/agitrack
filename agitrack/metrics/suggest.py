@@ -65,6 +65,12 @@ def has_tracked_tokens(repo: GitRepo) -> bool:
         )
     except Exception:
         return True  # never divert on a failed probe
+    if getattr(result, "returncode", 0) not in (0, 1):
+        # git ran and FAILED (a contended index.lock while the tracker commits, an unreadable
+        # pack, a repo mid-rewrite). Empty stdout then means "could not tell", not "nothing
+        # tracked" — and answering "nothing tracked" sends a fully tracked repository to the
+        # reconstruction. Exit 1 is git's ordinary "no commit matched", which IS an answer.
+        return True
     return bool(result.stdout.strip())
 
 
