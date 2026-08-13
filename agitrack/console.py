@@ -122,6 +122,12 @@ def ask(question: str, *, input_fn: Callable[[str], str] = input) -> str:
     return input_fn(question)
 
 
+# How long the block waits for the ticking thread on its way out. Only ever spent finishing one
+# in-flight `output_fn` call, so it is generous rather than tight: the cost of being wrong the
+# other way is a stray line printed under whatever came next.
+_TICKER_JOIN_SECONDS = 2.0
+
+
 @contextmanager
 def progress_ticker(
     message: str,
@@ -135,7 +141,14 @@ def progress_ticker(
     For steps that can be silent for minutes (downloading and installing an agent CLI):
     without it the terminal looks frozen and users start pressing keys. Only ticks on an
     interactive stdout by default — piped/redirected output stays clean — and the ticking
-    thread is a daemon, so it can never hold up an exit."""
+    thread is a daemon, so it can never hold up an exit.
+
+    **Nothing is printed after the block ends.** Setting the stop event alone did not guarantee
+    that: a tick whose ``wait`` had just timed out was already on its way to ``output_fn``, so a
+    line could land after the step it describes had finished — "installing… (0s elapsed)" printed
+    under the next question. On a loaded machine that window is easy to hit (CI caught it on
+    macOS). The tick re-checks the event immediately before printing, and the block waits for the
+    thread on the way out — bounded, so a wedged ``output_fn`` still cannot hold anything up."""
     if enabled is None:
         enabled = stdout_is_interactive()
     if not enabled:
@@ -146,6 +159,10 @@ def progress_ticker(
 
     def tick() -> None:
         while not done.wait(interval):
+            # The wait timing out and the block ending are one race apart: `wait` can return
+            # False microseconds before `done.set()` runs. Ask again with the answer now settled.
+            if done.is_set():
+                return
             elapsed = int(time.monotonic() - started)
             try:
                 output_fn(f"  … {message} ({elapsed}s elapsed)")
@@ -158,3 +175,7 @@ def progress_ticker(
         yield
     finally:
         done.set()
+        # Bounded: the thread is parked on the event and returns as soon as it is set, so this
+        # costs nothing in the normal case. The timeout is the guarantee that an `output_fn`
+        # which never returns cannot turn a progress message into a hang.
+        thread.join(timeout=_TICKER_JOIN_SECONDS)
