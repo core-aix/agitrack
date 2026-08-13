@@ -373,6 +373,31 @@ Added --version using the package metadata; prints and exits.
       <strong>whole project</strong>, attributing each turn to the GitHub id that shared it, which a transcript alone
       can never tell you. A fresh clone with no local transcripts rebuilds the entire history.
       <a href="docs.html#across-machines-and-teammates">Details in the docs.</a></p>
+
+      <h2 id="dashboard-hub" style="margin-top:34px">Two views of the same project, side by side.</h2>
+      <p>The reconstruction is a <em>view</em> of a repository, not a separate tool: it lives on the same
+      dashboard as the tracked history, one click apart in the page header, and the toggle applies to the
+      story and learn pages too.</p>
+      <div class="branches two">
+        <div class="branch" data-ref="tracked">
+          <h3>The tracked view</h3>
+          <p>What aGiTrack <strong>recorded</strong>: each commit with the prompts, replies and token counts
+          that produced exactly those lines. It tells you when your backtrace holds agent work no commit
+          covers yet, so nothing quietly goes untracked.</p>
+        </div>
+        <div class="branch" data-ref="backtrace">
+          <h3>The backtrace view</h3>
+          <p>What can be <strong>reconstructed</strong> from your agent's own transcripts. Kept deliberately
+          separate, and labelled as inferred, because it is less accurate than the recorded history. A repo
+          with nothing tracked yet opens here, then moves to the tracked view once there is something in it.</p>
+        </div>
+      </div>
+      <p style="margin-top:22px">That dashboard is a <strong>single server for all your projects</strong>, and it
+      opens by itself when you start aGiTrack on a repository, in any mode, once every startup question has
+      been answered. Pick another project from the header and the same page you were reading opens for it, in
+      whichever view suits it; the list shows each project's own tracking state, so one glance tells you which
+      of them aGiTrack is actually recording. One port to remember, one <span class="p">ssh -L</span> line to
+      forward.</p>
     </section>
 
     <section class="commit" id="backends">
@@ -429,34 +454,6 @@ Added --version using the package metadata; prints and exits.
           <h3>One way to stop</h3>
           <p>Whatever is holding the repository, <span class="p">agitrack stop</span> stops it: the background
           tracker, an interactive session, this repo's dashboard. No need to remember which mode you picked.</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="commit" id="dashboard-hub">
-      <div class="commit-head">
-        <span class="sha">0n3p0rt</span>
-        <span class="subject">one dashboard</span>
-      </div>
-      <h2>Every repository, one port, switched by path.</h2>
-      <p>The dashboard opens by itself when you start aGiTrack on a repository, in any mode, once every
-      startup question has been answered. It is a single server for <em>all</em> your projects: pick another
-      from the header and the same page you were reading (dashboard, story, or learn) opens for it, in
-      whichever view suits that project. The repository list shows each project's own tracking state,
-      so one glance tells you which of them aGiTrack is actually recording, and a status light in the
-      header repeats it for the one you are reading. One port to remember, one <span class="p">ssh -L</span> line to forward.</p>
-      <div class="branches two">
-        <div class="branch" data-ref="tracked">
-          <h3>The tracked view</h3>
-          <p>What aGiTrack <strong>recorded</strong>: each commit with the prompts, replies and token counts
-          that produced exactly those lines. It tells you when your backtrace holds agent work no commit
-          covers yet, so nothing quietly goes untracked.</p>
-        </div>
-        <div class="branch" data-ref="backtrace">
-          <h3>The backtrace view</h3>
-          <p>What can be <strong>reconstructed</strong> from your agent's own transcripts. Kept deliberately
-          separate, and labelled as inferred, because it is less accurate than the recorded history. A repo
-          with nothing tracked yet opens here, then moves to the tracked view once there is something in it.</p>
         </div>
       </div>
     </section>
