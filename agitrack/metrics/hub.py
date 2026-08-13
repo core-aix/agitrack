@@ -295,7 +295,7 @@ class _Clients:
         # tab instead of the one you were just looking at. A counter cannot tie.
         self._order = 0
 
-    def ping(self, client_id: str, path: str, page: str) -> str:
+    def ping(self, client_id: str, path: str, page: str, browser: str = "") -> str:
         """Record that this page is open; return a URL it has been asked to navigate to, if any."""
         if not client_id:
             return ""
@@ -304,6 +304,8 @@ class _Clients:
             self._order += 1
             record = self._seen.setdefault(client_id, {})
             record.update(path=path, page=page, seen=time.monotonic(), order=self._order)
+            if browser:
+                record["browser"] = browser
             target = str(record.pop("navigate", "") or "")
             if target:
                 waiter = record.pop("waiter", None)
@@ -317,7 +319,7 @@ class _Clients:
         with self._lock:
             self._seen.pop(client_id, None)
 
-    def navigate(self, url: str, *, timeout: float = _NAVIGATE_WAIT_SECONDS) -> bool:
+    def navigate(self, url: str, *, timeout: float = _NAVIGATE_WAIT_SECONDS) -> str | None:
         """Ask an open DASHBOARD tab to go to ``url``. True once one has taken it.
 
         Only a dashboard page qualifies. A tab showing the story or the learn page is somewhere
@@ -325,23 +327,28 @@ class _Clients:
         dashboard would take that away, so those get a new tab instead.
 
         Waits for the page to actually pick the navigation up. A tab closed a second ago still
-        looks open here, and queueing into that would leave the user with no window at all."""
+        looks open here, and queueing into that would leave the user with no window at all.
+
+        Returns the steered tab's BROWSER FAMILY (possibly ``""`` if it did not say) once one has
+        taken the navigation, or None when nothing did. The caller needs it to raise the right
+        window: a page cannot raise itself."""
         waiter = threading.Event()
         with self._lock:
             self._expire()
             target = self._pick_dashboard()
             if target is None:
-                return False
+                return None
             self._seen[target]["navigate"] = url
             self._seen[target]["waiter"] = waiter
         if waiter.wait(timeout):
-            return True
+            with self._lock:
+                return str((self._seen.get(target) or {}).get("browser") or "")
         with self._lock:  # nobody took it: drop it so it cannot fire later, out of context
             record = self._seen.get(target)
             if record is not None:
                 record.pop("navigate", None)
                 record.pop("waiter", None)
-        return False
+        return None
 
     def _pick_dashboard(self) -> str | None:
         """The most recently active open dashboard page, or None.
@@ -420,12 +427,17 @@ class HubRouter:
                 self.clients.close(str(body.get("id") or ""))
                 return json_response({"ok": True})
             target = self.clients.ping(
-                str(body.get("id") or ""), str(body.get("path") or ""), str(body.get("page") or "")
+                str(body.get("id") or ""),
+                str(body.get("path") or ""),
+                str(body.get("page") or ""),
+                str(body.get("browser") or ""),
             )
             return json_response({"navigate": target})
         if path == "/navigate":
-            # A launcher asking an already-open dashboard tab to show a repository.
-            return json_response({"navigated": self.clients.navigate(str(body.get("url") or ""))})
+            # A launcher asking an already-open dashboard tab to show a repository. The answer
+            # carries which browser took it, so the launcher can raise that window.
+            steered = self.clients.navigate(str(body.get("url") or ""))
+            return json_response({"navigated": steered is not None, "browser": steered or ""})
         mount = split_mount(path)
         if mount is None:
             return None
@@ -773,7 +785,15 @@ def _steer_open_tab(record: dict, url: str) -> bool:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=_NAVIGATE_WAIT_SECONDS + 3.0) as response:
-            return bool(_json.loads(response.read().decode("utf-8")).get("navigated"))
+            answer = _json.loads(response.read().decode("utf-8"))
+        if not answer.get("navigated"):
+            return False
+        # The tab now holds the right page, but it may be behind three other windows, and a page
+        # that changed where nobody can see it is indistinguishable from nothing happening.
+        from agitrack.metrics.server import raise_browser_window
+
+        raise_browser_window(str(answer.get("browser") or ""))
+        return True
     except Exception:
         return False
 

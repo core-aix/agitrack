@@ -496,14 +496,34 @@ const HUB_CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(
 const HUB_PING_MS = 2000;
 let hubNavigating = false;
 
+// Which browser this is, so aGiTrack can raise THAT application when it steers this tab. A page
+// cannot raise itself (window.focus() is ignored without a user gesture, by design in every
+// current browser), so the ask has to come from the process outside, and it needs to know which
+// window to ask for on a machine with several browsers open. Order matters: every Chromium
+// browser also says "Chrome".
+function hubBrowserFamily(){
+  const ua = navigator.userAgent || "";
+  if(/Edg\//.test(ua)) return "edge";
+  if(/OPR\//.test(ua)) return "opera";
+  if(/Vivaldi/.test(ua)) return "vivaldi";
+  if(/Firefox\//.test(ua)) return "firefox";
+  if(/Chrome\//.test(ua)) return "chrome";
+  if(/Safari\//.test(ua)) return "safari";
+  return "";
+}
+
 async function hubPing(){
   if(!HUB || hubNavigating) return;
   let answer = null;
   try{
-    answer = await postJson("/clients", {id: HUB_CLIENT_ID, path: location.pathname, page: HUB.page});
+    answer = await postJson("/clients",
+      {id: HUB_CLIENT_ID, path: location.pathname, page: HUB.page, browser: hubBrowserFamily()});
   }catch(e){ return; }   // no hub, or an older one: the launcher just opens a tab, as it used to
   if(answer && answer.navigate){
     hubNavigating = true;   // stop pinging: this tab is on its way somewhere else
+    // Ignored in most browsers without a user gesture, and that is fine: the real raise comes
+    // from aGiTrack's own process. Asking costs nothing and works where it is allowed.
+    try{ window.focus(); }catch(e){}
     location.href = answer.navigate;
   }
 }

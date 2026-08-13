@@ -757,7 +757,7 @@ def test_an_open_dashboard_tab_is_steered_instead_of_opening_another():
     import threading
 
     threading.Timer(0.05, tab).start()
-    assert clients.navigate("/r/two/") is True
+    assert clients.navigate("/r/two/") is not None
     assert taken == ["/r/two/"]
 
 
@@ -768,7 +768,7 @@ def test_a_story_or_learn_tab_is_left_where_the_reader_put_it():
     clients.ping("tab-story", "/r/one/story", "story")
     clients.ping("tab-learn", "/r/one/learn", "learn")
 
-    assert clients.navigate("/r/two/", timeout=0.2) is False
+    assert clients.navigate("/r/two/", timeout=0.2) is None
 
 
 def test_a_tab_that_has_gone_does_not_swallow_the_navigation():
@@ -777,14 +777,14 @@ def test_a_tab_that_has_gone_does_not_swallow_the_navigation():
     clients.ping("tab-1", "/r/one/", "")
     clients.close("tab-1")
 
-    assert clients.navigate("/r/two/", timeout=0.2) is False
+    assert clients.navigate("/r/two/", timeout=0.2) is None
 
 
 def test_a_tab_that_stopped_answering_is_given_up_on():
     clients = hub._Clients()
     clients.ping("tab-1", "/r/one/", "")  # registered, then never pings again
 
-    assert clients.navigate("/r/two/", timeout=0.2) is False
+    assert clients.navigate("/r/two/", timeout=0.2) is None
     # ...and the abandoned instruction is dropped, so it cannot fire later out of context.
     assert clients.ping("tab-1", "/r/one/", "") == ""
 
@@ -798,7 +798,7 @@ def test_the_most_recently_active_dashboard_tab_is_the_one_steered():
     import threading
 
     threading.Timer(0.05, lambda: taken.append(clients.ping("newer", "/r/two/", ""))).start()
-    assert clients.navigate("/r/three/") is True
+    assert clients.navigate("/r/three/") is not None
     assert taken == ["/r/three/"]
 
 
@@ -846,3 +846,118 @@ def test_the_hub_answers_the_pages_and_the_launcher(tmp_path):
     assert json.loads(router.post("/navigate", {"url": "/r/y/"}).body)["navigated"] in (True, False)
     assert json.loads(router.post("/clients", {"id": "t", "closing": True}).body) == {"ok": True}
     assert json.loads(router.get("/clients", {}).body)["clients"] == []
+
+
+# --- the steered tab is brought forward ---------------------------------------------------------
+
+
+def test_the_steered_tab_reports_which_browser_it_is_in():
+    """A page cannot raise itself: `window.focus()` is ignored without a user gesture in every
+    current browser, by design. So the ask comes from aGiTrack's own process, and it needs to know
+    WHICH browser to ask for on a machine with several open."""
+    clients = hub._Clients()
+    clients.ping("tab", "/r/one/", "", "firefox")
+    import threading
+
+    threading.Timer(0.05, lambda: clients.ping("tab", "/r/one/", "", "firefox")).start()
+
+    assert clients.navigate("/r/two/") == "firefox"
+
+
+def test_a_tab_that_did_not_say_which_browser_still_steers():
+    # An older page, or one whose user agent says nothing useful. Steering it is still right;
+    # only the raise is skipped.
+    clients = hub._Clients()
+    clients.ping("tab", "/r/one/", "")
+    import threading
+
+    threading.Timer(0.05, lambda: clients.ping("tab", "/r/one/", "")).start()
+
+    assert clients.navigate("/r/two/") == ""
+
+
+def test_nothing_steered_means_nothing_raised():
+    clients = hub._Clients()
+
+    assert clients.navigate("/r/two/", timeout=0.2) is None
+
+
+def test_the_launcher_raises_the_browser_that_took_the_navigation(monkeypatch):
+    raised: list[str] = []
+    monkeypatch.setattr("agitrack.metrics.server.raise_browser_window", lambda family="": raised.append(family) or True)
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps({"navigated": True, "browser": "firefox"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResponse())
+
+    assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is True
+    assert raised == ["firefox"]
+
+
+def test_no_window_is_raised_when_no_tab_was_steered(monkeypatch):
+    monkeypatch.setattr(
+        "agitrack.metrics.server.raise_browser_window",
+        lambda family="": pytest.fail("nothing was steered, so there is no window to raise"),
+    )
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps({"navigated": False, "browser": ""}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResponse())
+
+    assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is False
+
+
+def test_a_browser_that_is_not_running_is_never_launched(monkeypatch):
+    """The point is to bring a window forward, not to start a browser nobody had open."""
+    from agitrack.metrics import server
+
+    monkeypatch.setattr(server, "_running_macos_apps", lambda: {"Finder", "Firefox"})
+    launched: list[list[str]] = []
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **k: launched.append(cmd))
+
+    assert server._raise_macos("chrome") is False
+    assert launched == []  # no Chromium browser is running, so nothing was asked to open
+    assert server._raise_macos("firefox") is True
+    assert launched and launched[0][:2] == ["open", "-a"]
+
+
+def test_raising_a_window_never_asks_macos_for_automation_permission(monkeypatch):
+    """`System Events` would pop "Terminal wants to control System Events" on first use: a
+    permission dialog nobody asked for, in service of a side errand."""
+    from agitrack.metrics import server
+
+    seen: list[list[str]] = []
+
+    class Result:
+        stdout = "/Applications/Firefox.app/Contents/MacOS/firefox\n"
+
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **k: seen.append(cmd) or Result())
+
+    server._running_macos_apps()
+
+    assert seen and seen[0][0] == "ps"
+    assert not any("osascript" in part for cmd in seen for part in cmd)
+
+
+def test_a_remote_or_headless_host_has_no_window_to_raise(monkeypatch):
+    from agitrack.metrics import server
+
+    monkeypatch.setattr(server, "browser_is_local", lambda: False)
+
+    assert server.raise_browser_window("firefox") is False
