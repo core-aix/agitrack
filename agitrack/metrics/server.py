@@ -21,7 +21,9 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import urllib.parse
 import webbrowser
@@ -29,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
+from agitrack.proc import UTF8_TEXT
 from agitrack.metrics import learn as learn_page
 from agitrack.metrics import story as story_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
@@ -623,6 +626,128 @@ def open_dashboard_in_browser(url: str) -> bool:
     try:
         return webbrowser.open(url)
     except (webbrowser.Error, OSError):
+        return False
+
+
+# macOS application names per browser family, most-likely first. A family can map to several
+# applications (every Chromium browser reports itself as Chrome, and Brave and Arc cannot be told
+# apart from it by user agent), so the first one that is actually RUNNING wins — aGiTrack must
+# never launch a browser nobody had open.
+_BROWSER_APPS = {
+    "chrome": ("Google Chrome", "Brave Browser", "Arc", "Chromium", "Google Chrome Canary"),
+    "firefox": ("Firefox", "firefox", "Firefox Developer Edition"),
+    "safari": ("Safari", "Safari Technology Preview"),
+    "edge": ("Microsoft Edge",),
+    "opera": ("Opera",),
+    "vivaldi": ("Vivaldi",),
+}
+
+
+def raise_browser_window(family: str = "") -> bool:
+    """Bring the user's browser to the front. True if we asked an application to activate.
+
+    When aGiTrack steers a dashboard tab that is already open instead of opening another, the tab
+    now holds the right page — but it may be behind three other windows, and a page that changed
+    where nobody can see it is indistinguishable from nothing happening at all.
+
+    A background page cannot raise itself: ``window.focus()`` is ignored without a user gesture in
+    every current browser, by design. So the ASK comes from out here, where a process can talk to
+    the window manager. ``family`` is what the page reported about itself, so the right browser is
+    raised on a machine with several open.
+
+    Best-effort everywhere and silent on failure: not being able to raise a window is never a
+    reason to fail the thing the user actually asked for."""
+    if not browser_is_local():
+        return False  # a remote/headless host has no window to raise
+    if sys.platform == "darwin":
+        return _raise_macos(family)
+    if sys.platform.startswith("linux"):
+        return _raise_linux(family)
+    return _raise_windows(family)
+
+
+def _running_macos_apps() -> set[str]:
+    """Application bundles currently running, by name, from the process table alone.
+
+    NOT via AppleScript's ``System Events``: asking that for a process list is an Automation
+    request, so the first attempt pops "Terminal wants to control System Events" — a permission
+    dialog nobody asked for, in service of a side errand. Every bundled application runs an
+    executable at ``…/<Name>.app/Contents/MacOS/…``, which ``ps`` will say for free.
+    """
+    try:
+        result = subprocess.run(["ps", "-eo", "comm="], capture_output=True, timeout=5, **UTF8_TEXT)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    apps = set()
+    for line in (result.stdout or "").splitlines():
+        marker = ".app/Contents/MacOS/"
+        if marker not in line:
+            continue
+        bundle = line.split(marker, 1)[0]
+        apps.add(bundle.rsplit("/", 1)[-1])
+    return apps
+
+
+def _raise_macos(family: str) -> bool:
+    running = _running_macos_apps()
+    if not running:
+        return False
+    for app in _BROWSER_APPS.get(family, ()) or tuple(name for names in _BROWSER_APPS.values() for name in names):
+        match = next((name for name in running if name.lower() == app.lower()), "")
+        if not match:
+            continue
+        try:
+            # `open -a` on an app that is ALREADY running just brings it forward — no Automation
+            # permission, no AppleScript. The running check above is what keeps it from launching
+            # a browser nobody had open.
+            subprocess.run(["open", "-a", match], capture_output=True, timeout=5, **UTF8_TEXT)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return False
+
+
+def _raise_linux(family: str) -> bool:
+    """X11/Wayland: ask the window manager, if a tool for doing so is installed. Many desktops
+    also refuse focus-stealing outright, in which case the window is highlighted instead — which
+    still answers "where did it go?"."""
+    for tool, args in (
+        ("wmctrl", ["-a", family or "Mozilla Firefox"]),
+        ("xdotool", ["search", "--name", family or "Firefox"]),
+    ):
+        if shutil.which(tool) is None:
+            continue
+        try:
+            subprocess.run([tool, *args], capture_output=True, timeout=5, **UTF8_TEXT)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def _raise_windows(family: str) -> bool:
+    """Windows refuses to let a background process steal focus outright; the documented result of
+    asking is that the taskbar button flashes, which is still an answer to "where did it go?"."""
+    if sys.platform != "win32":
+        return False
+    titles = {"chrome": "Chrome", "firefox": "Firefox", "edge": "Edge", "opera": "Opera", "vivaldi": "Vivaldi"}
+    needle = titles.get(family, "")
+    if not needle:
+        return False
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"$s = New-Object -ComObject WScript.Shell; $s.AppActivate('{needle}')",
+            ],
+            capture_output=True,
+            timeout=5,
+            **UTF8_TEXT,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
         return False
 
 

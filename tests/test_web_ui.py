@@ -450,3 +450,21 @@ def test_presence_stops_once_the_tab_is_on_its_way_elsewhere():
     html = _hub_pages()["dashboard"]
 
     assert "if(!HUB || hubNavigating) return;" in html
+
+
+def test_a_page_tells_the_hub_which_browser_it_is_in():
+    html = _hub_pages()["dashboard"]
+
+    assert "hubBrowserFamily" in html
+    # Order matters: every Chromium browser also says "Chrome".
+    assert html.index("Edg\\/") < html.index("Chrome\\/")
+    assert html.index("Firefox\\/") < html.index("Chrome\\/")
+    assert html.index("Chrome\\/") < html.index("Safari\\/")
+
+
+def test_a_steered_page_also_asks_to_be_focused():
+    html = _hub_pages()["dashboard"]
+
+    # Ignored in most browsers without a user gesture, and that is fine: the real raise comes
+    # from aGiTrack's own process. Asking costs nothing and works where it is allowed.
+    assert "window.focus();" in html
