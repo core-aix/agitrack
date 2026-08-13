@@ -1355,7 +1355,11 @@ def test_dashboard_shows_only_the_repo_name_not_its_path(tmp_path, monkeypatch):
     # still exposes the layout. Build the repo before patching HOME so git still finds the
     # real global identity for the seed commits.
     home = tmp_path / "home"
-    repo_dir = home / "projects" / "demo"
+    # The containing directory is deliberately NOT an English word. The assertion below is "this
+    # path component appears nowhere in the page", and with a name like "projects" it fired twice
+    # on ordinary prose in a CSS comment rather than on a leaked path: a false alarm that teaches
+    # the reader to distrust the test instead of the leak it exists to catch.
+    repo_dir = home / "wkspc7f3" / "demo"
     repo_dir.parent.mkdir(parents=True)
     repo = _demo_repo(repo_dir)
     monkeypatch.setenv("HOME", str(home))
@@ -1367,8 +1371,8 @@ def test_dashboard_shows_only_the_repo_name_not_its_path(tmp_path, monkeypatch):
     assert dash.repo == "demo"
     html = render_html(repo)
     assert str(home) not in html
-    assert "~/projects/demo" not in html  # not even the home-abbreviated form
-    assert "projects" not in html  # the containing directory never appears
+    assert "~/wkspc7f3/demo" not in html  # not even the home-abbreviated form
+    assert "wkspc7f3" not in html  # the containing directory never appears
 
 
 def test_dashboard_repo_outside_home_is_also_reduced_to_its_name(tmp_path, monkeypatch):
