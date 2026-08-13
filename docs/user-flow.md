@@ -901,6 +901,13 @@ because every page fetches with **relative** URLs. `/repos` is what the header's
 from. A mount reached without its trailing slash redirects, so the address bar and the page's own
 relative links never disagree.
 
+**The header.** Three controls, shared by all three pages: a repository selector (a listbox, so it
+scrolls at a bounded height and can pin a "show another repository" item that opens a how-to
+dialog), the tracked/backtrace toggle, and a status light saying whether aGiTrack is running on
+the repository being shown and in which mode. Switching repository goes through `/go/<slug>/`,
+which redirects to whichever view suits THAT repository: carrying the current view across is what
+lands you on another project's empty page.
+
 **Two views, deliberately separate.** The tracked view shows what aGiTrack recorded; the backtrace
 shows what can be inferred from the agent's transcripts. They are never merged, because a
 reconstruction is less accurate than a recording. Instead each points at the other: the backtrace
@@ -910,6 +917,10 @@ agent work no commit covers, so nothing goes quietly untracked.
 **Empty repositories** get a reason rather than a blank page: no tracked commits but reconstructable
 sessions opens the backtrace; no sessions at all says so and still lists the repository's own
 commits; nothing at all says there is nothing to show yet.
+
+**When it opens.** After the LAST startup question, never in the middle of them: the interactive
+path asks its final questions (the privacy acknowledgment, the pre-agent commit) inside the runner,
+so the open is handed to it rather than fired from the CLI beforehand.
 
 **Stopping.** `agitrack stop` drops this repository from the dashboard (and stops the hub when
 nothing is left); `agitrack -d stop` stops the dashboard itself, for every repository.

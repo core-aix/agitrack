@@ -220,6 +220,13 @@ class RepoScope:
             return json_response(payload)
         if path == "/learn/models":
             return json_response(learn_page.model_options(_str(query, "backend")))
+        if path == "/state":
+            # Whether aGiTrack is running on THIS repository, and in which mode. Read fresh on
+            # every request (a handshake file and a pid check, no git), because the whole point
+            # of the answer is that it changes while the page is open.
+            from agitrack.proxy.background import running_mode
+
+            return json_response(running_mode(self.repo))
         return None
 
     def post(self, path: str, body: dict) -> "Response | None":

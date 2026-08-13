@@ -285,7 +285,9 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 **One dashboard, one port, every repository.** A single server serves all of your projects, switched by URL path: `/r/<repo>/` is a repository's tracked view and `/b/<repo>/` is its backtrace. Pick another repository from the selector in the page header and the same page you were reading (dashboard, story, or learn) opens for it. So there is one port to remember and one `ssh -L` line to forward, however many projects you have. The list of repositories it offers is every repository you have run aGiTrack in; `agitrack stop` drops one from it, `agitrack -d stop` stops the whole dashboard.
 
-**Two views, kept separate.** The header has a **tracked / backtrace** toggle that applies to the dashboard, the story page and the learn page alike, since all three read differently depending on which history they are telling:
+**The header tells you what is happening.** A repository selector switches between every project aGiTrack knows (it scrolls when the list is long, and its last entry explains how to add one), a status light says whether aGiTrack is running on the repository you are looking at and in which mode, and a **tracked / backtrace** toggle switches the view. Switching repository keeps the page you were reading and picks whichever view suits the project you moved to, rather than carrying the current one across.
+
+**Two views, kept separate.** The toggle applies to the dashboard, the story page and the learn page alike, since all three read differently depending on which history they are telling:
 
 - **tracked** is what aGiTrack *recorded*: each commit with the prompts, replies and token counts that produced exactly those lines.
 - **backtrace** is what can be *reconstructed* from your agent's own transcripts. It is labelled as inferred everywhere it appears, and kept apart from the tracked view on purpose, because a reconstruction is less accurate than a recording and merging the two would quietly drag the recorded history down to the inferred one's accuracy.
@@ -376,6 +378,8 @@ agitrack --backtrace commit --backtrace-branch tracked-history   # write the rec
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
 
 The reconstruction is best-effort from what the transcripts recorded; review it before relying on it. By default nothing is uploaded — it all runs locally; the one exception is opt-in and described next.
+
+**A new project at an old path.** Transcripts are keyed by directory, so a directory you deleted and recreated would otherwise hand its replacement the previous occupant's conversations. Sessions whose transcript stopped changing before the directory itself was created are set aside, and the banner says how many. Where the filesystem does not record a creation time (most Linux setups) nothing is filtered, and `AGITRACK_BACKTRACE_ALL_SESSIONS=1` brings them back everywhere.
 
 ### Across machines and teammates
 
@@ -791,7 +795,7 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 
 `autotrack_hook` (default `"auto"`, **per-repository**) controls the persistent `pre-commit` hook. `"auto"`: on a `git commit` made while aGiTrack isn't running, fold the AI trace into that commit and **auto-start** the background tracker (in the same commit mode as the last run) for the turns that follow. `"off"`: don't install it — track only while aGiTrack is running. aGiTrack asks the first time you run `agitrack -b` on a repo; `agitrack --remove-hooks` sets it to `"off"`. See [Background mode](#background-mode---background---b).
 
-`open_dashboard_on_start` (default `true`) controls whether starting aGiTrack on a repository also opens its [dashboard](#dashboard) in your browser. It is on by default because a record nobody looks at may as well not exist, and because one dashboard serves every repository, so opening it costs a browser tab rather than another server. Set it to `false` on a machine where a browser has no business appearing (a shared box, a build agent); scripted and non-interactive runs never open one regardless.
+`open_dashboard_on_start` (default `true`) controls whether starting aGiTrack on a repository also opens its [dashboard](#dashboard) in your browser. It is on by default because a record nobody looks at may as well not exist, and because one dashboard serves every repository, so opening it costs a browser tab rather than another server. It opens once every startup question has been answered, never in the middle of them. Set it to `false` on a machine where a browser has no business appearing (a shared box, a build agent); scripted and non-interactive runs never open one regardless.
 
 `log_file` (default unset) is a path to a plain-text **event log** aGiTrack appends notable events to — an AI change detected, a commit made, an update available — in **every** mode (interactive and background, with or without `-b`), so you can `tail -f` one file and watch what aGiTrack is doing. A relative path is resolved against the repo root. Set it for a single run with `--log-file PATH`, or persist it here (`"log_file": "agitrack-events.log"`).
 

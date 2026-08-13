@@ -259,13 +259,54 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 HUBBAR_CSS = """.hubbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   padding:7px 18px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12.5px}
 .hubbar .hb-label{color:var(--fg-dim);letter-spacing:.6px;text-transform:uppercase;font-size:10.5px}
-.hubbar select{background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:12.5px;padding:4px 8px;max-width:min(52vw,420px)}
-.hubbar select:focus{outline:none;border-color:var(--phosphor)}
 .hubbar .hb-group{display:flex;align-items:center;gap:7px}
-/* The view toggle. Two states, both always visible: which one you are in is only legible next to
-   the one you are not in, and the pair also says the other view EXISTS, which a single button
-   labelled with the other mode never manages to. */
+.hubbar .hb-state{color:var(--fg-dim);display:flex;align-items:center;gap:6px}
+.hubbar .hb-dot{width:7px;height:7px;border-radius:50%;background:var(--fg-dim);flex:none}
+.hubbar .hb-state.live .hb-dot{background:var(--phosphor);box-shadow:0 0 6px var(--phosphor-dim)}
+.hubbar .hb-state.live{color:var(--phosphor)}
+/* ---- the repository picker -------------------------------------------------------------
+   A native <select> cannot be given a scrollbar, a two-line row, or a pinned footer item, and
+   its popup is drawn by the OS in a light theme on every platform we do not control. This is a
+   button plus a listbox, so the list scrolls at a bounded height however many repositories
+   there are, and "track another repository" stays reachable at the bottom of it. */
+.repo-picker{position:relative}
+.repobtn{display:flex;align-items:center;gap:8px;max-width:min(52vw,420px);
+  background:var(--ink);color:var(--fg);border:1px solid var(--line);cursor:pointer;
+  font-family:var(--mono);font-size:12.5px;padding:4px 9px}
+.repobtn:hover{border-color:var(--phosphor-dim)}
+.repobtn[aria-expanded="true"]{border-color:var(--phosphor)}
+.repobtn .rb-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.repobtn .rb-caret{color:var(--fg-dim);flex:none}
+.repomenu{position:absolute;top:100%;left:0;z-index:70;margin-top:6px;min-width:min(92vw,420px);
+  max-width:min(92vw,560px);background:var(--panel);border:1px solid var(--phosphor-dim);
+  box-shadow:0 12px 32px rgba(0,0,0,.65);display:flex;flex-direction:column}
+/* The SCROLLING part is the list alone, so the footer action never scrolls out of reach.
+   Bounded by the viewport, not by a fixed pixel count: on a short window a fixed max-height
+   would push the footer off the bottom of the screen, which is the bug this is avoiding. */
+.repolist{overflow-y:auto;max-height:min(52vh,340px);overscroll-behavior:contain}
+.repolist::-webkit-scrollbar{width:9px}
+.repolist::-webkit-scrollbar-track{background:var(--ink)}
+.repolist::-webkit-scrollbar-thumb{background:var(--line);border:2px solid var(--ink)}
+.repolist::-webkit-scrollbar-thumb:hover{background:var(--phosphor-dim)}
+.repolist{scrollbar-width:thin;scrollbar-color:var(--line) var(--ink)}
+.repoitem{display:block;width:100%;text-align:left;background:transparent;border:0;cursor:pointer;
+  font-family:var(--mono);font-size:12.5px;padding:7px 12px;color:var(--fg);
+  border-bottom:1px solid var(--line)}
+.repoitem:last-child{border-bottom:0}
+.repoitem:hover,.repoitem.cursor{background:var(--panel2)}
+.repoitem .ri-name{display:block;color:var(--fg)}
+.repoitem .ri-path{display:block;color:var(--fg-dim);font-size:11px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.repoitem.on .ri-name{color:var(--phosphor);font-weight:600}
+.repoitem.on .ri-name::after{content:" ✓"}
+.repohelp{flex:none;width:100%;text-align:left;cursor:pointer;background:var(--panel2);
+  border:0;border-top:1px solid var(--phosphor-dim);color:var(--phosphor);
+  font-family:var(--mono);font-size:12px;padding:8px 12px}
+.repohelp:hover{background:var(--phosphor);color:var(--ink)}
+/* ---- the view toggle -------------------------------------------------------------------
+   Two states, both always visible: which one you are in is only legible next to the one you
+   are not in, and the pair also says the other view EXISTS, which a single button labelled
+   with the other mode never manages to. */
 .viewtoggle{display:inline-flex;border:1px solid var(--line)}
 .viewtoggle a{padding:4px 11px;color:var(--fg-dim);text-decoration:none;border-right:1px solid var(--line)}
 .viewtoggle a:last-child{border-right:0}
@@ -276,16 +317,57 @@ HUBBAR_CSS = """.hubbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
    it: the reconstruction is the inferred view, and the page says so in one colour throughout. */
 .viewtoggle a.on.bt{background:var(--amber);color:var(--ink)}
 .viewtoggle a.on.bt:hover{background:var(--amber);color:var(--ink)}
+/* ---- the "how do I add a repository?" dialog ------------------------------------------- */
+.hubmodal{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.62);padding:20px}
+.hubmodal .hm-box:focus{outline:none}
+.hubmodal .hm-box{background:var(--panel);border:1px solid var(--phosphor-dim);max-width:620px;
+  width:100%;max-height:84vh;overflow-y:auto;padding:22px 24px;box-shadow:0 18px 48px rgba(0,0,0,.7)}
+.hubmodal h3{font-family:var(--display);color:var(--phosphor);font-size:22px;margin:0 0 10px}
+.hubmodal p{color:var(--fg);font-size:13px;line-height:1.65;margin:0 0 12px}
+.hubmodal code{background:var(--ink);color:var(--phosphor);padding:1px 6px;border:1px solid var(--line)}
+.hubmodal .hm-steps{margin:0 0 14px;padding-left:18px;color:var(--fg);font-size:13px;line-height:1.9}
+.hubmodal .hm-close{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);
+  background:transparent;font-family:var(--mono);font-size:13px;padding:7px 16px}
+.hubmodal .hm-close:hover{background:var(--phosphor);color:var(--ink)}
 @media (max-width:760px){.hubbar{padding:7px 8px;gap:9px}.hubbar .hb-label{display:none}}"""
 
 HUBBAR_HTML = """<div class="hubbar" id="hubbar" hidden>
-  <div class="hb-group"><span class="hb-label">repo</span>
-    <select id="hub-repo" title="Switch to another repository aGiTrack is tracking"></select></div>
+  <div class="hb-group repo-picker">
+    <span class="hb-label">repo</span>
+    <button class="repobtn" id="hub-repo-btn" aria-haspopup="listbox" aria-expanded="false"
+            title="Switch to another repository aGiTrack knows about">
+      <span class="rb-name" id="hub-repo-name">this repository</span><span class="rb-caret">&#9662;</span>
+    </button>
+    <div class="repomenu" id="hub-repo-menu" hidden role="listbox" aria-label="Repositories">
+      <div class="repolist" id="hub-repo-list"></div>
+      <button class="repohelp" id="hub-repo-help">&#43; show another repository here&hellip;</button>
+    </div>
+  </div>
   <div class="hb-group" id="hub-views" hidden><span class="hb-label">view</span>
     <span class="viewtoggle">
       <a id="hub-active" href="#" title="aGiTrack's own tracking: commits it recorded, with the conversation and tokens behind each one">tracked</a>
       <a id="hub-backtrace" class="bt" href="#" title="Reconstructed from your local agent transcripts: inferred, not recorded">backtrace</a>
     </span></div>
+  <div class="hb-group hb-state" id="hub-state" hidden><span class="hb-dot"></span><span id="hub-state-text"></span></div>
+</div>
+<div class="hubmodal" id="hub-help" hidden>
+  <div class="hm-box" tabindex="-1">
+    <h3>Showing another repository here</h3>
+    <p>This dashboard lists every repository aGiTrack has worked in on this machine. A project
+    appears the moment you point aGiTrack at it, and stays until you stop it.</p>
+    <ol class="hm-steps">
+      <li>Open a terminal in the project you want to add.</li>
+      <li>Run <code>agitrack</code> and pick a mode. Every mode tracks the work and adds the
+      project here.</li>
+      <li>Only want to look, without tracking anything? <code>agitrack -d</code> adds it too.</li>
+      <li>Never used an agent there through aGiTrack? <code>agitrack --backtrace</code> still
+      reconstructs what past sessions did, and adds the project here.</li>
+    </ol>
+    <p>To remove one, run <code>agitrack stop</code> in it. That stops whatever aGiTrack is doing
+    there and drops it from this list, without losing anything it already recorded.</p>
+    <button class="hm-close" id="hub-help-close">got it</button>
+  </div>
 </div>"""
 
 # ``__UI_HUBBAR_PAGE__`` is substituted per page with "", "learn" or "story", so the toggle keeps
@@ -300,6 +382,79 @@ const HUB = (() => {
 function hubUrl(view, slug){
   return "/" + (view === "backtrace" ? "b" : "r") + "/" + encodeURIComponent(slug) + "/" + HUB.page;
 }
+// Switching REPOSITORY goes through /go/, which redirects to whichever view suits that project.
+// Carrying the current view across is what lands you on another project's empty tracked
+// dashboard, which is the exact empty page the view-selection rule exists to avoid.
+function hubGoUrl(slug){
+  return "/go/" + encodeURIComponent(slug) + "/" + HUB.page;
+}
+function openHubHelp(){
+  const m = $("hub-help"); if(!m) return;
+  m.hidden = false;
+  // Focused so Escape reaches the dialog's own handler rather than needing a page-wide one.
+  const box = m.querySelector(".hm-box"); if(box) box.focus();
+}
+function closeHubHelp(){
+  const m = $("hub-help"); if(!m) return;
+  m.hidden = true;
+  const btn = $("hub-repo-btn"); if(btn) btn.focus();
+}
+
+function wireRepoPicker(repos){
+  const btn = $("hub-repo-btn"), menu = $("hub-repo-menu"), list = $("hub-repo-list");
+  const picker = btn.parentElement;
+  const here = repos.find(r => r.slug === HUB.slug);
+  $("hub-repo-name").textContent = here ? here.name : "this repository";
+  btn.title = here ? here.path : btn.title;
+  list.innerHTML = repos.map(r =>
+    `<button class="repoitem${r.slug === HUB.slug ? " on" : ""}" role="option" data-slug="${esc(r.slug)}"
+       aria-selected="${r.slug === HUB.slug}"><span class="ri-name">${esc(r.name)}</span>
+       <span class="ri-path">${esc(r.path)}</span></button>`).join("");
+  const items = Array.from(list.querySelectorAll(".repoitem"));
+  items.forEach(el => el.onclick = () => { location.href = hubGoUrl(el.dataset.slug); });
+  let cursor = Math.max(0, items.findIndex(el => el.classList.contains("on")));
+  const mark = () => items.forEach((el, i) => el.classList.toggle("cursor", i === cursor));
+  const open = () => {
+    menu.hidden = false; btn.setAttribute("aria-expanded", "true"); mark();
+    // Keep the current repository in view: with a long list the checked one is otherwise
+    // somewhere below the fold of a menu that just opened scrolled to the top.
+    if(items[cursor]) items[cursor].scrollIntoView({block: "nearest"});
+  };
+  const close = () => { menu.hidden = true; btn.setAttribute("aria-expanded", "false"); };
+  btn.onclick = e => { e.stopPropagation(); menu.hidden ? open() : close(); };
+  $("hub-repo-help").onclick = () => { close(); openHubHelp(); };
+  document.addEventListener("click", e => { if(!menu.hidden && !menu.contains(e.target)) close(); });
+  // Bound to the PICKER, not the document. A page-wide keydown scheme is the kind nobody can
+  // discover and everybody trips over; these keys only mean anything while focus is inside this
+  // control, which is exactly what a listbox owes the keyboard and no more.
+  picker.addEventListener("keydown", e => {
+    if(e.key === "Escape"){ close(); btn.focus(); return; }
+    if(menu.hidden || !items.length) return;
+    if(e.key === "ArrowDown" || e.key === "ArrowUp"){
+      e.preventDefault();
+      cursor = (cursor + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+      mark(); items[cursor].scrollIntoView({block: "nearest"});
+    } else if(e.key === "Enter"){
+      e.preventDefault(); items[cursor].click();
+    }
+  });
+}
+
+// Whether aGiTrack is actually running on the repository being shown, and in which mode. A
+// dashboard that looks identical whether or not anything is being tracked is a dashboard you
+// cannot use to answer "is this on?", which is the first thing anyone asks of it.
+async function refreshHubState(){
+  if(!HUB) return;
+  const box = $("hub-state"); if(!box) return;
+  let state = null;
+  try{ state = await (await fetch("state", {cache:"no-store"})).json(); }catch(e){}
+  if(!state || !state.label){ box.hidden = true; return; }
+  box.classList.toggle("live", !!state.running);
+  box.title = state.detail || "";
+  $("hub-state-text").textContent = state.label;
+  box.hidden = false;
+}
+
 async function initHubBar(){
   if(!HUB) return;
   const bar = $("hubbar"); if(!bar) return;
@@ -310,16 +465,19 @@ async function initHubBar(){
   backtrace.classList.toggle("on", HUB.view === "backtrace");
   views.hidden = false;
   bar.hidden = false;
+  const closeBtn = $("hub-help-close");
+  if(closeBtn) closeBtn.onclick = closeHubHelp;
+  const modal = $("hub-help");
+  if(modal){
+    modal.onclick = e => { if(e.target === modal) closeHubHelp(); };
+    modal.addEventListener("keydown", e => { if(e.key === "Escape") closeHubHelp(); });
+  }
+  refreshHubState();
+  setInterval(refreshHubState, 15000);
   let repos = [];
   try{ repos = (await (await fetch("/repos", {cache:"no-store"})).json()).repos || []; }catch(e){}
-  const select = $("hub-repo");
-  if(repos.length < 1){ select.parentElement.hidden = true; return; }
-  select.innerHTML = repos.map(r =>
-    `<option value="${esc(r.slug)}" ${r.slug === HUB.slug ? "selected" : ""}>${esc(r.name)} &nbsp; ${esc(r.path)}</option>`
-  ).join("");
-  // Switching repository KEEPS the current view and page: someone comparing one repo's
-  // backtrace with another's should not be dropped onto a dashboard halfway through.
-  select.onchange = () => { location.href = hubUrl(HUB.view, select.value); };
+  if(!repos.length){ $("hub-repo-btn").parentElement.hidden = true; return; }
+  wireRepoPicker(repos);
 }"""
 
 DOM_JS = """const $ = id => document.getElementById(id);

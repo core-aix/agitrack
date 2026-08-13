@@ -1546,3 +1546,110 @@ def test_every_backend_root_is_watched_for_newly_appeared_sessions(codex_home, m
 
     assert str(codex_home / "sessions") in dirs, dirs
     assert str(codex_home / "sessions" / "2026" / "08" / "10") in dirs, dirs
+
+
+# --- a new directory at an old path is not the old project --------------------------------------
+
+
+def _source(tmp_path, name, *, mtime):
+    """A discovery source whose transcript file was last written at ``mtime``."""
+    import os
+
+    from agitrack.metrics.backtrace import _Source
+
+    path = tmp_path / name
+    path.write_text("{}", encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+    return _Source("claude", name, mtime, str(tmp_path), lambda: None, watch=(path,))
+
+
+def test_sessions_written_before_this_directory_existed_are_set_aside(tmp_path, monkeypatch):
+    """Delete a project, create a new one at the same path, and the transcripts do not notice.
+
+    They are keyed by path, so the new project's backtrace was the deleted project's
+    conversations: someone else's work, presented as this project's history."""
+    from agitrack.metrics import backtrace
+
+    monkeypatch.setattr(backtrace, "_directory_born", lambda directory: 2_000.0)
+    old = _source(tmp_path, "before.jsonl", mtime=1_000.0)
+    new = _source(tmp_path, "after.jsonl", mtime=3_000.0)
+
+    kept, dropped = backtrace._drop_sessions_predating(tmp_path, [new, old])
+
+    assert [s.ref_id for s in kept] == ["after.jsonl"]
+    assert [s.ref_id for s in dropped] == ["before.jsonl"]
+
+
+def test_nothing_is_set_aside_where_the_filesystem_has_no_creation_time(tmp_path, monkeypatch):
+    # Linux mostly does not record one. No signal means no filtering, never a guess.
+    from agitrack.metrics import backtrace
+
+    monkeypatch.setattr(backtrace, "_directory_born", lambda directory: 0.0)
+    old = _source(tmp_path, "ancient.jsonl", mtime=1.0)
+
+    kept, dropped = backtrace._drop_sessions_predating(tmp_path, [old])
+
+    assert kept == [old] and dropped == []
+
+
+def test_a_session_still_being_written_survives_the_directory_being_recreated(tmp_path, monkeypatch):
+    # Only a transcript that stopped changing BEFORE the directory existed can belong to a
+    # previous occupant; one still being appended to is this directory's.
+    from agitrack.metrics import backtrace
+
+    monkeypatch.setattr(backtrace, "_directory_born", lambda directory: 2_000.0)
+    live = _source(tmp_path, "live.jsonl", mtime=2_000.0)
+
+    kept, dropped = backtrace._drop_sessions_predating(tmp_path, [live])
+
+    assert kept == [live] and dropped == []
+
+
+def test_a_session_that_cannot_be_stat_ed_is_kept(tmp_path, monkeypatch):
+    from agitrack.metrics import backtrace
+    from agitrack.metrics.backtrace import _Source
+
+    monkeypatch.setattr(backtrace, "_directory_born", lambda directory: 2_000.0)
+    ghost = _Source("claude", "ghost", 1.0, str(tmp_path), lambda: None, watch=(tmp_path / "not-there",))
+
+    kept, dropped = backtrace._drop_sessions_predating(tmp_path, [ghost])
+
+    # This test may only ever remove history it is sure about.
+    assert kept == [ghost] and dropped == []
+
+
+def test_the_escape_hatch_brings_them_back(tmp_path, monkeypatch):
+    from agitrack.metrics import backtrace
+
+    monkeypatch.setattr(backtrace, "_directory_born", lambda directory: 2_000.0)
+    monkeypatch.setenv("AGITRACK_BACKTRACE_ALL_SESSIONS", "1")
+    old = _source(tmp_path, "before.jsonl", mtime=1_000.0)
+
+    kept, dropped = backtrace._drop_sessions_predating(tmp_path, [old])
+
+    assert kept == [old] and dropped == []
+
+
+def test_setting_sessions_aside_is_said_out_loud(tmp_path):
+    """Hiding history is the one thing this view must never do without saying so."""
+    from agitrack.metrics import backtrace
+    from agitrack.metrics.backtrace import BacktraceView
+    from agitrack.metrics.collect import Dashboard
+
+    backtrace._PREDATING[str(tmp_path)] = 3
+    try:
+        view = BacktraceView(
+            directory=str(tmp_path),
+            root=tmp_path,
+            dashboard=Dashboard(repo=str(tmp_path), branch="main", stats=[]),
+            diffs={},
+            file_edits={},
+            backends=["claude"],
+            session_count=1,
+        )
+        text = view.banner_text()
+    finally:
+        backtrace._PREDATING.pop(str(tmp_path), None)
+
+    assert "3 session(s) recorded at this path finished before this directory existed" in text
+    assert "AGITRACK_BACKTRACE_ALL_SESSIONS=1" in text  # ...and how to see them anyway
