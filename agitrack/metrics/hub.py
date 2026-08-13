@@ -50,6 +50,10 @@ from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
 # aGiTrack tracked it, "b" for the backtrace it reconstructed).
 ACTIVE_PREFIX = "r"
 BACKTRACE_PREFIX = "b"
+# "Take me to this repository, in whichever view suits it" — the prefix the repo switcher uses.
+# It is a REDIRECT, not a third view: the page you land on is always /r/ or /b/, so the address
+# bar, the toggle and a bookmark all agree about what you are looking at.
+CHOOSE_PREFIX = "go"
 
 _PREFIX_VIEW = {ACTIVE_PREFIX: repo_registry.ACTIVE, BACKTRACE_PREFIX: repo_registry.BACKTRACE}
 _VIEW_PREFIX = {view: prefix for prefix, view in _PREFIX_VIEW.items()}
@@ -59,6 +63,19 @@ def mount_path(slug: str, view: str = repo_registry.ACTIVE, subpath: str = "") -
     """The URL path a repository's view is served at, always with its trailing slash."""
     prefix = _VIEW_PREFIX.get(view, ACTIVE_PREFIX)
     return f"/{prefix}/{slug}/{subpath.lstrip('/')}"
+
+
+def choose_path(slug: str, subpath: str = "") -> str:
+    """The URL that opens a repository in whichever view suits it (see :func:`preferred_view`)."""
+    return f"/{CHOOSE_PREFIX}/{slug}/{subpath.lstrip('/')}"
+
+
+def split_choose(path: str) -> tuple[str, str] | None:
+    """``(slug, subpath)`` for a ``/go/`` path, or None when it is not one."""
+    parts = path.split("/")
+    if len(parts) < 3 or parts[0] != "" or parts[1] != CHOOSE_PREFIX or not parts[2]:
+        return None
+    return parts[2], "/".join(parts[3:])
 
 
 def split_mount(path: str) -> tuple[str, str, str] | None:
@@ -250,6 +267,17 @@ class HubRouter:
             return self._root()
         if path == "/repos":
             return json_response({"repos": self.repo_list()})
+        chosen = split_choose(path)
+        if chosen is not None:
+            # Switching repository must not carry the CURRENT view across: the view that suits one
+            # project is not the view that suits another, and arriving on a project's empty
+            # tracked dashboard because the last one happened to be tracked is exactly the empty
+            # page the whole view-selection rule exists to avoid.
+            slug, subpath = chosen
+            entry = repo_registry.find(slug)
+            if entry is None:
+                return self._unknown_repo(slug)
+            return redirect(mount_path(slug, preferred_view(entry.directory), subpath))
         mount = split_mount(path)
         if mount is None:
             return None
@@ -302,6 +330,8 @@ class HubRouter:
                     "path": _display(entry.path),
                     "active_url": mount_path(entry.slug, repo_registry.ACTIVE),
                     "backtrace_url": mount_path(entry.slug, repo_registry.BACKTRACE),
+                    # What the switcher navigates to: the server picks the view on arrival.
+                    "go_url": choose_path(entry.slug),
                     "last_seen": entry.last_seen,
                 }
             )
@@ -525,7 +555,16 @@ def open_dashboard(directory: Path, *, view: str = "", open_browser: bool = True
     url, chosen = ensure_hub_for(directory, view=view)
     if not url:
         if not quiet:
-            print(f"The aGiTrack dashboard did not start. See {log_path()} for details.")
+            # Two failures reach here and they need different answers: a port nobody can bind,
+            # and a child that died on startup. The log has the actual reason either way, so it
+            # is named first, followed by the one knob that fixes the common case.
+            print(
+                "The aGiTrack dashboard did not start.\n"
+                f"  Why: see {log_path()} (the last lines are the child's own output).\n"
+                "  If something else already holds the port, aGiTrack tries the next few; if all\n"
+                "  of them are taken, free one or set AGITRACK_DASHBOARD_HOST to another address.\n"
+                "  Everything else still works: tracking does not depend on the dashboard."
+            )
         return 1
     record = running_hub() or {}
     if not quiet:
@@ -713,12 +752,14 @@ __all__ = [
     "ACTIVE_PREFIX",
     "BACKTRACE_PREFIX",
     "HubRouter",
+    "choose_path",
     "ensure_hub_for",
     "hub_status",
     "hub_url",
     "mount_path",
     "preferred_view",
     "run_hub_daemon",
+    "split_choose",
     "split_mount",
     "start_hub",
     "stop_hub",

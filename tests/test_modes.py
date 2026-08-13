@@ -214,6 +214,82 @@ def test_yes_never_shows_the_menu(monkeypatch, quiet_startup):
     cli.main(["--yes"])
 
 
+# --- the dashboard opens last -----------------------------------------------------------------
+
+
+def test_the_dashboard_waits_until_every_startup_question_is_answered(monkeypatch, tmp_path):
+    """A browser window arriving mid-startup pulls the user away from a prompt still waiting.
+
+    The interactive path asks its last questions INSIDE the runner (the privacy acknowledgment,
+    the pre-agent commit), so the open has to be handed to the runner rather than fired from the
+    CLI before it is constructed."""
+    from agitrack.proxy.runner import ProxyRunner
+
+    order: list[str] = []
+    runner = object.__new__(ProxyRunner)
+    runner._on_startup_complete = lambda: order.append("dashboard")
+    runner._debug = lambda message: None
+
+    # The hook fires where run() calls it: after the questions, before the TUI takes the screen.
+    order.append("privacy")
+    order.append("pre-agent commit")
+    runner._on_startup_complete()
+
+    assert order == ["privacy", "pre-agent commit", "dashboard"]
+
+
+def test_the_cli_hands_the_dashboard_to_the_runner_rather_than_opening_it_first(monkeypatch, quiet_startup):
+    """The interactive launch must not open a browser before the runner has had its say."""
+    captured: dict = {}
+
+    class Fake:
+        def __init__(self, repo, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "ProxyRunner", Fake)
+    monkeypatch.setattr(cli, "_check_gh_availability", lambda repo, scripted=False: (True, True))
+    monkeypatch.setattr(cli, "_verify_menu_key", lambda config, scripted=False: True)
+    monkeypatch.setattr(cli, "_refuse_during_merge_conflict", lambda repo: False)
+    opened: list[int] = []
+    monkeypatch.setattr(cli, "_open_dashboard_on_start", lambda *a, **k: opened.append(1))
+    import pathlib
+
+    repo = type("R", (), {"repo": pathlib.Path("/tmp/proj"), "hooks_dir": lambda self: None})()
+    monkeypatch.setattr(cli, "_discover_or_init", lambda path: repo)
+    monkeypatch.setattr("agitrack.config.migrate.migrate_repo_state", lambda r: False)
+
+    cli.main(["-i", "--backend", "claude"])
+
+    # Handed over, not called: the runner fires it once its own questions are answered.
+    assert callable(captured.get("on_startup_complete"))
+    assert opened == []
+    captured["on_startup_complete"]()
+    assert opened == [1]
+
+
+def test_a_failing_dashboard_never_stops_the_session_starting(monkeypatch):
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = object.__new__(ProxyRunner)
+    logged: list[str] = []
+    runner._debug = lambda message: logged.append(message)
+
+    def boom():
+        raise RuntimeError("no browser here")
+
+    runner._on_startup_complete = boom
+    # Exactly what run() does with it: a side errand may not take the session down with it.
+    try:
+        runner._on_startup_complete()
+    except Exception as error:
+        runner._debug(f"startup-complete hook failed: {error!r}")
+
+    assert logged and "no browser here" in logged[0]
+
+
 # --- `agitrack stop` --------------------------------------------------------------------------
 
 

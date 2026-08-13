@@ -751,6 +751,11 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # Suppress the privacy acknowledgment (set on an in-app menu re-exec, where the
         # user already acknowledged it earlier this session) — see _acknowledge_privacy_warning.
         skip_privacy_ack: bool = False,
+        # Called once every blocking startup question has been answered and the TUI is about to
+        # take the terminal. The dashboard opens from here rather than from cli.py: a browser
+        # window arriving while questions are still waiting in the console pulls the user away
+        # from a prompt they have not noticed is there.
+        on_startup_complete: "Callable[[], None] | None" = None,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -826,6 +831,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # (see _HOST_TERMINAL_REPLY_PREFIX_RE).
         self._held_reply_prefix = bytearray()
         self._skip_privacy_ack = skip_privacy_ack
+        self._on_startup_complete = on_startup_complete
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -1694,6 +1700,14 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                     "agent work in this tree as it is."
                 )
                 return 1
+        # Every blocking question is answered by here (backend availability, the second-instance
+        # lock, the privacy acknowledgment, and the pre-agent commit above; cli.py asked its gh
+        # and menu-key questions before constructing us). Only now is it safe to open a browser.
+        if self._on_startup_complete is not None:
+            try:
+                self._on_startup_complete()
+            except Exception as error:  # never let a side errand stop the session starting
+                self._debug(f"startup-complete hook failed: {error!r}")
         # Base-merge-only: run even the first session in a worktree so the base
         # branch is only advanced by integration, never edited by a live agent.
         self._announce_diagnostics()

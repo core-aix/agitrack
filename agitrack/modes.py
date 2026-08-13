@@ -100,10 +100,14 @@ MODES: tuple[Mode, ...] = (
     ),
     Mode(
         name="dashboard",
-        headline="dashboard",
+        # "only", because every mode above ALSO opens the dashboard as it starts. Called just
+        # "dashboard" it read as the way to get one, and picking it instead of a tracking mode
+        # was a step backwards that the menu had made look like a step forwards.
+        headline="dashboard only, no tracking",
         summary=(
-            "Open this repository's tracking dashboard in your browser: coverage, tokens, models, "
-            "who changed what, and the conversation behind each commit."
+            "Just look: coverage, tokens, models, who changed what, and the conversation behind "
+            "each commit. Every mode above opens this too, so pick this one only when you want "
+            "the dashboard without starting any tracking."
         ),
         argv=("-d",),
     ),

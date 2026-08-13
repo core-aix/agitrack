@@ -931,7 +931,15 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # subdirectory backtraces its own sessions.
         directory = Path(args.repo).expanduser().resolve()
         if not directory.is_dir():
-            print(f"{directory} is not a directory.")
+            # Same three cases as `-d` in a non-repository (see _dashboard_without_a_repo): say
+            # which of them this is and what to do, rather than one flat sentence for all.
+            where = _display_path(directory)
+            if not directory.exists():
+                print(f"{where} does not exist, so there are no sessions to reconstruct.")
+                print("Check the path, or run `agitrack --backtrace` from inside the directory you mean.")
+            else:
+                print(f"{where} is a file, not a directory.")
+                print("Point --repo at the folder the agent worked in (or run it from inside that folder).")
             return 1
         if args.backtrace == "text":
             from agitrack.metrics.backtrace import render_backtrace_text
@@ -970,6 +978,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Bare `--backtrace`: open this directory's BACKTRACE view on the shared dashboard. The
         # view is explicit here (unlike `-d`, which lets the repo's state decide), because asking
         # for the reconstruction is exactly what this flag is.
+        from agitrack.metrics.suggest import has_backtrace_history
+
+        if not has_backtrace_history(directory):
+            # Opening a browser onto an empty reconstruction says "there is nothing here" in the
+            # least useful place available. Say it in the terminal the user is already looking at,
+            # with what would put something there.
+            from agitrack.metrics.backtrace import _empty_message
+
+            print(_empty_message(directory))
+            print(
+                "\nIf you have used a coding agent here, it may have run in a different directory "
+                "(sessions are matched by the working directory the agent recorded).\n"
+                "To start recording from now on: run `agitrack` here and pick a mode."
+            )
+            return 1
         from agitrack.metrics.hub import open_dashboard
         from agitrack.repos import BACKTRACE
 
@@ -1019,9 +1042,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             dashboard_repo = GitRepo.discover(Path(args.repo).expanduser())
         except (GitError, OSError) as error:
-            # OSError: --repo points at a directory that does not exist.
-            print(error)
-            return 1
+            # OSError: --repo points at a directory that does not exist. GitError: it exists but
+            # is not a repository. Neither is a reason to print git's sentence and stop — the
+            # user asked to SEE something, and there is usually still something to show them or
+            # one command that gets them there.
+            return _dashboard_without_a_repo(Path(args.repo).expanduser(), error, mode=args.dashboard)
         if args.dashboard == "text":
             from agitrack.metrics import render_dashboard
 
@@ -1044,10 +1069,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # One dashboard serves every repository, so `-d stop` stops the whole thing — which
             # is what the flag has always meant, and is now visibly wider than it was. Use
             # `agitrack stop` to drop only this repository from it.
+            import contextlib
+            import io
+
             from agitrack.metrics import stop_dashboard_daemon
             from agitrack.metrics.hub import stop_hub
 
-            stop_dashboard_daemon(dashboard_repo)  # a pre-hub per-repo daemon, if one survives
+            # A pre-hub per-repo daemon, if one survived an upgrade. Silenced: its "no dashboard
+            # daemon is running for this repository" is about a thing that no longer exists, and
+            # printed next to the hub's own answer it reads as a contradiction.
+            with contextlib.redirect_stdout(io.StringIO()):
+                stop_dashboard_daemon(dashboard_repo)
             return stop_hub()
         if args.dashboard == "status":
             from agitrack.metrics.hub import hub_status
@@ -1592,11 +1624,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
-            # The dashboard shows up when aGiTrack starts on a repo, in every mode. It opens on
-            # the view that fits the repo, so a project with nothing tracked yet gets the
-            # reconstruction of its past agent sessions rather than an empty page — which is what
-            # the old "shall I open the backtrace?" question was asking, without asking.
-            _open_dashboard_on_start(repo, config, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -1617,6 +1644,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 log_file=log_file_spec,
                 gh_prechecked=gh_handled,
                 skip_privacy_ack=args.skip_privacy_ack,
+                # The dashboard shows up when aGiTrack starts on a repo, in every mode, on the
+                # view that fits the repo. Handed to the runner rather than called here so it
+                # happens after ITS startup questions (the privacy acknowledgment, the pre-agent
+                # commit) rather than in the middle of them.
+                on_startup_complete=lambda: _open_dashboard_on_start(repo, config, scripted=scripted),
                 _lock=management_lock,
             ).run()
     except (GitError, RuntimeError) as error:
@@ -1891,6 +1923,83 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False, 
         print("aGiTrack not started.", file=stream or sys.stdout)
         return False
     return True
+
+
+def _dashboard_without_a_repo(directory: Path, error: Exception, *, mode: str) -> int:  # noqa: ARG001
+    """`agitrack -d` where there is no git repository. Returns a process exit code.
+
+    "Not a Git repository: ." was the whole answer, which tells someone who has just asked to look
+    at their own work neither what is wrong nor what to do. There are three genuinely different
+    situations here and they deserve three different answers:
+
+    * **The directory does not exist.** Nothing to discuss; say which path, and stop.
+    * **It exists, is not a repository, but coding agents HAVE worked here.** The backtrace needs
+      no git at all, so there is something to show: show it, and say why this is not the dashboard
+      that was asked for.
+    * **It exists and there is nothing here.** Say so, and give the two commands that change that.
+    """
+    if not directory.exists():
+        print(f"{_display_path(directory)} does not exist, so there is nothing to show.")
+        print("Check the path, or run aGiTrack from inside the project you want to look at.")
+        return 1
+    if not directory.is_dir():
+        print(f"{_display_path(directory)} is a file, not a project directory.")
+        print("Point --repo at the project's folder (or run `agitrack -d` from inside it).")
+        return 1
+
+    from agitrack.metrics.suggest import has_backtrace_history
+
+    where = _display_path(directory)
+    if has_backtrace_history(directory):
+        # The reconstruction reads the agents' own transcripts, so it works in a directory that
+        # was never a repository. Refusing to show it here would be withholding the one view that
+        # CAN answer the question.
+        print(
+            f"{where} is not a Git repository, so there are no tracked commits to chart.\n"
+            "Coding-agent sessions HAVE run here though, so showing the BACKTRACE view instead: "
+            "what those past conversations did to these files, reconstructed from the transcripts "
+            "on this machine.\n"
+            "To track new work here properly:\n"
+            "  git init          then commit your files\n"
+            "  agitrack          and pick a mode"
+        )
+        if mode == "text":
+            from agitrack.metrics.backtrace import render_backtrace_text
+
+            print()
+            print(render_backtrace_text(directory))
+            return 0
+        from agitrack.metrics.hub import open_dashboard
+        from agitrack.repos import BACKTRACE
+
+        return open_dashboard(directory, view=BACKTRACE)
+    print(
+        f"{where} is not a Git repository, and no coding-agent sessions have run here, so there "
+        "is nothing for the dashboard to show yet.\n"
+        "To start:\n"
+        "  git init          make this a repository\n"
+        "  agitrack          pick a mode and let aGiTrack track the work\n"
+        "Already have a project elsewhere? Run `agitrack -d` inside it, or "
+        "`agitrack -d --repo <path>`."
+    )
+    return 1
+
+
+def _display_path(path: Path) -> str:
+    """A path as the user would recognize it (absolute, ``~`` for home), for a message.
+
+    RESOLVED first: the default is the cwd, and a message that names the directory as "." tells
+    someone reading it back later nothing at all about which directory was meant."""
+    try:
+        from agitrack.metrics.collect import _abbreviate_home
+
+        try:
+            path = path.resolve()
+        except OSError:
+            path = path.absolute()
+        return _abbreviate_home(str(path))
+    except Exception:
+        return str(path)
 
 
 def _open_dashboard_on_start(repo: GitRepo, config, *, scripted: bool = False) -> None:

@@ -99,6 +99,16 @@ class BacktraceView:
         ]
         if self.dropped_sessions:
             parts.append(f"Older sessions beyond the most recent {MAX_SESSIONS} were not included.")
+        set_aside = predating_count(Path(self.directory))
+        if set_aside:
+            # Never hide history without saying so. A directory recreated at a path a different
+            # project used to occupy inherits that project's transcripts, and showing them as this
+            # project's history is worse than showing nothing; so is dropping them in silence.
+            parts.append(
+                f"{set_aside} session(s) recorded at this path finished before this directory "
+                f"existed, so they belong to whatever was here before and are not shown. To "
+                f"include them anyway, set {ALL_SESSIONS_ENV}=1."
+            )
         parts.append(
             f"Tip: run '{BAKE_COMMAND}' to bake this history into your git commit "
             "messages, then launch your coding agent through 'agitrack' and everything is fully "
@@ -196,7 +206,94 @@ def _discover(directory: Path) -> list[_Source]:
         sources = [replace(source, owner=mine) for source in sources]
         sources.extend(remote)
     sources.sort(key=lambda s: s.updated, reverse=True)
-    return sources
+    kept, predating = _drop_sessions_predating(directory, sources)
+    if predating:
+        # Not silent. Hiding history is the one thing this view must never do without saying so;
+        # the count rides on the view's banner and the env var below brings them back.
+        _note_predating(directory, predating)
+    return kept
+
+
+# Set to 1 to reconstruct EVERY session recorded at this path, including ones that ran before the
+# directory now standing there existed. The escape hatch for the case the birthtime test gets
+# wrong: a directory restored from a backup, or recreated by a tool, is younger than the work
+# genuinely done in it.
+ALL_SESSIONS_ENV = "AGITRACK_BACKTRACE_ALL_SESSIONS"
+
+
+def _directory_born(directory: Path) -> float:
+    """When the directory now at this path was created, or 0.0 when the OS will not say.
+
+    Only the CREATION time answers the question, and only some filesystems record it: macOS and
+    the BSDs expose ``st_birthtime``, Linux mostly does not. Modification time is no substitute —
+    it moves every time a file is written — and neither is the repository's first commit, because
+    running an agent in a directory and adopting git afterwards is the exact story this whole view
+    exists to tell. So where there is no birthtime, nothing is filtered."""
+    try:
+        stat = directory.stat()
+    except OSError:
+        return 0.0
+    born = getattr(stat, "st_birthtime", None)
+    return float(born) if isinstance(born, (int, float)) and born > 0 else 0.0
+
+
+def _drop_sessions_predating(directory: Path, sources: list[_Source]) -> tuple[list[_Source], list[_Source]]:
+    """Split ``sources`` into the ones that belong to the directory standing here, and the ones
+    that were recorded at this path before it existed.
+
+    Delete a project and create a new one at the same path and the agents' transcripts do not
+    notice: they are keyed by path, so the new project's backtrace was the old, deleted project's
+    conversations. A session that finished BEFORE this directory was created cannot be about it.
+
+    Deliberately conservative in both directions: with no birthtime nothing is dropped, and a
+    session is only dropped when it ended strictly before the directory existed (a session running
+    while the directory was recreated stays)."""
+    from agitrack.env import getenv_compat
+
+    if (getenv_compat("BACKTRACE_ALL_SESSIONS") or "").strip() in {"1", "true", "yes"}:
+        return sources, []
+    born = _directory_born(directory)
+    if not born:
+        return sources, []
+    keep: list[_Source] = []
+    older: list[_Source] = []
+    for source in sources:
+        (older if _recorded_before(source, born) else keep).append(source)
+    return keep, older
+
+
+def _recorded_before(source: _Source, born: float) -> bool:
+    """Whether this session's transcript was last WRITTEN before ``born``.
+
+    The file's mtime, not the session's recorded ``updated``: mtime is a physical fact about this
+    machine (when the bytes last landed on this disk), while ``updated`` is read out of the
+    transcript and can be any timestamp the backend chose to put there. A transcript still being
+    appended to while you recreate the directory is kept, which is the safe way round.
+
+    A session with nothing to stat is kept: this test may only ever remove history it is sure
+    about."""
+    stamps = []
+    for path in source.watch:
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return bool(stamps) and max(stamps) < born
+
+
+def _note_predating(directory: Path, dropped: list[_Source]) -> None:
+    """Remember that sessions were set aside, so the view can say so (see BacktraceView)."""
+    _PREDATING[str(directory)] = len(dropped)
+
+
+# directory → how many sessions the last discovery set aside as predating it. Module-level because
+# discovery and rendering are far apart, and this is one integer per directory.
+_PREDATING: dict[str, int] = {}
+
+
+def predating_count(directory: Path) -> int:
+    """How many sessions at this path were set aside as belonging to a previous occupant."""
+    return _PREDATING.get(str(directory), 0)
 
 
 def _local_owner(directory: Path) -> str:
@@ -1010,6 +1107,31 @@ class BacktraceScope:
         stats = _filter_stats(active.view.dashboard, author=source, backend="", model="", frm=frm, to=to)
         return stats, active.insights_for(source, "", "", frm, to), active.browser.files_payload()
 
+    def _state(self) -> "Response":
+        """The same header control as the live view: is aGiTrack tracking this directory?
+
+        A directory that is not a git repository reports that honestly rather than hiding the
+        control: someone reading a reconstruction is exactly the person who needs to be told that
+        nothing here is being recorded, and what would change that."""
+        from agitrack.metrics.routing import json_response
+
+        if self.learn_repo is None:
+            return json_response(
+                {
+                    "running": False,
+                    "kind": "none",
+                    "label": "not a repository",
+                    "detail": (
+                        "This directory is not a Git repository, so aGiTrack cannot track work "
+                        "here. `git init` and then `agitrack` starts recording it."
+                    ),
+                    "pid": None,
+                }
+            )
+        from agitrack.proxy.background import running_mode
+
+        return json_response(running_mode(self.learn_repo))
+
     def story_view(self, branch: str) -> tuple[list, dict]:
         """What the storyline is told from HERE: the reconstructed turns and the files each one
         touched. Same shape the live server passes, so both dashboards tell their story through
@@ -1028,6 +1150,11 @@ class BacktraceScope:
         from agitrack.metrics.routing import Response, html_response, json_response
         from agitrack.metrics.web import aggregates_payload, log_page
 
+        if path == "/state":
+            # Answered BEFORE the reconstruction is touched: "is aGiTrack running here?" is a
+            # handshake file and a pid check, and building a view to answer it would make the
+            # header's status light the most expensive thing on the page.
+            return self._state()
         active = self.serving()
         view, browser = active.view, active.browser
         author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")

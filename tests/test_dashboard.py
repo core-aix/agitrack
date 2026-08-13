@@ -1833,6 +1833,9 @@ def test_cli_dashboard_shorthand_d_opens_the_hub_like_dashboard(tmp_path, monkey
 def test_cli_backtrace_opens_the_backtrace_view_on_the_same_hub(tmp_path, monkeypatch):
     _demo_repo(tmp_path)
     seen = _capture_hub(monkeypatch)
+    # There is something to reconstruct; an empty one is reported in the terminal instead of
+    # opening a browser onto a blank page (see test_hub.py).
+    monkeypatch.setattr("agitrack.metrics.suggest.has_backtrace_history", lambda directory: True)
 
     # Asking for the reconstruction IS the flag, so unlike `-d` it names the view outright.
     assert cli.main(["--backtrace", "--repo", str(tmp_path)]) == 0
@@ -1899,7 +1902,11 @@ def test_cli_dashboard_outside_repo_fails_cleanly(tmp_path, capsys, monkeypatch)
     rc = cli.main(["--dashboard", "--repo", str(tmp_path / "plain")])
 
     assert rc == 1
-    assert "Not a Git repository" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # Clean, and ACTIONABLE: "Not a Git repository: ." was the whole answer, which tells someone
+    # who has just asked to look at their own work neither what is wrong nor what to do.
+    assert "is not a Git repository" in out
+    assert "git init" in out
 
 
 def test_cli_dashboard_missing_directory_fails_cleanly(tmp_path, monkeypatch):
@@ -2170,3 +2177,54 @@ def test_dashboard_names_the_unborn_branch(tmp_path):
     subprocess.run(["git", "init", "-q", "-b", "trunk"], cwd=repo, check=True)
 
     assert GitRepo.discover(repo).current_branch() == "trunk"
+
+
+# --- the static demo's story chapters open ------------------------------------------------------
+
+
+def test_the_static_export_lets_a_story_chapter_show_its_commits():
+    """A snapshot cannot write a moment's prose, but it can show everything else it has.
+
+    Every shipped moment arrives without ``detail`` (that is written per moment, on demand, by a
+    live agent), and the page used to answer a click by asking the agent — so in the public demo
+    every chapter opened onto an error about a feature the reader cannot use, hiding the commits
+    that were sitting right there in the data."""
+    from agitrack.metrics.story import _STORY_TEMPLATE
+
+    # The gate that decides between "ask the agent" and "render what we have".
+    assert "if (!c.detail && !window.AGITRACK_STATIC) { writeMoment(el, c, box); return; }" in _STORY_TEMPLATE
+    # ...and the body below it is what renders the commits.
+    assert "the commits themselves" in _STORY_TEMPLATE
+
+
+def test_the_static_shim_announces_itself_to_the_pages():
+    from agitrack.metrics.export import _shim
+
+    shim = _shim(base="../demo/", files_index={}, page="story", site_root="../../")
+
+    assert "window.AGITRACK_STATIC = true" in shim
+
+
+def test_a_story_chapter_says_which_part_of_it_the_snapshot_is_missing():
+    from agitrack.metrics.story import _STORY_TEMPLATE
+
+    # A shorter body must not read as the whole story.
+    assert "ships the moment" in _STORY_TEMPLATE
+    assert "Its commits, below, are real." in _STORY_TEMPLATE
+
+
+def test_the_export_bakes_every_diff_a_story_chapter_points_at(tmp_path):
+    from agitrack.metrics.export import _story_shas
+
+    state = {
+        "story": {
+            "moments": [
+                {"commits": [{"sha": "a" * 40}, {"sha": "b" * 40}]},
+                {"commits": [{"sha": "b" * 40}, {"sha": "c" * 40}]},
+            ]
+        }
+    }
+
+    # Deduped, and every one of them: a chapter whose commit has no baked diff opens onto an
+    # error, which is the same failure in a different place.
+    assert _story_shas(state) == ["a" * 40, "b" * 40, "c" * 40]

@@ -358,3 +358,210 @@ def test_nothing_pending_says_nothing(tmp_path):
     from agitrack.metrics import pending
 
     assert pending.notice_text(pending.PendingWork()) == ""
+
+
+# --- every way into the dashboard has an answer ------------------------------------------------
+
+
+def test_a_missing_directory_names_the_path_and_stops(tmp_path, capsys):
+    from agitrack import cli
+
+    assert cli.main(["-d", "--repo", str(tmp_path / "nope")]) == 1
+    out = capsys.readouterr().out
+    assert "does not exist" in out and "nope" in out
+
+
+def test_a_file_instead_of_a_directory_says_which_it_is(tmp_path, capsys):
+    from agitrack import cli
+
+    target = tmp_path / "a-file.txt"
+    target.write_text("x", encoding="utf-8")
+
+    assert cli.main(["-d", "--repo", str(target)]) == 1
+    out = capsys.readouterr().out
+    assert "is a file, not a project directory" in out
+
+
+def test_a_plain_directory_with_no_history_gets_the_two_commands_that_change_that(tmp_path, capsys):
+    from agitrack import cli
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkey_free = cli  # the probe below is what decides; no sessions exist under tmp_path
+
+    assert monkey_free.main(["-d", "--repo", str(plain)]) == 1
+    out = capsys.readouterr().out
+    assert "not a Git repository" in out
+    assert "git init" in out and "agitrack" in out
+    # The raw git sentence is not echoed back: it was the whole unhelpful answer before.
+    assert "Not a Git repository:" not in out
+
+
+def test_a_non_git_directory_with_sessions_shows_the_backtrace_instead(tmp_path, monkeypatch, capsys):
+    # The reconstruction needs no git at all, so refusing here would withhold the one view that
+    # can answer the question.
+    from agitrack import cli
+
+    plain = tmp_path / "explored"
+    plain.mkdir()
+    monkeypatch.setattr("agitrack.metrics.suggest.has_backtrace_history", lambda directory: True)
+    opened: dict = {}
+    monkeypatch.setattr(
+        "agitrack.metrics.hub.open_dashboard",
+        lambda directory, **kw: opened.update(directory=directory, **kw) or 0,
+    )
+
+    assert cli.main(["-d", "--repo", str(plain)]) == 0
+    assert opened["view"] == repo_registry.BACKTRACE
+    out = capsys.readouterr().out
+    assert "showing the BACKTRACE view instead" in out
+    assert "git init" in out  # ...and how to make it a tracked project
+
+
+def test_backtrace_on_a_missing_directory_says_so(tmp_path, capsys):
+    from agitrack import cli
+
+    assert cli.main(["--backtrace", "--repo", str(tmp_path / "gone")]) == 1
+    assert "does not exist" in capsys.readouterr().out
+
+
+def test_a_dashboard_that_will_not_start_says_where_to_look(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(hub, "ensure_hub_for", lambda directory, **kw: ("", "active"))
+
+    assert hub.open_dashboard(tmp_path) == 1
+    out = capsys.readouterr().out
+    assert "did not start" in out
+    assert "dashboard.log" in out  # the actual reason lives there
+    assert "tracking does not depend on the dashboard" in out  # ...and nothing else is broken
+
+
+def test_the_menu_calls_the_dashboard_entry_dashboard_only():
+    from agitrack import modes
+
+    entry = modes.mode_by_name("dashboard")
+    # Every other mode opens the dashboard too, so an entry called just "dashboard" made the
+    # look-only option read as the way to get one.
+    assert "only" in entry.headline
+    assert "without starting any tracking" in entry.summary
+
+
+# --- switching repository picks that repo's view ------------------------------------------------
+
+
+def test_switching_repository_lands_on_the_view_that_suits_it(tmp_path, monkeypatch):
+    """Carrying the current view across is what lands you on another project's empty page."""
+    _repo(tmp_path, "tracked")
+    _repo(tmp_path, "untracked")
+    repo_registry.remember(tmp_path / "tracked")
+    other = repo_registry.remember(tmp_path / "untracked")
+    # The one being switched TO has nothing tracked but sessions to reconstruct.
+    monkeypatch.setattr(hub, "_has_tracked_tokens", lambda d: "untracked" not in str(d))
+    monkeypatch.setattr(hub, "_has_backtrace", lambda d: True)
+    router = hub.HubRouter()
+
+    # The switcher navigates to /go/<slug>/, from wherever it currently is.
+    response = router.get(hub.choose_path(other.slug), {})
+
+    assert response.status == 302
+    assert response.headers["Location"] == f"/b/{other.slug}/"
+
+
+def test_switching_keeps_the_page_you_were_reading(tmp_path, monkeypatch):
+    _repo(tmp_path, "proj")
+    entry = repo_registry.remember(tmp_path / "proj")
+    monkeypatch.setattr(hub, "_has_tracked_tokens", lambda d: True)
+    router = hub.HubRouter()
+
+    response = router.get(hub.choose_path(entry.slug, "learn"), {})
+
+    assert response.headers["Location"] == f"/r/{entry.slug}/learn"
+
+
+def test_the_repo_list_offers_the_view_choosing_url(tmp_path):
+    _repo(tmp_path, "proj")
+    entry = repo_registry.remember(tmp_path / "proj")
+    router = hub.HubRouter()
+
+    row = json.loads(router.get("/repos", {}).body)["repos"][0]
+
+    assert row["go_url"] == f"/go/{entry.slug}/"
+
+
+def test_switching_to_a_repo_that_is_gone_says_so(tmp_path):
+    router = hub.HubRouter()
+
+    response = router.get(hub.choose_path("never-heard-of-it"), {})
+
+    assert response.status == 404
+
+
+# --- is aGiTrack actually running here? --------------------------------------------------------
+
+
+def test_the_dashboard_reports_the_repos_running_mode(tmp_path, monkeypatch):
+    from agitrack.metrics.server import RepoScope
+
+    repo = _repo(tmp_path, "proj")
+    monkeypatch.setattr("agitrack.proxy.background._live_background_pid", lambda r: 4242, raising=False)
+    monkeypatch.setattr(
+        "agitrack.proxy.background._read_handshake",
+        lambda r: {"mode": "auto commits", "backend": "claude"},
+        raising=False,
+    )
+
+    state = json.loads(RepoScope(repo).get("/state", {}).body)
+
+    assert state["running"] is True and state["kind"] == "background"
+    assert "background" in state["label"] and "auto commits" in state["label"]
+    assert "4242" in state["detail"]
+
+
+def test_a_repo_nothing_is_tracking_says_so_and_how_to_start(tmp_path, monkeypatch):
+    from agitrack.metrics.server import RepoScope
+
+    repo = _repo(tmp_path, "idle")
+    monkeypatch.setattr("agitrack.proxy.background._live_background_pid", lambda r: None, raising=False)
+    monkeypatch.setattr("agitrack.proxy.background._read_proxy_status", lambda r: None, raising=False)
+
+    state = json.loads(RepoScope(repo).get("/state", {}).body)
+
+    assert state["running"] is False and state["label"] == "not tracking"
+    # A dashboard that only says "off" leaves the reader with nowhere to go.
+    assert "agitrack" in state["detail"]
+
+
+def test_an_unreadable_repo_reports_not_tracking_rather_than_breaking_the_page(tmp_path):
+    from agitrack.proxy.background import running_mode
+
+    broken = type("R", (), {"repo": tmp_path / "gone"})()
+
+    assert running_mode(broken)["running"] is False
+
+
+def test_the_backtrace_of_a_non_repository_says_it_cannot_be_tracked(tmp_path):
+    from agitrack.metrics.backtrace import BacktraceScope
+
+    scope = object.__new__(BacktraceScope)
+    scope.learn_repo = None
+    state = json.loads(BacktraceScope.get(scope, "/state", {}).body)
+
+    assert state["running"] is False and state["label"] == "not a repository"
+    assert "git init" in state["detail"]
+
+
+def test_backtrace_with_no_sessions_explains_itself_in_the_terminal(tmp_path, monkeypatch, capsys):
+    """Opening a browser onto an empty reconstruction says "nothing here" in the least useful
+    place available."""
+    from agitrack import cli
+
+    monkeypatch.setattr("agitrack.metrics.suggest.has_backtrace_history", lambda directory: False)
+    monkeypatch.setattr(
+        hub, "open_dashboard", lambda *a, **k: pytest.fail("an empty reconstruction must not open a browser")
+    )
+
+    assert cli.main(["--backtrace", "--repo", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "No local coding-agent history found" in out
+    # ...and the two things a reader can act on: why it might be empty, and what fills it.
+    assert "different directory" in out
+    assert "pick a mode" in out

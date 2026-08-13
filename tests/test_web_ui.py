@@ -286,3 +286,82 @@ def test_the_banner_command_is_set_apart_from_the_explanation():
     # The plain-text form (terminal output, `--backtrace text`) keeps its quotes and no markup.
     assert f"'{bt.BAKE_COMMAND}'" in view.banner_text() and "<code" not in view.banner_text()
     assert ".backtracebanner code.cmd,.btbanner code.cmd,.updatebanner code.cmd{color:var(--phosphor)" in ui.BANNER_CSS
+
+
+# --- the repository picker in the page header --------------------------------------------------
+
+
+def _hub_pages():
+    """The three pages, rendered as a browser sees them."""
+    from pathlib import Path
+
+    from agitrack.metrics import ui
+    from agitrack.metrics.learn import learn_html
+    from agitrack.metrics.story import story_html
+    from agitrack.metrics.web import _TEMPLATE
+
+    return {
+        "dashboard": ui.render(_TEMPLATE, __UI_HUBBAR_PAGE__=""),
+        "learn": learn_html(Path(".")),
+        "story": story_html(Path(".")),
+    }
+
+
+def test_every_page_carries_the_same_repo_picker_and_view_toggle():
+    # One strip, three pages: the controls answer the same question wherever you are, and moving
+    # between pages must not move them.
+    for name, html in _hub_pages().items():
+        assert 'id="hub-repo-btn"' in html, name
+        assert 'id="hub-repo-menu"' in html, name
+        assert 'id="hub-active"' in html and 'id="hub-backtrace"' in html, name
+        assert 'id="hub-state"' in html, name
+
+
+def test_the_repo_list_scrolls_instead_of_growing_past_the_window():
+    html = _hub_pages()["dashboard"]
+
+    # The SCROLLING part is the list alone, so the "show another repository" action below it
+    # never scrolls out of reach...
+    assert ".repolist{overflow-y:auto;max-height:min(52vh,340px)" in html
+    # ...and the bound is the viewport, not a fixed pixel count, or a short window pushes the
+    # footer off the bottom of the screen.
+    assert "52vh" in html
+    assert ".repolist::-webkit-scrollbar" in html  # a visible scrollbar, not an invisible one
+
+
+def test_the_picker_offers_a_way_to_add_a_repository():
+    html = _hub_pages()["dashboard"]
+
+    assert 'id="hub-repo-help"' in html
+    assert 'id="hub-help"' in html  # ...and it opens a dialog, not a link to nowhere
+    assert "Showing another repository here" in html
+    assert "agitrack -d" in html and "agitrack --backtrace" in html  # the commands that add one
+    assert "agitrack stop" in html  # ...and the one that removes it
+
+
+def test_the_picker_navigates_through_the_view_choosing_url():
+    html = _hub_pages()["dashboard"]
+
+    # Switching repository must not carry the current view across (see hub.choose_path).
+    assert 'return "/go/" + encodeURIComponent(slug)' in html
+    assert "hubGoUrl(el.dataset.slug)" in html
+
+
+def test_the_picker_is_keyboard_navigable_and_closable():
+    html = _hub_pages()["dashboard"]
+
+    assert 'e.key === "ArrowDown"' in html and 'e.key === "Enter"' in html
+    assert 'e.key === "Escape"' in html
+    # Bound to the CONTROL, never to the document: a page-wide keydown scheme is the kind
+    # nobody can discover and everybody trips over, and the story page forbids one outright.
+    assert 'picker.addEventListener("keydown"' in html
+    assert 'document.addEventListener("keydown"' not in html
+
+
+def test_the_header_shows_whether_agitrack_is_running_here():
+    html = _hub_pages()["dashboard"]
+
+    assert 'fetch("state"' in html
+    assert "refreshHubState" in html
+    # Polled, because the whole point of the answer is that it changes while the page is open.
+    assert "setInterval(refreshHubState" in html

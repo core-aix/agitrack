@@ -324,6 +324,10 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
   var NOTE = {json.dumps(_DEMO_NOTE)};
   var LEARN = {json.dumps(learn)};
   var STORY = {json.dumps(page == "story")};
+  // The pages ask this before offering anything that needs a live agent or a live repo. A
+  // snapshot cannot write a moment's prose, but it CAN show everything already in the data,
+  // and a page that offers neither is the failure this flag exists to prevent.
+  window.AGITRACK_STATIC = true;
   var real = window.fetch.bind(window);
   var asJson = function(obj){{ return Promise.resolve(new Response(JSON.stringify(obj), {{headers: {{"Content-Type": "application/json"}}}})); }};
   var unavailable = function(){{ return Promise.resolve(new Response("", {{status: 503}})); }};

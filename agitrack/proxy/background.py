@@ -410,6 +410,74 @@ def autostart_status_line(repo: GitRepo) -> str:
         return "Auto-start: unknown (could not read this repo's hooks)."
 
 
+def running_mode(repo: GitRepo) -> dict:
+    """What aGiTrack is doing for ``repo`` right now, as data.
+
+    The same question ``agitrack -s`` answers in prose, for callers that need it structured: the
+    dashboard says it in its header, because a page that looks identical whether or not anything
+    is being tracked cannot answer "is this on?", which is the first thing anyone asks of it.
+
+    Returns ``{"running", "kind", "label", "detail", "pid"}``. ``kind`` is one of ``background``,
+    ``interactive``, ``unknown`` (something holds the repo lock but left no mode record) or
+    ``none``. Never raises: an unreadable repository reports "not tracking" rather than breaking
+    the page that asked.
+    """
+    unknown = {"running": False, "kind": "none", "label": "not tracking", "detail": "", "pid": None}
+    try:
+        from agitrack.git import RepoLock
+
+        bg_pid = _live_background_pid(repo)
+        if bg_pid is not None:
+            info = _read_handshake(repo) or {}
+            commits = "manual commits" if handshake_is_manual(info) else "auto commits"
+            backend = str(info.get("backend") or "?")
+            return {
+                "running": True,
+                "kind": "background",
+                "label": f"tracking · background · {commits}",
+                "detail": (
+                    f"aGiTrack is tracking this repository in background mode (PID {bg_pid}): "
+                    f"{commits}, no worktree, backend {backend}. Stop it with `agitrack stop`."
+                ),
+                "pid": bg_pid,
+            }
+        proxy = _read_proxy_status(repo) or {}
+        proxy_pid = proxy.get("pid")
+        if isinstance(proxy_pid, int) and pid_alive(proxy_pid):
+            commits = "manual commits" if proxy.get("commits") == "manual" else "auto commits"
+            worktree = "worktree" if proxy.get("worktree") else "your working tree"
+            return {
+                "running": True,
+                "kind": "interactive",
+                "label": f"tracking · interactive · {commits}",
+                "detail": (
+                    f"An interactive aGiTrack session is running here (PID {proxy_pid}): {commits}, {worktree}."
+                ),
+                "pid": proxy_pid,
+            }
+        owner = RepoLock(repo.repo / ".agitrack" / "lock").owner_pid()
+        if isinstance(owner, int) and pid_alive(owner):
+            return {
+                "running": True,
+                "kind": "unknown",
+                "label": "tracking",
+                "detail": f"aGiTrack holds this repository (PID {owner}); the mode was not recorded.",
+                "pid": owner,
+            }
+        return {
+            "running": False,
+            "kind": "none",
+            "label": "not tracking",
+            "detail": (
+                "aGiTrack is not running on this repository, so new agent work is not being "
+                "recorded. Run `agitrack` in it and pick a mode."
+            ),
+            "pid": None,
+        }
+    except Exception:
+        return unknown
+
+
 def repo_status(repo: GitRepo) -> int:
     """`agitrack --status` / `-s`: report whether aGiTrack is running for this repo and in which
     mode (interactive vs background, auto vs manual commit, worktree vs no-worktree)."""

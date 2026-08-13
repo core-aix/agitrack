@@ -2623,10 +2623,21 @@ function fillMoment(el, animate){
   if (box.dataset.filled === "1") return;
   // A moment's body is written the first time someone opens it (one agent call), not up
   // front for a hundred moments nobody may read. Headline now, prose on demand.
-  if (!c.detail) { writeMoment(el, c, box); return; }
+  //
+  // Except in a static snapshot, where there is no agent to ask. The prose is the only part
+  // that needs one: the stats, the files and THE COMMITS THEMSELVES are already in the moment,
+  // and refusing to show any of them because one field is missing turned every chapter of the
+  // public demo into an error message about a feature the reader cannot use anyway.
+  if (!c.detail && !window.AGITRACK_STATIC) { writeMoment(el, c, box); return; }
   box.dataset.filled = "1";
   const st = c.stats || {};
   let html = '<div class="detail md">' + md(c.detail || c.summary || "") + "</div>";
+  if (!c.detail && window.AGITRACK_STATIC) {
+    // Say which part is missing and why, so a reader does not take the shorter body for the
+    // whole story. Everything below this line is real.
+    html += '<div class="notice">This snapshot ships the moment\'s headline rather than the ' +
+      "longer piece its agent would write on a live install. Its commits, below, are real.</div>";
+  }
   if (c.thoughts && c.thoughts.length) {
     html += '<div class="thoughts"><h4>&#128172; in their own words</h4>' + c.thoughts.map((t, i) =>
       '<div class="th" data-i="' + i + '">' +
