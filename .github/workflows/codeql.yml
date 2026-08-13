@@ -1,0 +1,63 @@
+name: CodeQL
+
+# Static security analysis. Findings land in the repository's Security tab (and, for a PR, as
+# review comments on the offending line), which is why this is a separate workflow from CI
+# rather than another `make check` step: `check.sh` gates the merge, CodeQL reports.
+#
+# Runs on the same branches as CI, plus a weekly cron. The cron matters because CodeQL's query
+# packs are updated continuously: a commit that was clean when it landed can be newly
+# implicated by a query written a month later, and nothing else would ever re-scan it.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    # Mondays, 04:17 UTC. Off the hour deliberately: scheduled jobs pile up on :00 across all
+    # of GitHub and get queued behind the crowd.
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      # Uploading the SARIF results to the Security tab needs this; everything else is read-only.
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # `python` is the package itself. `javascript-typescript` covers the VS Code extension
+        # in editors/ and the JavaScript embedded in the dashboard/learn/storyline pages, which
+        # render repository content (commit messages, branch names, paths) into HTML and are
+        # therefore the one place in this project where an injection bug is reachable.
+        language: [python, javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          language: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+          # security-extended adds the lower-severity security queries to the default set. The
+          # noise cost is acceptable for a codebase that shells out to git and serves HTTP.
+          queries: security-extended
+
+      # No build step: both languages are interpreted, so CodeQL's autobuild has nothing to do
+      # and skipping it avoids it guessing at (and failing on) the uv/npm setup.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
