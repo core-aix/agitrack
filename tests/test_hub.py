@@ -802,6 +802,33 @@ def test_the_most_recently_active_dashboard_tab_is_the_one_steered():
     assert taken == ["/r/three/"]
 
 
+def test_the_right_tab_is_steered_even_when_the_clock_cannot_tell_them_apart():
+    """`time.monotonic()` is ~15.6ms coarse on Windows, so two tabs pinging inside one tick get
+    an identical timestamp. Ordering by that timestamp then fell through to comparing client IDS,
+    steering the alphabetically-last tab instead of the one you were just looking at. CI caught
+    it; a counter cannot tie."""
+    clients = hub._Clients()
+    clients.ping("zzz-opened-first", "/r/one/", "")
+    clients.ping("aaa-opened-second", "/r/two/", "")
+    # What a coarse clock produces, without freezing the real one out from under every other
+    # thread in the process: two pings that are indistinguishable by time.
+    for record in clients._seen.values():
+        record["seen"] = 1000.0
+
+    # The LAST tab to ping, whatever it happens to be called.
+    assert clients._pick_dashboard() == "aaa-opened-second"
+
+
+def test_liveness_still_comes_from_the_clock(monkeypatch):
+    # Only the ORDERING moved to a counter. Whether a page is alive at all is still a question
+    # about elapsed time, which coarse resolution cannot get wrong.
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "")
+    monkeypatch.setattr(hub, "_CLIENT_TTL_SECONDS", -1.0)
+
+    assert clients.snapshot() == []
+
+
 def test_a_stale_tab_is_forgotten(monkeypatch):
     clients = hub._Clients()
     clients.ping("tab-1", "/r/one/", "")

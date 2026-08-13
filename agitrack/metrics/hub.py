@@ -289,6 +289,11 @@ class _Clients:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._seen: dict[str, dict] = {}
+        # Which ping came last, counted rather than timed. `time.monotonic()` is ~15.6ms coarse on
+        # Windows, so two tabs pinging inside one tick get an identical timestamp and "the most
+        # recent tab" then fell through to comparing client IDS — steering the alphabetically-last
+        # tab instead of the one you were just looking at. A counter cannot tie.
+        self._order = 0
 
     def ping(self, client_id: str, path: str, page: str) -> str:
         """Record that this page is open; return a URL it has been asked to navigate to, if any."""
@@ -296,8 +301,9 @@ class _Clients:
             return ""
         with self._lock:
             self._expire()
+            self._order += 1
             record = self._seen.setdefault(client_id, {})
-            record.update(path=path, page=page, seen=time.monotonic())
+            record.update(path=path, page=page, seen=time.monotonic(), order=self._order)
             target = str(record.pop("navigate", "") or "")
             if target:
                 waiter = record.pop("waiter", None)
@@ -338,8 +344,11 @@ class _Clients:
         return False
 
     def _pick_dashboard(self) -> str | None:
-        """The most recently active open dashboard page, or None."""
-        candidates = [(record["seen"], key) for key, record in self._seen.items() if not record.get("page")]
+        """The most recently active open dashboard page, or None.
+
+        Ordered by the ping COUNTER, not the clock: see ``_order``. The timestamp is still what
+        decides whether a page is alive at all, which coarse resolution cannot get wrong."""
+        candidates = [(record.get("order", 0), key) for key, record in self._seen.items() if not record.get("page")]
         return max(candidates)[1] if candidates else None
 
     def _expire(self) -> None:
