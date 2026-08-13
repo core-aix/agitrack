@@ -470,6 +470,11 @@ function wireRepoPicker(repos){
 // Whether aGiTrack is actually running on the repository being shown, and in which mode. A
 // dashboard that looks identical whether or not anything is being tracked is a dashboard you
 // cannot use to answer "is this on?", which is the first thing anyone asks of it.
+// How often the header re-asks whether aGiTrack is running here. Short, because the answer is a
+// handshake file and a pid check (no git, no history walk) and because a status that is stale is
+// worse than no status: it is read as fact.
+const HUB_STATE_MS = 5000;
+
 async function refreshHubState(){
   if(!HUB) return;
   const box = $("hub-state"); if(!box) return;
@@ -500,7 +505,14 @@ async function initHubBar(){
     modal.addEventListener("keydown", e => { if(e.key === "Escape") closeHubHelp(); });
   }
   refreshHubState();
-  setInterval(refreshHubState, 15000);
+  // Polled on its own clock as well as with the page's data (see below): the learn and story
+  // pages have no data poll of their own, and a tracker can start or stop at any moment.
+  setInterval(refreshHubState, HUB_STATE_MS);
+  // A tab that was in the background for an hour is showing an hour-old answer the instant it
+  // comes forward. Both events fire in the cases that matter (switching tab, switching window),
+  // and asking twice costs one file read.
+  document.addEventListener("visibilitychange", () => { if(!document.hidden) refreshHubState(); });
+  window.addEventListener("focus", refreshHubState);
   let repos = [];
   try{ repos = (await (await fetch("/repos", {cache:"no-store"})).json()).repos || []; }catch(e){}
   if(!repos.length){ $("hub-repo-btn").parentElement.hidden = true; return; }

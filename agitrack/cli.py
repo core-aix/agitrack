@@ -1584,8 +1584,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 child_args += ["--log-file", args.log_file]
             # The dashboard shows up when aGiTrack starts on a repo, in EVERY mode — including
             # this one, where there is no TUI to reach it from.
-            _open_dashboard_on_start(repo, config, scripted=scripted)
-            return start_background_daemon(repo, extra_args=child_args)
+            #
+            # AFTER the daemon, not before. `start_background_daemon` waits for the tracker to
+            # publish its handshake, and that handshake is exactly what the dashboard's status
+            # reads: opening the browser first meant the page asked "is aGiTrack running here?"
+            # of a tracker that did not exist yet and was told "no", then sat on that answer.
+            # A failed start is not opened at all — the terminal is where that news belongs.
+            code = start_background_daemon(repo, extra_args=child_args)
+            if code == 0:
+                _open_dashboard_on_start(repo, config, scripted=scripted)
+            return code
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
             # privacy warning here (it auto-proceeds without a TTY) before the shell starts.

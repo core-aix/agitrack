@@ -621,3 +621,54 @@ def test_the_row_label_keeps_only_what_differs_between_repositories(state, expec
     # "tracking · background · auto commits" reads well on its own line in the header and is far
     # too long next to twenty repository names.
     assert hub._short_state(state) == expected
+
+
+# --- the header status must not lag ------------------------------------------------------------
+
+
+def _run_background(tmp_path, monkeypatch, *, daemon_code=0):
+    """Drive `agitrack -b` far enough to see the launcher's ordering, and record it."""
+    from agitrack import cli
+
+    _repo(tmp_path, "proj")
+    order: list[str] = []
+    monkeypatch.setattr(
+        "agitrack.proxy.background.start_background_daemon",
+        lambda repo, **kw: (order.append("tracker started"), daemon_code)[1],
+    )
+    monkeypatch.setattr(cli, "_open_dashboard_on_start", lambda *a, **k: order.append("dashboard opened"))
+    monkeypatch.setattr(cli, "_maybe_prompt_background_hook", lambda *a, **k: None)
+    cli.main(["-b", "--repo", str(tmp_path / "proj"), "--backend", "claude", "--yes"])
+    return order
+
+
+def test_background_mode_starts_the_tracker_before_opening_the_dashboard(tmp_path, monkeypatch):
+    """Opening the browser first meant the page asked "is aGiTrack running here?" of a tracker
+    that did not exist yet, was told no, and sat on that answer until a manual refresh."""
+    assert _run_background(tmp_path, monkeypatch) == ["tracker started", "dashboard opened"]
+
+
+def test_a_tracker_that_fails_to_start_does_not_open_a_browser(tmp_path, monkeypatch):
+    # A failed start is news that belongs in the terminal, not behind a page saying "not tracking".
+    assert _run_background(tmp_path, monkeypatch, daemon_code=1) == ["tracker started"]
+
+
+def test_the_state_is_live_the_moment_the_launcher_returns(tmp_path, monkeypatch):
+    """The property the ordering buys: by the time the dashboard is opened, the answer is real.
+
+    `start_background_daemon` waits for the tracker's handshake, and that handshake is exactly
+    what the header's status reads."""
+    from agitrack.proxy.background import background_handshake_path, running_mode_for
+
+    directory = tmp_path / "proj"
+    (directory / ".agitrack").mkdir(parents=True)
+    import json
+    import os
+
+    background_handshake_path(type("R", (), {"repo": directory})()).write_text(
+        json.dumps({"pid": os.getpid(), "mode": "auto commits", "backend": "claude"}), encoding="utf-8"
+    )
+
+    state = running_mode_for(directory)
+
+    assert state["running"] is True and "background" in state["label"]

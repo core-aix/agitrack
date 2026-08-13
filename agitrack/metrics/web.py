@@ -2176,6 +2176,10 @@ async function applyFilters(){
 }
 async function refresh(){
   const prev = HEAD;
+  // Whether aGiTrack is running here changes for the same reasons new commits appear (a tracker
+  // started, a session ended), so the header answers on the same beat as the numbers under it
+  // rather than drifting out of step with them on a clock of its own.
+  if(typeof refreshHubState === "function") refreshHubState();
   if(!await loadAgg()) return;
   if(HEAD !== prev){  // new commits landed — refresh the whole view
     resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
