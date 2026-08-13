@@ -7,6 +7,8 @@ real terminal: stdin/stdout are stubbed, so the drains are no-ops that must stay
 
 from __future__ import annotations
 
+import threading
+
 import agitrack.console as console
 
 
@@ -62,6 +64,39 @@ def test_progress_ticker_stops_ticking_after_the_block():
     count = len(lines)
     time.sleep(0.05)
     assert len(lines) == count  # the thread stopped with the block
+
+
+def test_the_ticking_thread_is_gone_by_the_time_the_block_returns():
+    """The guarantee behind the test above, asserted directly rather than by waiting and hoping.
+
+    Setting the stop event is not the same as the thread having stopped: a tick whose ``wait``
+    had just timed out was already on its way to ``output_fn``, so a line could land under
+    whatever the program printed next. The timing-based test caught it only on a loaded CI
+    machine; this one cannot miss it."""
+    import threading
+
+    with console.progress_ticker("working", output_fn=lambda line: None, interval=0.001, enabled=True):
+        assert any(t.name == "agitrack-progress" and t.is_alive() for t in threading.enumerate())
+
+    assert not [t for t in threading.enumerate() if t.name == "agitrack-progress" and t.is_alive()]
+
+
+def test_a_wedged_output_never_turns_a_progress_message_into_a_hang(monkeypatch):
+    # Waiting for the thread must not become a way to block forever: the join is bounded, and a
+    # progress line is never worth holding up the program that printed it.
+    import time
+
+    monkeypatch.setattr(console, "_TICKER_JOIN_SECONDS", 0.05)
+    blocked = threading.Event()
+
+    def wedged(_line: str) -> None:
+        blocked.set()
+        time.sleep(30)  # never returns within the test
+
+    started = time.monotonic()
+    with console.progress_ticker("working", output_fn=wedged, interval=0.001, enabled=True):
+        blocked.wait(2.0)
+    assert time.monotonic() - started < 5.0
 
 
 # --------------------------------------------------------------------------------------
