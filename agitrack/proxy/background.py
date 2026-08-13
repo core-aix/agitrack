@@ -1008,7 +1008,14 @@ class BackgroundRunner:
             self._stop.set()
 
         while True:
-            update_restart.watch_for_update(self._stop, _restart_for_update)
+            # self_update: the tracker CHECKS for a new release itself, not only reacting to
+            # someone else installing one. It is the daemon most likely to be the only aGiTrack
+            # running on a machine — `agitrack -b` is the default mode, it is meant to be left
+            # alone for days, and it has no TUI whose startup check would ever fire. Watching the
+            # on-disk fingerprint alone, it would sit on the version it started with forever
+            # while a PyPI release came and went. The dashboard daemons already opt in for
+            # exactly this reason; this one had been left out.
+            update_restart.watch_for_update(self._stop, _restart_for_update, self_update=True)
             try:
                 self._loop()
             finally:
