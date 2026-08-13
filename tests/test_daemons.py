@@ -157,3 +157,57 @@ def test_registry_dir_honors_config_dir_isolation(monkeypatch, tmp_path):
 
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
     assert daemons._registry_dir() == tmp_path / "daemons"
+
+
+# --- every daemon updates itself, and every daemon comes back ----------------------------------
+
+
+def test_every_long_lived_daemon_checks_for_updates_itself():
+    """Watching the on-disk fingerprint only reacts to SOMEONE ELSE installing a new version.
+
+    On a machine whose only aGiTrack is a daemon — which is the normal case for `agitrack -b`,
+    the default mode, left running for days with no TUI whose startup check would ever fire —
+    nobody else ever installs anything, so a watcher alone sits on its starting version while
+    release after release goes by on PyPI. The background tracker had been left out of this.
+
+    A source-level check on purpose: the next daemon someone adds must opt in too, and a runtime
+    test would only cover the daemons that already exist."""
+    import re
+    from pathlib import Path
+
+    calls = []
+    for path in Path("agitrack").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"watch_for_update\(([^)]*)\)", source, re.S):
+            if source[: match.start()].rstrip().endswith("def"):
+                continue  # the definition itself, not a call
+            calls.append((path.as_posix(), match.group(1)))
+
+    assert calls, "no daemon watches for updates at all"
+    missing = [path for path, args in calls if "self_update=True" not in args]
+    assert not missing, f"these daemons never check for an update themselves: {missing}"
+
+
+def test_the_dashboard_hub_is_recognised_as_a_daemon_to_restart():
+    """`restart_all` demands proof a pid really is an aGiTrack daemon before signalling it (a
+    registry pid can be a reused pid after a reboot). A daemon whose serve flag is not listed
+    would be silently skipped by every update restart."""
+    flags = {flag: kind for flag, kind in daemons._SERVE_FLAGS}
+
+    assert flags.get("--hub-serve") == "hub"
+    # ...and it is in the set the update restart acts on at all.
+    assert "hub" in daemons._STOPPABLE_KINDS
+
+
+def test_a_live_session_is_never_restarted_from_under_the_user():
+    # The one kind deliberately left out: restarting someone's conversation is not an update.
+    assert "session" in daemons.KIND_LABELS
+    assert "session" not in daemons._STOPPABLE_KINDS
+
+
+def test_every_kind_aGiTrack_can_leave_running_is_either_restarted_or_deliberately_not():
+    # A new daemon kind that is neither restarted nor consciously exempt would quietly keep
+    # running old code after every update.
+    deliberate_exemptions = {"session"}
+
+    assert set(daemons.KIND_LABELS) - daemons._STOPPABLE_KINDS == deliberate_exemptions
