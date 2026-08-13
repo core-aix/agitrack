@@ -320,9 +320,14 @@ class HubRouter:
 
         Deliberately cheap: no dashboard is built to answer it. The page header polls this to fill
         its switcher, and a hub with ten projects mounted must not walk ten histories to draw a
-        dropdown."""
+        dropdown. The per-repo tracking state costs a handshake file and a pid check each, which
+        is on the same order as listing the repositories at all — and it is what turns the
+        switcher from a list of names into an answer to "where am I actually tracking?"."""
+        from agitrack.proxy.background import running_mode_for
+
         out = []
         for entry in repo_registry.list_repos():
+            state = running_mode_for(entry.directory)
             out.append(
                 {
                     "slug": entry.slug,
@@ -333,6 +338,11 @@ class HubRouter:
                     # What the switcher navigates to: the server picks the view on arrival.
                     "go_url": choose_path(entry.slug),
                     "last_seen": entry.last_seen,
+                    "running": bool(state.get("running")),
+                    # The mode in as few words as a dropdown row can carry; the full sentence is
+                    # the row's tooltip.
+                    "state": _short_state(state),
+                    "state_detail": str(state.get("detail") or ""),
                 }
             )
         return out
@@ -346,6 +356,22 @@ class HubRouter:
         # answer that did not move is pure IO on the hot path.
         if entry.view != view:
             repo_registry.set_view(entry.path, view)
+
+
+def _short_state(state: dict) -> str:
+    """A tracking state short enough for a dropdown row.
+
+    ``running_mode``'s label reads well on its own line in the header ("tracking · background ·
+    auto commits") and is far too long next to twenty repository names, so the row keeps the part
+    that differs between repositories and drops the word they would all share."""
+    if not state.get("running"):
+        return "off"
+    kind = str(state.get("kind") or "")
+    if kind == "background":
+        return "background" + (" · manual" if "manual" in str(state.get("label") or "") else "")
+    if kind == "interactive":
+        return "interactive" + (" · manual" if "manual" in str(state.get("label") or "") else "")
+    return "tracking"
 
 
 def _display(path: str) -> str:

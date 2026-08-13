@@ -365,3 +365,21 @@ def test_the_header_shows_whether_agitrack_is_running_here():
     assert "refreshHubState" in html
     # Polled, because the whole point of the answer is that it changes while the page is open.
     assert "setInterval(refreshHubState" in html
+
+
+def test_every_dropdown_row_shows_whether_that_repo_is_being_tracked():
+    html = _hub_pages()["dashboard"]
+
+    assert 'class="ri-state' in html and 'class="ri-dot"' in html
+    assert "r.state_detail" in html  # the full sentence as the row's tooltip
+    # Lit when running, so the answer is legible without reading a word.
+    assert ".repoitem .ri-state.live .ri-dot{background:var(--phosphor)" in html
+
+
+def test_the_dropdown_rereads_the_states_each_time_it_opens():
+    html = _hub_pages()["dashboard"]
+
+    # A tracker can start or stop while the page sits open.
+    assert "refreshStates" in html
+    # Updated in place: rebuilding the list would move the reader's cursor and scroll position.
+    assert "chip.classList.toggle" in html
