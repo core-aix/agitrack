@@ -29,7 +29,7 @@ from agitrack.shell.bridge import BridgeServer, BridgeUI
 class _FakeBackend:
     name = "claude"
 
-    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None, **kwargs):
         self.repo = repo
 
     def run(self, *args, **kwargs):  # pragma: no cover - these tests drive commands, not turns

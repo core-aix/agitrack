@@ -109,9 +109,9 @@ def merge_transcripts(new: str, existing: str) -> str:
     already contains the other's rows changes nothing).
 
     Only line-oriented JSONL with per-row ids can be merged this way. When lineage
-    can't be established — the first rows have no id or differ (a different
-    conversation, or OpenCode's single-object export) — it falls back to ``new``
-    (last-write-wins), the prior behaviour."""
+    can't be established — the first rows have no id or differ — it falls back to ``new``
+    (last-write-wins), the prior behaviour. That is the case for OpenCode (a single export
+    object, not lines at all) and for Codex, whose rollout rows carry no per-row id."""
     new_rows = [line for line in new.splitlines() if line.strip()]
     old_rows = [line for line in existing.splitlines() if line.strip()]
     if not old_rows:
@@ -147,7 +147,7 @@ def _transcript_is_readable(text: str, backend: str | None) -> bool:
     Used to guard a union merge before it's uploaded: a merge that combined two
     diverged copies must not produce a transcript the backend can no longer load.
     True only when the backend's OWN parser yields at least one turn; False on a
-    parse failure or an empty result. Supported for both backends — Claude
+    parse failure or an empty result. Every backend has a parser here — Claude and Codex
     (line-oriented JSONL via ``parse_rows``) and OpenCode (a single export object via
     ``parse_exported_session``). An unknown/unspecified backend has no parser to
     check, so it is treated as readable (the merge logic only runs for line-mergeable
@@ -172,6 +172,17 @@ def _transcript_is_readable(text: str, backend: str | None) -> bool:
             from agitrack.transcripts.opencode import parse_exported_session
 
             return bool(parse_exported_session(json.loads(text)).turns)
+        if backend == "codex":
+            # Codex's rollout is JSONL, but its rows carry no ``uuid`` — the per-row id
+            # ``_row_id`` needs — so it does NOT line-union merge; ``merge_transcripts`` takes its
+            # documented last-write-wins fallback, as it does for OpenCode. Keying on the raw line
+            # instead was considered and rejected: a redacted shared copy and a raw local copy
+            # differ textually row for row, so every row would read as new and the "merge" would
+            # emit the conversation twice — worse than one side winning. The parser still takes
+            # the raw text (it skips damaged lines itself) so the readability guard applies.
+            from agitrack.transcripts.codex import parse_exported_session as parse_codex
+
+            return bool(parse_codex(text).turns)
     except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
         return False
     return True
@@ -256,7 +267,7 @@ class SharedSessionStore:
 
     def _would_regress(self, gid: str, nm: str, transcript: str) -> bool:
         """Whether writing ``transcript`` would REPLACE a longer shared copy with a
-        shorter one — i.e. this machine is behind. Claude/OpenCode transcripts are
+        shorter one — i.e. this machine is behind. Backend transcripts are
         append-only, so fewer rows means an older conversation. Refusing this is what
         stops a stale machine (or its auto-share, which fires on every commit) from
         rewinding everyone's shared copy to an earlier state."""

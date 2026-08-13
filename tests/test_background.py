@@ -5,6 +5,7 @@ as the proxy, so token/turn accounting is identical."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -23,6 +24,7 @@ from agitrack.proxy.background import (
     stop_background,
 )
 from agitrack.transcripts.types import ExportedSession, SessionTurn
+from agitrack.backends.proxy_agents import available_backends
 
 
 def _init_repo(path: Path) -> GitRepo:
@@ -257,7 +259,7 @@ def test_completed_turn_still_covers_the_commit_it_stamped_mid_flight(tmp_path):
     assert runner._is_agitrack_tracked(repo.rev_parse("HEAD")) is True
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tmp_path, backend_name):
     # The dirty-tree hand-off. The agent commits ONCE mid-turn, then keeps editing, so when the
     # turn finishes the tree is still dirty and the clean-tree cover path bails — the turn records
@@ -301,7 +303,7 @@ def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tm
     assert agent_commit[:7] not in second  # already accounted for by the first turn's body
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_stop_finalize_never_covers_a_mid_turn_commit_before_the_final_message(tmp_path, backend_name):
     # The constraint: a cover (which attributes the agent's own commit to AI) is made ONLY after the
     # turn's final message. The stop finalize keeps a still-running turn so in-flight work is captured
@@ -938,6 +940,12 @@ def _precommit_env(tmp_path, monkeypatch, backend: "FakeBackend", *, autostart: 
     (cfg / "config.json").write_text(f'{{"default_backend": "claude", "autotrack_hook": "{hook}"}}', encoding="utf-8")
     monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: backend)
     monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    # Stub the spawn by DEFAULT. Auto-start is no longer gated on "did this commit carry AI
+    # work" (a dead tracker could never be revived otherwise), so every autostart=True test now
+    # reaches it — and one that had not thought about the daemon started a real detached
+    # `python -m agitrack --background-serve` that outlived the test. The tests that are ABOUT
+    # the spawn re-patch this with their own recorder, which wins.
+    monkeypatch.setattr("agitrack.proxy.background.spawn_background_daemon", lambda repo, *, extra_args: None)
 
 
 def test_precommit_sync_folds_ai_work_into_the_commit(tmp_path, monkeypatch):
@@ -1034,6 +1042,10 @@ def test_the_commit_hook_installs_as_soon_as_the_repo_state_names_a_backend(tmp_
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
     (cfg / "config.json").write_text('{"privacy_ack": true}', encoding="utf-8")  # no default_backend
     monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+    # autotrack_hook defaults to "auto" here, and auto-start is no longer gated on the commit
+    # carrying AI work, so this reaches the spawn. This test is about the HOOKS; a real detached
+    # daemon would outlive it.
+    monkeypatch.setattr("agitrack.proxy.background.spawn_background_daemon", lambda repo, *, extra_args: None)
 
     assert precommit_sync(repo) == 0  # never fails the user's commit
     assert not (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
@@ -1376,7 +1388,7 @@ def _commit_at(repo: GitRepo, path, name: str, message: str, *, when: int) -> st
 
 
 @pytest.mark.parametrize("manual", [True, False])
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_stale_watermark_never_claims_a_human_commit_from_another_mode(tmp_path, manual, backend_name):
     # THE mode-switch regression. The coverage watermark is PERSISTENT (it must survive the daemon
     # being down when a commit is made), so after a crash — or a switch to interactive/manual mode,
@@ -1452,10 +1464,12 @@ def test_repo_status_reports_each_mode(tmp_path, capsys):
     agit = repo.repo / ".agitrack"
     agit.mkdir(exist_ok=True)
 
-    # Not running — and it reports the auto-start (autotrack_hook) state.
+    # Not running — and it reports the auto-start (autotrack_hook) state. Not "on commit":
+    # auto-start also fires when an agent turn leaves changes behind, so a status line that
+    # says "on commit" tells the user tracking will wait for something it will not wait for.
     assert bg.repo_status(repo) == 0
     out = capsys.readouterr().out.lower()
-    assert "not running" in out and "auto-start on commit:" in out
+    assert "not running" in out and "auto-start:" in out
 
     # Background daemon (live pid via our own pid) with a manual-commit handshake.
     bg.background_handshake_path(repo).write_text(
@@ -1743,7 +1757,8 @@ def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
 
 # --- a repo that TRACKS the agent scaffolding dirs ---------------------------
 #
-# `snapshot_worktree_tree()` strips `.agitrack/` / `.claude/` / `.opencode/`; a raw `^{tree}` does
+# `snapshot_worktree_tree()` strips every agent-config prefix (`.agitrack/`, `.claude/`, `.codex/`,
+# `.opencode/` — see git/repo.py `_NEVER_STAGE_PREFIXES`); a raw `^{tree}` does
 # not. So in a repo that COMMITS its `.claude/` config — ordinary practice, a team shares its
 # agent setup like an editorconfig — "is the working tree clean?" answered "dirty" forever, and
 # `_agent_committed_own_work` bails on a dirty tree. The daemon therefore covered NO agent
@@ -1818,3 +1833,512 @@ def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
 
     assert repo.ref_sha(runner._manual.ref()) in (None, repo.rev_parse("HEAD"))
     assert runner._manual.pending_count() == 0
+
+
+# --- commit guidance in background mode -------------------------------------
+
+
+def _guidance_runner(tmp_path, *, backend="claude", guidance=True):
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend=backend)
+    gc = GlobalConfig(path=tmp_path / "gc.json")
+    runner = BackgroundRunner(repo, commit_guidance=guidance, _global_config=gc, _state=state)
+    runner.backend = FakeBackend()
+    return runner, repo
+
+
+def test_the_daemon_installs_and_removes_the_commit_guidance_hook(tmp_path):
+    """The -b answer to "why did the agent commit that itself?".
+
+    Proxy mode tells the agent aGiTrack is committing for it with
+    --append-system-prompt. Background mode never spawns the agent, so the note has to
+    reach it another way; Claude Code's SessionStart hook is that way. It is REMOVED on
+    teardown, unlike the auto-track hook: with no tracker running, nothing is committing
+    for the agent and the note would be false.
+    """
+    from agitrack.backends import claude_settings
+
+    runner, repo = _guidance_runner(tmp_path)
+
+    runner._install_commit_guidance()
+    assert claude_settings.hook_is_installed(repo.repo) is True
+
+    runner._remove_commit_guidance()
+    assert claude_settings.hook_is_installed(repo.repo) is False
+
+
+def test_no_commit_guidance_installs_nothing(tmp_path):
+    # The flag means "do not tell the agent what to do about commits" — which mechanism
+    # carries the note is an implementation detail it should not have to know about.
+    from agitrack.backends import claude_settings
+
+    runner, repo = _guidance_runner(tmp_path, guidance=False)
+
+    runner._install_commit_guidance()
+
+    assert claude_settings.hook_is_installed(repo.repo) is False
+
+
+def test_a_non_claude_backend_is_left_alone(tmp_path):
+    # Codex's only lever REPLACES its base instructions and OpenCode's CLI has none at all,
+    # so neither gets a half-measure — and neither gets a stray .claude/ directory either.
+    runner, repo = _guidance_runner(tmp_path, backend="opencode")
+    runner.state.backend = "opencode"
+
+    runner._install_commit_guidance()
+
+    assert not (tmp_path / ".claude").exists()
+
+
+# --- auto-start on new changes ----------------------------------------------
+
+
+def test_a_finished_turn_that_changed_code_starts_the_tracker(tmp_path, monkeypatch):
+    """Auto-start used to be reachable only through the git pre-commit hook, so tracking
+    resumed when the user COMMITTED — and an agent that edits for an hour without committing
+    is exactly the work aGiTrack exists to record. No git hook can see a plain file edit
+    (they fire on git operations, not on writes), so the trigger is the agent's own turn-end
+    hook: a turn finished and the tree is not what HEAD says it is.
+    """
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    assert background_module.autostart_on_change(repo) == 0
+
+    assert spawned and "--backend" in spawned[0]
+
+
+def test_a_turn_that_changed_nothing_starts_nothing(tmp_path, monkeypatch):
+    # A question-and-answer turn ends like any other. Starting a daemon for it would mean a
+    # tracker (and its commit hooks) appearing because someone asked what a function does.
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned == []
+
+
+def test_auto_start_never_creates_a_second_writer(tmp_path, monkeypatch):
+    """The rule the whole design rests on: one git-editing aGiTrack per repo.
+
+    This hook fires on every turn end, including turns of a session an interactive aGiTrack is
+    already driving. That process holds the repo's single-writer lock, so a daemon started
+    beside it would be a second writer committing into the same branch.
+    """
+    from agitrack.git import RepoLock
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+    holder = RepoLock(tmp_path / ".agitrack" / "lock")
+    assert holder.acquire()
+    try:
+        background_module.autostart_on_change(repo)
+    finally:
+        holder.release()
+
+    assert spawned == []
+
+
+def test_auto_start_respects_the_opt_out(tmp_path, monkeypatch):
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    config.set("autotrack_hook", "off", scope="repo")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned == []
+
+
+def test_stop_disarms_every_way_tracking_could_restart(tmp_path):
+    """`-b stop` means stop.
+
+    Two things would otherwise keep acting after the user asked aGiTrack to stop: the
+    auto-start hooks would bring the tracker back on the next commit or the next agent turn,
+    and the session note would keep telling the agent that aGiTrack is committing for it —
+    false with no tracker running, and it stops the agent committing at all.
+    """
+    from agitrack.backends import claude_settings
+    from agitrack.git import hooks as git_hooks
+    from agitrack.proc import agitrack_invocation
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(repo.repo), version="9.9.9"
+    )
+    claude_settings.install_autostart_hook(repo.repo)
+    claude_settings.install_commit_guidance_hook(repo.repo)
+
+    assert background_module.stop_background(repo) == 0
+
+    assert not git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")
+    assert claude_settings.hook_is_installed(repo.repo, claude_settings.AUTOSTART_HOOK) is False
+    assert claude_settings.hook_is_installed(repo.repo, claude_settings.SESSION_NOTE_HOOK) is False
+
+
+def test_stop_does_not_revoke_the_users_standing_auto_start_choice(tmp_path):
+    # Disarming now is not the same as opting out forever: the next `agitrack -b` re-arms it.
+    # Only `--remove-hooks` turns the preference itself off.
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+
+    background_module.stop_background(repo)
+
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    assert config.autotrack_hook == "auto"
+
+
+def test_autostart_status_is_read_from_the_hooks_not_the_preference(tmp_path, monkeypatch):
+    """B7 / C32: `Auto-start: on` was derived from the config VALUE and never from the hook file,
+    so it lied in four separate ways, all confirmed live:
+
+    * a virgin repo reported `on` before any hook existed — the first commit after agent work
+      was silently lost and no tracker ever started;
+    * `-b stop` printed "Auto-start is off for this repo", really did remove the hooks, and `-s`
+      a second later still said `on`;
+    * with core.hooksPath set aGiTrack installs nothing at all, and `-s` asserted the opposite —
+      anyone on Husky / pre-commit / lefthook was told their commits were tracked when nothing
+      was, disproved by a real commit;
+    * every backend was told "…or when an agent turn leaves changes", which only Claude Code
+      does.
+    """
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "virgin")
+
+    line = autostart_status_line(repo)
+    assert "not armed" in line
+    assert "on (" not in line
+
+    # core.hooksPath: aGiTrack installs nothing and must say so, naming the setting.
+    other = _init_repo(tmp_path / "hookspath")
+    subprocess.run(["git", "-C", str(other.repo), "config", "core.hooksPath", "myhooks"], check=True)
+    line = autostart_status_line(other)
+    assert "core.hooksPath" in line
+    assert "NOT tracked" in line
+
+
+def test_autostart_status_says_on_once_the_hook_is_really_installed(tmp_path, monkeypatch):
+    from agitrack import __version__
+    from agitrack.git import hooks as git_hooks
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "armed")
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=["python", "-m", "agitrack"], repo_root=str(repo.repo), version=__version__
+    )
+
+    line = autostart_status_line(repo)
+    assert line.startswith("Auto-start: on (")
+    assert "on a commit" in line
+    # No Claude turn-end hook here, so the clause that only Claude Code honours must be absent.
+    assert "agent turn leaves changes" not in line
+    assert "last-run" not in line  # the placeholder that used to leak onto a fresh repo
+
+
+def test_autostart_status_reports_the_opt_out(tmp_path, monkeypatch):
+    from agitrack.config import GlobalConfig
+    from agitrack.proxy.background import autostart_status_line
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "optout")
+    config = GlobalConfig()
+    config.load_repo_overlay(repo.repo)
+    config.set("autotrack_hook", "off", scope="repo")
+
+    assert autostart_status_line(repo).startswith("Auto-start: off")
+
+
+def test_status_names_the_repository(tmp_path, monkeypatch, capsys):
+    """`-s`, `-b status` and the `-b` banner never named the repo — exactly wrong in a submodule
+    or a multi-repo terminal, which is the one place the answer needs disambiguating."""
+    from agitrack.proxy.background import background_status, repo_status
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "named-repo")
+
+    repo_status(repo)
+    background_status(repo)
+
+    out = capsys.readouterr().out
+    assert out.count("named-repo") >= 2
+
+
+def test_core_hookspath_is_announced_not_only_debug_logged(tmp_path, monkeypatch, capsys):
+    """B7: with core.hooksPath set, aGiTrack installs nothing and the string `core.hooksPath`
+    never reached the user — both skip messages were `_debug`-only, invisible even with
+    --verbose (those diagnostics go to a log file whose path is never printed). The spec says it
+    must SAY it cannot install hooks and continue."""
+    from agitrack.proxy.background import BackgroundRunner
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    repo = _init_repo(tmp_path / "husky")
+    subprocess.run(["git", "-C", str(repo.repo), "config", "core.hooksPath", "myhooks"], check=True)
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: FakeBackend())
+
+    runner = BackgroundRunner(repo, backend="claude")
+    capsys.readouterr()  # drop construction output
+    runner._install_autotrack_hook()
+
+    out = capsys.readouterr().out
+    assert "core.hooksPath" in out
+    assert "myhooks" in out
+    assert "NOT tracked" in out
+
+
+# --- what `-b` publishes, and when ------------------------------------------
+
+
+def test_the_handshake_is_written_only_once_the_hooks_are_armed(tmp_path, monkeypatch):
+    """The handshake is what `agitrack -b` waits on before printing "daemon live" and handing
+    the shell back, so anything the daemon does AFTER writing it is a race the user can lose.
+    Arming came after, and it showed: ~0.6s after a successful `agitrack -b`, `agitrack -s`
+    reported "Auto-start: not armed — no aGiTrack hook is installed in this repo yet. Run
+    `agitrack` or `agitrack -b` once" — the exact command that had just been run. A script
+    doing `agitrack -b run` then `agitrack -b stop` armed nothing at all.
+
+    Measured on Windows, where the launcher returns fastest, but the ordering was wrong on
+    every platform."""
+    from agitrack.git import hooks as git_hooks
+
+    order: list[str] = []
+    monkeypatch.setattr("agitrack.daemons.register", lambda *a, **k: None)
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    real_handshake = runner._write_handshake
+    real_hook = runner._install_autotrack_hook
+
+    def _handshake():
+        # The hook has to be on disk BEFORE the record that says the daemon is up.
+        order.append("handshake")
+        assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit"), (
+            "the handshake went out while the repo was still unarmed"
+        )
+        real_handshake()
+
+    monkeypatch.setattr(runner, "_write_handshake", _handshake)
+    monkeypatch.setattr(runner, "_install_autotrack_hook", lambda: (order.append("hook"), real_hook())[1])
+    monkeypatch.setattr(runner, "_loop", lambda: None)
+    monkeypatch.setattr(runner, "_teardown", lambda **kw: None)
+    monkeypatch.setattr(runner, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+
+    runner.run()
+
+    assert order == ["hook", "handshake"]
+
+
+def test_stop_logs_daemon_stop_to_the_log_file_the_daemon_was_started_with(tmp_path, monkeypatch):
+    """`--log-file` is a command-line flag and is never persisted to config, but `-b stop` read
+    the log path from config alone — so a tracker started as `agitrack -b --log-file events.log`
+    got `daemon-start` and nothing else, ever. It matters most on Windows, where `-b stop` is a
+    TerminateProcess and the daemon's own teardown (which emits the event) never runs at all."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    log = tmp_path / "events.log"
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"pid": 4242, "mode": "auto commits", "backend": "claude", "log_file": str(log)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(background_module, "_live_background_pid", lambda r: 4242)
+    monkeypatch.setattr(background_module, "_terminate_and_wait", lambda pid: True)
+
+    assert background_module.stop_background(repo) == 0
+
+    assert "daemon-stop" in log.read_text(encoding="utf-8")
+
+
+def test_stop_without_a_log_file_writes_nothing_anywhere(tmp_path, monkeypatch):
+    """A tracker with no event log configured must not have one invented for it."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4242, "mode": "auto commits", "backend": "claude"}), encoding="utf-8")
+    monkeypatch.setattr(background_module, "_live_background_pid", lambda r: 4242)
+    monkeypatch.setattr(background_module, "_terminate_and_wait", lambda pid: True)
+
+    assert background_module.stop_background(repo) == 0
+    assert not list(tmp_path.glob("*.log"))
+
+
+# --- a dead tracker must not stay dead -------------------------------------
+
+
+def test_a_commit_with_no_ai_work_still_revives_a_dead_tracker(tmp_path, monkeypatch):
+    """Auto-start used to sit behind `if not synced: return 0` — "no AI work in this commit, no
+    footprint, no nag". That made a stopped tracker PERMANENT: with nothing running, no agent
+    turn can be recorded, so `synced` is False on the next commit too, and on every commit after
+    it, so the one hook that could bring the tracker back never even looked. Observed in the
+    wild — the tracker stopped during a failed restart and none of the commits that followed
+    restarted it, because none of them had pending AI work to fold.
+
+    `agitrack -s` has always advertised this as "on a commit", unqualified. Now it is."""
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()  # no session ⇒ no pending AI work, the whole point
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\njust me\n", encoding="utf-8")  # a purely human commit
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned, "a commit made with no tracker running must start one"
+
+
+def test_a_commit_does_not_start_a_second_tracker(tmp_path, monkeypatch):
+    """The other half: reviving a DEAD tracker must not mean racing a LIVE one."""
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    monkeypatch.setattr(bg, "_live_background_pid", lambda r: 4242)  # one is already running
+    spawned: list = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\njust me\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+
+    assert spawned == []
+
+
+# --- the restart handoff: a successor must win the lock, and a loss must be loud ---------
+
+
+def test_a_serve_child_waits_for_the_lock_instead_of_declaring_success(tmp_path, monkeypatch, capsys):
+    """A `--background-serve` child is a DAEMON TAKING OVER, not a second writer asking
+    permission. Its predecessor may still be dying with the repo lock held — on Windows a
+    byte-range lock outlives the process while the kernel tears its handles down — and the
+    child's first `acquire()` had no retry.
+
+    So it lost the race, took the LAUNCHER's branch ("already running (PID N, current version)
+    — left in place"), and exited **0**. The predecessor then exited too. Nothing tracked the
+    repo, and the exit code said everything was fine. Reproduced live before this fix."""
+    from agitrack import cli
+    from agitrack.git import RepoLock
+
+    repo = _init_repo(tmp_path)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: True)
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert holder.acquire() is True
+    try:
+        code = cli.main(
+            ["--repo", str(tmp_path), "--background", "--background-serve", "--skip-privacy-ack", "--backend", "claude"]
+        )
+    finally:
+        holder.release()
+
+    out = capsys.readouterr().out
+    assert code == 1, "a serve child that cannot take the lock must FAIL, not report success"
+    assert "could not take this repo's single-writer lock" in out
+    assert "left in place" not in out  # never the launcher's message
+
+
+def test_a_failed_serve_start_records_a_traceback(tmp_path, monkeypatch, capsys):
+    """A daemon has no terminal — its stdout IS .agitrack/background.log. One that died on the
+    way up left that log holding a bare "aGiTrack is starting..." and nothing else: no reason, no
+    traceback, no exit code, which is why the original failure could not be diagnosed after the
+    fact."""
+    from agitrack import cli
+    from agitrack.proxy import background as bg
+
+    _init_repo(tmp_path)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: True)
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("the new code does not import")
+
+    monkeypatch.setattr(cli, "BackgroundRunner", _Boom)
+
+    code = cli.main(
+        ["--repo", str(tmp_path), "--background", "--background-serve", "--skip-privacy-ack", "--backend", "claude"]
+    )
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAILED to start" in out
+    assert "the new code does not import" in out
+    assert "Traceback (most recent call last)" in out  # the actual stack, not just the message
+    assert "cli.py" in out and "test_background.py" in out  # ...naming both frames
+    assert bg is not None
+
+
+def test_a_daemon_is_registered_before_it_finishes_starting(tmp_path, monkeypatch):
+    """The registry is what `--daemons`, a self-update restart, and the test suite's own sweep
+    all read. It used to be written by `_write_handshake`, which runs LAST — so for the whole of
+    startup (hooks, git work: seconds) the process existed and nothing could see it. Any sweep in
+    that window missed it, and the daemon outlived the run.
+
+    Findability and readiness are different claims: the registry says "this process exists, here
+    is how to stop it" and must be true immediately; the handshake says "up and armed" and must
+    not be published early."""
+    from agitrack.git import hooks as git_hooks
+
+    seen: list[str] = []
+    monkeypatch.setattr("agitrack.daemons.register", lambda kind, path, **kw: seen.append(f"register:{kind}"))
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    monkeypatch.setattr(runner, "_loop", lambda: None)
+    monkeypatch.setattr(runner, "_teardown", lambda **kw: None)
+    monkeypatch.setattr(runner, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    real_hook = runner._install_autotrack_hook
+    monkeypatch.setattr(runner, "_install_autotrack_hook", lambda: (seen.append("hooks"), real_hook())[1])
+
+    runner.run()
+
+    assert seen[0] == "register:background", f"registered too late: {seen}"
+    assert "hooks" in seen  # ...and the slow startup work really did come after it
+    assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")

@@ -173,6 +173,17 @@ _POST_COMMIT_SCRIPT = f"""#!/bin/sh
 # One ref per line: a commit folds the pending turns of every session that ran in this
 # working tree (a new session / backend switch moves the ref), so each must be advanced
 # or its turns would be folded again into the NEXT commit.
+#
+# Every exit path goes through `_agitrack_chain`, exactly as prepare-commit-msg does. The early
+# `exit 0` below fires on every commit WITHOUT aGiTrack metadata — i.e. every ordinary human
+# commit — and it used to return before the chain block at the bottom, so a project's own
+# post-commit hook (a CI trigger, a notification, a ctags rebuild) went silently dead from
+# `agitrack -b` onward, and `-b stop` did not bring it back; only `--remove-hooks` did.
+_agitrack_chain() {{
+  _orig="$0{_ORIG_SUFFIX}"
+  [ -x "$_orig" ] && exec "$_orig" "$@"
+  exit 0
+}}
 _root="$(git rev-parse --show-toplevel 2>/dev/null)" || _root="."
 _reffile="$_root/{_MANUAL_REF_REL}"
 _agitrack_cr="$(printf '\\r')"
@@ -183,7 +194,7 @@ _agitrack_cr="$(printf '\\r')"
 # turn's trace and tokens were gone, silently and permanently. The two hooks have to reach the
 # SAME decision, and the commit's own message is the only honest evidence of what was folded.
 if ! git log -1 --format=%B 2>/dev/null | grep -q '^{_METADATA_HEADER_LINE}$'; then
-  exit 0
+  _agitrack_chain "$@"
 fi
 if [ -f "$_reffile" ]; then
   while IFS= read -r _ref || [ -n "$_ref" ]; do
@@ -196,9 +207,7 @@ fi
 : > "$_root/{_PENDING_TRAILER_REL}" 2>/dev/null || true
 touch "$_root/{_MANUAL_SIGNAL_REL}" 2>/dev/null || true
 # Chain to any project post-commit hook aGiTrack moved aside.
-_orig="$0{_ORIG_SUFFIX}"
-[ -x "$_orig" ] && exec "$_orig" "$@"
-exit 0
+_agitrack_chain "$@"
 """
 
 

@@ -329,3 +329,49 @@ def _find_dead_pid() -> int:
         if candidate != os.getpid() and not pid_alive(candidate):
             return candidate
     return 999_999
+
+
+def test_a_model_pin_is_dropped_when_the_backend_changes():
+    """Backend parity: `--model` was forwarded VERBATIM to whatever backend was spawned,
+    including after a Ctrl-G switch. Launching with `--backend codex --model gpt-5.4-mini` and
+    switching to claude handed claude a model id it does not have — the next turn died
+    instantly, with the error buried inside the backend's own pane and no aGiTrack-level
+    warning anywhere. The repo's own harness command hits this."""
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._backend_args = ["--model", "gpt-5.4-mini", "--verbose"]
+    messages: list[str] = []
+    runner._set_message = lambda text, **kw: messages.append(text)
+
+    runner._drop_model_pin_on_switch("claude")
+
+    assert runner._backend_args == ["--verbose"]  # unrelated passthroughs survive
+    assert messages and "--model gpt-5.4-mini" in messages[0]
+    assert "claude" in messages[0]
+
+
+def test_the_glued_model_form_is_dropped_too():
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._backend_args = ["--model=o4-mini", "--foo", "bar"]
+    runner._set_message = lambda text, **kw: None
+
+    runner._drop_model_pin_on_switch("opencode")
+
+    assert runner._backend_args == ["--foo", "bar"]
+
+
+def test_switching_with_no_model_pin_says_nothing():
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._backend_args = ["--verbose"]
+    messages: list[str] = []
+    runner._set_message = lambda text, **kw: messages.append(text)
+
+    runner._drop_model_pin_on_switch("claude")
+
+    assert runner._backend_args == ["--verbose"]
+    assert messages == []

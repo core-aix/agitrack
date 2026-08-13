@@ -1,7 +1,7 @@
 {
   "name": "agitrack-vscode",
   "displayName": "aGiTrack",
-  "description": "Start aGiTrack with the aG button (top-right of the editor) or \"aGiTrack: Start aGiTrack\" in the Command Palette — a coding agent (Claude Code / OpenCode) that auto-commits every turn with full provenance, run inside VSCode with no terminal typing required.",
+  "description": "Start aGiTrack with the aG button (top-right of the editor) or \"aGiTrack: Start aGiTrack\" in the Command Palette — a coding agent (Claude Code / Codex / OpenCode) that auto-commits every turn with full provenance, run inside VSCode with no terminal typing required.",
   "version": "0.6.10",
   "publisher": "core-aix",
   "license": "Apache-2.0",
@@ -18,6 +18,7 @@
     "ai",
     "agent",
     "claude",
+    "codex",
     "opencode",
     "git",
     "commit"
@@ -112,10 +113,11 @@
         "agitrack.backend": {
           "type": "string",
           "default": "",
-          "enum": ["", "claude", "opencode"],
+          "enum": ["", "claude", "codex", "opencode"],
           "enumDescriptions": [
             "Use aGiTrack's configured default backend",
             "Claude Code",
+            "Codex",
             "OpenCode"
           ],
           "description": "Backend to drive. Empty uses aGiTrack's configured default."
@@ -124,7 +126,7 @@
           "type": "array",
           "items": { "type": "string" },
           "default": [],
-          "markdownDescription": "Any extra command-line arguments to pass to `agitrack` on launch, one per array entry (e.g. `[\"--no-worktree\", \"--delay-merge\"]`). Anything aGiTrack doesn't recognize is forwarded to the backend CLI (claude/opencode), so this is the place to pass backend flags too — e.g. `[\"--\", \"--verbose\"]`. These are appended after `agitrack.backend`."
+          "markdownDescription": "Any extra command-line arguments to pass to `agitrack` on launch, one per array entry (e.g. `[\"--no-worktree\", \"--delay-merge\"]`). Anything aGiTrack doesn't recognize is forwarded to the backend CLI (claude/codex/opencode), so this is the place to pass backend flags too — e.g. `[\"--\", \"--verbose\"]`. These are appended after `agitrack.backend`."
         },
         "agitrack.openOnStartup": {
           "type": "boolean",
@@ -158,7 +160,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "tsc -p ./ && node --test out/platform.test.js out/installPaths.test.js out/liveness.test.js out/github.test.js out/msi.test.js",
+    "test": "tsc -p ./ && node --test out/platform.test.js out/installPaths.test.js out/liveness.test.js out/github.test.js out/msi.test.js out/spawnFlags.test.js",
     "vscode:prepublish": "npm run compile",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"

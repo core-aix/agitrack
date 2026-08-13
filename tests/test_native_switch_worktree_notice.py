@@ -32,8 +32,11 @@ from agitrack.git.worktree import WorktreeManager
 from agitrack.proxy.session import Session
 from agitrack.transcripts.types import SessionRef
 from proxy_helpers import make_runner
+from agitrack.backends.proxy_agents import available_backends
 
-BACKENDS = ["claude", "opencode"]
+# Every registered backend, so a newly added one is covered the moment it is registered
+# (the pattern test_backend_parity.py already uses).
+BACKENDS = available_backends()
 
 SWITCHED = [
     SessionRef(id="old-session", updated=100.0, label="old"),
@@ -42,6 +45,14 @@ SWITCHED = [
 
 YES = "Yes"
 NO = "No"
+
+# An activity value meaning "this conversation's turn is running RIGHT NOW", resolved when the
+# code under test asks rather than when the test set it up. `time.time()` frozen into the map
+# at construction made these tests a race against their own setup: the runner build does real
+# git work, and if it outran the idle window the "running" turn was already stale by the first
+# assertion. That is exactly how it failed — green everywhere for months, then red once on a
+# loaded windows-latest runner (see AGENTS.md, "Timing-dependent tests").
+LIVE = "live"
 
 
 def _init_repo(path):
@@ -90,7 +101,8 @@ def _runner(tmp_path, backend_name, *, refs, worktree: bool, answer=NO, activity
 
         def session_activity_mtime(self, session_id):
             # None = "unknown", which is how a backend with no such signal answers.
-            return (activity or {}).get(session_id)
+            value = (activity or {}).get(session_id)
+            return time.time() if value is LIVE else value
 
         def forget_session_in(self, repo, session_id):
             forgotten.append((str(repo), session_id))
@@ -481,7 +493,7 @@ def test_the_switch_waits_for_the_new_conversations_turn_to_finish(tmp_path, bac
         refs=SWITCHED,
         worktree=True,
         answer=YES,
-        activity={"new-session": time.time()},  # its turn is running right now
+        activity={"new-session": LIVE},  # its turn is running right now
     )
 
     runner._service_native_session_switch()
@@ -502,7 +514,7 @@ def test_the_switch_is_handled_once_the_new_conversation_goes_quiet(tmp_path, ba
         refs=SWITCHED,
         worktree=True,
         answer=YES,
-        activity={"new-session": time.time()},
+        activity={"new-session": LIVE},
     )
 
     runner._service_native_session_switch()

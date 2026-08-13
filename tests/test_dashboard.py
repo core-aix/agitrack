@@ -837,7 +837,7 @@ def test_build_server_accepts_email_logins_hint(tmp_path):
     server = build_server(repo, email_logins={"Someone@Example.com": "octocat"})
     try:
         # Emails are lowercased so the hint matches git's lowercased author email.
-        assert server.RequestHandlerClass.email_logins == {"someone@example.com": "octocat"}
+        assert server.RequestHandlerClass.scope.email_logins == {"someone@example.com": "octocat"}
     finally:
         server.server_close()
 
@@ -1355,7 +1355,11 @@ def test_dashboard_shows_only_the_repo_name_not_its_path(tmp_path, monkeypatch):
     # still exposes the layout. Build the repo before patching HOME so git still finds the
     # real global identity for the seed commits.
     home = tmp_path / "home"
-    repo_dir = home / "projects" / "demo"
+    # The containing directory is deliberately NOT an English word. The assertion below is "this
+    # path component appears nowhere in the page", and with a name like "projects" it fired twice
+    # on ordinary prose in a CSS comment rather than on a leaked path: a false alarm that teaches
+    # the reader to distrust the test instead of the leak it exists to catch.
+    repo_dir = home / "wkspc7f3" / "demo"
     repo_dir.parent.mkdir(parents=True)
     repo = _demo_repo(repo_dir)
     monkeypatch.setenv("HOME", str(home))
@@ -1367,8 +1371,8 @@ def test_dashboard_shows_only_the_repo_name_not_its_path(tmp_path, monkeypatch):
     assert dash.repo == "demo"
     html = render_html(repo)
     assert str(home) not in html
-    assert "~/projects/demo" not in html  # not even the home-abbreviated form
-    assert "projects" not in html  # the containing directory never appears
+    assert "~/wkspc7f3/demo" not in html  # not even the home-abbreviated form
+    assert "wkspc7f3" not in html  # the containing directory never appears
 
 
 def test_dashboard_repo_outside_home_is_also_reduced_to_its_name(tmp_path, monkeypatch):
@@ -1794,40 +1798,52 @@ def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, 
 # --- CLI -----------------------------------------------------------------------
 
 
-def test_cli_dashboard_html_is_default_and_starts_daemon(tmp_path, monkeypatch):
-    _demo_repo(tmp_path)
-    started: dict[str, object] = {}
+def _capture_hub(monkeypatch) -> dict:
+    """Record what the CLI asks the dashboard hub to open, without starting one."""
+    from agitrack.metrics import hub
 
-    def fake_start(repo, **kwargs):
-        started["repo"] = repo
-        started["owner_pid"] = kwargs.get("owner_pid")
+    seen: dict = {}
+
+    def fake_open(directory, *, view="", open_browser=True, quiet=False):
+        seen["directory"] = directory
+        seen["view"] = view
         return 0
 
-    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
-
-    # Bare --dashboard now means html, which starts the background daemon.
-    rc = cli.main(["--dashboard", "--repo", str(tmp_path)])
-
-    assert rc == 0
-    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
-    # Free-standing: no owner pid, so the daemon survives the launching terminal and
-    # runs until `agitrack -d stop` (or an update self-restart).
-    assert started["owner_pid"] is None
+    monkeypatch.setattr(hub, "open_dashboard", fake_open)
+    return seen
 
 
-def test_cli_dashboard_shorthand_d_starts_daemon_like_dashboard(tmp_path, monkeypatch):
+def test_cli_dashboard_html_is_default_and_opens_this_repo_on_the_hub(tmp_path, monkeypatch):
     _demo_repo(tmp_path)
-    started: dict[str, GitRepo] = {}
+    seen = _capture_hub(monkeypatch)
 
-    def fake_start(repo, **kwargs):
-        started["repo"] = repo
-        return 0
+    # Bare --dashboard means html, which opens this repo on the shared dashboard.
+    assert cli.main(["--dashboard", "--repo", str(tmp_path)]) == 0
+    assert seen["directory"] == GitRepo.discover(tmp_path).repo
+    # No view is forced: which one opens is the repo's own state to decide (hub.preferred_view),
+    # so a repo with nothing tracked yet lands on the backtrace rather than an empty page.
+    assert seen["view"] == ""
 
-    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
 
-    # `-d` is shorthand for `--dashboard`; bare form defaults to html (start daemon).
+def test_cli_dashboard_shorthand_d_opens_the_hub_like_dashboard(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    seen = _capture_hub(monkeypatch)
+
+    # `-d` is shorthand for `--dashboard`; bare form defaults to html.
     assert cli.main(["-d", "--repo", str(tmp_path)]) == 0
-    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert seen["directory"] == GitRepo.discover(tmp_path).repo
+
+
+def test_cli_backtrace_opens_the_backtrace_view_on_the_same_hub(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    seen = _capture_hub(monkeypatch)
+    # There is something to reconstruct; an empty one is reported in the terminal instead of
+    # opening a browser onto a blank page (see test_hub.py).
+    monkeypatch.setattr("agitrack.metrics.suggest.has_backtrace_history", lambda directory: True)
+
+    # Asking for the reconstruction IS the flag, so unlike `-d` it names the view outright.
+    assert cli.main(["--backtrace", "--repo", str(tmp_path)]) == 0
+    assert seen["view"] == "backtrace"
 
 
 def test_cli_dashboard_stop_stops_daemon(tmp_path, monkeypatch):
@@ -1839,16 +1855,16 @@ def test_cli_dashboard_stop_stops_daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(metrics, "stop_dashboard_daemon", lambda repo: stopped.__setitem__("repo", repo) or 0)
 
     assert cli.main(["-d", "stop", "--repo", str(tmp_path)]) == 0
+    # A pre-hub per-repo daemon is still stopped, so an upgrade does not strand one...
     assert stopped["repo"].repo == GitRepo.discover(tmp_path).repo
 
 
-def test_cli_dashboard_status_reports_daemon(tmp_path, monkeypatch):
+def test_cli_dashboard_status_reports_the_hub(tmp_path, monkeypatch, capsys):
     _demo_repo(tmp_path)
-    queried: dict[str, GitRepo] = {}
-    monkeypatch.setattr(metrics, "dashboard_daemon_status", lambda repo: queried.__setitem__("repo", repo) or 0)
 
+    # One dashboard serves every repository, so its status is the hub's, not this repo's.
     assert cli.main(["-d", "status", "--repo", str(tmp_path)]) == 0
-    assert queried["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert "dashboard is not running" in capsys.readouterr().out
 
 
 def test_cli_dashboard_shorthand_d_accepts_text(tmp_path, capsys, monkeypatch):
@@ -1890,7 +1906,11 @@ def test_cli_dashboard_outside_repo_fails_cleanly(tmp_path, capsys, monkeypatch)
     rc = cli.main(["--dashboard", "--repo", str(tmp_path / "plain")])
 
     assert rc == 1
-    assert "Not a Git repository" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # Clean, and ACTIONABLE: "Not a Git repository: ." was the whole answer, which tells someone
+    # who has just asked to look at their own work neither what is wrong nor what to do.
+    assert "is not a Git repository" in out
+    assert "git init" in out
 
 
 def test_cli_dashboard_missing_directory_fails_cleanly(tmp_path, monkeypatch):
@@ -1995,19 +2015,19 @@ def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch)
     real_build = server_mod.build_dashboard
     monkeypatch.setattr(server_mod, "build_dashboard", lambda *a, **k: (builds.append(1), real_build(*a, **k))[1])
     try:
-        # A handler instance without the request cycle: BaseHTTPRequestHandler.__init__ IS
-        # the request, so it is skipped and only the class attributes (repo, caches) are used.
-        probe = type("Probe", (handler,), {"__init__": lambda self: None})()
-        first = probe._dashboard()
-        again = probe._dashboard()
+        # The scope owns the repo and the caches, with no socket involved, so the question can
+        # be asked directly instead of faking a request cycle.
+        scope = handler.scope
+        first = scope._dashboard()
+        again = scope._dashboard()
         assert again is first and len(builds) == 1  # the second request reused it
 
         _write_lines(repo, "later.txt", 3)
         repo.commit("something new")
-        after = probe._dashboard()
+        after = scope._dashboard()
         assert after is not first and len(builds) == 2  # ...and a new commit rebuilds it
     finally:
-        handler._dash_cache.clear()
+        scope._dash_cache.clear()
         server.server_close()
 
 
@@ -2126,3 +2146,89 @@ def test_a_block_without_a_conversation_anchor_is_never_suppressed(tmp_path):
     ]
     _suppress_copied_turns(stats)
     assert [s.tokens for s in stats] == [{"output": 10}, {"output": 10}]
+
+
+def test_dashboard_on_a_repo_with_no_commits(tmp_path, capsys):
+    """A fresh `git init` is the very first state a new user can be in, and `-d text` answered it
+    with a raw traceback and exit 1: `git rev-parse --abbrev-ref HEAD` fails outright on an unborn
+    branch, and `current_branch()` ran it with check=True. `-d html` was worse — it reported
+    success and served a page that spun forever while every /data request crashed server-side."""
+    import subprocess
+
+    from agitrack import cli
+
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    assert cli.main(["-d", "text", "--repo", str(repo)]) == 0
+
+    out = capsys.readouterr().out
+    assert "Traceback" not in out
+    assert "0 commits" in out
+    # ...and the empty case explains itself rather than just printing zeroes, the way `-d html`
+    # already did when it diverted to the backtrace view.
+    assert "--backtrace" in out
+
+
+def test_dashboard_names_the_unborn_branch(tmp_path):
+    import subprocess
+
+    from agitrack.git import GitRepo
+
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "trunk"], cwd=repo, check=True)
+
+    assert GitRepo.discover(repo).current_branch() == "trunk"
+
+
+# --- the static demo's story chapters open ------------------------------------------------------
+
+
+def test_the_static_export_lets_a_story_chapter_show_its_commits():
+    """A snapshot cannot write a moment's prose, but it can show everything else it has.
+
+    Every shipped moment arrives without ``detail`` (that is written per moment, on demand, by a
+    live agent), and the page used to answer a click by asking the agent — so in the public demo
+    every chapter opened onto an error about a feature the reader cannot use, hiding the commits
+    that were sitting right there in the data."""
+    from agitrack.metrics.story import _STORY_TEMPLATE
+
+    # The gate that decides between "ask the agent" and "render what we have".
+    assert "if (!c.detail && !window.AGITRACK_STATIC) { writeMoment(el, c, box); return; }" in _STORY_TEMPLATE
+    # ...and the body below it is what renders the commits.
+    assert "the commits themselves" in _STORY_TEMPLATE
+
+
+def test_the_static_shim_announces_itself_to_the_pages():
+    from agitrack.metrics.export import _shim
+
+    shim = _shim(base="../demo/", files_index={}, page="story", site_root="../../")
+
+    assert "window.AGITRACK_STATIC = true" in shim
+
+
+def test_a_story_chapter_says_which_part_of_it_the_snapshot_is_missing():
+    from agitrack.metrics.story import _STORY_TEMPLATE
+
+    # A shorter body must not read as the whole story.
+    assert "ships the moment" in _STORY_TEMPLATE
+    assert "Its commits, below, are real." in _STORY_TEMPLATE
+
+
+def test_the_export_bakes_every_diff_a_story_chapter_points_at(tmp_path):
+    from agitrack.metrics.export import _story_shas
+
+    state = {
+        "story": {
+            "moments": [
+                {"commits": [{"sha": "a" * 40}, {"sha": "b" * 40}]},
+                {"commits": [{"sha": "b" * 40}, {"sha": "c" * 40}]},
+            ]
+        }
+    }
+
+    # Deduped, and every one of them: a chapter whose commit has no baked diff opens onto an
+    # error, which is the same failure in a different place.
+    assert _story_shas(state) == ["a" * 40, "b" * 40, "c" * 40]

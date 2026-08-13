@@ -9,11 +9,62 @@ keep every call site identical and platform-agnostic.
 
 from __future__ import annotations
 
+import codecs
 import os
 import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
+
+
+# The ONLY correct way to ask subprocess for text I/O in this codebase. Spread it instead of
+# writing ``text=True``:
+#
+#     subprocess.run(cmd, **UTF8_TEXT, stdout=subprocess.PIPE, ...)
+#
+# Bare ``text=True`` decodes with ``locale.getencoding()`` — cp1252 on a Western Windows box,
+# ASCII under ``LC_ALL=C`` or ``PYTHONUTF8=0`` on Linux. Every tool aGiTrack shells out to (git
+# above all) speaks UTF-8, so the locale codec is simply the wrong one, and the failure is not
+# cosmetic: ``git rev-parse --show-toplevel`` in ``C:\Users\Müller\repo`` came back as mojibake,
+# which was then passed as ``cwd`` to the next git call and surfaced as ``[WinError 267] The
+# directory name is invalid`` — aGiTrack was unusable for anyone whose profile directory is not
+# pure ASCII. On Linux the same call raised ``UnicodeDecodeError`` outright.
+#
+# ``errors="replace"`` is deliberate: a stray undecodable byte in a tool's OUTPUT must degrade
+# one character, never crash a command.
+# Annotated ``dict[str, Any]``: inferred as ``dict[str, object]`` it cannot satisfy any
+# ``subprocess.run`` overload when spread, and every call site fails to type-check.
+UTF8_TEXT: dict[str, Any] = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
+def fs_path(printed: str) -> Path:
+    """The other half of ``UTF8_TEXT``: a path a tool PRINTED, made usable as a path.
+
+    ``UTF8_TEXT`` gets the wire format right — git speaks UTF-8 — but decoding is only half
+    the round trip. Python encodes ``str`` paths back to bytes for every syscall using
+    ``sys.getfilesystemencoding()``, and that is **not** always UTF-8 on Linux: under
+    ``PYTHONUTF8=0`` in a non-UTF-8 locale (``LC_ALL=C``, a bare cron or systemd unit, a slim
+    container image with no locales installed) it is ASCII. So in ``/home/u/tëst`` the ``ë``
+    that came back correctly from ``git rev-parse --show-toplevel`` then blew up on the very
+    next line — ``Path(printed).resolve()`` raised ``UnicodeEncodeError`` from inside
+    ``posixpath.realpath``, before any of aGiTrack's own error handling could run, and every
+    command (``-s``, ``-d text``, the TUI) died on a raw traceback.
+
+    Re-decoding those UTF-8 bytes with ``os.fsdecode`` yields the surrogate-escaped form that
+    encodes back to *the same bytes on disk*, which is what the filesystem layer wants. Where
+    the filesystem encoding already is UTF-8 — always on Windows and macOS, and on Linux
+    unless someone has explicitly opted out — this is the identity.
+    """
+    encoding = sys.getfilesystemencoding()
+    if codecs.lookup(encoding).name == "utf-8":
+        return Path(printed)
+    # ``os.fsdecode`` would be the obvious call, but it binds its codec at import time, so it
+    # cannot be reasoned about (or tested) against the encoding in force now. This is the same
+    # conversion, spelled out: git's bytes, decoded the way the filesystem layer will re-encode
+    # them. ``surrogateescape`` is what makes that re-encoding lossless.
+    return Path(printed.encode("utf-8", "surrogateescape").decode(encoding, "surrogateescape"))
 
 
 def agitrack_invocation() -> list[str]:
@@ -39,6 +90,14 @@ _IS_WINDOWS = os.name == "nt"
 
 # Windows: a process that is still running reports this as its exit code.
 _STILL_ACTIVE = 259
+
+# The PATH aGiTrack INHERITED from the shell that launched it, captured at import — before
+# any install prepends a freshly-created bin directory to ``os.environ["PATH"]`` for this
+# process. That distinction is what lets aGiTrack tell "the user's own shells already find
+# this command" from "only aGiTrack finds it, because it just installed it" (see
+# agitrack/path_setup.py). This module is imported by the CLI at startup and by the installer
+# itself, so it is always read before an install can mutate the value.
+INHERITED_PATH = os.environ.get("PATH", "")
 
 
 def which_executable(name: str) -> str | None:

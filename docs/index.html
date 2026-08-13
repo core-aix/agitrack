@@ -211,6 +211,10 @@ a.more:hover{background:var(--amber);color:var(--ink);border-bottom-color:var(--
   padding:9px 13px;font-size:13.5px;color:var(--phosphor);
 }
 .step .note{font-size:12.5px;color:var(--fg-dim);margin-top:5px}
+/* A step that is something aGiTrack DOES, not something you type. Plain prose, in the same font
+   and size as the note under it: no terminal box and no green (a boxed monospace string reads as
+   "type this"), and no display face either, which read as decoration rather than as text. */
+.step .happens{display:block;padding:9px 0;font-size:12.5px;color:var(--fg)}
 
 footer{
   padding:34px 0 60px;color:var(--fg-dim);font-size:13px;
@@ -260,7 +264,7 @@ footer .sha{font-size:12px}
         </div>
         <div class="branch cmd" data-ref="agitrack -d">
           <h3>Live dashboard</h3>
-          <p>Who and what wrote the code, from commit metadata alone.</p>
+          <p>Who and what wrote the code, from commit metadata alone. All your projects on one port.</p>
           <a class="go" href="dashboard/">demo &rarr;</a>
         </div>
         <div class="branch" data-ref="agent efficiency">
@@ -283,14 +287,14 @@ footer .sha{font-size:12px}
           <p>Reconstruct the history you didn't track from day one.</p>
           <a class="go more" href="readmore.html#backtrace">read more &rarr;</a>
         </div>
-        <div class="branch cmd" data-ref="agitrack [-b] [-m]">
-          <h3>Four modes</h3>
-          <p>TUI or background, auto or manual commits. Switch freely.</p>
+        <div class="branch cmd" data-ref="agitrack">
+          <h3>It asks which mode</h3>
+          <p>Background or TUI, worktree or not, auto or manual commits. Run it bare and pick from the menu.</p>
           <a class="go more" href="readmore.html#modes">read more &rarr;</a>
         </div>
         <div class="branch" data-ref="native agent backends">
           <h3>Your agent, your choice</h3>
-          <p>Use your agent exactly the same way as before. Claude Code and OpenCode today. More on request.</p>
+          <p>Use your agent exactly the same way as before. Claude Code, Codex and OpenCode today. More on request.</p>
         </div>
         <div class="branch" data-ref="your repo only">
           <h3>Private by design</h3>
@@ -314,16 +318,18 @@ footer .sha{font-size:12px}
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
-          <div class="note">launches your coding agent's TUI under aGiTrack's watch</div>
+          <div class="note">asks which mode you want: arrow keys, Enter</div>
         </div></div>
         <div class="step"><div>
-          <code>Ctrl-G</code>
-          <div class="note">opens the aGiTrack menu</div>
+          <span class="happens">your dashboard opens</span>
+          <div class="note">automatically, whichever mode you picked</div>
         </div></div>
       </div>
-      <p style="margin-top:18px">Then <span class="p">agitrack -d</span> shows your tracked commits in the
-      dashboard, and <span class="p">agitrack --backtrace</span> recovers previous agentic coding sessions
-      if you already have some.</p>
+      <p style="margin-top:18px">Know what you want already? <span class="p">agitrack -b</span> tracks the agent
+      you drive yourself, <span class="p">agitrack -i</span> runs it in aGiTrack's TUI,
+      <span class="p">agitrack -d</span> opens the dashboard, and <span class="p">agitrack --backtrace</span>
+      recovers previous agentic coding sessions if you already have some. One
+      <span class="p">agitrack stop</span> stops whatever is running here.</p>
     </section>
 
     <section class="commit agent">

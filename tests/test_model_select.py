@@ -176,3 +176,29 @@ def test_smallest_model_no_haiku_in_list_returns_none():
 
 def test_smallest_model_empty_list_returns_none():
     assert smallest_model("claude", []) is None
+
+
+def test_a_claude_model_id_is_rejected_under_codex():
+    # Codex and Claude both use BARE ids, so the provider check alone cannot separate them.
+    # Without a second test a global summarization_model of a Claude id was handed to
+    # `codex -m`, which rejects it, and EVERY summary failed after a backend switch.
+    for claude_id in ("claude-haiku-4-5-20251001", "haiku", "sonnet", "claude-opus-4-8"):
+        assert compatible_summarization_model("codex", claude_id) is None, claude_id
+
+
+def test_an_opencode_style_id_is_rejected_under_codex():
+    assert compatible_summarization_model("codex", "openai/gpt-5.5") is None
+
+
+def test_a_codex_model_id_is_kept_including_unknown_families():
+    # Rejecting Claude-shaped ids (rather than allow-listing Codex's) keeps a model family
+    # OpenAI has not shipped yet working.
+    assert compatible_summarization_model("codex", "gpt-5.4-mini") == "gpt-5.4-mini"
+    assert compatible_summarization_model("codex", "o5-nano") == "o5-nano"
+
+
+def test_codex_recommends_its_mini_tier_as_the_summarizer_default():
+    models = ["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.5"]
+
+    assert smallest_model("codex", models) == "gpt-5.4-mini"
+    assert smallest_model("opencode", models) is None  # no size ordering to presume

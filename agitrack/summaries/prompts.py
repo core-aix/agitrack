@@ -11,7 +11,9 @@ The first sentence should be a topic sentence summarizing everything, before exp
 
 The topic sentence becomes the git commit subject, so it MUST be at most 63 characters long (including spaces) so it displays in full in the commit list without being truncated. Make it a short, self-contained headline and move all detail into the sentences that follow. Do not end it with an ellipsis.
 
-Begin your response immediately with that topic sentence. Do not prepend any preamble, acknowledgement, or meta-commentary — never start with phrasings such as "Here is the summary", "The summary has been written", "No further action is needed", "Below is", "Sure", or anything that describes the act of summarizing. Output only the summary text itself, with no heading and no sentence stating that it is a summary."""
+Begin your response immediately with that topic sentence. Do not prepend any preamble, acknowledgement, or meta-commentary — never start with phrasings such as "Here is the summary", "The summary has been written", "No further action is needed", "Below is", "Sure", or anything that describes the act of summarizing. Output only the summary text itself, with no heading and no sentence stating that it is a summary.
+
+The trace is the ONLY evidence you have. Never state anything it does not show. In particular: do not name a file, a function, a count, or a command unless that exact name or number appears in the trace, and never describe work as done because it was asked for — a request in the trace is a request, not an outcome. If the trace shows only what the user asked and nothing the agent did, say what was REQUESTED and say that the turn did not report completing it. An accurate vague summary is always better than a specific invented one, because the topic sentence becomes the commit subject and is the line people read."""
 
 SESSION_UPDATE_SYSTEM = """You are maintaining a running session summary for a coding session. Given the current session summary and new changes, produce an updated summary that:
 

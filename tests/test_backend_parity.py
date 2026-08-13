@@ -1,10 +1,11 @@
 """Structural parity between the backends aGiTrack ships.
 
-aGiTrack supports two coding agents and the project rule is that every feature works on
-both. Nothing enforced that: ``ProxyAgent`` is a ``Protocol``, so a method present on one
-agent and missing on the other is not a type error, and the runner reaches most of them
-through ``getattr(..., None)`` — which turns "this backend can't do that" into a SILENT
-degradation rather than a failure. Two real drifts were live when this file was written:
+The project rule is that every feature works on EVERY registered backend (Claude Code,
+Codex and OpenCode today; whatever the registry holds tomorrow). Nothing enforced that:
+``ProxyAgent`` is a ``Protocol``, so a method present on one agent and missing on another is
+not a type error, and the runner reaches most of them through ``getattr(..., None)`` — which
+turns "this backend can't do that" into a SILENT degradation rather than a failure. Two real
+drifts were live when this file was written:
 
 * ``retarget_working_dir`` — implemented on both agents and called by the runner, but not
   declared on the Protocol at all;
@@ -12,9 +13,9 @@ degradation rather than a failure. Two real drifts were live when this file was 
   OpenCode ran the whole session with the runner's PTY-only fallback (see
   ``test_turn_end_detection.py`` for what that costs the user).
 
-These tests are deliberately structural: they compare the two agents against the contract
-rather than against each other's current behaviour, so adding a THIRD backend gets the same
-checks for free.
+These tests are deliberately structural: they compare every agent against the contract rather
+than against each other's current behaviour, and they enumerate ``available_backends()`` — so a
+newly registered backend gets the same checks for free (Codex did).
 """
 
 from __future__ import annotations

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import json
 import subprocess
 import threading
@@ -9,6 +11,7 @@ from typing import IO
 from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.proc import (  # _IS_WINDOWS: see proc.py
     _IS_WINDOWS,
+    UTF8_TEXT,
     console_isolation_kwargs,
     resolve_subprocess_command,
 )
@@ -38,9 +41,16 @@ class OpenCodeBackend:
         verbose: bool = False,
         backend_args: list[str] | None = None,
         launch_command: list[str] | None = None,
+        console_stream=None,
     ) -> None:
         self.repo = repo
         self.verbose = verbose
+        # Where this backend echoes the agent's streamed output. Defaults to stdout, which is
+        # right for a terminal — but under `--json-events`/`--ui-bridge` stdout carries ONLY
+        # protocol lines, and a raw echo there is a non-JSON line in the middle of the stream
+        # (the live test saw exactly that: a bare "OK" between `ready` and `response`). The
+        # shell hands us its own prose stream so the echo follows the rest of the prose.
+        self._console = console_stream if console_stream is not None else sys.stdout
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
         # Command that launches the backend, replacing the "opencode" executable with a user
         # wrapper (e.g. ["somewrapper", "opencode"]); empty ⇒ run "opencode" directly.
@@ -101,8 +111,15 @@ class OpenCodeBackend:
         process = subprocess.Popen(
             resolve_subprocess_command(command),  # find/launch opencode(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
-            text=True,
-            stdin=subprocess.PIPE if to_stdin else None,
+            **UTF8_TEXT,
+            # DEVNULL, never None. `None` means "inherit", and on POSIX `to_stdin` is False, so
+            # the opencode child inherited whatever aGiTrack's own stdin was. Under `--ui-bridge`
+            # that is the editor's protocol pipe: the child held it open, it never reached EOF,
+            # and the bridge hung forever — zero frames for 720 s after `ready`, reproduced twice.
+            # `lsof` showed aGiTrack and the child sharing fd 0. codex already used DEVNULL and
+            # claude passes detach_stdin=not to_stdin; opencode was the only backend that
+            # inherited stdin. Nothing here ever wants the user's terminal.
+            stdin=subprocess.PIPE if to_stdin else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
             # Keep the opencode CLI off a console on Windows: the background daemon runs the
@@ -167,6 +184,16 @@ class OpenCodeBackend:
 
             resolved_model = session_model(parsed_session_id or session_id or "")
 
+        if bare and parsed_session_id:
+            # A bare run is aGiTrack's own machinery (the summarizer), not a conversation.
+            # OpenCode's `session list` carries no programmatic marker — Claude has
+            # `promptSource: sdk` and Codex has `source == "exec"` — so without recording it
+            # here, the very next session listing offered this to the user as their chat, and
+            # `latest_session_id` would resume into it.
+            from agitrack.transcripts.opencode import mark_programmatic
+
+            mark_programmatic(parsed_session_id)
+
         return AgentResult(
             backend=self.name,
             session_id=parsed_session_id or session_id,
@@ -200,7 +227,7 @@ class OpenCodeBackend:
             model = model or parsed_model
             self._add_tokens(tokens, parsed_tokens)
             if display_text and stream_console:
-                print(display_text, end="" if display_text.endswith("\n") else "\n")
+                print(display_text, end="" if display_text.endswith("\n") else "\n", file=self._console)
             if final_text:
                 final_parts.append(final_text)
 

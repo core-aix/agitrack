@@ -168,12 +168,36 @@ def test_maybe_install_tool_declined_returns_false(monkeypatch):
 
 
 def test_maybe_install_tool_accepts_and_installs(monkeypatch):
+    # A REQUIRED tool keeps its Y default: without git, aGiTrack cannot work at all.
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     with (
         patch("agitrack.system_tools.can_install_tool", return_value=True),
         patch("agitrack.system_tools.install_system_tool", return_value=True) as install,
         patch("builtins.input", lambda _prompt: ""),  # Enter → default yes
+    ):
+        assert cli._maybe_install_tool("git", required=True) is True
+    install.assert_called_once_with("git")
+
+
+def test_maybe_install_an_optional_tool_needs_an_explicit_yes(monkeypatch):
+    # `gh` is explicitly OPTIONAL — aGiTrack degrades to git author names without it — yet a bare
+    # Enter shelled straight into `brew install gh`: a package install nobody asked for, on the
+    # most reflexive keypress there is.
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    with (
+        patch("agitrack.system_tools.can_install_tool", return_value=True),
+        patch("agitrack.system_tools.install_system_tool", return_value=True) as install,
+        patch("builtins.input", lambda _prompt: ""),  # Enter → default NO
+    ):
+        assert cli._maybe_install_tool("gh", required=False) is False
+    install.assert_not_called()
+
+    with (
+        patch("agitrack.system_tools.can_install_tool", return_value=True),
+        patch("agitrack.system_tools.install_system_tool", return_value=True) as install,
+        patch("builtins.input", lambda _prompt: "y"),
     ):
         assert cli._maybe_install_tool("gh", required=False) is True
     install.assert_called_once_with("gh")
@@ -188,3 +212,55 @@ def test_ensure_powershell_execution_policy_noop_off_windows(monkeypatch):
     monkeypatch.setattr(st.os, "name", "posix")
     # Must not touch the registry or raise on POSIX.
     st.ensure_powershell_execution_policy(output_fn=lambda _: None)
+
+
+# ---------------------------------------------------------------------------
+# Prompt hygiene around the prerequisite installs
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_install_tool_drains_input_before_asking(monkeypatch):
+    # Enter pressed during an earlier install must not auto-answer this question.
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    events: list[str] = []
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: events.append("drain"))
+    with (
+        patch("agitrack.system_tools.can_install_tool", return_value=True),
+        patch("agitrack.system_tools.install_system_tool", return_value=True),
+        patch("builtins.input", lambda prompt: events.append("input") or "y"),
+    ):
+        assert cli._maybe_install_tool("gh", required=False) is True
+    assert events == ["drain", "input"]  # drained first, then read
+
+
+def test_maybe_install_tool_question_starts_its_own_block(monkeypatch):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+    prompts: list[str] = []
+    with (
+        patch("agitrack.system_tools.can_install_tool", return_value=True),
+        patch("agitrack.system_tools.install_system_tool", return_value=True),
+        patch("builtins.input", lambda prompt: prompts.append(prompt) or ""),
+    ):
+        cli._maybe_install_tool("gh", required=False)
+    # Two newlines: one closes any partial line a preceding subprocess left, the other
+    # leaves a blank line so the question is not glued to the output above it.
+    assert prompts[0].startswith("\n\nthe GitHub CLI (gh) isn't installed")
+
+
+def test_install_system_tool_announces_a_slow_step_and_closes_its_output(monkeypatch):
+    monkeypatch.setattr(st.os, "name", "posix")
+    monkeypatch.setattr(st.sys, "platform", "linux")
+    lines: list[str] = []
+    ok = st.install_system_tool(
+        "git",
+        output_fn=lines.append,
+        run=lambda *a, **k: _ok(),
+        which=lambda exe: f"/usr/bin/{exe}" if exe in {"apt-get", "git"} else None,
+    )
+    assert ok is True
+    assert any("take a few minutes" in line for line in lines)
+    assert "" in lines  # a newline after the package manager's own output
+    assert any(line.startswith("\nInstalling git") for line in lines)

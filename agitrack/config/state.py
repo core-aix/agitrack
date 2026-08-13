@@ -1,18 +1,36 @@
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from agitrack.fileio import atomic_write_text
-from agitrack.proc import console_isolation_kwargs
+from agitrack.fileio import atomic_write_text, merge_json_for_save
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, fs_path
 
 # The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
 # (see AgitrackState._exclude_path) instead of spawning `git rev-parse` on every save/ensure.
 _EXCLUDE_PATH_CACHE: dict[Path, Path] = {}
+
+# What aGiTrack adds to the repo's `.git/info/exclude` — every path IT writes inside the user's
+# working tree, so none of them ever appears in `git status` as the user's change.
+#
+# `.claude/settings.local.json` is on this list because aGiTrack WRITES it (the Stop /
+# SessionStart hooks that make auto-start work). Only `.agitrack/` was ever excluded, so a new
+# user saw `?? .claude/` the moment they ran `agitrack -b` — and in a submodule that surfaced in
+# the parent as ` M vendor/sub`. It went unnoticed for so long because the developers' own
+# machines happened to carry a personal `**/.claude/settings.local.json` in
+# ~/.config/git/ignore, which aGiTrack did not create and no new user has.
+#
+# An exclude entry has no effect on a file the repo already TRACKS, which is the correct
+# behaviour here: a team that deliberately commits that file keeps deciding for themselves.
+# What protects THEM is `add_tracked()`'s scaffolding filter (git/repo.py).
+_EXCLUDE_LINES = (".agitrack/", ".claude/settings.local.json")
 
 
 class AgitrackState:
@@ -23,12 +41,21 @@ class AgitrackState:
         self._default_backend = default_backend
         self.data = self._load()
         self.config = self._load_config()
+        # What this instance believes was on disk when it loaded. save() writes only the
+        # difference against it, so a concurrent writer's keys are not dropped — see
+        # fileio.merge_json_for_save.
+        self._baseline = copy.deepcopy(self.data)
+        self._config_baseline = copy.deepcopy(self.config)
+        self._saves_suspended = 0
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return self._default()
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # utf-8-SIG: a BOM (a Windows editor, `Out-File -Encoding utf8`) otherwise made
+            # json.load raise and the file was quarantined as corrupt. Identical to utf-8
+            # when there is no BOM.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             # A truncated or invalid state file must not brick startup. Keep the
@@ -97,52 +124,89 @@ class AgitrackState:
         if not self.config_path.exists():
             return default
         try:
-            with self.config_path.open("r", encoding="utf-8") as handle:
+            with self.config_path.open("r", encoding="utf-8-sig") as handle:  # tolerate a BOM
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return default  # user-edited file; don't crash, just use defaults
         default.update(data if isinstance(data, dict) else {})
         return default
 
+    @contextmanager
+    def suspend_saves(self) -> Iterator[None]:
+        """Keep mutations in memory instead of writing them, for a block that must not touch
+        the file yet. Used where state is prepared BEFORE the repo lock is held: writing there
+        rewrites a live tracker's state file even when the run is then refused, and the
+        tracker's own next save reverts it — a lost update in both directions."""
+        self._saves_suspended += 1
+        try:
+            yield
+        finally:
+            self._saves_suspended -= 1
+
     def save(self) -> None:
+        if self._saves_suspended:
+            return
         self._ensure_repo_local_ignore()
         # Atomic write (unique tmp, see fileio): save() runs on every property setter, so
         # an in-place rewrite interrupted by a crash/SIGKILL/full disk would leave exactly
         # the truncated file that bricks the next startup — and a FIXED tmp name crashed
         # whenever a second aGiTrack process (dashboard, export, tracker) saved this same
         # repo's state concurrently.
-        atomic_write_text(self.path, json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+        #
+        # Merge against the file rather than overwriting it: atomicity is not isolation, and
+        # a whole-document write silently discards whatever another live instance (a second
+        # AgitrackState in this process, or another aGiTrack process on this repo) wrote in
+        # the meantime. See fileio.merge_json_for_save.
+        merged = merge_json_for_save(self.path, self.data, self._baseline)
+        atomic_write_text(self.path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        # Adopt the merged document (in place, so anything holding ``state.data`` keeps
+        # seeing the live dict) and re-baseline: this instance is now in sync with disk.
+        self.data.clear()
+        self.data.update(merged)
+        self._baseline = copy.deepcopy(merged)
 
     def ensure_local_ignore(self) -> None:
-        """Make sure ``.agitrack/`` is git-ignored for this repo (idempotent). Call this before
-        writing any ``.agitrack/`` file (the manual trailer/ref, handshake, …) so aGiTrack's
-        internal state can never leak into a ``git add -A`` / user commit — ``save()`` also does
-        it, but state isn't always saved before those files are written (e.g. an idle daemon)."""
+        """Make sure everything aGiTrack writes into the repo is git-ignored (idempotent). Call
+        this before writing any ``.agitrack/`` file (the manual trailer/ref, handshake, …) so
+        aGiTrack's internal state can never leak into a ``git add -A`` / user commit — ``save()``
+        also does it, but state isn't always saved before those files are written (e.g. an idle
+        daemon)."""
         self._ensure_repo_local_ignore()
 
-    def _ensure_repo_local_ignore(self) -> None:
+    def add_local_ignore(self, line: str) -> None:
+        """Add one extra pattern to this repo's ``.git/info/exclude`` (idempotent).
+
+        For paths aGiTrack writes whose location the USER chose, so they cannot live in the
+        fixed ``_EXCLUDE_LINES`` list — today that is the ``--log-file`` event log."""
+        self._ensure_repo_local_ignore(extra=(line,))
+
+    def _ensure_repo_local_ignore(self, *, extra: tuple[str, ...] = ()) -> None:
+        wanted = (*_EXCLUDE_LINES, *extra)
         exclude = self._exclude_path()
         if exclude is None:
             return
         if not exclude.exists():
             # Repos created without the default template have no info/exclude;
-            # create it (only in an actual git repo) so .agitrack/ stays unignored
+            # create it (only in an actual git repo) so aGiTrack's files stay unignored
             # nowhere. The worktree case resolves to the shared git dir via git.
             if not (self.repo / ".git").exists():
                 return
             try:
                 exclude.parent.mkdir(parents=True, exist_ok=True)
-                exclude.write_text(".agitrack/\n", encoding="utf-8")
+                exclude.write_text("".join(f"{line}\n" for line in wanted), encoding="utf-8")
             except OSError:
                 pass
             return
         content = exclude.read_text(encoding="utf-8")
-        if ".agitrack/" in content.splitlines():
+        present = set(content.splitlines())
+        missing = [line for line in wanted if line not in present]
+        if not missing:
             return
         with exclude.open("a", encoding="utf-8") as handle:
             if content and not content.endswith("\n"):
                 handle.write("\n")
-            handle.write(".agitrack/\n")
+            for line in missing:
+                handle.write(f"{line}\n")
 
     def _exclude_path(self) -> Path | None:
         # The info/exclude location is invariant for a repo, but ensure_local_ignore() /
@@ -169,7 +233,7 @@ class AgitrackState:
             process = subprocess.run(
                 ["git", "rev-parse", "--git-path", "info/exclude"],
                 cwd=self.repo,
-                text=True,
+                **UTF8_TEXT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -183,7 +247,7 @@ class AgitrackState:
             return fallback
         if process.returncode != 0:
             return fallback
-        path = Path(process.stdout.strip())
+        path = fs_path(process.stdout.strip())  # git printed UTF-8; see proc.fs_path
         return path if path.is_absolute() else self.repo / path
 
     @property
@@ -213,7 +277,7 @@ class AgitrackState:
             return self._default_backend
         raise RuntimeError(
             "No coding agent backend is configured for this session. Run aGiTrack in an "
-            "interactive terminal to choose a default, or pass --backend <claude|opencode>."
+            "interactive terminal to choose a default, or pass --backend <" + "|".join(available_backends()) + ">."
         )
 
     @backend.setter
@@ -632,7 +696,15 @@ class AgitrackState:
         self._save_config()
 
     def _save_config(self) -> None:
-        atomic_write_text(self.config_path, json.dumps(self.config, indent=2, sort_keys=True) + "\n")
+        # ``<repo>/.agitrack/config.json`` is written by TWO classes with disjoint key sets —
+        # this one and GlobalConfig.save_repo (the repo settings overlay, which the dashboard
+        # daemon also writes) — so an unmerged whole-file write here drops every setting the
+        # other one owns. Merge, exactly as save() does.
+        merged = merge_json_for_save(self.config_path, self.config, self._config_baseline)
+        atomic_write_text(self.config_path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.config.clear()
+        self.config.update(merged)
+        self._config_baseline = copy.deepcopy(merged)
 
     def append_trace(self, role: str, content: str) -> None:
         trace = self.pending_trace()

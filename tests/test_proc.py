@@ -7,6 +7,9 @@ covered on a Linux CI too, without a Windows box)."""
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 import agitrack.proc as proc
 
@@ -183,3 +186,58 @@ def test_which_executable_windows_honours_explicit_extension(monkeypatch):
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\bin\opencode.exe" if name == "opencode.exe" else None)
     assert proc.which_executable("opencode.exe") == r"C:\bin\opencode.exe"
+
+
+def test_fs_path_is_the_identity_on_a_utf8_filesystem():
+    """Which is every Windows and macOS box, and Linux unless someone opts out.
+
+    Compared as a Path, not as a string: `str(Path("/home/u/x"))` is `\\home\\u\\x` on Windows,
+    because pathlib renders separators for the host. That is pathlib's business and says nothing
+    about fs_path, but asserting on the raw string made this fail on every Windows run — the
+    identity that matters is that the CHARACTERS are untouched, which is checked explicitly."""
+    printed = "/home/u/tëst_репо"
+
+    assert proc.fs_path(printed) == Path(printed)
+    assert "tëst_репо" in proc.fs_path(printed).name  # the non-ASCII survived intact
+
+
+def _encodes_back_to(text: str, encoding: str) -> bytes:
+    """The bytes the filesystem layer would send to the kernel for ``text``.
+
+    This is the operation that failed: ``Path(...).resolve()`` reaches ``posixpath.realpath``,
+    which encodes the string with the filesystem codec. Raises exactly where aGiTrack did.
+    """
+    return text.encode(encoding, "surrogateescape")
+
+
+def test_fs_path_survives_an_ascii_filesystem_encoding(monkeypatch):
+    """UTF8_TEXT decodes git's output correctly, but the resulting str is only half the round
+    trip: Python encodes str paths back to bytes for every syscall with the FILESYSTEM
+    encoding, which under `PYTHONUTF8=0` in a C locale is ASCII. `Path(git_output).resolve()`
+    then raised UnicodeEncodeError from inside posixpath — a raw traceback out of every command
+    on any repo with a non-ASCII path.
+    """
+    if proc._IS_WINDOWS:  # pragma: no cover - the filesystem encoding is always UTF-8 there
+        return
+    printed = "/home/u/tëst"  # git printed UTF-8 and UTF8_TEXT decoded it
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "ascii")
+
+    with pytest.raises(UnicodeEncodeError):
+        _encodes_back_to(printed, "ascii")  # the bug, if the string is passed on unconverted
+
+    assert _encodes_back_to(str(proc.fs_path(printed)), "ascii") == printed.encode("utf-8")
+
+
+def test_fs_path_round_trips_a_real_non_ascii_directory(tmp_path, monkeypatch):
+    """The same property against bytes that really are on this disk, rather than a literal."""
+    if proc._IS_WINDOWS:  # pragma: no cover
+        return
+    target = tmp_path / "ünïcode_репо"
+    target.mkdir()
+    printed = str(target)  # what `git rev-parse --show-toplevel` hands back through UTF8_TEXT
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "latin-1")
+
+    # The bytes the kernel would be handed are the bytes the directory actually has. (Only the
+    # ENCODE side can be checked on a UTF-8 host: `is_dir()` would use this host's real codec,
+    # not the latin-1 one being simulated.)
+    assert _encodes_back_to(str(proc.fs_path(printed)), "latin-1") == os.fsencode(target)

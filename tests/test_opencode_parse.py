@@ -207,3 +207,80 @@ def test_the_debug_log_never_INVENTS_a_directory(tmp_path, monkeypatch):
     (repo / ".agitrack").mkdir(parents=True)
     _debug(repo, "scanning")
     assert "scanning" in (repo / ".agitrack" / "proxy-debug.log").read_text(encoding="utf-8")
+
+
+def test_apply_patch_edits_are_counted(tmp_path):
+    """C31: `_edits_from_parts` matched only write/edit/patch and dropped `apply_patch`, whose
+    payload key is `patchText`. OpenAI-family models under OpenCode reach for it, so those
+    sessions reported +0/-0 lines and `--backtrace commit` exited 128 with "every agent-made
+    commit here is user commits with no agent-made edits to attribute" — seconds after
+    `--backtrace text` had reported the same commit as `agent 1 … 1/1 (100.0%)`."""
+    from agitrack.transcripts.opencode import _edits_from_parts
+
+    parts = [
+        {
+            "type": "tool",
+            "tool": "apply_patch",
+            "state": {
+                "input": {"patchText": ("*** Begin Patch\n*** Add File: hello.txt\n+hello\n+world\n*** End Patch\n")}
+            },
+        }
+    ]
+    edits = _edits_from_parts(parts, {})
+
+    assert [e.path for e in edits] == ["hello.txt"]
+    assert edits[0].insertions == 2 and edits[0].deletions == 0
+
+
+def test_apply_patch_update_diffs_incrementally():
+    from agitrack.transcripts.edits import edits_from_apply_patch
+
+    state = {"a.py": "one\ntwo\nthree\n"}
+    patch = "*** Begin Patch\n*** Update File: a.py\n@@\n one\n-two\n+TWO\n three\n*** End Patch\n"
+
+    edits = edits_from_apply_patch(state, patch)
+
+    assert [(e.path, e.insertions, e.deletions) for e in edits] == [("a.py", 1, 1)]
+    assert state["a.py"] == "one\nTWO\nthree\n"
+
+
+def test_context_tokens_are_the_peak_not_the_last_step():
+    """D7: OpenCode records usage per STEP and `TokenUsage.add` overwrites `context` with
+    whatever came last, so the final — often tiny — step's count replaced the real total:
+    349 / 357 / 187 reported against an actual ~6.5 K."""
+    from agitrack.transcripts.opencode import _tokens
+
+    parts = [
+        {"tokens": {"input": 6500, "output": 40, "cache": {"read": 0, "write": 0}}},
+        {"tokens": {"input": 187, "output": 5, "cache": {"read": 0, "write": 0}}},
+    ]
+
+    usage = _tokens({}, parts)
+
+    assert usage.context == 6500
+    assert usage.output == 45  # the summed fields are unaffected
+
+
+def test_a_session_agitrack_drove_itself_is_not_offered_as_a_conversation(tmp_path, monkeypatch):
+    """Parity: Claude filters `promptSource: sdk` and Codex filters `source == "exec"`, but
+    OpenCode's `session list` exposes no such field — so a scripted run was adopted as the
+    user's conversation. aGiTrack cannot see into someone else's script, but it must always
+    account for its own."""
+    from agitrack.transcripts import opencode as oc
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(
+        oc,
+        "_fetch_sessions",
+        lambda repo, n: [
+            {"id": "ses_real", "updated": 1000, "title": "my chat", "directory": str(tmp_path)},
+            {"id": "ses_bot", "updated": 2000, "title": "summary", "directory": str(tmp_path)},
+        ],
+    )
+
+    assert oc.latest_session_id(tmp_path) == "ses_bot"  # newest wins while nothing is marked
+
+    oc.mark_programmatic("ses_bot")
+
+    assert oc.latest_session_id(tmp_path) == "ses_real"
+    assert {r.id: r.programmatic for r in oc.list_sessions(tmp_path)} == {"ses_real": False, "ses_bot": True}

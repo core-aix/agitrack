@@ -8,6 +8,8 @@ itself with the new version instead of silently running stale modules.
 import threading
 import time
 
+import pytest
+
 from agitrack.update import restart as update_restart
 
 from tests.test_background import _runner
@@ -256,7 +258,7 @@ def test_background_run_execs_replacement_after_update(tmp_path, monkeypatch):
 
     executed: list[list[str]] = []
 
-    def fake_exec(cmd, log=print):
+    def fake_exec(cmd, log=print, **kwargs):  # **kwargs: the spawn-and-verify handoff passes verify=
         executed.append(cmd)
         raise _Execed()
 
@@ -283,7 +285,7 @@ def test_background_retries_and_restores_tracking_after_a_failed_restart(tmp_pat
 
     executed: list[list[str]] = []
 
-    def fake_exec(cmd, log=print):
+    def fake_exec(cmd, log=print, **kwargs):  # **kwargs: the spawn-and-verify handoff passes verify=
         executed.append(cmd)
         if len(executed) == 1:
             return  # first attempt fails
@@ -298,3 +300,84 @@ def test_background_retries_and_restores_tracking_after_a_failed_restart(tmp_pat
     # (initial setup + the post-failure re-setup).
     assert setups.count("handshake") >= 2
     assert setups.count("manual") >= 2 and setups.count("hook") >= 2
+
+
+# --- the Windows handoff: never exit until the successor provably took over -------------
+
+
+class _FakeChild:
+    """Stand-in for the spawned replacement's Popen handle."""
+
+    def __init__(self, pid=4242, exits_with=None):
+        self.pid = pid
+        self._exits_with = exits_with
+        self.returncode = None
+        self.terminated = False
+
+    def poll(self):
+        self.returncode = self._exits_with
+        return self._exits_with
+
+    def terminate(self):
+        self.terminated = True
+
+
+def test_a_replacement_that_never_comes_up_leaves_the_old_daemon_running(monkeypatch):
+    """The Windows restart was `Popen(...)` then `os._exit(0)` — fire-and-forget. `Popen`
+    returns once the process is CREATED, which says nothing about whether it went on to track
+    anything, so the documented contract ("returning means the restart failed, resume on the
+    current code") could never hold there. A successor that died on the way up left the repo
+    with NO tracker, exit code 0, and nothing in the log.
+
+    Measured cause: the successor lost the race for the repo lock its dying predecessor still
+    held, concluded a live tracker was already running, and exited 0."""
+    monkeypatch.setattr(update_restart.os, "name", "nt")
+    child = _FakeChild(exits_with=1)  # started, then died during startup
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: child)
+    exited: list = []
+    monkeypatch.setattr(update_restart.os, "_exit", lambda code: exited.append(code))
+    lines: list[str] = []
+
+    update_restart.exec_replacement(["agitrack"], log=lines.append, verify=lambda pid: False, verify_seconds=2.0)
+
+    assert exited == [], "the old daemon must NOT exit when the replacement did not take over"
+    assert any("exited during startup" in line for line in lines)
+    assert any("keeping the current version running" in line for line in lines)
+
+
+def test_a_replacement_that_takes_over_ends_the_old_daemon(monkeypatch):
+    monkeypatch.setattr(update_restart.os, "name", "nt")
+    child = _FakeChild(pid=777)
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: child)
+    exited: list = []
+
+    def _exit(code):
+        # The real os._exit NEVER returns; a double that does would let the function run on
+        # into the give-up path and terminate a successor that had already taken over.
+        exited.append(code)
+        raise _Execed()
+
+    monkeypatch.setattr(update_restart.os, "_exit", _exit)
+
+    with pytest.raises(_Execed):
+        update_restart.exec_replacement(
+            ["agitrack"], log=lambda _: None, verify=lambda pid: pid == 777, verify_seconds=5.0
+        )
+
+    assert exited == [0]  # handed over, so this process is done
+    assert not child.terminated
+
+
+def test_a_replacement_that_hangs_is_abandoned_not_left_racing(monkeypatch):
+    """A successor still alive at the deadline is terminated: it must not come up LATER and
+    fight the daemon that is about to resume tracking."""
+    monkeypatch.setattr(update_restart.os, "name", "nt")
+    child = _FakeChild()  # alive, but verify never succeeds
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: child)
+    monkeypatch.setattr(update_restart.os, "_exit", lambda code: pytest.fail("must not exit"))
+    lines: list[str] = []
+
+    update_restart.exec_replacement(["agitrack"], log=lines.append, verify=lambda pid: False, verify_seconds=0.5)
+
+    assert child.terminated
+    assert any("did not come up within" in line for line in lines)

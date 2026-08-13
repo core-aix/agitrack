@@ -2,7 +2,7 @@
 directory, from local transcripts alone — no git history, and no prior aGiTrack use.
 
 The dashboard is normally computed from ``git log`` (aGiTrack's own commit metadata).
-Backtrace instead reads the local Claude and OpenCode session transcripts for the current
+Backtrace instead reads the local session transcripts of every supported backend for the current
 directory, recovers each turn's file edits from the tool-call inputs, and maps every turn
 onto the SAME :class:`~agitrack.metrics.collect.Dashboard` / :class:`CommitStat` model the
 web dashboard already renders. So a first-time user — even in a folder that was never a git
@@ -32,7 +32,8 @@ from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
-from agitrack.transcripts import claude, opencode
+from agitrack.metrics.routing import Response
+from agitrack.transcripts import claude, codex, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
 
@@ -87,11 +88,27 @@ class BacktraceView:
         parts = [
             f"BACKTRACE — reconstructed {self.dashboard.total_commits} agent turn(s) from "
             f"{where} ({backends}) in {self.directory}.",
-            "A historical view of how past coding-agent conversations changed this directory — "
-            "not aGiTrack's live repo tracking.",
+            # Say what this is NOT, in the same breath as what it is. The two dashboards look
+            # alike by design (same pages, same charts, same trace), which is exactly why the one
+            # built from inference has to keep saying so: a reader who forgets which view they are
+            # in will otherwise read reconstructed numbers as recorded ones.
+            "THIS IS NOT AGITRACK'S ACTIVE TRACKING. Everything here is INFERRED from the agent's "
+            "own transcripts — which turn touched which file, and when — so it is less accurate "
+            "than the tracked dashboard, where each change is recorded as it is committed. Switch "
+            "views from the 'tracked' button at the top of the page.",
         ]
         if self.dropped_sessions:
             parts.append(f"Older sessions beyond the most recent {MAX_SESSIONS} were not included.")
+        set_aside = predating_count(Path(self.directory))
+        if set_aside:
+            # Never hide history without saying so. A directory recreated at a path a different
+            # project used to occupy inherits that project's transcripts, and showing them as this
+            # project's history is worse than showing nothing; so is dropping them in silence.
+            parts.append(
+                f"{set_aside} session(s) recorded at this path finished before this directory "
+                f"existed, so they belong to whatever was here before and are not shown. To "
+                f"include them anyway, set {ALL_SESSIONS_ENV}=1."
+            )
         parts.append(
             f"Tip: run '{BAKE_COMMAND}' to bake this history into your git commit "
             "messages, then launch your coding agent through 'agitrack' and everything is fully "
@@ -127,7 +144,7 @@ class _Source:
 
 
 def _discover(directory: Path) -> list[_Source]:
-    """Every Claude and OpenCode session that ran in ``directory`` or beneath it, newest
+    """Every supported-backend session that ran in ``directory`` or beneath it, newest
     first — the sessions to reconstruct. Each backend's discovery is best-effort: a failure
     in one (e.g. the OpenCode CLI missing) never blocks the other."""
     sources: list[_Source] = []
@@ -149,6 +166,20 @@ def _discover(directory: Path) -> list[_Source]:
             base = claude._first_cwd(path) or str(directory)
             export: Callable[[], ExportedSession | None] = partial(claude.export_session_at, path, collect_edits=True)
             sources.append(_Source("claude", ref.id, ref.updated, base, export, watch=(path,)))
+    except Exception:
+        pass
+    try:
+        seen_codex: set[str] = set()
+        for ref, cpath in codex.sessions_under(directory):
+            if ref.id in seen_codex:
+                continue
+            seen_codex.add(ref.id)
+            path = Path(cpath)
+            export = partial(codex.export_session_at, path, collect_edits=True)
+            # base_dir is the directory the SESSION recorded, used to relativize its (absolute)
+            # edit paths — never the rollout file's own location under ~/.codex/sessions/.
+            recorded = codex.recorded_cwd(path) or str(directory)
+            sources.append(_Source("codex", ref.id, ref.updated, recorded, export, watch=(path,)))
     except Exception:
         pass
     try:
@@ -175,7 +206,94 @@ def _discover(directory: Path) -> list[_Source]:
         sources = [replace(source, owner=mine) for source in sources]
         sources.extend(remote)
     sources.sort(key=lambda s: s.updated, reverse=True)
-    return sources
+    kept, predating = _drop_sessions_predating(directory, sources)
+    if predating:
+        # Not silent. Hiding history is the one thing this view must never do without saying so;
+        # the count rides on the view's banner and the env var below brings them back.
+        _note_predating(directory, predating)
+    return kept
+
+
+# Set to 1 to reconstruct EVERY session recorded at this path, including ones that ran before the
+# directory now standing there existed. The escape hatch for the case the birthtime test gets
+# wrong: a directory restored from a backup, or recreated by a tool, is younger than the work
+# genuinely done in it.
+ALL_SESSIONS_ENV = "AGITRACK_BACKTRACE_ALL_SESSIONS"
+
+
+def _directory_born(directory: Path) -> float:
+    """When the directory now at this path was created, or 0.0 when the OS will not say.
+
+    Only the CREATION time answers the question, and only some filesystems record it: macOS and
+    the BSDs expose ``st_birthtime``, Linux mostly does not. Modification time is no substitute —
+    it moves every time a file is written — and neither is the repository's first commit, because
+    running an agent in a directory and adopting git afterwards is the exact story this whole view
+    exists to tell. So where there is no birthtime, nothing is filtered."""
+    try:
+        stat = directory.stat()
+    except OSError:
+        return 0.0
+    born = getattr(stat, "st_birthtime", None)
+    return float(born) if isinstance(born, (int, float)) and born > 0 else 0.0
+
+
+def _drop_sessions_predating(directory: Path, sources: list[_Source]) -> tuple[list[_Source], list[_Source]]:
+    """Split ``sources`` into the ones that belong to the directory standing here, and the ones
+    that were recorded at this path before it existed.
+
+    Delete a project and create a new one at the same path and the agents' transcripts do not
+    notice: they are keyed by path, so the new project's backtrace was the old, deleted project's
+    conversations. A session that finished BEFORE this directory was created cannot be about it.
+
+    Deliberately conservative in both directions: with no birthtime nothing is dropped, and a
+    session is only dropped when it ended strictly before the directory existed (a session running
+    while the directory was recreated stays)."""
+    from agitrack.env import getenv_compat
+
+    if (getenv_compat("BACKTRACE_ALL_SESSIONS") or "").strip() in {"1", "true", "yes"}:
+        return sources, []
+    born = _directory_born(directory)
+    if not born:
+        return sources, []
+    keep: list[_Source] = []
+    older: list[_Source] = []
+    for source in sources:
+        (older if _recorded_before(source, born) else keep).append(source)
+    return keep, older
+
+
+def _recorded_before(source: _Source, born: float) -> bool:
+    """Whether this session's transcript was last WRITTEN before ``born``.
+
+    The file's mtime, not the session's recorded ``updated``: mtime is a physical fact about this
+    machine (when the bytes last landed on this disk), while ``updated`` is read out of the
+    transcript and can be any timestamp the backend chose to put there. A transcript still being
+    appended to while you recreate the directory is kept, which is the safe way round.
+
+    A session with nothing to stat is kept: this test may only ever remove history it is sure
+    about."""
+    stamps = []
+    for path in source.watch:
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return bool(stamps) and max(stamps) < born
+
+
+def _note_predating(directory: Path, dropped: list[_Source]) -> None:
+    """Remember that sessions were set aside, so the view can say so (see BacktraceView)."""
+    _PREDATING[str(directory)] = len(dropped)
+
+
+# directory → how many sessions the last discovery set aside as predating it. Module-level because
+# discovery and rendering are far apart, and this is one integer per directory.
+_PREDATING: dict[str, int] = {}
+
+
+def predating_count(directory: Path) -> int:
+    """How many sessions at this path were set aside as belonging to a previous occupant."""
+    return _PREDATING.get(str(directory), 0)
 
 
 def _local_owner(directory: Path) -> str:
@@ -245,6 +363,13 @@ def _remote_sources(directory: Path, *, local_ids: set[str]) -> list[_Source]:
 
 def _shared_base_dir(backend: str, path: Path) -> str:
     """The directory a shared session recorded as its working directory, or "" if unknown."""
+    if backend == "codex":
+        # Same reasoning as Claude below: a shared Codex session ran in someone else's checkout,
+        # so its absolute edit paths only relativize against the root recorded in its rollout.
+        try:
+            return codex.recorded_cwd(path) or ""
+        except Exception:
+            return ""
     if backend == "claude":
         try:
             return claude._first_cwd(path) or ""
@@ -262,6 +387,27 @@ def _shared_cache_dir(directory: Path) -> Path:
     return path
 
 
+def _shared_cache_name(backend: str, github_id: str, session_id: str) -> str:
+    """The file name a fetched shared transcript is cached under.
+
+    The SUFFIX names what the bytes actually are: Claude's and Codex's shared transcripts are
+    their on-disk JSONL transcripts, and only OpenCode shares a ``{info, messages}`` JSON export.
+
+    Codex additionally needs a ``rollout-…-<uuid>.jsonl`` NAME, because the rollout file name is
+    where Codex records a conversation's id: ``export_session_at`` reads the id off the path and
+    only falls back to the ``session_meta`` header. Under any other name that fallback was the
+    only thing supplying the id — and a share whose header did not survive the transport cap
+    (see ``codex.cap_shared_transcript``) then exports with an EMPTY session id. Every such
+    session's turns would collide on the same virtual shas (a sha is
+    ``backend:session:index:message``) and lose ``backend_session_id`` from their metadata.
+    """
+    if backend == "opencode":
+        return f"{github_id}--{session_id}.json"
+    if backend == "codex":
+        return f"rollout-{github_id}--{session_id}.jsonl"
+    return f"{github_id}--{session_id}.jsonl"
+
+
 def _materialize_shared(store, entry, cache: Path, backend: str, session_id: str) -> Path | None:
     """Write a shared transcript to the cache and return its path (None when unreadable).
 
@@ -272,8 +418,7 @@ def _materialize_shared(store, entry, cache: Path, backend: str, session_id: str
     text = store.read_transcript(entry)
     if not text:
         return None
-    suffix = ".jsonl" if backend == "claude" else ".json"
-    path = cache / f"{entry.github_id}--{session_id}{suffix}"
+    path = cache / _shared_cache_name(backend, entry.github_id, session_id)
     try:
         if path.exists() and path.read_text(encoding="utf-8", errors="replace") == text:
             return path
@@ -292,6 +437,10 @@ def _shared_export(backend: str, path: Path) -> "Callable[[], ExportedSession | 
     """
     if backend == "claude":
         return partial(claude.export_session_at, path, collect_edits=True)
+    if backend == "codex":
+        # Codex's shared transcript IS its rollout file, so — like Claude and unlike OpenCode —
+        # the on-disk path can be handed straight to the exporter.
+        return partial(codex.export_session_at, path, collect_edits=True)
     if backend == "opencode":
 
         def export() -> "ExportedSession | None":
@@ -370,8 +519,17 @@ def _watch_signature(sources: list[_Source]) -> tuple[dict[str, tuple], dict[str
     files: dict[str, tuple] = {}
     dirs: dict[str, tuple] = {}
     watched_dirs: set[Path] = set()
+    # EVERY backend's root, not just Claude's. Only discovered sessions contribute their own
+    # parent below, so a backend whose root is missing here is invisible until something else
+    # forces a rediscovery — the FIRST conversation in a directory is exactly the case that
+    # needs one. Codex additionally nests rollouts under `sessions/YYYY/MM/DD/`, so it supplies
+    # a chain of dirs rather than a single root (see `codex.watch_roots`).
     try:
         watched_dirs.add(claude._projects_root())
+    except Exception:
+        pass
+    try:
+        watched_dirs.update(codex.watch_roots())
     except Exception:
         pass
     for source in sources:
@@ -845,265 +1003,283 @@ def _str(query: dict[str, list[str]], key: str) -> str:
     return (query.get(key) or [""])[0]
 
 
-def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
-    """Serve a backtrace view. ``view_source`` is either a fixed :class:`BacktraceView` or a
-    zero-argument callable returning the CURRENT one, which is how the daemon serves a
-    reconstruction that keeps up with new sessions.
+class _Serving:
+    """The derived artefacts for one built view: the rendered page, the file browser, and the
+    memoized insights. A built view never changes, so everything here is computed once, lazily,
+    the first time a request sees a newer view — the watcher thread only does transcript work."""
 
-    Everything a request needs beyond the view itself — the rendered page, the file browser,
-    the insight cache — is derived once per view and rebuilt lazily the first time a request
-    sees a newer one. So the watcher thread only does transcript work; rendering happens on
-    demand, and a rebuild nobody looks at costs nothing extra."""
-    import threading as _threading
+    def __init__(self, view: BacktraceView, *, banner_html: str = "") -> None:
+        from agitrack.metrics.files import backtrace_browser
+        from agitrack.metrics.web import format_html
 
-    from agitrack.metrics import learn as learn_page
-    from agitrack.metrics import story as story_page
-    from agitrack.metrics.files import backtrace_browser
-    from agitrack.metrics.insights import build_insights, context_from_browser
-    from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
+        self.view = view
+        self.browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+        self.insight_cache: dict[tuple, list[dict]] = {}
+        self.page = format_html(
+            view.dashboard,
+            banner_html=banner_html or _banner_html(view),
+            backtrace=True,
+            insights=self.insights_for("", "", "", 0, 0),
+        ).encode("utf-8")
 
-    get_view = view_source if callable(view_source) else (lambda: view_source)
+    def insights_for(self, author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
+        # Scoped to the current filter, exactly as the live dashboard does, so narrowing the time
+        # range re-asks the question for that slice. A built view never changes, so each distinct
+        # filter is computed once and memoized (bounded).
+        from agitrack.metrics.insights import build_insights, context_from_browser
+        from agitrack.metrics.web import _filter_stats
 
-    class _Serving:
-        """The derived artefacts for one built view."""
+        key = (author, backend, model, frm, to)
+        hit = self.insight_cache.get(key)
+        if hit is None:
+            stats = _filter_stats(self.view.dashboard, author=author, backend=backend, model=model, frm=frm, to=to)
+            files, sha_paths = context_from_browser(self.browser, stats)
+            hit = build_insights(stats, files, sha_paths)
+            if len(self.insight_cache) >= 16:
+                self.insight_cache.pop(next(iter(self.insight_cache)))
+            self.insight_cache[key] = hit
+        return hit
 
-        def __init__(self, view: BacktraceView) -> None:
-            self.view = view
-            self.browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
-            self.insight_cache: dict[tuple, list[dict]] = {}
-            self.page = format_html(
-                view.dashboard,
-                banner_html=_banner_html(view),
-                backtrace=True,
-                insights=self.insights_for("", "", "", 0, 0),
-            ).encode("utf-8")
 
-        def insights_for(self, author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
-            # Scoped to the current filter, exactly as the live dashboard does, so narrowing the
-            # time range re-asks the question for that slice. A built view never changes, so each
-            # distinct filter is computed once and memoized (bounded).
-            key = (author, backend, model, frm, to)
-            hit = self.insight_cache.get(key)
-            if hit is None:
-                stats = _filter_stats(self.view.dashboard, author=author, backend=backend, model=model, frm=frm, to=to)
-                files, sha_paths = context_from_browser(self.browser, stats)
-                hit = build_insights(stats, files, sha_paths)
-                if len(self.insight_cache) >= 16:
-                    self.insight_cache.pop(next(iter(self.insight_cache)))
-                self.insight_cache[key] = hit
-            return hit
+class BacktraceScope:
+    """One directory's BACKTRACE dashboard: every route it answers, over a reconstruction.
 
-    state: dict = {"view": None, "serving": None}
-    build_lock = _threading.Lock()
+    The counterpart of :class:`agitrack.metrics.server.RepoScope`, and deliberately its twin: the
+    two dashboards are separate because the reconstruction is inferred and the live one is
+    recorded, but they are the same three pages over the same shapes of data, so they answer the
+    same paths and are mounted the same way. Nothing here touches a socket, which is what lets one
+    hub serve this view of one repository next to the live view of another.
 
-    def serving() -> "_Serving":
-        current = get_view()
-        cached = state["serving"]
-        if cached is not None and state["view"] is current:
-            return cached
-        with build_lock:
-            if state["serving"] is None or state["view"] is not current:
-                state["view"] = current
-                state["serving"] = _Serving(current)
-            return state["serving"]
+    ``view_source`` is either a fixed :class:`BacktraceView` or a zero-argument callable returning
+    the CURRENT one, which is how the daemon serves a reconstruction that keeps up with new
+    sessions: everything derived from the view is rebuilt lazily the first time a request sees a
+    newer one, so a rebuild nobody looks at costs nothing.
+    """
 
-    # The learning page works over the reconstruction too: same traces, same coach. The
-    # served directory may not be a git repo at all — learn then runs with repo=None
-    # (identity falls back to the gh login, progress sync reports unavailable, everything
-    # else works; the progress log lives in <dir>/.agitrack/learning.json either way).
-    learn_root = get_view().root or Path.cwd()
-    try:
-        learn_repo: GitRepo | None = GitRepo.discover(learn_root)
-    except Exception:
-        learn_repo = None
+    def __init__(self, view_source) -> None:
+        import threading as _threading
 
-    def learn_view(source: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
+        self._get_view = view_source if callable(view_source) else (lambda: view_source)
+        self._view: BacktraceView | None = None
+        self._serving: _Serving | None = None
+        self._build_lock = _threading.Lock()
+        # The learning page works over the reconstruction too: same traces, same coach. The served
+        # directory may not be a git repo at all — learn then runs with repo=None (identity falls
+        # back to the gh login, progress sync reports unavailable, everything else works; the
+        # progress log lives in <dir>/.agitrack/learning.json either way).
+        self.learn_root = self._get_view().root or Path.cwd()
+        try:
+            self.learn_repo: GitRepo | None = GitRepo.discover(self.learn_root)
+        except Exception:
+            self.learn_repo = None
+
+    # ----------------------------------------------------------------- view
+
+    def serving(self) -> _Serving:
+        """The newest built view's derived artefacts, rendered on first sight."""
+        current = self._get_view()
+        if self._serving is not None and self._view is current:
+            return self._serving
+        with self._build_lock:
+            if self._serving is None or self._view is not current:
+                self._view = current
+                self._serving = _Serving(current)
+            return self._serving
+
+    @property
+    def view(self) -> BacktraceView:
+        return self.serving().view
+
+    @property
+    def directory(self) -> str:
+        return self.view.directory
+
+    @property
+    def repo_name(self) -> str:
+        directory = self.view.directory
+        return Path(directory).name or directory
+
+    def learn_view(self, source: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
         # ``branch`` is ignored: the reconstruction has no git refs to switch between.
-        active = serving()
+        from agitrack.metrics.web import _filter_stats
+
+        active = self.serving()
         stats = _filter_stats(active.view.dashboard, author=source, backend="", model="", frm=frm, to=to)
         return stats, active.insights_for(source, "", "", frm, to), active.browser.files_payload()
 
-    def story_view(branch: str) -> tuple[list, dict]:
-        """What the storyline is told from HERE: the reconstructed turns and the files each
-        one touched. Same shape the live server passes, so both dashboards tell their story
-        through identical code, each from its own data."""
+    def _state(self) -> "Response":
+        """The same header control as the live view: is aGiTrack tracking this directory?
+
+        A directory that is not a git repository reports that honestly rather than hiding the
+        control: someone reading a reconstruction is exactly the person who needs to be told that
+        nothing here is being recorded, and what would change that."""
+        from agitrack.metrics.routing import json_response
+
+        if self.learn_repo is None:
+            return json_response(
+                {
+                    "running": False,
+                    "kind": "none",
+                    "label": "not a repository",
+                    "detail": (
+                        "This directory is not a Git repository, so aGiTrack cannot track work "
+                        "here. `git init` and then `agitrack` starts recording it."
+                    ),
+                    "pid": None,
+                }
+            )
+        from agitrack.proxy.background import running_mode
+
+        return json_response(running_mode(self.learn_repo))
+
+    def story_view(self, branch: str) -> tuple[list, dict]:
+        """What the storyline is told from HERE: the reconstructed turns and the files each one
+        touched. Same shape the live server passes, so both dashboards tell their story through
+        identical code, each from its own data."""
         from agitrack.metrics.insights import context_from_browser
 
-        active = serving()
+        active = self.serving()
         _files, sha_paths = context_from_browser(active.browser, active.view.dashboard.stats)
         return active.view.dashboard.stats, sha_paths
+
+    # ----------------------------------------------------------------- routes
+
+    def get(self, path: str, query: dict[str, list[str]]) -> "Response | None":
+        from agitrack.metrics import learn as learn_page
+        from agitrack.metrics import story as story_page
+        from agitrack.metrics.routing import Response, html_response, json_response
+        from agitrack.metrics.web import aggregates_payload, log_page
+
+        if path == "/state":
+            # Answered BEFORE the reconstruction is touched: "is aGiTrack running here?" is a
+            # handshake file and a pid check, and building a view to answer it would make the
+            # header's status light the most expensive thing on the page.
+            return self._state()
+        active = self.serving()
+        view, browser = active.view, active.browser
+        author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
+        frm, to = _int(query, "from", 0), _int(query, "to", 0)
+        if path in ("", "/", "/index.html"):
+            return Response(content_type="text/html; charset=utf-8", body=active.page, cache_control="no-cache")
+        if path == "/data":
+            payload = aggregates_payload(
+                view.dashboard,
+                author=author,
+                backend=backend,
+                model=model,
+                frm=frm,
+                to=to,
+                granularity=_str(query, "granularity"),
+            )
+            payload["shared_sessions"] = []
+            payload["insights"] = active.insights_for(author, backend, model, frm, to)
+            return json_response(payload)
+        if path == "/log":
+            return json_response(
+                log_page(
+                    view.dashboard,
+                    author=author,
+                    backend=backend,
+                    model=model,
+                    frm=frm,
+                    to=to,
+                    offset=_int(query, "offset", 0),
+                    limit=_int(query, "limit", 50),
+                    sort=_str(query, "sort"),
+                )
+            )
+        if path == "/diff":
+            sha = _str(query, "sha")
+            # The message rides along for the storyline, which shows it before the file changes
+            # (see web.commit_diff). Here it is the reconstructed turn.
+            message = next((stat.message for stat in view.dashboard.stats if stat.sha == sha), "")
+            return json_response({"sha": sha, "diff": view.diffs.get(sha, ""), "message": message})
+        if path == "/files":
+            return json_response({"files": browser.files_payload()})
+        if path == "/filelog":
+            return json_response(browser.file_log_payload(_str(query, "path")))
+        if path == "/filediff":
+            return json_response(browser.file_diff(_str(query, "path"), _str(query, "sha")))
+        if path == "/story":
+            # The storyline over the reconstruction: same page, same code, told from the
+            # backtraced turns instead of a branch's commits.
+            return html_response(
+                story_page.story_html(self.learn_root, banner_html=story_page.story_backtrace_banner(view.directory))
+            )
+        if path == "/story/state":
+            stats, sha_paths = self.story_view("")
+            return json_response(
+                story_page.story_state(
+                    self.learn_root,
+                    stats,
+                    sha_paths,
+                    branch="",
+                    branches=[],  # a reconstruction has no refs to switch between
+                    repo_name=self.repo_name,
+                    backtrace=True,
+                )
+            )
+        if path == "/learn":
+            return html_response(
+                learn_page.learn_html(self.learn_root, banner_html=learn_page.learn_backtrace_banner(view.directory))
+            )
+        if path == "/learn/state":
+            payload = learn_page.learn_state(self.learn_root, self.learn_repo)
+            # Reconstructed turns carry no committers, so the trace-source select usually only
+            # offers "entire team" here; harmless when some exist.
+            try:
+                payload["committers"] = sorted(
+                    {label for stat in view.dashboard.stats for label in view.dashboard.committers_of(stat)}
+                )
+            except Exception:
+                payload["committers"] = []
+            # No git refs in a reconstruction: the page hides its branch selector.
+            payload["branches"] = []
+            payload["branch"] = ""
+            payload["trace_turns"] = sum(1 for stat in view.dashboard.stats if stat.kind in learn_page._AI_KINDS)
+            return json_response(payload)
+        if path == "/learn/models":
+            return json_response(learn_page.model_options(_str(query, "backend")))
+        return None
+
+    def post(self, path: str, body: dict) -> "Response | None":
+        """The learning and story pages' POST endpoints, shared with the live server."""
+        from agitrack.metrics import learn as learn_page
+        from agitrack.metrics import story as story_page
+        from agitrack.metrics.routing import json_response
+
+        if path.startswith("/story/"):
+            payload = story_page.handle_story_post(
+                path, body, root=self.learn_root, view=self.story_view, repo_name=self.repo_name
+            )
+        else:
+            payload = learn_page.handle_learn_post(
+                path, body, root=self.learn_root, repo=self.learn_repo, view=self.learn_view
+            )
+        return None if payload is None else json_response(payload)
+
+
+def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
+    """Serve a backtrace view on its own, at the root of a server. The request logic lives in
+    :class:`BacktraceScope`; this is only the socket end of it."""
+    from agitrack.metrics.server import read_json_body, write_response
+
+    scope = view_source if isinstance(view_source, BacktraceScope) else BacktraceScope(view_source)
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             try:
                 parsed = urllib.parse.urlparse(self.path)
-                query = urllib.parse.parse_qs(parsed.query)
-                active = serving()  # the newest built view, rendered on first sight
-                view, browser, page = active.view, active.browser, active.page
-                insights_for = active.insights_for
-                if parsed.path in ("/", "/index.html"):
-                    self._respond("text/html; charset=utf-8", page, cache_control="no-cache")
-                elif parsed.path == "/data":
-                    payload = aggregates_payload(
-                        view.dashboard,
-                        author=_str(query, "author"),
-                        backend=_str(query, "backend"),
-                        model=_str(query, "model"),
-                        frm=_int(query, "from", 0),
-                        to=_int(query, "to", 0),
-                        granularity=_str(query, "granularity"),
-                    )
-                    payload["shared_sessions"] = []
-                    payload["insights"] = insights_for(
-                        _str(query, "author"),
-                        _str(query, "backend"),
-                        _str(query, "model"),
-                        _int(query, "from", 0),
-                        _int(query, "to", 0),
-                    )
-                    self._respond("application/json", json.dumps(payload).encode("utf-8"))
-                elif parsed.path == "/log":
-                    page_data = log_page(
-                        view.dashboard,
-                        author=_str(query, "author"),
-                        backend=_str(query, "backend"),
-                        model=_str(query, "model"),
-                        frm=_int(query, "from", 0),
-                        to=_int(query, "to", 0),
-                        offset=_int(query, "offset", 0),
-                        limit=_int(query, "limit", 50),
-                        sort=_str(query, "sort"),
-                    )
-                    self._respond("application/json", json.dumps(page_data).encode("utf-8"))
-                elif parsed.path == "/diff":
-                    sha = _str(query, "sha")
-                    # The message rides along for the storyline, which shows it before the
-                    # file changes (see web.commit_diff). Here it is the reconstructed turn.
-                    message = next((stat.message for stat in view.dashboard.stats if stat.sha == sha), "")
-                    self._respond(
-                        "application/json",
-                        json.dumps({"sha": sha, "diff": view.diffs.get(sha, ""), "message": message}).encode("utf-8"),
-                    )
-                elif parsed.path == "/files":
-                    self._respond("application/json", json.dumps({"files": browser.files_payload()}).encode("utf-8"))
-                elif parsed.path == "/filelog":
-                    self._respond(
-                        "application/json", json.dumps(browser.file_log_payload(_str(query, "path"))).encode("utf-8")
-                    )
-                elif parsed.path == "/filediff":
-                    self._respond(
-                        "application/json",
-                        json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
-                    )
-                elif parsed.path == "/story":
-                    # The storyline over the reconstruction: same page, same code, told from
-                    # the backtraced turns instead of a branch's commits.
-                    self._respond(
-                        "text/html; charset=utf-8",
-                        story_page.story_html(
-                            learn_root, banner_html=story_page.story_backtrace_banner(view.directory)
-                        ).encode("utf-8"),
-                        cache_control="no-cache",
-                    )
-                elif parsed.path == "/story/state":
-                    stats, sha_paths = story_view("")
-                    self._respond(
-                        "application/json",
-                        json.dumps(
-                            story_page.story_state(
-                                learn_root,
-                                stats,
-                                sha_paths,
-                                branch="",
-                                branches=[],  # a reconstruction has no refs to switch between
-                                repo_name=Path(view.directory).name or view.directory,
-                                backtrace=True,
-                            )
-                        ).encode("utf-8"),
-                    )
-                elif parsed.path == "/learn":
-                    self._respond(
-                        "text/html; charset=utf-8",
-                        learn_page.learn_html(
-                            learn_root, banner_html=learn_page.learn_backtrace_banner(view.directory)
-                        ).encode("utf-8"),
-                        cache_control="no-cache",
-                    )
-                elif parsed.path == "/learn/state":
-                    payload = learn_page.learn_state(learn_root, learn_repo)
-                    # Reconstructed turns carry no committers, so the trace-source select
-                    # usually only offers "entire team" here; harmless when some exist.
-                    try:
-                        payload["committers"] = sorted(
-                            {label for stat in view.dashboard.stats for label in view.dashboard.committers_of(stat)}
-                        )
-                    except Exception:
-                        payload["committers"] = []
-                    # No git refs in a reconstruction: the page hides its branch selector.
-                    payload["branches"] = []
-                    payload["branch"] = ""
-                    payload["trace_turns"] = sum(
-                        1 for stat in view.dashboard.stats if stat.kind in learn_page._AI_KINDS
-                    )
-                    self._respond("application/json", json.dumps(payload).encode("utf-8"))
-                elif parsed.path == "/learn/models":
-                    self._respond(
-                        "application/json", json.dumps(learn_page.model_options(_str(query, "backend"))).encode("utf-8")
-                    )
-                else:
-                    self.send_error(404, "not found")
+                write_response(self, scope.get(parsed.path, urllib.parse.parse_qs(parsed.query)))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
-            # The learning page's POST endpoints, shared with the live server (see
-            # learn.handle_learn_post). Bodies are JSON; a beacon flush may arrive
-            # without an application/json header, so parse regardless of content type.
             try:
                 parsed = urllib.parse.urlparse(self.path)
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
-                try:
-                    body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
-                except json.JSONDecodeError:
-                    body = {}
-                if not isinstance(body, dict):
-                    body = {}
-                if parsed.path.startswith("/story/"):
-                    payload = story_page.handle_story_post(
-                        parsed.path,
-                        body,
-                        root=learn_root,
-                        view=story_view,
-                        repo_name=Path(get_view().directory).name or get_view().directory,
-                    )
-                else:
-                    payload = learn_page.handle_learn_post(
-                        parsed.path, body, root=learn_root, repo=learn_repo, view=learn_view
-                    )
-                if payload is None:
-                    self.send_error(404, "not found")
-                    return
-                self._respond("application/json", json.dumps(payload).encode("utf-8"))
+                write_response(self, scope.post(parsed.path, read_json_body(self)))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
-
-        def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
-            from agitrack.metrics.server import maybe_gzip
-
-            # Same compression as the live server: the backtrace page is the same ~90 KB of
-            # text, and it is usually being read over the connection that made it slow.
-            body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            if encoding:
-                self.send_header("Content-Encoding", encoding)
-            self.send_header("Content-Length", str(len(body)))
-            # HTML pages use "no-cache" so the browser's back/forward cache can restore
-            # them instantly (see the live server's _respond); data stays "no-store".
-            self.send_header("Cache-Control", cache_control)
-            self.end_headers()
-            self.wfile.write(body)
 
         def log_message(self, *args: object) -> None:
             """Stay quiet — this is a foreground tool, not a web log."""
@@ -1809,8 +1985,10 @@ def render_backtrace_text(directory: Path) -> str:
 
 
 def _empty_message(directory: Path) -> str:
+    from agitrack.backends.proxy_agents import backend_phrase
+
     return (
         f"No local coding-agent history found for {_abbreviate_home(str(directory))}.\n"
-        "Backtrace reconstructs past Claude or OpenCode sessions that ran in this directory "
+        f"Backtrace reconstructs past {backend_phrase()} sessions that ran in this directory "
         "(or a subdirectory) and changed files — none were found here."
     )

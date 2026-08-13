@@ -36,6 +36,7 @@ from agitrack.git import hooks as git_hooks
 from agitrack.metrics.collect import _parse_commit, build_dashboard, collect_manual_pending
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.transcripts.opencode import SessionTurn
+from agitrack.backends.proxy_agents import available_backends
 
 
 def _init_repo(path: Path) -> GitRepo:
@@ -392,7 +393,7 @@ def test_proxy_no_worktree_attributes_an_agent_commit_made_mid_turn(tmp_path, ma
     assert "do x" in msg
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 @pytest.mark.parametrize("manual", [True, False], ids=["manual-commits", "auto-commits"])
 def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, manual, backend_name):
     # Parity with the daemon: when the agent commits mid-turn in a no-worktree interactive
@@ -437,7 +438,7 @@ def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, 
     assert "This commit accounts" in body  # the explanatory note
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_proxy_no_worktree_stop_finalize_does_not_cover_an_unfinished_turn(tmp_path, backend_name):
     # The constraint, interactive side: the exit finalize (require_complete=False) keeps a
     # still-running turn to capture in-flight work, but it must not attribute the agent's mid-turn
@@ -1009,7 +1010,7 @@ def test_noworktree_auto_force_fold_lands_even_with_summary_pending(tmp_path):
     assert runner._manual_pending_count() == 0
 
 
-@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("backend_name", available_backends())
 def test_noworktree_auto_new_prompt_while_summarizing_does_not_offer_user_commit(tmp_path, backend_name):
     # Reported bug: submitting a NEW prompt while aGiTrack is still summarizing the just-finished
     # turn (no-worktree auto) popped the "commit your uncommitted changes" modal — but those
@@ -2417,7 +2418,7 @@ def test_nothing_is_reported_when_no_chain_is_dropped(tmp_path):
 
 # --- a repo that TRACKS the agent scaffolding dirs ---------------------------
 #
-# Committing `.claude/settings.json`, a `.claude/commands/` dir or an `.opencode/` config is
+# Committing `.claude/settings.json`, a `.claude/commands/` dir, a `.codex/` or an `.opencode/` config is
 # ordinary practice — a team shares its agent setup the same way it shares an editorconfig. But
 # EVERY "has the working tree changed?" question in manual / no-worktree / background mode is a
 # comparison between `snapshot_worktree_tree()` and some commit's tree, and the snapshot
@@ -2587,3 +2588,56 @@ def test_the_proxys_own_manual_copy_agrees_with_the_tracker_in_a_scaffolded_repo
     assert runner._manual_record(_agent_body("work", 10)) is not None
     _git(repo, "checkout", "--", "a.txt")
     assert runner._reset_stale_manual_ref() is True
+
+
+def test_the_project_post_commit_hook_runs_on_an_ORDINARY_commit(tmp_path):
+    """B6 / C36: the `exit 0` guard fired on every commit WITHOUT aGiTrack metadata — i.e. every
+    ordinary human commit — and returned before the chain block at the bottom of the script. A
+    project's own post-commit hook (a CI trigger, a notification, a ctags rebuild) went silently
+    dead from `agitrack -b` onward, and `-b stop` did not bring it back; only `--remove-hooks`
+    did. `prepare-commit-msg` got this right all along with its `_agitrack_chain()` helper."""
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    ran = tmp_path / "project-hook-ran.txt"
+    existing = hooks_dir / "post-commit"
+    # as_posix(): git hooks run under sh even on Windows, where a WindowsPath interpolates as
+    # C:\Users\...\project-hook-ran.txt and sh eats the backslashes as escapes — the hook then
+    # runs (which is what this asserts) but writes to a mangled path, so the test failed for a
+    # reason that has nothing to do with hook chaining.
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran.as_posix()}\n", encoding="utf-8")
+    existing.chmod(0o755)
+
+    assert git_hooks.install_manual_commit_hooks(hooks_dir)
+
+    # A purely human commit: no aGiTrack turn pending, so no metadata lands in the message.
+    (tmp_path / "b.txt").write_text("mine\n", encoding="utf-8")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "an ordinary human commit")
+
+    assert "# aGiTrack Metadata" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert ran.exists(), "the project's own post-commit hook never ran"
+
+
+def test_the_project_post_commit_hook_still_runs_on_a_folded_commit(tmp_path):
+    """The other branch: a commit that DOES carry aGiTrack metadata advances the latent refs and
+    must still hand off to the project's hook."""
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    ran = tmp_path / "project-hook-ran.txt"
+    existing = hooks_dir / "post-commit"
+    existing.write_text(f"#!/bin/sh\necho ran >> {ran.as_posix()}\n", encoding="utf-8")  # as_posix: see above
+    existing.chmod(0o755)
+
+    assert git_hooks.install_manual_commit_hooks(hooks_dir)
+    trailer = build_manual_squash_trailer(agitrack_session_id="s", latent_bodies=[_agent_body("do x", 10)])
+    _setup_manual_ref_and_trailer(repo, trailer)
+
+    (tmp_path / "a.txt").write_text("one\nedit\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My change")
+
+    assert "# aGiTrack Metadata" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert repo.rev_parse("refs/agitrack/manual/s") == repo.rev_parse("HEAD")  # the fold still happened
+    assert ran.exists()

@@ -6,6 +6,8 @@ from shutil import get_terminal_size
 from dataclasses import dataclass
 from pathlib import Path
 
+from agitrack.console import stdin_is_interactive, stdout_is_interactive
+
 
 AGITRACK_COMMANDS = {
     ":help": "show aGiTrack commands",
@@ -41,10 +43,16 @@ class PromptState:
 
 
 class AgitrackPrompt:
-    def __init__(self, state_provider) -> None:
+    def __init__(self, state_provider, *, human_stream=None) -> None:
         self.state_provider = state_provider
+        # Where the "> " marker goes. Under --json-events stdout is a MACHINE stream and this
+        # marker is written with no newline, so the next event line came out glued to it as
+        # `> {"type": "response", …}` — the one event carrying the answer, and the only one that
+        # was not parseable JSON (json-ok=1, non-json=7). codex and opencode escaped it only
+        # because their streamed reply happened to terminate the line first.
+        self._human = human_stream if human_stream is not None else sys.stdout
         self.session: Any = None
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if stdin_is_interactive() and stdout_is_interactive():
             try:
                 from prompt_toolkit import PromptSession
 
@@ -58,7 +66,10 @@ class AgitrackPrompt:
 
     def prompt(self) -> str:
         if self.session is None:
-            return input("> ")
+            # `input(prompt)` always writes to stdout, so write the marker ourselves.
+            self._human.write("> ")
+            self._human.flush()
+            return input()
         return self.session.prompt("> ")
 
     def _bottom_toolbar(self):

@@ -1,7 +1,7 @@
 """When the live dashboard would be empty but a reconstruction would not.
 
 A repo only has live-dashboard history once aGiTrack has committed in it. Someone who has been
-coding with Claude or OpenCode *without* aGiTrack therefore gets an empty dashboard — while their
+coding with a supported agent CLI *without* aGiTrack therefore gets an empty dashboard — while their
 past conversations are sitting right there in the backends' local transcripts, which is exactly
 what ``--backtrace`` reconstructs. Showing them an empty page in that situation is the worst
 answer available: it tells them there is nothing to see when there is.
@@ -65,6 +65,12 @@ def has_tracked_tokens(repo: GitRepo) -> bool:
         )
     except Exception:
         return True  # never divert on a failed probe
+    if getattr(result, "returncode", 0) not in (0, 1):
+        # git ran and FAILED (a contended index.lock while the tracker commits, an unreadable
+        # pack, a repo mid-rewrite). Empty stdout then means "could not tell", not "nothing
+        # tracked" — and answering "nothing tracked" sends a fully tracked repository to the
+        # reconstruction. Exit 1 is git's ordinary "no commit matched", which IS an answer.
+        return True
     return bool(result.stdout.strip())
 
 
@@ -102,7 +108,7 @@ def should_show_backtrace(repo: GitRepo, directory: Path | None = None) -> bool:
 SUBSTITUTION_NOTICE = (
     "This repository has no recorded AI work yet — no aGiTrack-tracked commits, or none carrying "
     "token counts — so the live dashboard would have nothing to show. Showing the BACKTRACE view "
-    "instead, reconstructed from your local Claude/OpenCode sessions.\n"
+    "instead, reconstructed from your local coding-agent sessions.\n"
     "It infers which past conversations changed which files. Commit through aGiTrack and that link "
     "is recorded rather than inferred: each commit carries the prompts, the agent's replies and the "
     "token counts that produced exactly those lines."
@@ -110,7 +116,7 @@ SUBSTITUTION_NOTICE = (
 
 STARTUP_HINT = (
     "This repository has no recorded AI work yet (no aGiTrack-tracked commits, or none carrying "
-    "token counts), but local Claude/OpenCode sessions for it were found. `agitrack --backtrace` "
+    "token counts), but local coding-agent sessions for it were found. `agitrack --backtrace` "
     "reconstructs that history — how past conversations changed these files — so you can see it "
     "before aGiTrack has tracked anything.\n"
     "Once you commit through aGiTrack, the history is recorded rather than reconstructed: prompts, "

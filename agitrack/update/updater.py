@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
 
-from agitrack.proc import console_isolation_kwargs, detach_kwargs
+from agitrack.proc import UTF8_TEXT, console_isolation_kwargs, detach_kwargs, fs_path
 
 import agitrack
 
@@ -135,7 +135,7 @@ def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subproces
         return subprocess.run(
             ["git", *args],
             cwd=str(cwd),
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -178,7 +178,7 @@ def detect_source_repo() -> Path | None:
     result = _git(["rev-parse", "--show-toplevel"], root)
     if result.returncode != 0:
         return None
-    return Path(result.stdout.strip())
+    return fs_path(result.stdout.strip())  # git printed UTF-8; see proc.fs_path
 
 
 class Updater:
@@ -395,7 +395,7 @@ class Updater:
         try:
             result = subprocess.run(
                 [*pip, "index", "versions", DIST_NAME],
-                text=True,
+                **UTF8_TEXT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -824,11 +824,14 @@ class Updater:
         try:
             result = subprocess.run(
                 [python, "-m", "pip", "--version"],
-                text=True,
+                **UTF8_TEXT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=_NET_TIMEOUT,
+                # Reached from the daemons' periodic self-update check, which runs console-less;
+                # without this each check flashes a console window (proc.py).
+                **console_isolation_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -867,7 +870,7 @@ class Updater:
             # runs to completion and the package is never left half-removed.
             result = subprocess.run(
                 upgrade_cmd,
-                text=True,
+                **UTF8_TEXT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -891,7 +894,7 @@ class Updater:
             if brew is not None:
                 result = subprocess.run(
                     [brew, "upgrade", DIST_NAME],
-                    text=True,
+                    **UTF8_TEXT,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,

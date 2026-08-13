@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -290,3 +291,94 @@ def test_build_bwrap_command_skips_missing_agent_dir(monkeypatch, tmp_path):
     # bwrap errors on a missing bind source, so a non-existent agent dir is skipped.
     args = sandbox.build_bwrap_command(str(base), str(wt))
     assert str(missing) not in args
+
+
+# --- a backend's OWN sandbox must stand down inside aGiTrack's -----------------
+#
+# Codex wraps each command it runs in macOS `sandbox-exec`, and aGiTrack wraps the whole backend
+# in `sandbox-exec` too. Seatbelt does not nest: with both on, every filesystem probe Codex made
+# failed, it escalated to asking the user to approve each command by hand, and the turn produced
+# NO file edit at all (observed on a live run). These pin the fix and its one condition.
+
+
+class _FakeRunner:
+    """Just enough of a runner for _relax_nested_backend_sandbox, which only reads ``backend``.
+
+    A real ProxyRunner can't be used here: ``backend`` is a Session-backed property, so setting
+    it on a bare instance raises. The method under test is pure — command in, command out.
+    """
+
+    def __init__(self, backend_name):
+        self.backend = SimpleNamespace(name=backend_name)
+
+
+def _relax(backend_name, command):
+    from agitrack.proxy.runner import ProxyRunner
+
+    return ProxyRunner._relax_nested_backend_sandbox(_FakeRunner(backend_name), command)
+
+
+def test_codex_inner_sandbox_is_disabled_when_agitrack_confines(monkeypatch):
+    # seatbelt forced ON rather than inherited from the host: the relaxation is macOS-only, so
+    # reading the real platform made this assert the macOS branch on a Mac and the *opposite*
+    # branch on Linux/Windows, where it failed. Both branches are pinned here instead, and the
+    # test now means the same thing on every runner.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
+    command = ["codex", "-C", "/repo/.agitrack/worktrees/s1"]
+
+    relaxed = _relax("codex", command)
+
+    assert relaxed[: len(command)] == command  # the flags are APPENDED, never reordered
+    # They must land on the codex command itself; appending after the sandbox wrapper would
+    # hand Codex's own `-c` override to sandbox-exec instead.
+    assert relaxed[-2:] == ["-c", 'sandbox_mode="danger-full-access"']
+
+
+def test_codex_keeps_its_own_sandbox_where_the_two_compose(monkeypatch):
+    # The other half of the trade: only seatbelt fails to nest. On Linux, bwrap composes with
+    # Codex's Landlock/seccomp sandbox, so Codex keeps its own outside-the-repo protection and
+    # nothing is appended. Without this, narrowing the relaxation to macOS could regress into a
+    # blanket "always disable Codex's sandbox" and no test would notice.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
+    command = ["codex", "-C", "/repo/.agitrack/worktrees/s1"]
+
+    assert _relax("codex", command) == command
+
+
+def test_a_non_codex_backend_is_left_alone():
+    for name in ("claude", "opencode"):
+        assert _relax(name, ["x", "--flag"]) == ["x", "--flag"]
+
+
+def test_will_confine_is_false_without_a_sandbox_or_for_an_in_place_session(tmp_path, monkeypatch):
+    base = tmp_path / "repo"
+    base.mkdir()
+    worktree = base / ".agitrack" / "worktrees" / "s1"
+    worktree.mkdir(parents=True)
+
+    # An in-place (legacy) session has nothing to isolate, so nothing is relaxed either.
+    assert sandbox.will_confine(base=str(base), worktree=str(base)) is False
+
+    # Confinement switched off => the backend keeps its own sandbox, which is then the only one.
+    monkeypatch.setattr(sandbox, "is_enabled", lambda: False)
+    assert sandbox.will_confine(base=str(base), worktree=str(worktree)) is False
+
+    # Enabled but no enforcement mechanism available on the platform.
+    monkeypatch.setattr(sandbox, "is_enabled", lambda: True)
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
+    monkeypatch.setattr(sandbox, "_have_bwrap", lambda: False)
+    assert sandbox.will_confine(base=str(base), worktree=str(worktree)) is False
+
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
+    assert sandbox.will_confine(base=str(base), worktree=str(worktree)) is True
+
+
+def test_codex_install_root_stays_writable_for_self_update(monkeypatch, tmp_path):
+    # `codex update` rewrites ~/.codex/packages/standalone/releases/<version>/ and repoints the
+    # ~/.local/bin launcher. Confining those would make the backend unable to update itself.
+    monkeypatch.setattr(os.path, "expanduser", lambda p: p.replace("~", str(tmp_path)))
+    dirs = sandbox.agent_writable_dirs()
+
+    # Compare the basename, not a "/.codex" suffix: `agent_writable_dirs` builds these with
+    # os.path.join, so on Windows the separator is a backslash and the suffix never matched.
+    assert any(os.path.basename(d) == ".codex" for d in dirs), dirs

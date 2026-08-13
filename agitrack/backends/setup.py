@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.console import ask, progress_ticker, stdin_is_interactive, stdout_is_interactive
 from agitrack.proc import resolve_subprocess_command, which_executable
 
 # Per-backend facts used to build a single install hint that covers macOS, Linux, AND
@@ -18,6 +19,15 @@ _BACKEND_INSTALL = {
         "url": "https://docs.claude.com/en/docs/claude-code",
         "unix": "curl -fsSL https://claude.ai/install.sh | bash",
         "npm": "@anthropic-ai/claude-code",
+    },
+    "codex": {
+        "label": "Codex CLI",
+        "url": "https://developers.openai.com/codex/cli",
+        # The chatgpt.com installer endpoint returns HTTP 403 from some networks (confirmed by
+        # two independent live-test runs), so npm — which the same hint already offers and which
+        # works everywhere Node does — is the primary suggestion for Codex.
+        "unix": "npm install -g @openai/codex",
+        "npm": "@openai/codex",
     },
     "opencode": {
         "label": "OpenCode",
@@ -41,7 +51,33 @@ def backend_installed(name: str) -> bool:
     # which_executable (not shutil.which) so a Windows backend is "installed" only when a
     # real runnable shim (.exe/.cmd/.bat) exists — not a half-installed npm package that left
     # only an extensionless shell script or a .ps1, which aGiTrack can't actually launch.
-    return which_executable(_executable(name)) is not None
+    return backend_executable(name) is not None
+
+
+def backend_executable(name: str) -> str | None:
+    """The path to ``name``'s CLI, searching PATH and then the directories the installers use.
+
+    Detection used to be PATH-only, so a working `claude` sitting at ``%APPDATA%\\npm`` or
+    ``~/.local/bin`` was reported "not installed" — with a reinstall recipe whose official
+    installer drops it in that same directory, so a naive user could loop forever. The damning
+    part is that ``_candidate_bin_dirs()`` already hardcodes exactly those paths, with the
+    comment "claude.cmd lands here" — but its only call site was INSIDE the install routine,
+    after a successful install. It was never consulted when deciding whether one was missing.
+
+    Found-off-PATH also adds the directory to this process's PATH, so the launch that follows
+    works rather than reporting success and then failing to spawn."""
+    executable = _executable(name)
+    found = which_executable(executable)
+    if found is not None:
+        return found
+    for directory in _candidate_bin_dirs(which_executable("npm"), subprocess.run):
+        if not directory or not os.path.isdir(directory):
+            continue
+        candidate = which_executable(os.path.join(directory, executable))
+        if candidate is not None:
+            _add_dirs_to_path([directory])
+            return candidate
+    return None
 
 
 def install_hint(name: str) -> str:
@@ -101,25 +137,28 @@ def _install_node_with_winget(
     winget = which("winget")
     if not winget:
         return None
-    output_fn("Node.js (needed to install the agent CLI) was not found; installing it with winget…\n")
+    output_fn("\nNode.js (needed to install the agent CLI) was not found; installing it with winget…")
+    output_fn("This can take a few minutes and installs silently. Please wait…\n")
     try:
-        run(
-            resolve_subprocess_command(
-                [
-                    winget,
-                    "install",
-                    "-e",
-                    "--id",
-                    "OpenJS.NodeJS",
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ]
-            ),
-            timeout=900,
-        )
+        with progress_ticker("still installing Node.js", output_fn=output_fn):
+            run(
+                resolve_subprocess_command(
+                    [
+                        winget,
+                        "install",
+                        "-e",
+                        "--id",
+                        "OpenJS.NodeJS",
+                        "--silent",
+                        "--accept-package-agreements",
+                        "--accept-source-agreements",
+                    ]
+                ),
+                timeout=900,
+            )
     except (OSError, subprocess.SubprocessError):
         return None
+    output_fn("")  # close any partial line winget left behind
     return _npm_command(which)
 
 
@@ -151,8 +190,9 @@ def _candidate_bin_dirs(npm: str | None, run: Callable[..., subprocess.Completed
                 dirs.append(os.path.join(base, "nodejs"))
     else:
         dirs += [
-            os.path.join(home, ".local", "bin"),  # claude's official installer target
+            os.path.join(home, ".local", "bin"),  # claude's AND codex's official installer target
             os.path.join(home, ".opencode", "bin"),  # opencode's installer target
+            os.path.join(home, ".codex", "bin"),  # codex's standalone package tree
             os.path.join(home, "bin"),
             "/usr/local/bin",
             "/opt/homebrew/bin",
@@ -172,6 +212,44 @@ def _add_dirs_to_path(dirs: list[str]) -> None:
         os.environ["PATH"] = os.pathsep.join([*additions, *parts])
 
 
+def _installed_bin_dir(name: str) -> str | None:
+    """The directory the freshly-installed backend CLI actually landed in, resolved from the
+    executable itself rather than guessed — that is the one directory worth putting on the
+    user's PATH (the candidate list above is deliberately broad and mostly irrelevant here)."""
+    found = which_executable(_executable(name))
+    return os.path.dirname(found) if found else None
+
+
+def _offer_path_for(
+    name: str,
+    label: str,
+    *,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> None:
+    """After a successful install, offer to make the CLI reachable from the user's other
+    terminals too. Best-effort and never fatal: the backend already runs under aGiTrack, so
+    nothing here may stand between the user and their session."""
+    from agitrack.path_setup import offer_to_persist_path
+
+    try:
+        directory = _installed_bin_dir(name)
+        if not directory:
+            return
+        offer_to_persist_path(
+            directory,
+            label=label,
+            command=_executable(name),
+            input_fn=input_fn,
+            output_fn=output_fn,
+            # Editing the user's profile needs their consent, so without a terminal to ask
+            # on (a scripted/piped run) it only prints what to do by hand.
+            interactive=stdin_is_interactive() and stdout_is_interactive(),
+        )
+    except Exception as error:  # a PATH convenience must never break the install it follows
+        output_fn(f"  (could not check your PATH: {error})\n")
+
+
 def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str], str | None]):
     """Ordered (description, command) install attempts for the current OS. POSIX prefers the
     backend's self-contained official installer (no Node needed); npm is the cross-platform
@@ -189,15 +267,20 @@ def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str],
 def install_backend(
     name: str,
     *,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     which: Callable[[str], str | None] = shutil.which,
+    persist_path: bool = True,
 ) -> bool:
     """Install the single backend CLI `name` automatically (the user opted in at the prompt).
 
     Cross-platform: the backend's official install script on macOS/Linux, npm everywhere,
     with a winget Node bootstrap on Windows when npm is absent. On success the installed
-    CLI's directory is added to this process's PATH so it runs immediately — no restart.
+    CLI's directory is added to this process's PATH so it runs immediately — no restart —
+    and, with the user's consent, to their shell profile / user PATH so the command also
+    works in their OTHER terminals (see agitrack/path_setup.py; ``persist_path=False`` skips
+    that offer for callers with no terminal to ask on).
     Returns True only when the backend is actually runnable afterwards. Never raises."""
     info = _BACKEND_INSTALL.get(name)
     if info is None:
@@ -215,12 +298,20 @@ def install_backend(
         output_fn(install_hint(name))
         return False
     for description, command in plan:
-        output_fn(f"\nInstalling {info['label']} — {description}\n")
+        # A leading blank line separates this step from whatever ran before it, and the
+        # "may take a while" note plus the ticker keep the terminal from looking frozen:
+        # these installers download hundreds of megabytes and can print NOTHING for minutes.
+        output_fn(f"\nInstalling {info['label']} — {description}")
+        output_fn("This can take several minutes and may show no output while it downloads. Please wait…\n")
         try:
-            result = run(command, timeout=900)
+            with progress_ticker(f"still installing {info['label']}", output_fn=output_fn):
+                result = run(command, timeout=900)
         except (OSError, subprocess.SubprocessError) as error:
-            output_fn(f"  that attempt failed: {error}\n")
+            output_fn(f"\n  that attempt failed: {error}\n")
             continue
+        # The installer's own output may end mid-line; close it so the next message (and the
+        # next question) starts on a line of its own.
+        output_fn("")
         if getattr(result, "returncode", 1) != 0:
             output_fn("  that attempt did not complete successfully.\n")
             continue
@@ -233,6 +324,8 @@ def install_backend(
 
             ensure_powershell_execution_policy(output_fn)
             output_fn(f"\n{info['label']} installed.\n")
+            if persist_path:
+                _offer_path_for(name, info["label"], input_fn=input_fn, output_fn=output_fn)
             return True
     output_fn(f"\n{info['label']} could not be made runnable automatically.\n")
     output_fn(install_hint(name))
@@ -242,23 +335,25 @@ def install_backend(
 def select_default_backend(
     config,
     *,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
     install_fn: Callable[..., bool] = install_backend,
 ) -> str:
     """First-run backend setup. Lists each agent backend ONCE with its install status, then asks
     which to use as the DEFAULT in a single prompt. The number selects the default coding agent;
     a not-yet-installed choice is installed first (if that install is declined or fails it stays
-    the default and the launch-time gate offers to install it before the agent starts). Pressing
+    the default; the launch-time gate then offers to SWITCH to an installed backend or prints
+    manual instructions — it does not install, see ensure_installed_backend). Pressing
     Enter accepts the default — the first installed backend, or the first listed when none is
     installed yet (then installed at launch). Saves and returns the chosen default, then explains
     how to change it later."""
     names = available_backends()
     while True:
         installed = [name for name in names if backend_installed(name)]
-        # Leading blank line so this question is visually separated from the preceding startup
-        # output (the update prompt / git-identity setup).
-        output_fn("\nAgent backends:")
+        # Two leading newlines so this section is visually separated from the preceding startup
+        # output (the update prompt / git-identity setup): the first ends any partial line a
+        # subprocess left behind, the second leaves a blank line before the list.
+        output_fn("\n\nAgent backends:")
         for index, name in enumerate(names, start=1):
             output_fn(f"  {index}. {name} ({'installed' if name in installed else 'not installed'})")
         default_index = (names.index(installed[0]) + 1) if installed else 1
@@ -275,7 +370,25 @@ def select_default_backend(
         if answer.isdigit() and 1 <= int(answer) <= len(names):
             chosen = names[int(answer) - 1]
             if chosen not in installed:
-                install_fn(chosen, output_fn=output_fn)  # explicit pick of an uninstalled one → install now
+                # CONFIRM FIRST. Typing a number used to run `curl … | bash` immediately — no
+                # y/N, no abort, the only disclosure a trailing clause on the question above —
+                # so a user picking the agent they PLANNED to use later got an unannounced
+                # ~291 MB download piped from the network into a shell. Declining is not a
+                # dead end: the choice is still saved, and the launch-time gate offers to
+                # install it when they actually start a session.
+                hint = install_hint(chosen)
+                output_fn(f"\n{chosen} is not installed yet.\n\n{hint}\n")
+                consent = input_fn(f"Install {chosen} now? [y/N]: ").strip().lower()
+                if consent.startswith("y"):
+                    # The same input_fn is handed down so the installer's own questions (notably
+                    # the PATH offer that follows it) are drained and answerable exactly like this.
+                    install_fn(chosen, input_fn=input_fn, output_fn=output_fn)
+                else:
+                    output_fn(
+                        f"Not installing. {chosen} stays your default — aGiTrack offers to "
+                        "install it again when you start a session, or install it yourself with "
+                        "the command above."
+                    )
             break
         output_fn("Please enter a valid number, or press Enter for the default.")
     config.default_backend = chosen
@@ -288,7 +401,7 @@ def _explain_default_backend_switching(default: str, *, output_fn: Callable[[str
     a single run, or persistently for this repo or globally via the in-app settings menu."""
     output_fn(f"\nDefault coding agent set to {default}.")
     output_fn("You can change it later:")
-    output_fn("  - for a single run:           agitrack --backend <claude|opencode>")
+    output_fn("  - for a single run:           agitrack --backend <" + "|".join(available_backends()) + ">")
     output_fn("  - for this repo or globally:  open the aGiTrack menu (Ctrl-G by default) -> Settings ->")
     output_fn('                                "Default coding agent", choosing repo or global scope when saving.')
 
@@ -297,7 +410,7 @@ def select_default_summarizer_model(
     config,
     backend_name: str,
     *,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
 ) -> None:
     """First-run setup (after the backend is chosen) for the model aGiTrack uses to summarize
@@ -332,13 +445,13 @@ def select_default_summarizer_model(
         )
         return
     ordered = [smallest, *(m for m in models if m != smallest)]
-    output_fn("\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
+    output_fn("\n\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
     for index, model in enumerate(ordered, start=1):
         tag = "  (smallest — recommended)" if model == smallest else ""
         output_fn(f"  {index}. {model}{tag}")
     same_index = len(ordered) + 1
     output_fn(f"  {same_index}. Same as the agent's session model")
-    raw = input_fn(f"Enter a number [1-{same_index}] (default 1): ").strip()
+    raw = input_fn(f"\nEnter a number [1-{same_index}] (default 1): ").strip()
     choice = raw or "1"
     if not choice.isdigit() or not 1 <= int(choice) <= same_index:
         config.summarization_model = ordered[0]  # invalid input → the recommended default
@@ -352,7 +465,7 @@ def ensure_installed_backend(
     config,
     *,
     interactive: bool,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] = ask,
     output_fn: Callable[[str], None] = print,
 ) -> str:
     """Make sure the backend that is about to run is installed before launching it. This is a
@@ -370,7 +483,7 @@ def ensure_installed_backend(
     while True:
         if backend_installed(name):
             return name
-        output_fn(f"\nThe selected backend '{name}' is not installed.\n")
+        output_fn(f"\n\nThe selected backend '{name}' is not installed.\n")
         output_fn(install_hint(name))
         installed = [other for other in names if backend_installed(other)]
         prompt = "\nPress Enter after installing it to retry"

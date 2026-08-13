@@ -129,7 +129,10 @@ def _render_template(*, repo_name: str, repo_path: str, banner_html: str, payloa
         .replace("__PREBOOT_CSS__", PREBOOT_CSS)
         .replace("__PREBOOT_HTML__", PREBOOT_HTML)
         .replace("__FONT_LINKS__", FONT_LINKS)
-        .replace("__DATA__", payload)
+        .replace("__DATA__", payload),
+        # The hub bar keeps you on the page you are reading when you switch
+        # repository or view; the dashboard IS the mount root, so no sub-path.
+        __UI_HUBBAR_PAGE__="",
     )
 
 
@@ -841,6 +844,22 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
    Opaque so page content scrolls cleanly beneath it; the filter bar's top offset is set to this
    strip's height in JS so the two stack instead of overlapping. */
 __UI_BANNER_CSS__
+__UI_HUBBAR_CSS__
+/* The uncommitted-work notice. Amber like every other "this is not the whole story" surface on
+   these pages (the backtrace strip, the update banner), so the colour means one thing throughout. */
+.pending{display:flex;gap:11px;align-items:flex-start;margin:18px 0 0;padding:11px 14px;
+  background:rgba(255,180,84,.07);border:1px solid var(--amber-dim);color:var(--warn);
+  font-size:12.5px;line-height:1.55}
+.pending .pd-icon{flex:none;font-size:14px;line-height:1.4}
+.pending .pd-text{flex:1}
+.pending .pd-link{flex:none;color:var(--phosphor);border-bottom:1px solid var(--phosphor-dim);white-space:nowrap}
+.pending .pd-link:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
+/* The empty state is INFORMATION, not a warning: a repository with no agent history has done
+   nothing wrong. Neutral panel, not the amber "something is missing" strip. */
+.emptystate{margin:18px 0 0;padding:16px 18px;background:var(--panel);border:1px solid var(--line)}
+.emptystate .es-title{color:var(--phosphor);font-family:var(--display);font-size:19px;margin-bottom:6px}
+.emptystate .es-text{color:var(--fg-dim);font-size:12.5px;line-height:1.6}
+@media (max-width:760px){.pending{flex-wrap:wrap}.pending .pd-link{width:100%}}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}
@@ -1215,6 +1234,7 @@ footer .flink:hover{text-decoration:underline}
 </head>
 <body>
 __PREBOOT_HTML__
+__UI_HUBBAR_HTML__
 <div class="topbanners">
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
 __UPDATE_BANNER__
@@ -1247,6 +1267,23 @@ __UPDATE_BANNER__
     </div>
     <button class="reset" id="reset">reset</button>
     <span class="loading" id="loading" hidden aria-live="polite"><span class="spin"></span>loading…</span>
+  </div>
+
+  <!-- Work the BACKTRACE can see and this dashboard cannot: sessions or turns no aGiTrack
+       commit covers. The two views are deliberately separate (one is recorded, the other
+       inferred), but a page that shows only what it recorded while saying nothing about what
+       it knows it is missing is reporting "this is everything" when it is not. -->
+  <!-- Why this dashboard is empty, when it is. Three different reasons need three different
+       answers, and none of them is a blank page (see agitrack/metrics/pending.py). -->
+  <div class="emptystate" id="emptystate" hidden>
+    <div class="es-title" id="emptystate-title"></div>
+    <div class="es-text" id="emptystate-text"></div>
+  </div>
+
+  <div class="pending" id="pending" hidden>
+    <span class="pd-icon">&#9888;</span>
+    <span class="pd-text" id="pending-text"></span>
+    <a class="pd-link" id="pending-link" href="#">see it in the backtrace &rarr;</a>
   </div>
 
   <h2 class="section">overview</h2>
@@ -1399,6 +1436,7 @@ const LIVE = location.protocol.indexOf("http") === 0;
 // are hidden (see hideFabricatedChrome). Everything shown is real transcript data.
 const BACKTRACE = !!INIT.backtrace;
 __UI_DOM_JS__
+__UI_HUBBAR_JS__
 const _pageEsc = null;
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
 // Commit-log subjects can be very long; cap the displayed line at 120 chars with an
@@ -1611,6 +1649,32 @@ function renderInsights(){
   if(rest.length) html += `<details class="insightmore"><summary>${rest.length} more insight${rest.length===1?"":"s"}</summary>${rest.map(insightCard).join("")}</details>`;
   host.innerHTML = html;
 }
+// The "there is agent work here that no commit covers" notice. Shown only on the LIVE dashboard
+// (the backtrace is where that work IS visible, so saying it there would be circular) and only
+// when the server found some; the link jumps to the same repo's backtrace view.
+// Why the page has nothing to show. Live dashboard only: the backtrace has its own banner, and
+// an empty reconstruction is reported by the daemon before it ever serves a page.
+const EMPTY_TITLES = {"no-sessions": "No agent history here", "nothing": "Nothing to show yet"};
+function renderEmptyState(){
+  const box = $("emptystate"), es = AGG.empty_state;
+  if(!box) return;
+  if(BACKTRACE || !es || !es.text){ box.hidden = true; return; }
+  $("emptystate-title").textContent = EMPTY_TITLES[es.kind] || "Nothing to show yet";
+  $("emptystate-text").textContent = es.text;
+  box.hidden = false;
+}
+
+function renderPending(){
+  const box = $("pending"), pd = AGG.pending;
+  if(!box) return;
+  if(BACKTRACE || !pd || !pd.notice){ box.hidden = true; return; }
+  $("pending-text").textContent = pd.notice;
+  const link = $("pending-link");
+  if(HUB){ link.href = hubUrl("backtrace", HUB.slug); link.hidden = false; }
+  else { link.hidden = true; }   // no hub: there is no backtrace view to send anyone to
+  box.hidden = false;
+}
+
 function renderAgg(){
   renderInsights();
   const total = AGG.total, tracked = AGG.tracked;
@@ -1620,6 +1684,8 @@ function renderAgg(){
 
   $("genat").textContent = "updated " + GENERATED;
   $("count").textContent = `${fmt(total)} commits in view`;
+  renderPending();
+  renderEmptyState();
 
   $("cards").innerHTML = [
     // Backtrace reconstructs conversation TURNS, not commits, and every turn it shows is by
@@ -2110,6 +2176,10 @@ async function applyFilters(){
 }
 async function refresh(){
   const prev = HEAD;
+  // Whether aGiTrack is running here changes for the same reasons new commits appear (a tracker
+  // started, a session ended), so the header answers on the same beat as the numbers under it
+  // rather than drifting out of step with them on a clock of its own.
+  if(typeof refreshHubState === "function") refreshHubState();
   if(!await loadAgg()) return;
   if(HEAD !== prev){  // new commits landed — refresh the whole view
     resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
@@ -2417,6 +2487,7 @@ async function init(){
   if(LIVE) setInterval(refresh, REFRESH_MS);
 }
 init();
+initHubBar();
 </script>
 </body>
 </html>

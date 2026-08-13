@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agitrack import paths
 from agitrack.backends.base import TokenUsage
+from agitrack.fileio import safe_is_dir
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts import capabilities
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
@@ -197,7 +198,7 @@ def latest_session_id(repo: Path) -> str | None:
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
-    if not project_dir.is_dir():
+    if not safe_is_dir(project_dir):
         return []
     refs = []
     for path in project_dir.glob("*.jsonl"):
@@ -232,12 +233,12 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
     conversations whose worktree has since been deleted (Claude keeps the
     transcript keyed by the worktree path), so they stay resumable."""
     root = _projects_root()
-    if not root.is_dir():
+    if not safe_is_dir(root):
         return []
     prefix = _encode_repo(worktrees_root) + "-"
     out: list[tuple[str, SessionRef]] = []
     for project_dir in root.iterdir():
-        if not project_dir.is_dir() or not project_dir.name.startswith(prefix):
+        if not safe_is_dir(project_dir) or not project_dir.name.startswith(prefix):
             continue
         worktree_key = project_dir.name[len(prefix) :]
         if not worktree_key:
@@ -290,13 +291,13 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, Path]]:
     with ``directory``'s encoding; the recorded cwd is then re-read to reject a same-prefix
     sibling (``/a/b`` vs ``/a/b-c``)."""
     root = _projects_root()
-    if not root.is_dir():
+    if not safe_is_dir(root):
         return []
     directory = directory.resolve()
     encoded = _encode_repo(directory)
     out: list[tuple[SessionRef, Path]] = []
     for project_dir in root.iterdir():
-        if not project_dir.is_dir():
+        if not safe_is_dir(project_dir):
             continue
         name = project_dir.name
         if name != encoded and not name.startswith(encoded + "-"):
@@ -827,11 +828,11 @@ def _find_session_file(session_id: str) -> Path | None:
     # The transcript for a session id may live under any project dir (the repo
     # root, a worktree). Return the most recent match.
     root = _projects_root()
-    if not root.is_dir():
+    if not safe_is_dir(root):
         return None
     newest: tuple[float, Path] | None = None
     for project_dir in root.iterdir():
-        if not project_dir.is_dir():
+        if not safe_is_dir(project_dir):
             continue
         candidate = project_dir / f"{session_id}.jsonl"
         if not candidate.is_file():
@@ -987,7 +988,7 @@ def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:
     with no readable tool id is keyed under None (attributed to the latest turn rather
     than dropped). Returns an empty map when the session has no sub-agents."""
     subdir = session_path.with_suffix("") / "subagents"
-    if not subdir.is_dir():
+    if not safe_is_dir(subdir):
         return {}
     out: dict[str | None, TokenUsage] = {}
     try:
@@ -1006,7 +1007,7 @@ def _subagent_unmatched_mtime(session_path: Path) -> int | None:
     the latest turn (which re-attaches, and double-counts, them onto each new turn on every
     re-parse). ``None`` when there are no id-less sub-agents or none has a readable mtime."""
     subdir = session_path.with_suffix("") / "subagents"
-    if not subdir.is_dir():
+    if not safe_is_dir(subdir):
         return None
     try:
         agent_files = sorted(subdir.glob("agent-*.jsonl"))
@@ -1065,7 +1066,7 @@ def subagent_agent_files(repo: Path, session_id: str) -> set[str]:
     snapshot the headless ``run()`` takes BEFORE a turn, so only the files that turn ADDS
     are counted afterwards (a resumed session already has prior sub-agents on disk)."""
     subdir = _subagents_dir(repo, session_id)
-    if subdir is None or not subdir.is_dir():
+    if subdir is None or not safe_is_dir(subdir):
         return set()
     try:
         return {path.name for path in subdir.glob("agent-*.jsonl")}
@@ -1080,7 +1081,7 @@ def subagent_tokens_since(repo: Path, session_id: str, prior_files: set[str]) ->
     separate from the ``--output-format json`` usage (which covers only the main agent)."""
     usage = TokenUsage()
     subdir = _subagents_dir(repo, session_id)
-    if subdir is None or not subdir.is_dir():
+    if subdir is None or not safe_is_dir(subdir):
         return usage
     try:
         agent_files = sorted(subdir.glob("agent-*.jsonl"))

@@ -28,7 +28,11 @@ def _inputs(*values):
 
 
 def test_available_backends_is_alphabetical():
-    assert available_backends() == ["claude", "opencode"]
+    # Sorted, and every registered backend is present. Asserted as a property rather than a
+    # literal list so registering a backend doesn't require editing this test — the ordering
+    # is what the first-run menu's numbering depends on.
+    assert available_backends() == sorted(available_backends())
+    assert {"claude", "codex", "opencode"} <= set(available_backends())
 
 
 def test_backend_installed_uses_executable_lookup(monkeypatch):
@@ -49,12 +53,15 @@ def test_select_default_backend_all_installed_defaults_to_first(monkeypatch):
 
 
 def test_select_default_backend_two_installed_user_picks_second(monkeypatch):
-    # Both installed: the choose-default prompt lets the user pick #2 (opencode) as the default.
+    # All installed: the choose-default prompt lets the user pick #2 as the default. The menu is
+    # the alphabetical backend list, so the expected name is read from it rather than hard-coded
+    # — registering a backend renumbers the menu and would otherwise silently invert this test.
     monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    second = available_backends()[1]
     config = FakeConfig()
     chosen = select_default_backend(config, input_fn=_inputs("2"), output_fn=lambda _s: None)
-    assert chosen == "opencode"
-    assert config.saved == ["opencode"]
+    assert chosen == second
+    assert config.saved == [second]
 
 
 def test_select_default_backend_single_list_only(monkeypatch):
@@ -77,7 +84,7 @@ def test_select_default_backend_enter_keeps_installed_default(monkeypatch):
         config,
         input_fn=_inputs(""),
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: pytest.fail("Enter on the installed default must not install"),
+        install_fn=lambda name, input_fn, output_fn: pytest.fail("Enter on the installed default must not install"),
     )
     assert chosen == "opencode"
 
@@ -101,25 +108,28 @@ def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
         config,
         input_fn=_inputs(""),  # skip installing opencode
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: pytest.fail("skip must not install anything"),
+        install_fn=lambda name, input_fn, output_fn: pytest.fail("skip must not install anything"),
     )
     assert chosen == "claude"
 
 
 def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
-    # claude installed, opencode not; the user picks '2' (opencode) as the default → opencode is
+    # claude installed, the rest not; the user picks '2' as the default → that backend is
     # installed first AND becomes the default (one unified prompt: the number is the default).
     installs = []
     monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude" or name in installs)
+    second = available_backends()[1]
     config = FakeConfig()
+    # "2" picks it; "y" confirms the install, which is no longer implicit — typing a number
+    # used to run `curl … | bash` immediately, with no y/N and no abort.
     chosen = select_default_backend(
         config,
-        input_fn=_inputs("2"),
+        input_fn=_inputs("2", "y"),
         output_fn=lambda _s: None,
-        install_fn=lambda name, output_fn: installs.append(name) or True,
+        install_fn=lambda name, input_fn, output_fn: installs.append(name) or True,
     )
-    assert installs == ["opencode"]
-    assert chosen == "opencode"
+    assert installs == [second]
+    assert chosen == second
 
 
 def test_ensure_installed_backend_returns_installed_backend(monkeypatch):

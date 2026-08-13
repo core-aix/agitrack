@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agitrack.env import getenv_compat
+from agitrack.fileio import atomic_write_text, merge_json_for_save
 
 # The key that opens aGiTrack's command menu in proxy mode. Configurable as
 # "menu_key" in config.json. Supports:
@@ -134,6 +136,16 @@ def _default_path() -> Path:
     return base / "config.json"
 
 
+# Keys a removed feature wrote and nothing reads any more. `seed_defaults` deletes them on the
+# next run, so an existing user's config does not keep them forever. Only ever add a key here
+# once NOTHING reads it — a key still consulted anywhere would be silently reset by this.
+_REMOVED_KEYS = (
+    # The light/dark scheme each backend was last seen painting, for the screen-content
+    # inference that oscillated and was deleted (see renderer.py, "Agent background").
+    "agent_theme_seen",
+)
+
+
 class GlobalConfig:
     """User-wide aGiTrack configuration stored in ``~/.agitrack/config.json``.
 
@@ -146,17 +158,26 @@ class GlobalConfig:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or _default_path()
         self.data = self._load()
+        # What was on disk when this instance loaded. save() writes only the difference
+        # against it, so another process's keys survive (see fileio.merge_json_for_save).
+        self._baseline = copy.deepcopy(self.data)
         # Repo-local overlay: settings written for THIS repository (in its
         # ``.agitrack/config.json``) take precedence over the global file. Loaded via
         # ``load_repo_overlay`` once aGiTrack knows which repo it's running in.
         self.repo_path: Path | None = None
         self.repo_data: dict[str, Any] = {}
+        self._repo_baseline: dict[str, Any] = {}
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return {}
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
+            # utf-8-SIG, not utf-8: a BOM makes json.load raise, and the whole config was then
+            # silently discarded and replaced with defaults — with no warning, so a user who
+            # edited it in a Windows editor (or wrote it with `Out-File -Encoding utf8`, which
+            # adds a BOM) simply found their settings had stopped applying. utf-8-sig is
+            # byte-identical to utf-8 on a file with no BOM.
+            with self.path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return {}
@@ -179,6 +200,7 @@ class GlobalConfig:
             "manual_commits": False,
             "background": False,
             "autotrack_hook": "auto",
+            "agent_background": "terminal",
             "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
@@ -188,6 +210,7 @@ class GlobalConfig:
             "learning_backend": None,
             "learning_model": None,
             "check_for_updates": True,
+            "open_dashboard_on_start": True,
             "share_max_transcript_bytes": DEFAULT_MAX_SHARED_BYTES,
             "timings": dict(DEFAULT_TIMINGS),
         }
@@ -204,15 +227,32 @@ class GlobalConfig:
             if key not in self.data:
                 self.data[key] = default
                 added = True
+        # And drop what a REMOVED feature left behind, so the file stays a readable list of the
+        # knobs that exist. `agent_theme_seen` recorded the light/dark scheme each backend was
+        # last seen painting, for an inference that no longer exists (see renderer.py, "Agent
+        # background"); nothing reads it now, and the code that used to prune it went with the
+        # feature — so without this it sits in every existing user's config forever.
+        for gone in _REMOVED_KEYS:
+            if gone in self.data:
+                del self.data[gone]
+                added = True
         if added:
             self.save()
         return added
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        # ONE global file is shared by every aGiTrack process on the machine — a TUI in one
+        # repo, a background tracker in another, a dashboard daemon, the self-updater — and
+        # no repo lock excludes them from each other. A long-lived instance's copy is minutes
+        # to hours stale, so writing it wholesale reverted whatever the others had recorded
+        # since (a pending manual update, a github login, a changed default backend). Write
+        # only this instance's own changes, merged onto the current file, and do it atomically
+        # so a concurrent reader can never see a half-written file. See fileio.
+        merged = merge_json_for_save(self.path, self.data, self._baseline)
+        atomic_write_text(self.path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.data.clear()
+        self.data.update(merged)
+        self._baseline = copy.deepcopy(merged)
 
     # --- repo-local overlay -------------------------------------------------
 
@@ -222,23 +262,31 @@ class GlobalConfig:
         self.repo_path = Path(repo_root) / ".agitrack" / "config.json"
         if not self.repo_path.exists():
             self.repo_data = {}
+            self._repo_baseline = {}
             return
         try:
-            with self.repo_path.open("r", encoding="utf-8") as handle:
+            with self.repo_path.open("r", encoding="utf-8-sig") as handle:  # tolerate a BOM (see _load)
                 data = json.load(handle)
             self.repo_data = data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
             self.repo_data = {}
+        self._repo_baseline = copy.deepcopy(self.repo_data)
 
     def save_repo(self) -> None:
         """Write the repo-local overlay back to ``<repo>/.agitrack/config.json``,
-        preserving any other keys the file already holds (e.g. AgitrackState's)."""
+        preserving any other keys the file already holds (e.g. AgitrackState's).
+
+        That promise used to hold only for keys present when ``load_repo_overlay`` ran: the
+        write dumped ``repo_data`` over the file, so anything written since — by
+        ``AgitrackState._save_config`` in this very process, or by the dashboard daemon's
+        ``set_learning_config`` in another — was dropped. Merge on save instead."""
         if self.repo_path is None:
             return
-        self.repo_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.repo_path.open("w", encoding="utf-8") as handle:
-            json.dump(self.repo_data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        merged = merge_json_for_save(self.repo_path, self.repo_data, self._repo_baseline)
+        atomic_write_text(self.repo_path, json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        self.repo_data.clear()
+        self.repo_data.update(merged)
+        self._repo_baseline = copy.deepcopy(merged)
 
     def _raw(self, key: str) -> Any:
         """The stored value for *key*: the repo-local overlay wins over the global file."""
@@ -390,6 +438,30 @@ class GlobalConfig:
         self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "auto"
         self.save()
 
+    AGENT_BACKGROUND_CHOICES = ("terminal", "dark", "light")
+
+    @property
+    def agent_background(self) -> str:
+        # How aGiTrack paints the cells the backend leaves at the terminal's default colour
+        # (see renderer.py, "Agent background"). "terminal" (default): never override — every
+        # unpainted cell keeps the HOST TERMINAL's background, so the session looks like the
+        # terminal profile the user chose. "dark"/"light": fill them with that background
+        # instead, and report it to the backend so a self-theming agent paints to match.
+        #
+        # A fourth choice, "auto", used to infer the agent's own light/dark scheme from the
+        # colours on screen. It is gone: the inference read the screen's CONTENT, so a turn
+        # that printed a code block voted one way and the prose after it the other, and the
+        # background flipped every few seconds. Configs still holding it read as "terminal" —
+        # when in doubt, the terminal's own colours.
+        value = str(self._raw("agent_background") or "terminal").lower()
+        return value if value in self.AGENT_BACKGROUND_CHOICES else "terminal"
+
+    @agent_background.setter
+    def agent_background(self, value: str) -> None:
+        chosen = str(value).lower()
+        self.data["agent_background"] = chosen if chosen in self.AGENT_BACKGROUND_CHOICES else "terminal"
+        self.save()
+
     @property
     def log_file(self) -> str | None:
         # Optional path to a plain-text EVENT LOG aGiTrack appends notable events to (an AI
@@ -534,6 +606,23 @@ class GlobalConfig:
     @summarization_enabled.setter
     def summarization_enabled(self, value: bool) -> None:
         self.data["summarization_enabled"] = bool(value)
+        self.save()
+
+    @property
+    def open_dashboard_on_start(self) -> bool:
+        """Whether starting aGiTrack on a repository also opens its dashboard in the browser.
+
+        On by default, and deliberately so: aGiTrack's whole point is the record it builds, and a
+        record nobody looks at may as well not exist. One dashboard serves every repository on one
+        port, so this opens a tab rather than starting yet another server. Turn it off here for a
+        machine where a browser has no business appearing (a shared box, a build agent); scripted
+        and non-interactive runs never open one regardless."""
+        value = self._raw("open_dashboard_on_start")
+        return True if value is None else bool(value)
+
+    @open_dashboard_on_start.setter
+    def open_dashboard_on_start(self, value: bool) -> None:
+        self.data["open_dashboard_on_start"] = bool(value)
         self.save()
 
     @property

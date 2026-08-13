@@ -29,14 +29,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agitrack import __version__
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
 from agitrack.config import AgitrackState, GlobalConfig
-from agitrack.events import EventLog, resolve_log_path
+from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
@@ -85,15 +85,27 @@ def _live_background_pid(repo: GitRepo) -> int | None:
     return None
 
 
+def background_tracker_is_running(repo: GitRepo) -> bool:
+    """Whether a background tracker is alive on this repo. Public because the Claude session
+    hook asks it on every session start: the note it prints ("aGiTrack commits for you") is
+    only TRUE while a tracker is running, so a hook left behind by a daemon that was killed
+    rather than stopped must stay silent instead of misleading the agent."""
+    return _live_background_pid(repo) is not None
+
+
 def background_status(repo: GitRepo) -> int:
     """Report whether a background tracker is running on this repo (`agitrack -b status`)."""
     pid = _live_background_pid(repo)
+    # NAME THE REPO. `-s`, `-b status` and the `-b` banner never did, which is exactly wrong in a
+    # submodule or a multi-repo terminal — the one place the answer needs disambiguating.
+    where = _abbreviated_repo(repo)
     if pid is None:
-        print("No aGiTrack background tracker is running on this repo.")
+        print(f"No aGiTrack background tracker is running on {where}.")
     else:
         info = _read_handshake(repo) or {}
         mode = info.get("mode", "?")
-        print(f"aGiTrack background tracker is running (PID {pid}, {mode}).")
+        print(f"aGiTrack background tracker is running on {where} (PID {pid}, {mode}).")
+    print(autostart_status_line(repo))
     from agitrack.update.marker import update_reminder_line
 
     reminder = update_reminder_line(repo.repo)
@@ -106,14 +118,104 @@ def stop_background(repo: GitRepo) -> int:
     """Stop the background tracker running on this repo (`agitrack -b stop`). Sends SIGTERM and
     waits briefly for a clean shutdown (it records any final turn and removes its hooks)."""
     pid = _live_background_pid(repo)
+    # Read the daemon's record BEFORE terminating it: on POSIX its own teardown deletes the
+    # handshake, and the `--log-file` it was started with lives nowhere else.
+    running = _read_handshake(repo) or {}
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
+        _disarm_tracking(repo)  # a tracker that died without tearing down may have left it armed
         return 0
     if not _terminate_and_wait(pid):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
         return 1
+    # Also from HERE, not only from the daemon's own teardown: Windows has no SIGTERM
+    # delivery, so `-b stop` calls TerminateProcess and the daemon's finally block never runs.
+    # The stopping process knows the repo, so it can do the cleanup the killed one could not —
+    # otherwise every Windows `-b stop` left a .claude/settings.local.json behind (measured).
+    disarmed = _disarm_tracking(repo)
+    # Reap the stopped daemon's REGISTRY entry too. `-b stop` reaped the handshake and left the
+    # registry file, so dead-pid entries accumulated across kill/restart cycles (1 → 6 over three)
+    # and were only ever pruned lazily, on the next read by something else.
+    try:
+        from agitrack import daemons
+        from agitrack.git import RepoLock
+
+        daemons.deregister(pid)
+        # ...and the lock file's owner record, for the same reason: on Windows the terminated
+        # daemon's own release() never ran, so a clean stop looked exactly like a crash on disk.
+        RepoLock(repo.repo / ".agitrack" / "lock").clear_owner_record()
+    except Exception:
+        pass
+    # Also from HERE for the same reason as the disarm above: the daemon emits `daemon-stop` in
+    # its own teardown, which never runs when it was TerminateProcess'd. `daemon-start` was
+    # therefore the only event a `--log-file` reader ever saw across a full -b lifecycle.
+    _emit_stop_event(repo, log_file=running.get("log_file"))
     print("Stopped the aGiTrack background tracker.")
+    if disarmed:
+        print("Auto-start is off for this repo until you run `agitrack -b` again.")
     return 0
+
+
+def _emit_stop_event(repo: GitRepo, *, log_file: str | None = None) -> None:
+    """Append ``daemon-stop`` to the event log the RUNNING daemon was using, best-effort.
+
+    Idempotent enough: the daemon's own teardown emits it too on POSIX, and one duplicate line
+    is far better than the silence a Windows stop produced.
+
+    The daemon's log path comes from the handshake first and the config only as a fallback,
+    because ``--log-file`` is a command-line flag that is never persisted: a tracker started as
+    ``agitrack -b --log-file events.log`` had no ``log_file`` in config, so this read None and
+    emitted nothing. On Windows — where `-b stop` is a ``TerminateProcess`` and the daemon's own
+    teardown never runs — ``daemon-start`` was therefore the only line a ``--log-file`` reader
+    ever saw across a full ``-b`` lifecycle, which is the very thing this function exists to
+    prevent."""
+    try:
+        from agitrack.config import GlobalConfig
+
+        spec = log_file or (_read_handshake(repo) or {}).get("log_file")
+        log = EventLog(resolve_log_path(spec or getattr(GlobalConfig(), "log_file", None), repo.repo))
+        log.emit("daemon-stop")
+    except Exception:
+        pass
+
+
+def _disarm_tracking(repo: GitRepo) -> bool:
+    """Everything `stop` has to mean beyond killing the process.
+
+    STOP MEANS STOP. Two things would otherwise keep acting on the user's behalf after they
+    asked aGiTrack to stop: the auto-start hooks would bring the tracker back on the next
+    commit or the next agent turn, and the Claude session note would keep telling the agent
+    that aGiTrack is committing for it — which, with no tracker running, is false and stops
+    the agent committing at all.
+
+    The ``autotrack_hook`` PREFERENCE is deliberately left alone: the user's standing choice
+    about auto-start is not revoked by one stop, so the next `agitrack -b` re-arms it. Only
+    `--remove-hooks` turns the preference itself off. Returns True when auto-start was armed
+    and is now disarmed."""
+    disarmed = False
+    try:
+        from agitrack.backends import claude_settings
+
+        claude_settings.remove_commit_guidance_hook(repo.repo)
+        disarmed |= claude_settings.remove_autostart_hook(repo.repo)
+    except Exception:
+        pass
+    try:
+        hooks_dir = repo.hooks_dir()
+        # Ask BEFORE removing: the remover is a no-op on a hook that isn't ours and reports
+        # nothing either way, so "was it armed" has to be answered while it is still there.
+        was_armed = git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
+        git_hooks.remove_autotrack_precommit_hook(hooks_dir)
+        # The manual-commit fold hooks too. `-b stop` removed `pre-commit` and the `.claude`
+        # entries and left `prepare-commit-msg` and `post-commit` intercepting every commit, with
+        # nothing telling the user two aGiTrack hooks were still installed. On Windows this is the
+        # only chance to do it at all: `-b stop` is TerminateProcess, so the daemon's own teardown
+        # never runs. Restores whatever project hooks they chained.
+        git_hooks.remove_manual_commit_hooks(hooks_dir)
+        disarmed = disarmed or was_armed
+    except Exception:
+        pass
+    return disarmed
 
 
 def handshake_is_manual(info: dict | None) -> bool:
@@ -248,6 +350,152 @@ def _read_proxy_status(repo: GitRepo) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _abbreviated_repo(repo: GitRepo) -> str:
+    """The repo path, with ``$HOME`` shortened — for status lines that must say WHICH repo."""
+    try:
+        from agitrack.metrics.collect import _abbreviate_home
+
+        return _abbreviate_home(str(repo.repo))
+    except Exception:
+        return str(getattr(repo, "repo", "?"))
+
+
+def autostart_status_line(repo: GitRepo) -> str:
+    """One line saying whether a commit made with aGiTrack down will actually be tracked.
+
+    This used to be derived from the ``autotrack_hook`` PREFERENCE alone and never from the hook
+    file, so it lied in four separate situations, all confirmed live:
+
+    * a virgin repo reported ``Auto-start: on`` before any hook existed — the first commit after
+      agent work was silently lost and no tracker ever started;
+    * ``agitrack -b stop`` printed "Auto-start is off for this repo" and really did remove the
+      hooks, and ``-s`` a second later still said ``on``;
+    * with ``core.hooksPath`` set, aGiTrack installs nothing at all and ``-s`` asserted the
+      opposite — anyone on Husky / pre-commit / lefthook was told their commits were tracked
+      when nothing was;
+    * every backend was told "…or when an agent turn leaves changes", which only Claude Code
+      does; on Codex and OpenCode nothing is picked up until you commit.
+
+    So each clause is now checked rather than assumed, and the mode placeholder ("last-run")
+    that leaked onto a fresh repo is gone."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if config.autotrack_hook == "off":
+            return "Auto-start: off (`agitrack -b` or Ctrl-G → settings to enable)."
+        if repo.core_hooks_path():
+            return (
+                "Auto-start: unavailable — this repo sets core.hooksPath, so git ignores the hooks "
+                "directory aGiTrack installs into.\n"
+                "  Commits made while aGiTrack is down are NOT tracked. Run `agitrack` or "
+                "`agitrack -b` while you work, or unset core.hooksPath."
+            )
+        if not git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit"):
+            return (
+                "Auto-start: not armed — no aGiTrack hook is installed in this repo yet.\n"
+                "  Run `agitrack` or `agitrack -b` once; the hook it leaves behind is what tracks "
+                "commits made later."
+            )
+        last = read_background_mode(repo)
+        mode = "manual-commit" if last else "auto-commit"
+        triggers = "on a commit"
+        # The turn-end half exists only where a backend offers a turn-end hook, and only when
+        # that hook is actually on disk for this repo.
+        from agitrack.backends import claude_settings
+
+        if claude_settings.hook_is_installed(repo.repo, claude_settings.AUTOSTART_HOOK):
+            triggers += ", or when an agent turn leaves changes"
+        return f"Auto-start: on ({mode} mode; {triggers})."
+    except Exception:
+        return "Auto-start: unknown (could not read this repo's hooks)."
+
+
+def running_mode(repo: GitRepo) -> dict:
+    """What aGiTrack is doing for ``repo`` right now, as data.
+
+    The same question ``agitrack -s`` answers in prose, for callers that need it structured: the
+    dashboard says it in its header, because a page that looks identical whether or not anything
+    is being tracked cannot answer "is this on?", which is the first thing anyone asks of it.
+
+    Returns ``{"running", "kind", "label", "detail", "pid"}``. ``kind`` is one of ``background``,
+    ``interactive``, ``unknown`` (something holds the repo lock but left no mode record) or
+    ``none``. Never raises: an unreadable repository reports "not tracking" rather than breaking
+    the page that asked.
+    """
+    unknown = {"running": False, "kind": "none", "label": "not tracking", "detail": "", "pid": None}
+    try:
+        from agitrack.git import RepoLock
+
+        bg_pid = _live_background_pid(repo)
+        if bg_pid is not None:
+            info = _read_handshake(repo) or {}
+            commits = "manual commits" if handshake_is_manual(info) else "auto commits"
+            backend = str(info.get("backend") or "?")
+            return {
+                "running": True,
+                "kind": "background",
+                "label": f"tracking · background · {commits}",
+                "detail": (
+                    f"aGiTrack is tracking this repository in background mode (PID {bg_pid}): "
+                    f"{commits}, no worktree, backend {backend}. Stop it with `agitrack stop`."
+                ),
+                "pid": bg_pid,
+            }
+        proxy = _read_proxy_status(repo) or {}
+        proxy_pid = proxy.get("pid")
+        if isinstance(proxy_pid, int) and pid_alive(proxy_pid):
+            commits = "manual commits" if proxy.get("commits") == "manual" else "auto commits"
+            worktree = "worktree" if proxy.get("worktree") else "your working tree"
+            return {
+                "running": True,
+                "kind": "interactive",
+                "label": f"tracking · interactive · {commits}",
+                "detail": (
+                    f"An interactive aGiTrack session is running here (PID {proxy_pid}): {commits}, {worktree}."
+                ),
+                "pid": proxy_pid,
+            }
+        owner = RepoLock(repo.repo / ".agitrack" / "lock").owner_pid()
+        if isinstance(owner, int) and pid_alive(owner):
+            return {
+                "running": True,
+                "kind": "unknown",
+                "label": "tracking",
+                "detail": f"aGiTrack holds this repository (PID {owner}); the mode was not recorded.",
+                "pid": owner,
+            }
+        return {
+            "running": False,
+            "kind": "none",
+            "label": "not tracking",
+            "detail": (
+                "aGiTrack is not running on this repository, so new agent work is not being "
+                "recorded. Run `agitrack` in it and pick a mode."
+            ),
+            "pid": None,
+        }
+    except Exception:
+        return unknown
+
+
+def running_mode_for(directory: Path) -> dict:
+    """:func:`running_mode` for a plain path, without opening a git repository.
+
+    Everything the answer reads lives under ``<dir>/.agitrack/`` (the tracker's handshake, the
+    interactive session's status file, the repo lock), so it needs the PATH and nothing else. That
+    matters because the dashboard asks this for every repository in its switcher, including ones
+    that are not git repositories at all (a directory can be listed for its reconstruction alone),
+    and because opening a repo per row would put git on the path of drawing a dropdown."""
+    return running_mode(cast(GitRepo, _PathOnlyRepo(Path(directory))))
+
+
+class _PathOnlyRepo:
+    """The one attribute :func:`running_mode` uses. Not a GitRepo, and never used as one."""
+
+    def __init__(self, directory: Path) -> None:
+        self.repo = directory
+
+
 def repo_status(repo: GitRepo) -> int:
     """`agitrack --status` / `-s`: report whether aGiTrack is running for this repo and in which
     mode (interactive vs background, auto vs manual commit, worktree vs no-worktree)."""
@@ -261,7 +509,7 @@ def repo_status(repo: GitRepo) -> int:
     if bg_pid is not None:
         info = _read_handshake(repo) or {}
         print(
-            f"aGiTrack is running in BACKGROUND mode (PID {bg_pid}): "
+            f"aGiTrack is running on {_abbreviated_repo(repo)} in BACKGROUND mode (PID {bg_pid}): "
             f"{_commit_mode(info.get('mode'))}, no worktree, backend {info.get('backend', '?')}."
         )
     else:
@@ -270,25 +518,24 @@ def repo_status(repo: GitRepo) -> int:
         if proxy is not None and isinstance(proxy_pid, int) and pid_alive(proxy_pid):
             commits = "manual-commit" if proxy.get("commits") == "manual" else "auto-commit"
             worktree = "worktree" if proxy.get("worktree") else "no worktree"
-            print(f"aGiTrack is running in INTERACTIVE mode (PID {proxy_pid}): {commits}, {worktree}.")
+            print(
+                f"aGiTrack is running on {_abbreviated_repo(repo)} in INTERACTIVE mode "
+                f"(PID {proxy_pid}): {commits}, {worktree}."
+            )
         else:
             owner = RepoLock(repo.repo / ".agitrack" / "lock").owner_pid()
             if isinstance(owner, int) and pid_alive(owner):
-                print(f"aGiTrack is running for this repo (PID {owner}); mode details are unavailable.")
+                print(f"aGiTrack is running on {_abbreviated_repo(repo)} (PID {owner}); mode details are unavailable.")
             else:
-                print("aGiTrack is not running for this repo.")
-    # Whether the persistent pre-commit hook will auto-start tracking on a commit (repo-scoped).
-    try:
-        config = GlobalConfig()
-        config.load_repo_overlay(repo.repo)
-        if config.autotrack_hook == "off":
-            print("Auto-start on commit: off (`agitrack -b` or Ctrl-G → settings to enable).")
-        else:
-            last = read_background_mode(repo)
-            mode = "manual-commit" if last else "auto-commit" if last is not None else "last-run"
-            print(f"Auto-start on commit: on ({mode} mode; disable with `agitrack --remove-hooks`).")
-    except Exception:
-        pass
+                print(f"aGiTrack is not running on {_abbreviated_repo(repo)}.")
+    print(autostart_status_line(repo))
+    # WHICH confinement mode is in effect. Nothing anywhere reported it — not the TUI, not `-s`,
+    # not the status bar — so a run on a host where the sandbox cannot be created (stock Ubuntu
+    # 24.04 denies unprivileged user namespaces) looked exactly like an enforced one, and what
+    # looked like enforcement was the agent choosing to comply.
+    from agitrack.proxy import sandbox
+
+    print(sandbox.status_line())
     reminder = update_reminder_line(repo.repo)
     if reminder:
         print(reminder)
@@ -433,6 +680,53 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     return 0
 
 
+def autostart_on_change(repo: GitRepo) -> int:
+    """Entry point of the Claude Code ``Stop`` hook (``agitrack --autostart-on-change``).
+
+    WHY A HOOK AND NOT A WATCHER. Auto-start used to be reachable only through the git
+    ``pre-commit`` hook, so tracking resumed when the user COMMITTED — and an agent that edits
+    for an hour without committing was exactly the case tracking is for. Nothing else can
+    observe a plain file edit without a process already running, which is what we do not have;
+    the agent's own turn-end hook is the one moment the editor tells us. So the trigger is
+    "a turn finished and left the tree changed", not "a file changed".
+
+    Every reason not to start is checked here rather than left to the daemon, because this
+    runs on EVERY turn end in the repo: the opt-out, an already-running tracker, any other
+    aGiTrack holding the single-writer lock, and a turn that changed nothing. Best-effort and
+    always 0 — a hook that fails or blocks would break the user's agent, which is a far worse
+    outcome than not starting a tracker."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if config.autotrack_hook == "off":
+            return 0
+        if _live_background_pid(repo) is not None:
+            return 0  # already tracking
+        # Any other aGiTrack on this repo (an interactive TUI, a `--recover`, a `--backtrace
+        # commit`) is the single writer while it runs. Starting a daemon beside it is exactly
+        # the double-writer this must never create, and the TUI is already tracking anyway.
+        from agitrack.git import RepoLock
+
+        lock = RepoLock(repo.repo / ".agitrack" / "lock")
+        if not lock.acquire():
+            return 0
+        lock.release()  # only probing: the daemon we spawn takes it for real
+        if not repo.has_changes():
+            return 0  # a question-and-answer turn leaves nothing to track
+        state = AgitrackState(repo.repo)
+        backend_name = _recorded_backend(state)
+        if not backend_name:
+            return 0
+        manual = read_background_mode(repo)
+        if manual is None:
+            manual = config.manual_commits
+        extra_args = ["--manual-commits" if manual else "--auto-commit", "--backend", backend_name]
+        spawn_background_daemon(repo, extra_args=extra_args)
+    except Exception:
+        return 0
+    return 0
+
+
 def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -> int:
     """Entry point of the persistent auto-track ``pre-commit`` hook. Best-effort; ALWAYS returns 0
     so it can never fail a commit.
@@ -473,7 +767,6 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         return 0
     config = GlobalConfig()
     config.load_repo_overlay(repo.repo)
-    synced = False
     try:
         # manual_commits=True gives fold-into-the-user's-commit semantics: record the pending AI
         # turns latently and let THIS commit's prepare-commit-msg hook fold them in (no auto-commit).
@@ -494,13 +787,17 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
         runner._process_once()  # parse the repo's own backend session, record NEW pending turns
         runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
-        synced = bool(runner._manual.pending_bodies())  # is there AI work to fold into this commit?
     except Exception:
         return 0
     finally:
         lock.release()  # release BEFORE spawning the daemon, which takes its own lock
-    if not synced:
-        return 0  # no AI work since the last commit ⇒ no footprint, no nag
+    # Auto-start is judged on its own, BEFORE the "was there AI work in this commit" question.
+    # It used to sit behind `if not synced: return 0`, which made a dead tracker permanent: with
+    # nothing running, no agent turn can be recorded, so `synced` is False on every commit that
+    # follows, so the one hook that could restart the tracker never even looked. That is a
+    # self-sustaining dead state — the tracker stops once and no number of later commits brings
+    # it back, which is exactly what was observed. Whether THIS commit carries AI work and
+    # whether a tracker should be running from now on are different questions.
     if config.autotrack_hook != "off" and _live_background_pid(repo) is None:
         # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
         # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
@@ -536,6 +833,7 @@ class BackgroundRunner:
         backend: str | None = None,
         new_session: bool = False,
         manual_commits: bool = False,  # background defaults to AUTO commits (like the interactive TUI)
+        commit_guidance: bool = True,
         backend_command: list[str] | None = None,
         log_file: str | None = None,
         poll_seconds: float | None = None,
@@ -547,8 +845,13 @@ class BackgroundRunner:
         self.base_repo = repo  # background mode is always no-worktree
         self.verbose = verbose
         self._manual_commits = manual_commits
+        self._commit_guidance = commit_guidance
         self._backend_command = list(backend_command or [])
         self.events = EventLog(resolve_log_path(log_file, repo.repo))
+        # Keep the log out of the user's tree. Under -b the tracker's own `git add` swept an
+        # in-repo events.log into the AGENT'S commit — aGiTrack telemetry about a turn ending
+        # up inside the turn, attributed to the AI, in permanent history.
+        exclude_log_file(repo.repo, self.events.path)
         self._poll_seconds = poll_seconds if poll_seconds is not None else self.POLL_SECONDS
         self._lock = _lock
         self._stop = threading.Event()
@@ -647,12 +950,16 @@ class BackgroundRunner:
         if not backend_installed(self.state.backend):
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
+        # FIRST, before any of the startup work below: from this point on the process is
+        # findable and stoppable by `--daemons`, by a self-update, and by the test suite's
+        # sweep. Everything after it can take seconds, and a daemon nobody can see for seconds
+        # is a daemon that gets left behind.
+        self._register_daemon()
         self.state.ensure_local_ignore()  # git-ignore .agitrack/ before we write any state there
         # Keep git's comment char off '#', or editing any commit we write (amend, rebase reword)
         # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
         self.repo.ensure_comment_char_preserves_headings()
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
-        self._write_handshake()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
         self._manual.setup()
@@ -664,6 +971,15 @@ class BackgroundRunner:
                 "changes are no longer uncommitted, so they had nothing left to attribute."
             )
         self._install_autotrack_hook()
+        self._install_commit_guidance()
+        # LAST, not first. The handshake is what `agitrack -b` waits on before printing "daemon
+        # live" and returning the shell, so anything written after it is a race the user can
+        # lose: `agitrack -b && agitrack -s` reported "Auto-start: not armed — no aGiTrack hook
+        # is installed in this repo yet. Run `agitrack` or `agitrack -b` once" ~0.6s after a
+        # successful `agitrack -b`, and a script that started and stopped the tracker left
+        # nothing armed at all. Publishing it only once the repo really is in the advertised
+        # state costs the launcher that fraction of a second and makes every reading true.
+        self._write_handshake()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
@@ -692,27 +1008,59 @@ class BackgroundRunner:
             self._stop.set()
 
         while True:
-            update_restart.watch_for_update(self._stop, _restart_for_update)
+            # self_update: the tracker CHECKS for a new release itself, not only reacting to
+            # someone else installing one. It is the daemon most likely to be the only aGiTrack
+            # running on a machine — `agitrack -b` is the default mode, it is meant to be left
+            # alone for days, and it has no TUI whose startup check would ever fire. Watching the
+            # on-disk fingerprint alone, it would sit on the version it started with forever
+            # while a PyPI release came and went. The dashboard daemons already opt in for
+            # exactly this reason; this one had been left out.
+            update_restart.watch_for_update(self._stop, _restart_for_update, self_update=True)
             try:
                 self._loop()
             finally:
                 self._teardown(restarting=self._restart_cmd is not None and not self._explicit_stop)
             if self._restart_cmd is None or self._explicit_stop:
                 return 0
-            update_restart.exec_replacement(self._restart_cmd, log=self._print)
-            # Only reached when the exec FAILED: resume tracking on the current code.
+            # Hand the single-writer lock over BEFORE spawning the successor, and take it back
+            # if the successor never comes up. Teardown has already stopped tracking, so we are
+            # not using it any more — but we used to hold it until `os._exit(0)`, and on Windows
+            # a byte-range lock outlives the process that held it by the time the kernel needs to
+            # tear its handles down (measured elsewhere in this codebase at ~100 ms). The
+            # successor's first `acquire()` has no retry, so it lost that race, mistook its own
+            # dying predecessor for a live tracker, and exited — leaving NOTHING tracking the
+            # repo, with exit code 0 and no error anywhere.
+            self._release_lock()
+            update_restart.exec_replacement(
+                self._restart_cmd,
+                log=self._print,
+                verify=lambda pid: (
+                    _read_handshake(self.repo) is not None and (_read_handshake(self.repo) or {}).get("pid") == pid
+                ),
+            )
+            # Only reached when the restart FAILED: resume tracking on the current code. The
+            # lock has to come back first — without it this process would keep tracking a repo
+            # it no longer holds, and a second writer could start alongside it.
+            if not self._reacquire_lock():
+                self._print(
+                    "update restart failed AND this tracker could not take its own repo lock "
+                    "back; another aGiTrack now holds it. Stopping rather than tracking without "
+                    "the lock."
+                )
+                return 1
             self._print(
                 "update restart failed; continuing to track on the current version and "
                 "retrying. Stop with `agitrack -b stop`."
             )
             self._restart_cmd = None
             self._stop.clear()
-            # Undo the teardown: visibility (handshake + --daemons registry, both via
-            # _write_handshake) and the commit hooks come back before tracking resumes.
-            self._write_handshake()
+            # Undo the teardown: the commit hooks first, then visibility (handshake +
+            # --daemons registry, both via _write_handshake) — same order as startup, so the
+            # handshake never advertises a state the repo has not reached.
             self._clear_stale_worktree_guard()
             self._manual.setup()
             self._install_autotrack_hook()
+            self._write_handshake()
 
     def _clear_stale_worktree_guard(self) -> None:
         """Drop a worktree base-commit guard left in the base repo by a crashed WORKTREE run.
@@ -744,6 +1092,11 @@ class BackgroundRunner:
             except Exception as error:
                 self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
+        # Kept across an update restart: the replacement daemon takes over immediately, and
+        # removing then reinstalling would leave a window where a session starting mid-swap
+        # gets no note at all.
+        if not restarting:
+            self._remove_commit_guidance()
         self._remove_handshake()
         from agitrack import daemons
 
@@ -752,6 +1105,27 @@ class BackgroundRunner:
         self._print(
             "background tracker restarting on the updated aGiTrack." if restarting else "background tracker stopped."
         )
+
+    def _release_lock(self) -> None:
+        """Give up the repo's single-writer lock, so a successor can take it. Best-effort:
+        a restart must not be blocked by a lock object that has already gone."""
+        try:
+            if self._lock is not None:
+                self._lock.release()
+        except Exception as error:
+            self._debug(f"lock release before restart failed: {error!r}")
+
+    def _reacquire_lock(self) -> bool:
+        """Take the repo lock back after a failed restart. The successor may still be dying
+        with the lock held, so this retries for a few seconds rather than asking once — the
+        same race, and the same answer, as `agitrack -b` replacing a tracker it just stopped."""
+        if self._lock is None:
+            return True
+        try:
+            return bool(self._lock.acquire(retry_seconds=5.0))
+        except Exception as error:
+            self._debug(f"lock re-acquire after failed restart failed: {error!r}")
+            return False
 
     def _write_handshake(self) -> None:
         # Record our pid so `agitrack -b stop`/`status` can target THIS background tracker
@@ -772,17 +1146,36 @@ class BackgroundRunner:
                         # new code). Without this, every rerun tore the daemon down and respawned it —
                         # the churn that made the tracker appear to "quit" on unrelated invocations.
                         "version": __version__,
+                        # The event log THIS daemon writes to, so `-b stop` can append
+                        # `daemon-stop` to it after a Windows TerminateProcess has denied the
+                        # daemon its own teardown. `--log-file` is a flag and is never persisted
+                        # to config, so the stopping process has no other way to learn it.
+                        "log_file": str(self.events.path) if self.events.path else None,
                     }
                 ),
                 encoding="utf-8",
             )
         except OSError as error:
             self._debug(f"handshake write failed: {error!r}")
-        # Also record it in the global daemon registry, so `agitrack --daemons` lists it and a
-        # self-update can restart it. Best-effort; never blocks the tracker.
-        from agitrack import daemons
+        self._register_daemon()
 
-        daemons.register("background", self.repo.repo)
+    def _register_daemon(self) -> None:
+        """Record this process in the global daemon registry, so `agitrack --daemons` lists it,
+        a self-update can restart it, and the test suite's session reaper can find it.
+
+        Deliberately SEPARATE from the handshake, and called much earlier. The two answer
+        different questions: the registry says "this process exists, here is how to reach and
+        stop it", while the handshake says "I am up, hooks armed, tracking" — which is why the
+        handshake has to come last. Registering with it meant a daemon was UNFINDABLE for the
+        whole of its startup: nothing could list it, and the suite's per-test sweep (which reads
+        this registry) missed any daemon that had not finished starting, so it was never reaped
+        and outlived the run. Idempotent; best-effort — never blocks the tracker."""
+        try:
+            from agitrack import daemons
+
+            daemons.register("background", self.repo.repo)
+        except Exception as error:
+            self._debug(f"daemon registry write failed: {error!r}")
 
     def _remove_handshake(self) -> None:
         try:
@@ -851,7 +1244,21 @@ class BackgroundRunner:
         the user chose "off" (via the `agitrack -b` prompt) it is NOT installed, and any existing
         one is removed. No-op when a custom core.hooksPath makes install impossible."""
         try:
-            if self.repo.core_hooks_path():
+            hooks_path = self.repo.core_hooks_path()
+            if hooks_path:
+                # SAY IT. This was `_debug`-only — invisible even with --verbose, since those
+                # diagnostics go to a log file whose path is never printed — so the string
+                # "core.hooksPath" never reached the user at all, and `-s` then asserted the
+                # opposite ("Auto-start: on"). Anyone on Husky / pre-commit / lefthook was told
+                # their commits were tracked while nothing was.
+                self._print(
+                    f"this repo sets core.hooksPath ({hooks_path}), so git ignores the hooks "
+                    "directory aGiTrack installs into.\n"
+                    "  Tracking works normally while aGiTrack runs, but commits made after it "
+                    "stops are NOT tracked.\n"
+                    "  Your own hooks are left exactly as they are — aGiTrack will not override "
+                    "core.hooksPath to install into it."
+                )
                 self._debug("autotrack hook skipped: core.hooksPath is set")
                 return
             if getattr(self.global_config, "autotrack_hook", "auto") == "off":
@@ -871,8 +1278,62 @@ class BackgroundRunner:
                 version=__version__,
                 debug=self._debug,
             )
+            self._install_change_autostart_hook()
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")
+
+    def _install_change_autostart_hook(self) -> None:
+        """The agent-side half of auto-start: resume tracking when a TURN leaves changes, not
+        only when the user commits.
+
+        The pre-commit hook above cannot see an agent that edits for an hour without
+        committing — which is precisely the work aGiTrack exists to record. Nothing can observe
+        a plain file edit without a process already running (the situation auto-start is FOR),
+        so the trigger is the agent's own turn-end hook. Claude Code is the only backend that
+        offers one; the others keep the commit-time behaviour they have always had.
+
+        Installed under the same ``autotrack_hook`` opt-in as the git hook, and persistent for
+        the same reason — its job is to run when aGiTrack is not."""
+        if self.state.backend != "claude":
+            return
+        from agitrack.backends import claude_settings
+
+        if claude_settings.install_autostart_hook(self.repo.repo, debug=self._debug):
+            self._debug("claude change-autostart hook installed")
+
+    def _install_commit_guidance(self) -> None:
+        """Tell the agent that aGiTrack commits for it — the thing proxy mode does with
+        ``--append-system-prompt`` and background mode cannot, because it never spawns the
+        agent. Claude Code is the only backend with a channel for it that does not touch the
+        user's source tree (see backends/claude_settings.py), so the others are simply left
+        alone rather than given a half-measure.
+
+        Skipped when the user opted out with ``--no-commit-guidance``: that flag means "do
+        not tell the agent what to do about commits", and which mechanism carries the note is
+        an implementation detail the flag should not have to know about.
+
+        UNLIKE THE AUTOTRACK HOOK, this one IS removed on teardown. That hook exists to keep
+        tracking working while aGiTrack is NOT running; this one would be a lie in the same
+        situation — with no tracker watching, nothing is committing for the agent and it
+        should behave normally again."""
+        if not self._commit_guidance or self.state.backend != "claude":
+            return
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.install_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook installed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook install failed: {error!r}")
+
+    def _remove_commit_guidance(self) -> None:
+        try:
+            from agitrack.backends import claude_settings
+
+            if claude_settings.remove_commit_guidance_hook(self.repo.repo, debug=self._debug):
+                self._debug("claude commit-guidance hook removed")
+        except Exception as error:
+            self._debug(f"commit-guidance hook removal failed: {error!r}")
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):
@@ -1464,25 +1925,25 @@ class BackgroundRunner:
     def _make_summarizer(self):
         if not self._summarization_enabled():
             return None
-        from agitrack.backends.claude import ClaudeBackend
-        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.backends import backend_class as _backend_class, backend_name as _backend_name
         from agitrack.summaries import Summarizer, summary_scratch_dir
         from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
-        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
+        backend_name = _backend_name(self.state.backend)
+        backend_class = _backend_class(backend_name)
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
         # A summarization_model configured for a different backend (e.g. a Claude id under an
         # OpenCode session) is invalid there and fails every summary — drop it for the default.
         model = compatible_summarization_model(backend_name, model)
-        if model is None and backend_name == "opencode":
+        if model is None and backend_name != "claude":
             # Same reasoning (and the same fix) as ProxyRunner._make_summarizer: the summarizer
-            # runs from a scratch dir outside the repo, so the project's `opencode.json` model
-            # pin cannot apply and OpenCode falls back to its global default — which failed
-            # every summary here too, leaving the daemon's commits with raw-prompt subjects
-            # while the interactive path had already been fixed. Two copies, one bug.
+            # runs from a scratch dir outside the repo, so a project-scoped model pin
+            # (`opencode.json`, `.codex/config.toml`) cannot apply and the backend falls back to
+            # its global default — which failed every summary here too, leaving the daemon's
+            # commits with raw-prompt subjects while the interactive path had already been
+            # fixed. Two copies, one bug.
             model = compatible_summarization_model(backend_name, self.state.model)
         launch = self._backend_command or None
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch), model=model)

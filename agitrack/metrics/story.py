@@ -208,7 +208,6 @@ class StoryStore:
         return data
 
     def save(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         try:  # keep .agitrack/ git-ignored even in a repo that never ran aGiTrack
             from agitrack.config.state import AgitrackState
 
@@ -1633,6 +1632,11 @@ def story_html(root: Path, *, banner_html: str = "") -> str:
         .replace("__PREBOOT_CSS__", PREBOOT_CSS)
         .replace("__PREBOOT_HTML__", PREBOOT_HTML.replace("the aGiTrack dashboard", "the storyline"))
         .replace("__FONT_LINKS__", FONT_LINKS)
+        # Built from the backend registry, never hand-written: a literal option list simply
+        # could not offer a newly added backend, and nothing failed to say so.
+        .replace("__BACKEND_OPTIONS__", learn_page._backend_option_html()),
+        # Switching repository or view from the hub bar keeps you on the storyline.
+        __UI_HUBBAR_PAGE__="story",
     )
 
 
@@ -1643,7 +1647,9 @@ def story_backtrace_banner(directory: str) -> str:
 
     return (
         '<div class="btbanner">&#9194; BACKTRACE. This story is told from a reconstruction of past '
-        f"coding-agent sessions in {_escape(directory)}, not from aGiTrack's live repo tracking. "
+        f"coding-agent sessions in {_escape(directory)}, <b>not from aGiTrack's active tracking</b>. "
+        "A reconstruction infers which conversation changed which files, so it is less accurate "
+        "than the tracked view. "
         "Tip: run <code>agitrack --backtrace commit</code> to bake this history into your git commit "
         "messages, then launch your coding agent through <code>agitrack</code> and every future "
         "moment writes itself.</div>"
@@ -1964,6 +1970,7 @@ __UI_COMMIT_CSS__
 
 /* The frozen top strips (backtrace notice, static-demo notice), matching the learn page. */
 __UI_BANNER_CSS__
+__UI_HUBBAR_CSS__
 
 footer{margin-top:40px;padding-top:14px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 footer code{color:var(--fg)}
@@ -1983,6 +1990,7 @@ footer code{color:var(--fg)}
 </head>
 <body>
 __PREBOOT_HTML__
+__UI_HUBBAR_HTML__
 __BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">
@@ -2068,16 +2076,16 @@ __BACKTRACE_BANNER__
       <div class="row"><label>backend</label>
         <select id="e-backend">
           <option value="">auto (latest session)</option>
-          <option value="claude">claude</option>
-          <option value="opencode">opencode</option>
+__BACKEND_OPTIONS__
         </select>
         <label style="min-width:auto">model</label>
         <select id="e-model"><option value="">auto (latest session)</option></select>
         <button class="btn" id="e-save">save</button>
         <span class="hint" id="e-msg" style="margin-top:0"></span>
       </div>
-      <div class="hint">Saved in this repo as <code>learning_backend</code> / <code>learning_model</code> in
-        <code>.agitrack/config.json</code>, the same pair the learn page uses, so one choice covers both.
+      <div class="hint">Saved as <code>learning_backend</code> / <code>learning_model</code> in
+        <code>~/.agitrack/config.json</code> (or this repo's <code>.agitrack/config.json</code>, if it already
+        pins them), the same pair the learn page uses, so one choice covers both.
         A bigger model tells a better story; a smaller one is quicker and cheaper.</div>
     </div>
   </details>
@@ -2090,6 +2098,7 @@ __BACKTRACE_BANNER__
 // The document is here and styled: drop the pre-boot overlay that covered its transfer.
 { const pb = document.getElementById("preboot"); if (pb) pb.remove(); }
 __UI_DOM_JS__
+__UI_HUBBAR_JS__
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const state = {
@@ -2614,10 +2623,21 @@ function fillMoment(el, animate){
   if (box.dataset.filled === "1") return;
   // A moment's body is written the first time someone opens it (one agent call), not up
   // front for a hundred moments nobody may read. Headline now, prose on demand.
-  if (!c.detail) { writeMoment(el, c, box); return; }
+  //
+  // Except in a static snapshot, where there is no agent to ask. The prose is the only part
+  // that needs one: the stats, the files and THE COMMITS THEMSELVES are already in the moment,
+  // and refusing to show any of them because one field is missing turned every chapter of the
+  // public demo into an error message about a feature the reader cannot use anyway.
+  if (!c.detail && !window.AGITRACK_STATIC) { writeMoment(el, c, box); return; }
   box.dataset.filled = "1";
   const st = c.stats || {};
   let html = '<div class="detail md">' + md(c.detail || c.summary || "") + "</div>";
+  if (!c.detail && window.AGITRACK_STATIC) {
+    // Say which part is missing and why, so a reader does not take the shorter body for the
+    // whole story. Everything below this line is real.
+    html += '<div class="notice">This snapshot ships the moment\'s headline rather than the ' +
+      "longer piece its agent would write on a live install. Its commits, below, are real.</div>";
+  }
   if (c.thoughts && c.thoughts.length) {
     html += '<div class="thoughts"><h4>&#128172; in their own words</h4>' + c.thoughts.map((t, i) =>
       '<div class="th" data-i="' + i + '">' +
@@ -2837,6 +2857,14 @@ async function saveEngine(){
 
 function renderEngine(){
   const e = (state.data && state.data.engine) || {};
+  // A backend that cannot be resolved is fixable right here — open the panel that fixes it
+  // rather than leaving the note as the only sign (#233).
+  if (e.needs_choice) {
+    $("engine").open = true;
+    if ($("e-backend").dataset.touched !== "1" && !$("e-backend").value) {
+      $("e-backend").value = (e.installed || [])[0] || "";
+    }
+  }
   if ($("e-backend").dataset.touched !== "1") {
     $("e-backend").value = e.backend_source === "config" ? (e.backend || "") : "";
     if ($("e-model").dataset.filled !== "1") {
@@ -3073,6 +3101,7 @@ $("f-branch").addEventListener("change", () => {
 });
 window.addEventListener("hashchange", openFromHash);
 
+initHubBar();
 load().catch(() => {});   // load() reports for itself, after its retries
 // A build started from another tab (or still running from before this page loaded) keeps
 // the page live without anyone pressing anything.

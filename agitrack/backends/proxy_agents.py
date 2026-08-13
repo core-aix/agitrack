@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Protocol
 
-from agitrack.transcripts import claude as claude_session, opencode as opencode_session
+from agitrack.transcripts import claude as claude_session, codex as codex_session, opencode as opencode_session
 from agitrack.transcripts import ExportedSession, SessionRef
 
 
@@ -125,6 +125,13 @@ class ProxyAgent(Protocol):
     """
 
     name: str
+    # How this backend is written in prose the user reads ("Claude Code", not "claude").
+    # Registered here so a sentence naming the backends can be BUILT from the registry
+    # instead of hand-written: every hardcoded "Claude or OpenCode" in a user-facing string
+    # silently became a lie the day Codex landed, and one of them ("Backtrace reconstructs
+    # past Claude or OpenCode sessions...") was still telling Codex users their own sessions
+    # were unsupported. See `backend_phrase`.
+    label: str
     # Whether this backend has a portable transcript that can be shared and
     # resumed across machines (issue #55). Both Claude (per-session .jsonl) and
     # OpenCode (export/import CLI) do.
@@ -281,6 +288,7 @@ class ProxyAgent(Protocol):
 
 class OpenCodeProxyAgent:
     name = "opencode"
+    label = "OpenCode"
     # OpenCode's `export`/`import` CLI serialises a whole session to JSON (id
     # preserved, directory retargeted to the import cwd), so its sessions are
     # portable and shareable like Claude's (issue #55).
@@ -389,6 +397,7 @@ class OpenCodeProxyAgent:
 
 class ClaudeProxyAgent:
     name = "claude"
+    label = "Claude Code"
     supports_session_sharing = True
 
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
@@ -497,14 +506,142 @@ class ClaudeProxyAgent:
         return False
 
 
+class CodexProxyAgent:
+    name = "codex"
+    label = "Codex"
+    # Codex keeps one append-only rollout JSONL per conversation, so a session is portable and
+    # shareable across machines exactly like Claude's per-session transcript (issue #55).
+    supports_session_sharing = True
+
+    def export_session_raw(self, repo: Path, session_id: str) -> str | None:
+        return codex_session.export_session_raw(repo, session_id)
+
+    def cap_shared_transcript(self, transcript: str, max_bytes: int) -> str:
+        return codex_session.cap_shared_transcript(transcript, max_bytes)
+
+    def transcript_size(self, repo: Path, session_id: str) -> int | None:
+        return codex_session.session_transcript_size(repo, session_id)
+
+    def has_local_session(self, repo: Path, session_id: str) -> bool:
+        return codex_session.has_imported_session(repo, session_id)
+
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
+        return codex_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
+
+    def new_session_id(self) -> str | None:
+        # Codex mints its own (time-ordered UUIDv7) thread id and its CLI exposes no flag to
+        # pin one, so aGiTrack discovers the id after the run rather than choosing it up front.
+        return None
+
+    def new_import_id(self) -> str | None:
+        # Codex resolves a session by the uuid in its rollout file name, so any fresh uuid works
+        # as the id to re-import a shared conversation under ("keep both").
+        return codex_session.new_import_id()
+
+    def spawn_command(
+        self,
+        repo: Path,
+        *,
+        session_id: str | None,
+        resume: bool,
+        fork: bool = False,
+        commit_guidance: bool = True,
+        use_worktrees: bool = True,
+        base_repo: Path | None = None,
+        executable: list[str] | None = None,
+    ) -> list[str]:
+        # ``commit_guidance``/``use_worktrees``/``base_repo`` are accepted for a uniform
+        # interface but unused: the only system-prompt lever Codex's TUI exposes
+        # (experimental_instructions_file) REPLACES the agent prompt rather than appending to
+        # it, so using it to add aGiTrack's note would delete Codex's own coding instructions.
+        # The note is therefore not delivered on this backend — see AGENTS.md's backend
+        # differences. ``fork`` is likewise unused: `codex fork` exists but only as an
+        # interactive picker, with no way to fork a NAMED session non-interactively.
+        command = list(executable) if executable else ["codex"]
+        if resume and session_id:
+            command.extend(["resume", session_id])
+        # `-C` rather than a positional path: Codex's positional argument is the PROMPT, so
+        # passing the repo there would submit the directory name as the user's first message.
+        command.extend(["-C", str(repo)])
+        # Carry the base repo's EXISTING trust onto the worktree, so the user isn't asked "do
+        # you trust this directory?" on every session just because aGiTrack made a fresh
+        # worktree. Adds nothing when the base repo isn't already trusted.
+        command.extend(codex_session.trust_args(repo, base_repo))
+        return command
+
+    def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool:
+        return codex_session.session_belongs_to_repo(repo, session_id)
+
+    def ensure_resumable(self, repo: Path, session_id: str) -> bool:
+        return codex_session.prepare_resume(repo, session_id)
+
+    def mirror_to_base(self, base_repo: Path, worktree: Path, session_id: str) -> bool:
+        # Codex resolves a session by id from its global store regardless of cwd, so there is
+        # no per-directory transcript file to link.
+        return False
+
+    def forget_session_in(self, repo: Path, session_id: str) -> bool:
+        # Nothing to forget: one conversation records exactly one directory, and relocating it
+        # (retarget_working_dir) moves that record rather than leaving a copy behind.
+        return codex_session.forget_session_in(repo, session_id)
+
+    def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
+        return codex_session.session_cwd(session_id, since=since)
+
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
+        return codex_session.retarget_session_cwd(repo, session_id, cwd, git_branch=git_branch)
+
+    def latest_session_id(self, repo: Path) -> str | None:
+        return codex_session.latest_session_id(repo)
+
+    def session_last_activity(self, session_id: str) -> float | None:
+        return codex_session.session_last_activity(session_id)
+
+    def session_transcript_path(self, session_id: str) -> Path | None:
+        # Codex appends every turn of a conversation — resumes included — to ONE rollout file,
+        # so its mtime is a true per-session liveness signal and the runner can use the same
+        # stat-the-transcript path it uses for Claude.
+        return codex_session.session_transcript_path(session_id)
+
+    def list_sessions(self, repo: Path) -> list[SessionRef]:
+        return codex_session.list_sessions(repo)
+
+    def list_worktree_sessions(self, worktrees_root: Path) -> list[tuple[str, SessionRef]]:
+        return codex_session.list_worktree_sessions(worktrees_root)
+
+    def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
+        return codex_session.export_session(repo, session_id)
+
+    def is_event_blob(self, content: str) -> bool:
+        return codex_session.looks_like_event_blob(content)
+
+
 _AGENTS: dict[str, type] = {
     OpenCodeProxyAgent.name: OpenCodeProxyAgent,
     ClaudeProxyAgent.name: ClaudeProxyAgent,
+    CodexProxyAgent.name: CodexProxyAgent,
 }
 
 
 def available_backends() -> list[str]:
     return sorted(_AGENTS)
+
+
+def backend_phrase(conjunction: str = "or") -> str:
+    """The supported backends written for a human: ``"Claude Code, Codex or OpenCode"``.
+
+    For prose in help text, prompts and error messages. Hand-written lists of backend names
+    are a maintenance trap — they read as authoritative, nothing fails when one goes stale,
+    and a user of the missing backend is actively told their sessions are unsupported.
+    """
+    # getattr, not `.label`: the registry is `dict[str, type]` (not `type[ProxyAgent]`) because
+    # mypy refuses to instantiate a Protocol type, so the class objects carry no declared attrs.
+    labels = [str(getattr(_AGENTS[name], "label")) for name in available_backends()]
+    if len(labels) == 1:
+        return labels[0]
+    return f"{', '.join(labels[:-1])} {conjunction} {labels[-1]}"
 
 
 def make_proxy_agent(name: str) -> ProxyAgent:

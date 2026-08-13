@@ -7,6 +7,8 @@ interactive untracked-file review (y/s/default).
 
 from __future__ import annotations
 
+import pytest
+
 from unittest.mock import MagicMock, patch
 
 from agitrack.commits.actions import AgitrackActions
@@ -191,3 +193,88 @@ def test_select_paths_non_numeric_ignored():
     with patch("builtins.input", return_value="abc 1"):
         result = actions._select_paths(["a.py", "b.py"])
     assert result == ["a.py"]
+
+
+def _dirty_repo(tmp_path):
+    import subprocess
+
+    from agitrack.git import GitRepo
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / "a.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    (root / "a.txt").write_text("one\nuser edit\n", encoding="utf-8")
+    return GitRepo.discover(root)
+
+
+def _actions(repo):
+    from agitrack.commits import AgitrackActions
+    from agitrack.config import AgitrackState
+
+    return AgitrackActions(repo, AgitrackState(repo.repo), interactive=True)
+
+
+def test_typing_skip_where_skipping_is_impossible_never_becomes_the_commit_message(tmp_path, monkeypatch):
+    """B9: in worktree mode the pre-agent commit is mandatory and `skip` was not recognised, so
+    it became the MESSAGE — a commit literally named `skip` landed on main. The same word means
+    "back out" one mode over (--no-worktree offers it explicitly), which is exactly why people
+    reach for it here."""
+    repo = _dirty_repo(tmp_path)
+    answers = iter(["skip", "a real message"])
+    monkeypatch.setattr("builtins.input", lambda _p="": next(answers))
+
+    assert _actions(repo).create_user_commit(allow_skip=False) is True
+
+    assert repo._run(["git", "log", "-1", "--format=%s"]).stdout.strip() == "a real message"
+
+
+def test_the_mandatory_prompt_has_a_way_out(tmp_path, monkeypatch):
+    """The prompt had NO exit at all: empty Enter re-asked forever and Ctrl-C was swallowed —
+    one live run spent 150 s and six Ctrl-C without escaping. A required question still has to
+    have an answer that ends it."""
+    from agitrack.commits import UserCommitAborted
+
+    repo = _dirty_repo(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _p="": "quit")
+
+    with pytest.raises(UserCommitAborted):
+        _actions(repo).create_user_commit(allow_skip=False)
+
+    assert repo.staged_paths() == []  # and it leaves the index exactly as it found it
+
+
+def test_ctrl_c_at_the_mandatory_prompt_aborts_rather_than_continuing(tmp_path, monkeypatch):
+    """Swallowing it meant launching into a worktree that is missing the user's uncommitted
+    work — the very thing the prompt exists to prevent."""
+    from agitrack.commits import UserCommitAborted
+
+    repo = _dirty_repo(tmp_path)
+
+    def _interrupt(_p=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _interrupt)
+
+    with pytest.raises(UserCommitAborted):
+        _actions(repo).create_user_commit(allow_skip=False)
+    assert repo.staged_paths() == []
+
+
+def test_skip_still_works_where_it_is_offered(tmp_path, monkeypatch):
+    """--no-worktree offers skip, and declining must leave the index untouched — staging on the
+    user's behalf and leaving it there hides a half-resolved file under "changes to be
+    committed"."""
+    repo = _dirty_repo(tmp_path)
+    (repo.repo / "untracked.txt").write_text("new\n", encoding="utf-8")
+    before = repo._run(["git", "status", "--porcelain"]).stdout
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
+
+    assert _actions(repo).create_user_commit(allow_skip=True) is False
+
+    assert repo._run(["git", "status", "--porcelain"]).stdout == before
+    assert repo.staged_paths() == []
