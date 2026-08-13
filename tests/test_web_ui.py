@@ -383,3 +383,38 @@ def test_the_dropdown_rereads_the_states_each_time_it_opens():
     assert "refreshStates" in html
     # Updated in place: rebuilding the list would move the reader's cursor and scroll position.
     assert "chip.classList.toggle" in html
+
+
+def test_the_header_status_is_refreshed_often_enough_to_be_trusted():
+    html = _hub_pages()["dashboard"]
+
+    # A status that is stale is worse than no status: it is read as fact.
+    assert "const HUB_STATE_MS = 5000;" in html
+    assert "setInterval(refreshHubState, HUB_STATE_MS)" in html
+
+
+def test_the_header_status_catches_up_when_the_tab_comes_forward():
+    html = _hub_pages()["dashboard"]
+
+    # A tab backgrounded for an hour shows an hour-old answer the instant it is looked at again.
+    assert 'document.addEventListener("visibilitychange"' in html
+    assert 'window.addEventListener("focus", refreshHubState)' in html
+
+
+def test_the_dashboard_refreshes_the_status_on_the_same_beat_as_new_commits():
+    from agitrack.metrics import ui
+    from agitrack.metrics.web import _TEMPLATE
+
+    html = ui.render(_TEMPLATE, __UI_HUBBAR_PAGE__="")
+
+    # Tracking starting and new commits appearing have the same causes, so the header must not
+    # drift out of step with the numbers under it.
+    assert 'if(typeof refreshHubState === "function") refreshHubState();' in html
+
+
+def test_the_status_refresh_is_optional_on_a_page_without_the_hub_bar():
+    # The dashboard also serves from a standalone daemon and from the static export, where the
+    # hub bar removes itself; the data poll must not throw looking for a function that is there.
+    from agitrack.metrics.web import _TEMPLATE
+
+    assert 'typeof refreshHubState === "function"' in _TEMPLATE
