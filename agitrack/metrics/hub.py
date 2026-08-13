@@ -573,7 +573,15 @@ def build_handler(router: HubRouter) -> type[http.server.BaseHTTPRequestHandler]
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
             try:
                 parsed = urllib.parse.urlparse(self.path)
-                write_response(self, router.post(parsed.path, read_json_body(self)))
+                body = read_json_body(self)
+                if parsed.path == "/clients" and not body.get("browser"):
+                    # The page says which browser it is in, but a tab loaded before it learned to
+                    # says nothing — and it is still the tab that has to be raised. The header is
+                    # on every request either way, so it fills the gap without a reload.
+                    from agitrack.metrics.server import browser_family_from_user_agent
+
+                    body["browser"] = browser_family_from_user_agent(self.headers.get("User-Agent", ""))
+                write_response(self, router.post(parsed.path, body))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 

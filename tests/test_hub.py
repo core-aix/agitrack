@@ -961,3 +961,43 @@ def test_a_remote_or_headless_host_has_no_window_to_raise(monkeypatch):
     monkeypatch.setattr(server, "browser_is_local", lambda: False)
 
     assert server.raise_browser_window("firefox") is False
+
+
+def test_an_unknown_browser_raises_nothing_rather_than_guessing():
+    """Trying each running browser in turn raised whichever came first in the list rather than
+    the one holding the tab. With Safari showing the dashboard and Firefox merely running, it
+    raised Firefox — and Firefox had no window open, so `open -a` made a blank one."""
+    from agitrack.metrics import server
+
+    assert server.raise_browser_window("") is False
+
+
+def test_a_browser_family_is_read_off_the_request_when_the_page_does_not_say():
+    """A tab loaded before the page learned to report its browser says nothing, and it is still
+    the tab that has to be raised. The header is on every request either way."""
+    from agitrack.metrics.server import browser_family_from_user_agent
+
+    safari = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    )
+    chrome = "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+    assert browser_family_from_user_agent(safari) == "safari"
+    # Order matters: Chrome's user agent also contains "Safari", and every Chromium browser
+    # contains "Chrome".
+    assert browser_family_from_user_agent(chrome) == "chrome"
+    assert browser_family_from_user_agent(chrome + " Edg/120.0") == "edge"
+    assert browser_family_from_user_agent("") == ""
+
+
+def test_the_page_that_does_say_is_believed_over_the_header(tmp_path):
+    # The body wins when it is there: the page knows things a user agent cannot say (Brave
+    # reports itself as Chrome), and the header is only the gap-filler.
+    router = hub.HubRouter()
+    router.post("/clients", {"id": "t", "path": "/r/x/", "page": "", "browser": "firefox"})
+
+    import threading
+
+    threading.Timer(0.05, lambda: router.post("/clients", {"id": "t", "path": "/r/x/", "page": ""})).start()
+    assert router.clients.navigate("/r/y/") == "firefox"

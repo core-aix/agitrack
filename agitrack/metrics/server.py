@@ -633,6 +633,26 @@ def open_dashboard_in_browser(url: str) -> bool:
 # applications (every Chromium browser reports itself as Chrome, and Brave and Arc cannot be told
 # apart from it by user agent), so the first one that is actually RUNNING wins — aGiTrack must
 # never launch a browser nobody had open.
+def browser_family_from_user_agent(user_agent: str) -> str:
+    """Which browser a request came from, by its ``User-Agent``.
+
+    The page reports this itself, but a tab loaded before it learned to says nothing — and it is
+    still the tab that has to be raised. The header is there on every request either way, so it
+    is the more reliable of the two. Order matters: every Chromium browser also says "Chrome"."""
+    ua = user_agent or ""
+    for needle, family in (
+        ("Edg/", "edge"),
+        ("OPR/", "opera"),
+        ("Vivaldi", "vivaldi"),
+        ("Firefox/", "firefox"),
+        ("Chrome/", "chrome"),
+        ("Safari/", "safari"),
+    ):
+        if needle in ua:
+            return family
+    return ""
+
+
 _BROWSER_APPS = {
     "chrome": ("Google Chrome", "Brave Browser", "Arc", "Chromium", "Google Chrome Canary"),
     "firefox": ("Firefox", "firefox", "Firefox Developer Edition"),
@@ -659,6 +679,13 @@ def raise_browser_window(family: str = "") -> bool:
     reason to fail the thing the user actually asked for."""
     if not browser_is_local():
         return False  # a remote/headless host has no window to raise
+    if not family:
+        # NEVER guess. Trying each running browser in turn raised whichever happened to come
+        # first in the list rather than the one holding the tab — and when that browser had no
+        # window open, `open -a` made a blank one. The browser that just took the navigation
+        # provably has a window (the tab itself), so knowing which it is also guarantees there is
+        # something to raise. Not knowing is a reason to do nothing.
+        return False
     if sys.platform == "darwin":
         return _raise_macos(family)
     if sys.platform.startswith("linux"):
@@ -692,7 +719,7 @@ def _raise_macos(family: str) -> bool:
     running = _running_macos_apps()
     if not running:
         return False
-    for app in _BROWSER_APPS.get(family, ()) or tuple(name for names in _BROWSER_APPS.values() for name in names):
+    for app in _BROWSER_APPS.get(family, ()):
         match = next((name for name in running if name.lower() == app.lower()), "")
         if not match:
             continue
