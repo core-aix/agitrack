@@ -295,8 +295,8 @@ HUBBAR_CSS = """.hubbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
 .repoitem:last-child{border-bottom:0}
 .repoitem:hover,.repoitem.cursor{background:var(--panel2)}
 /* Name on the left, tracking state on the right, path underneath. The state is the reason the
-   row is two lines rather than one: "which of my projects is actually being tracked right now"
-   is a question the switcher can answer for every repository at once, and a list of bare names
+   row is two lines rather than one: "which of these is actually being tracked right now" is a
+   question the switcher can answer for every repository at once, and a list of bare names
    answers it for none of them. */
 .repoitem .ri-top{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
 .repoitem .ri-name{color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
