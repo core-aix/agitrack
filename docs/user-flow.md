@@ -902,9 +902,9 @@ from. A mount reached without its trailing slash redirects, so the address bar a
 relative links never disagree.
 
 **The header.** Three controls, shared by all three pages: a repository selector (a listbox, so it
-scrolls at a bounded height and can pin a "show another repository" item that opens a how-to
-dialog), the tracked/backtrace toggle, and a status light saying whether aGiTrack is running on
-the repository being shown and in which mode. Switching repository goes through `/go/<slug>/`,
+scrolls at a bounded height, shows each repository's own tracking state on its row, and can pin a
+"show another repository" item that opens a how-to dialog), the tracked/backtrace toggle, and a
+status light saying whether aGiTrack is running on the repository being shown and in which mode. Switching repository goes through `/go/<slug>/`,
 which redirects to whichever view suits THAT repository: carrying the current view across is what
 lands you on another project's empty page.
 

@@ -565,3 +565,59 @@ def test_backtrace_with_no_sessions_explains_itself_in_the_terminal(tmp_path, mo
     # ...and the two things a reader can act on: why it might be empty, and what fills it.
     assert "different directory" in out
     assert "pick a mode" in out
+
+
+def test_the_repo_list_carries_each_repos_tracking_state(tmp_path, monkeypatch):
+    """A list of bare names cannot answer "which of my projects is actually being tracked?"."""
+    _repo(tmp_path, "live")
+    _repo(tmp_path, "idle")
+    repo_registry.remember(tmp_path / "live")
+    repo_registry.remember(tmp_path / "idle")
+    monkeypatch.setattr(
+        "agitrack.proxy.background.running_mode",
+        lambda repo: (
+            {"running": True, "kind": "background", "label": "tracking · background · auto commits", "detail": "d"}
+            if repo.repo.name == "live"
+            else {"running": False, "kind": "none", "label": "not tracking", "detail": "start it"}
+        ),
+    )
+    router = hub.HubRouter()
+
+    rows = {r["name"]: r for r in json.loads(router.get("/repos", {}).body)["repos"]}
+
+    assert rows["live"]["running"] is True and rows["live"]["state"] == "background"
+    assert rows["idle"]["running"] is False and rows["idle"]["state"] == "off"
+    # The full sentence rides along for the row's tooltip.
+    assert rows["idle"]["state_detail"] == "start it"
+
+
+def test_a_repos_state_is_read_from_its_path_without_opening_a_repository(tmp_path):
+    """Putting git on the path of drawing a dropdown would make the switcher the slowest control
+    on the page, and some listed directories are not repositories at all."""
+    from agitrack.proxy.background import running_mode_for
+
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+
+    state = running_mode_for(plain)
+
+    assert state["running"] is False and state["label"] == "not tracking"
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        ({"running": False}, "off"),
+        ({"running": True, "kind": "background", "label": "tracking · background · auto commits"}, "background"),
+        (
+            {"running": True, "kind": "background", "label": "tracking · background · manual commits"},
+            "background · manual",
+        ),
+        ({"running": True, "kind": "interactive", "label": "tracking · interactive · auto commits"}, "interactive"),
+        ({"running": True, "kind": "unknown", "label": "tracking"}, "tracking"),
+    ],
+)
+def test_the_row_label_keeps_only_what_differs_between_repositories(state, expected):
+    # "tracking · background · auto commits" reads well on its own line in the header and is far
+    # too long next to twenty repository names.
+    assert hub._short_state(state) == expected

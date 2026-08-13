@@ -294,7 +294,16 @@ HUBBAR_CSS = """.hubbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   border-bottom:1px solid var(--line)}
 .repoitem:last-child{border-bottom:0}
 .repoitem:hover,.repoitem.cursor{background:var(--panel2)}
-.repoitem .ri-name{display:block;color:var(--fg)}
+/* Name on the left, tracking state on the right, path underneath. The state is the reason the
+   row is two lines rather than one: "which of my projects is actually being tracked right now"
+   is a question the switcher can answer for every repository at once, and a list of bare names
+   answers it for none of them. */
+.repoitem .ri-top{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
+.repoitem .ri-name{color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.repoitem .ri-state{flex:none;display:flex;align-items:center;gap:5px;font-size:11px;color:var(--fg-dim)}
+.repoitem .ri-state.live{color:var(--phosphor)}
+.repoitem .ri-dot{width:6px;height:6px;border-radius:50%;background:var(--fg-dim);flex:none}
+.repoitem .ri-state.live .ri-dot{background:var(--phosphor);box-shadow:0 0 5px var(--phosphor-dim)}
 .repoitem .ri-path{display:block;color:var(--fg-dim);font-size:11px;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .repoitem.on .ri-name{color:var(--phosphor);font-weight:600}
@@ -408,14 +417,32 @@ function wireRepoPicker(repos){
   btn.title = here ? here.path : btn.title;
   list.innerHTML = repos.map(r =>
     `<button class="repoitem${r.slug === HUB.slug ? " on" : ""}" role="option" data-slug="${esc(r.slug)}"
-       aria-selected="${r.slug === HUB.slug}"><span class="ri-name">${esc(r.name)}</span>
+       aria-selected="${r.slug === HUB.slug}" title="${esc(r.state_detail || "")}">
+       <span class="ri-top"><span class="ri-name">${esc(r.name)}</span>
+       <span class="ri-state${r.running ? " live" : ""}"><span class="ri-dot"></span>${esc(r.state || "")}</span></span>
        <span class="ri-path">${esc(r.path)}</span></button>`).join("");
   const items = Array.from(list.querySelectorAll(".repoitem"));
   items.forEach(el => el.onclick = () => { location.href = hubGoUrl(el.dataset.slug); });
   let cursor = Math.max(0, items.findIndex(el => el.classList.contains("on")));
   const mark = () => items.forEach((el, i) => el.classList.toggle("cursor", i === cursor));
+  // The states were read when the page loaded, and a tracker can start or stop while it sits
+  // open. Re-read them each time the menu is opened and update the chips in place, so the cursor
+  // and the scroll position survive: rebuilding the list would move the reader's place under them.
+  const refreshStates = async () => {
+    let fresh = [];
+    try{ fresh = (await (await fetch("/repos", {cache:"no-store"})).json()).repos || []; }catch(e){ return; }
+    const by = {};
+    fresh.forEach(r => by[r.slug] = r);
+    items.forEach(el => {
+      const r = by[el.dataset.slug]; if(!r) return;
+      const chip = el.querySelector(".ri-state"); if(!chip) return;
+      chip.classList.toggle("live", !!r.running);
+      chip.lastChild.textContent = r.state || "";
+      el.title = r.state_detail || "";
+    });
+  };
   const open = () => {
-    menu.hidden = false; btn.setAttribute("aria-expanded", "true"); mark();
+    menu.hidden = false; btn.setAttribute("aria-expanded", "true"); mark(); refreshStates();
     // Keep the current repository in view: with a long list the checked one is otherwise
     // somewhere below the fold of a menu that just opened scrolled to the top.
     if(items[cursor]) items[cursor].scrollIntoView({block: "nearest"});

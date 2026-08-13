@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agitrack import __version__
 from agitrack.backends.proxy_agents import make_proxy_agent
@@ -476,6 +476,24 @@ def running_mode(repo: GitRepo) -> dict:
         }
     except Exception:
         return unknown
+
+
+def running_mode_for(directory: Path) -> dict:
+    """:func:`running_mode` for a plain path, without opening a git repository.
+
+    Everything the answer reads lives under ``<dir>/.agitrack/`` (the tracker's handshake, the
+    interactive session's status file, the repo lock), so it needs the PATH and nothing else. That
+    matters because the dashboard asks this for every repository in its switcher, including ones
+    that are not git repositories at all (a directory can be listed for its reconstruction alone),
+    and because opening a repo per row would put git on the path of drawing a dropdown."""
+    return running_mode(cast(GitRepo, _PathOnlyRepo(Path(directory))))
+
+
+class _PathOnlyRepo:
+    """The one attribute :func:`running_mode` uses. Not a GitRepo, and never used as one."""
+
+    def __init__(self, directory: Path) -> None:
+        self.repo = directory
 
 
 def repo_status(repo: GitRepo) -> int:
