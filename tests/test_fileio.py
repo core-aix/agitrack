@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-from agitrack.fileio import atomic_write_text
+from agitrack.fileio import atomic_write_text, merge_json_for_save, read_json_object
 
 _HAMMER = """
 import json, sys
@@ -90,3 +90,43 @@ def test_atomic_write_creates_parents_and_replaces(tmp_path):
     atomic_write_text(target, "two")
     assert target.read_text(encoding="utf-8") == "two"
     assert not list(target.parent.glob("file.json.*"))
+
+
+# --- merge_json_for_save: atomicity is not isolation ----------------------------------
+
+
+def test_a_key_this_writer_never_touched_keeps_the_value_on_disk(tmp_path):
+    path = tmp_path / "store.json"
+    path.write_text('{"mine": 1, "theirs": "written-since"}', encoding="utf-8")
+    baseline = {"mine": 1, "theirs": "stale"}
+    current = {"mine": 2, "theirs": "stale"}
+
+    assert merge_json_for_save(path, current, baseline) == {"mine": 2, "theirs": "written-since"}
+
+
+def test_a_key_this_writer_deleted_is_removed_not_resurrected(tmp_path):
+    path = tmp_path / "store.json"
+    path.write_text('{"gone": "still-here", "other": 1}', encoding="utf-8")
+
+    assert merge_json_for_save(path, {"other": 1}, {"gone": "x", "other": 1}) == {"other": 1}
+
+
+def test_keys_the_file_has_never_had_are_contributed(tmp_path):
+    # The first save, and every newly introduced default afterwards.
+    path = tmp_path / "store.json"
+
+    assert merge_json_for_save(path, {"a": 1}, {"a": 1}) == {"a": 1}
+
+    path.write_text('{"a": 1}', encoding="utf-8")
+    assert merge_json_for_save(path, {"a": 1, "b": 2}, {"a": 1, "b": 2}) == {"a": 1, "b": 2}
+
+
+def test_a_corrupt_or_missing_file_is_simply_replaced(tmp_path):
+    path = tmp_path / "store.json"
+    path.write_text("{ not json", encoding="utf-8")
+
+    assert merge_json_for_save(path, {"a": 1}, {}) == {"a": 1}
+    assert read_json_object(path) == {}
+    assert read_json_object(tmp_path / "missing.json") == {}
+    (tmp_path / "list.json").write_text("[1, 2]", encoding="utf-8")
+    assert read_json_object(tmp_path / "list.json") == {}

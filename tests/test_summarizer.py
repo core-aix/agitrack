@@ -493,3 +493,47 @@ def test_turns_block_keeps_most_recent_within_budget() -> None:
     assert "prompt-new" in block  # most recent kept
     assert "prompt-old" not in block  # earliest dropped over budget
     assert "[earlier turns omitted]" in block
+
+
+def test_a_trace_with_no_agent_activity_is_refused_rather_than_invented() -> None:
+    """D6: on an INTERRUPTED turn the summarizer is handed a trace containing the user's prompt
+    and no tool records at all — and a model asked to summarize a request produces the request as
+    though it were an outcome. One real commit's subject claimed four files created when only
+    `t1.txt` existed; another claimed zero files written when `t1.txt` was in that very commit.
+    The subject is the line people read, so a fabricated one is worse than none — callers already
+    treat a raising summarizer as "no summary" and keep the honest prompt-led message."""
+    import pytest
+
+    from agitrack.summaries.summarizer import UnusableSummaryError
+
+    backend = Mock()
+    summarizer = Summarizer(backend, model="test-model")
+
+    with pytest.raises(UnusableSummaryError):
+        summarizer.summarize_commit(trace="## User\n\nCreate t1.txt through t4.txt\n")
+
+    backend.run.assert_not_called()  # and it does not spend tokens finding that out
+
+
+def test_a_trace_with_agent_activity_is_still_summarized() -> None:
+    backend = Mock()
+    backend.run.return_value = AgentResult(
+        backend="test",
+        session_id=None,
+        model="test-model",
+        final_response="Created t1.txt.",
+        exit_code=0,
+        tokens=TokenUsage(),
+    )
+    summarizer = Summarizer(backend, model="test-model")
+
+    assert summarizer.summarize_commit(trace=_TRACE) == "Created t1.txt."
+
+
+def test_the_commit_prompt_forbids_inventing_specifics() -> None:
+    """The other half of D6: even with evidence present, the instruction must rule out naming a
+    file or a count the trace does not contain."""
+    from agitrack.summaries.prompts import COMMIT_SUMMARY_SYSTEM
+
+    assert "ONLY evidence" in COMMIT_SUMMARY_SYSTEM
+    assert "a request in the trace is a request, not an outcome" in COMMIT_SUMMARY_SYSTEM

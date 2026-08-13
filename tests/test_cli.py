@@ -106,10 +106,22 @@ def test_gh_check_non_interactive_does_not_prompt(monkeypatch):
     assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
 
 
-def test_gh_check_unauthenticated_continue(monkeypatch):
+def test_gh_check_unauthenticated_defaults_to_login(monkeypatch):
+    # Signing in is the recommended action, so a bare Enter runs `gh auth login`.
     _force_tty(monkeypatch, stdin=True)
     _stub_gh(monkeypatch, status="unauthenticated")
     monkeypatch.setattr("builtins.input", lambda *a: "")
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == [True]
+
+
+def test_gh_check_unauthenticated_skip_continues_without_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "s")
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: (_ for _ in ()).throw(AssertionError("skipped")))
     assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
 
 
@@ -323,7 +335,7 @@ def _stub_repo_and_free_lock(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return True  # nobody else holds it — we take it
 
         def release(self):
@@ -387,7 +399,7 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return False  # another instance holds it — refuse
 
         def owner_pid(self):
@@ -437,7 +449,7 @@ def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             return False  # another instance already holds the repo
 
         def owner_pid(self):
@@ -491,7 +503,7 @@ def test_background_rerun_replaces_a_running_background_tracker(monkeypatch):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             type(self).calls += 1
             return type(self).calls > 1  # held by the old daemon; free once it stops
 
@@ -550,7 +562,7 @@ def _bg_rerun_over_live_tracker(monkeypatch, argv: list[str]):
         def __init__(self, _path):
             pass
 
-        def acquire(self):
+        def acquire(self, **kw):  # **kw: the takeover path passes retry_seconds (see RepoLock.acquire)
             type(self).calls += 1
             return type(self).calls > 1
 
@@ -734,6 +746,51 @@ def _autostart_config(tmp_path):
     cfg = GlobalConfig(path=tmp_path / "global.json")
     cfg.load_repo_overlay(tmp_path)  # repo overlay at tmp_path/.agitrack/config.json
     return cfg
+
+
+def test_the_autostart_prompt_describes_what_this_backend_will_actually_install(tmp_path, monkeypatch, capsys):
+    """The prompt is the consent moment, so it has to match what gets written.
+
+    Answering yes installs a git pre-commit hook on every backend, and ADDITIONALLY a turn-end
+    hook in the repo's `.claude/settings.local.json` — but only on Claude Code, which is the
+    only backend exposing one. Describing that file to a Codex or OpenCode user would promise
+    an install that never happens and hide the limit that does apply to them: nothing is picked
+    up until they commit.
+    """
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    cli._maybe_prompt_background_hook(_autostart_config(tmp_path / "claude"), scripted=False, backend="claude")
+    claude_text = capsys.readouterr().out
+    cli._maybe_prompt_background_hook(_autostart_config(tmp_path / "codex"), scripted=False, backend="codex")
+    codex_text = capsys.readouterr().out
+
+    assert ".claude/settings.local.json" in claude_text
+    assert "without waiting for a commit" in claude_text
+    assert ".claude" not in codex_text
+    assert "at your next COMMIT" in codex_text  # the limitation, said plainly
+    for text in (claude_text, codex_text):
+        assert "pre-commit hook" in text  # the part every backend gets
+        assert "--remove-hooks" in text
+
+
+def test_the_prompt_resolves_the_backend_the_daemon_will_use(tmp_path, monkeypatch):
+    # --backend wins; otherwise the repo's own recorded backend; otherwise the global default.
+    # Getting this wrong shows the wrong description to the user, which is the whole point.
+    import json as _json
+
+    from agitrack.git import GitRepo
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    repo = GitRepo.discover(tmp_path)
+    config = _autostart_config(tmp_path)
+
+    assert cli._autostart_backend(repo, "opencode", config) == "opencode"  # the flag wins
+
+    (tmp_path / ".agitrack").mkdir(exist_ok=True)
+    (tmp_path / ".agitrack" / "state.json").write_text(_json.dumps({"backend": "codex"}), encoding="utf-8")
+    assert cli._autostart_backend(repo, None, config) == "codex"  # then what this repo ran
 
 
 def test_background_hook_prompt_enable_off_and_reask_when_off(tmp_path, monkeypatch, capsys):
@@ -954,7 +1011,7 @@ def test_update_check_runs_under_a_tty(monkeypatch):
     ran = {"checked": False}
     monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
 
-    cli.main([])  # plain interactive proxy launch
+    cli.main(["-i"])  # plain interactive proxy launch (bare `agitrack` on a tty shows the menu)
 
     assert ran["checked"] is True
     assert captured  # launch still proceeded
@@ -1082,7 +1139,7 @@ def test_backend_command_invalid_value_fails_fast(monkeypatch, capsys):
 
 def test_backend_command_mismatch_warns(monkeypatch, capsys):
     captured = _stub_launch(monkeypatch)
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "Warning" in out and "opencode" in out and "claude" in out
@@ -1099,7 +1156,7 @@ def test_backend_command_mismatch_aborts_when_declined(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 1
     out = capsys.readouterr().out
     assert "Warning" in out and "not started" in out
@@ -1114,7 +1171,7 @@ def test_backend_command_mismatch_proceeds_when_confirmed(monkeypatch):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
-    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    rc = cli.main(["-i", "--backend", "claude", "--backend-command", "wrap opencode"])
     assert rc == 0
     assert captured["backend_command"] == ["wrap", "opencode"]
 
@@ -1199,6 +1256,38 @@ def test_help_shows_only_agitrack_options(monkeypatch, capsys):
     assert "--backend" in out and "--no-commit-guidance" in out  # aGiTrack's own options
     assert "Backend help" not in out  # NOT the backend's help section
     assert calls == []  # the backend CLI was never invoked for help
+
+
+def test_help_survives_a_legacy_code_page_console(monkeypatch, capsys):
+    """`agitrack --help` must be printable on a cp1252 console (#233).
+
+    It was not: one help string described the "user↔agent trace", and U+2194 has no cp1252
+    representation, so `--help` — the first command anyone runs — died with a
+    UnicodeEncodeError on a default Windows console. Asserting on the whole rendered help
+    rather than on that one string is the point: any future arrow, box-drawing character or
+    emoji added to an option's help fails here instead of on a user's terminal.
+    """
+    _no_backend_spawn(monkeypatch)
+
+    assert cli.main(["--help"]) == 0
+
+    help_text = capsys.readouterr().out
+    help_text.encode("cp1252")  # raises UnicodeEncodeError if an unrepresentable char is back
+
+
+def test_console_output_degrades_instead_of_crashing(monkeypatch):
+    """The second line of defence: paths, branch names and backend errors are not ours to
+    sanitize, and any of them can carry a character the console's code page lacks."""
+    import io
+
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(cli.sys, "stdout", stream)
+
+    cli._make_console_output_lossy()
+
+    stream.write("user↔agent")  # would raise UnicodeEncodeError under errors="strict"
+    stream.flush()
+    assert stream.errors == "replace"
 
 
 def test_help_short_flag_shows_only_agitrack_options(monkeypatch, capsys):
@@ -1352,7 +1441,7 @@ def test_prompt_flag_implies_json_mode_and_passes_prompts(monkeypatch):
             captured.update(kw)
 
         def run(self):
-            return None
+            return 0  # the real shell returns a process exit code, which main() propagates
 
     monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     monkeypatch.setattr(
@@ -1385,7 +1474,7 @@ def test_prompt_flag_never_blocks_on_input_even_with_a_tty(monkeypatch):
             captured.update(kw)
 
         def run(self):
-            return None
+            return 0  # the real shell returns a process exit code, which main() propagates
 
     monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     _stub_repo_and_free_lock(monkeypatch)
@@ -1506,3 +1595,339 @@ def test_main_stops_when_privacy_warning_declined(monkeypatch):
 
     assert rc == 1
     assert captured == {}  # the shell was not launched
+
+
+def test_auto_commit_overrides_manual_in_interactive_mode(monkeypatch):
+    """C4: the --auto-commit override sat INSIDE the `if background:` block, so it could never
+    fire for a TUI run. The flag was accepted, printed nothing, and did nothing: the turn stayed
+    latent on refs/agitrack/manual/…, the branch never advanced (+0 commits after 420 s), and
+    --help did not say it was background-only."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+
+    assert cli.main(["--manual-commits", "--auto-commit"]) == 0
+
+    assert captured["manual_commits"] is False
+
+
+def test_manual_commits_alone_still_means_manual(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+
+    assert cli.main(["--manual-commits"]) == 0
+
+    assert captured["manual_commits"] is True
+
+
+def test_overwrite_shared_alone_is_an_error_not_an_agent_session(monkeypatch, capsys):
+    """C34: `--overwrite-shared` is a MODIFIER and was read nowhere except next to
+    --share-sessions, so on its own it fell straight through to launching a full agent session.
+    On a machine with a configured backend, someone who typed it meaning to fix a rejected share
+    got a live agent instead."""
+    monkeypatch.setattr(
+        cli, "ProxyRunner", lambda *a, **k: pytest.fail("--overwrite-shared alone must not start a session")
+    )
+
+    assert cli.main(["--overwrite-shared"]) == 2
+
+    out = capsys.readouterr().out
+    assert "--share-sessions" in out
+
+
+def test_flag_prefixes_are_not_accepted(monkeypatch, capsys):
+    """The refusal message named `--overwrite`, a flag that does not exist in --help. It only
+    ever resolved because argparse prefix-matches, and it would have broken silently the moment
+    a second `--overwrite*` option was added. With allow_abbrev off, `--overwrite` is an unknown
+    flag — it is passed through to the backend like any other, not silently promoted to
+    `--overwrite-shared`."""
+    monkeypatch.setattr(
+        cli, "_run_share_sessions", lambda *a, **k: pytest.fail("a flag PREFIX must not trigger a share")
+    )
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("--overwrite must not start a session either"))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    _stub_launch(monkeypatch)
+
+    # Reaching the launcher at all (rather than the share path or the overwrite-shared error)
+    # is the proof: the prefix was not resolved to the real flag.
+    assert cli.main(["--overwrite", "-s"]) == 0
+
+
+def test_the_usage_line_does_not_leak_the_interpreter_path(capsys):
+    """`--help`'s usage line was `usage: python.exe C:\\Users\\dev\\AppData\\Local\\...\\agitrack`
+    — Python 3.14 on Windows derives prog from sys.argv[0] — leaking the user's home layout into
+    any pasted help output, and the only line over 80 columns."""
+    assert cli.main(["--help"]) == 0
+    out = capsys.readouterr().out
+    assert "usage: agitrack" in out
+
+
+def _no_configured_backend(monkeypatch):
+    """A machine that has never chosen a default — the state the backend gate is written for."""
+
+    class Config:
+        default_backend = None
+        use_worktrees = False
+        commit_guidance = True
+
+        def has_default_backend(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+
+def test_the_only_installed_backend_is_used_without_a_tty(monkeypatch, capsys):
+    """Windows/no-TTY: bare `agitrack` and `agitrack -b` both stopped at the backend gate
+    IDENTICALLY whether one or two backends were installed, so an explicitly headless mode
+    required a terminal for its first run and the entire documented prompt chain was
+    unreachable. Five separate live-test scenarios dead-ended here."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name == "claude")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 0
+
+    assert captured["backend"] == "claude"
+    out = capsys.readouterr().out
+    assert "only coding agent backend installed" in out
+
+
+def test_the_gate_offers_only_backends_that_are_actually_installed(monkeypatch, capsys):
+    """The no-backend message offered `--backend <claude|codex|opencode>` unconditionally, so on
+    a box where codex is not installed two of its three suggestions would have failed."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name in {"claude", "opencode"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 1
+
+    out = capsys.readouterr().out
+    assert "claude|opencode" in out
+    assert "codex" not in out
+
+
+def test_the_gate_says_so_when_nothing_is_installed(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    _no_configured_backend(monkeypatch)
+
+    assert cli.main([]) == 1
+    assert "None of the supported backends are installed" in capsys.readouterr().out
+
+
+def test_help_does_not_promise_things_that_do_not_exist(capsys):
+    """A message naming a flag, file, or command that does not exist is filed as a bug in its own
+    right by this project's own live-test plan. These four were found live."""
+    assert cli.main(["--help"]) == 0
+    # argparse hard-wraps help text, so compare on a whitespace-normalised copy.
+    out = " ".join(capsys.readouterr().out.split())
+
+    # `--skip-privacy-ack` is the only way to get a clean machine-readable stream, and a driver
+    # author cannot find a flag that is not in --help (it was argparse.SUPPRESS'd).
+    assert "--skip-privacy-ack" in out
+    # `--ui-bridge` is newline-delimited JSON, not JSON-RPC 2.0; developers who believed the help
+    # wrote JSON-RPC clients and got silence.
+    assert "JSON-RPC 2.0" in out and "NEWLINE-DELIMITED JSON" in out
+    # `--log-file` claimed a "merge integrated" event that no code ever emits.
+    assert "merge integrated" not in out
+    # Confinement protects the REPOSITORY, not the rest of the disk — true on both platforms by
+    # construction (`--dev-bind / /` on Linux, `(allow default)` on macOS).
+    assert "protects the REPOSITORY, not the rest of the disk" in out
+    # `--auto-commit` is not background-only.
+    assert "in EVERY mode" in out
+
+
+def test_a_failed_takeover_does_not_name_the_pid_it_just_killed(monkeypatch, capsys):
+    """The `-b -m` zero-writer bug's user-facing half: on losing the lock race it printed
+    "already running (PID N)" naming the PID it had just terminated, and told the user to
+    `agitrack -b stop` a process that no longer existed."""
+    import pathlib
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_refuse_during_merge_conflict", lambda repo: False)
+    monkeypatch.setattr("agitrack.config.migrate.migrate_repo_state", lambda repo: None)
+
+    class _Lock:
+        def __init__(self, _path):
+            pass
+
+        def acquire(self, **kw):
+            return False  # never obtainable, even with the retry
+
+        def owner_pid(self):
+            return 4242
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _Lock)
+    monkeypatch.setattr("agitrack.proxy.background._running_tracker_is_current", lambda *a, **k: False)
+    monkeypatch.setattr("agitrack.proxy.background.replace_running_tracker", lambda *a, **k: True)
+
+    class Config:
+        default_backend = "claude"
+        use_worktrees = False
+        commit_guidance = True
+
+        def has_default_backend(self):
+            return True
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    assert cli.main(["-b", "-m"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Nothing is tracking it now" in out
+    assert "4242" not in out  # never name the process we just stopped
+
+
+def test_an_optional_tool_install_does_not_default_to_yes(monkeypatch):
+    """`gh` is explicitly OPTIONAL — aGiTrack degrades to git author names without it — yet a
+    bare Enter shelled straight into `brew install gh`: a package install nobody asked for, on
+    the most reflexive keypress there is. `git` is genuinely required, so it keeps its Y
+    default."""
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("agitrack.system_tools.can_install_tool", lambda name: True)
+    monkeypatch.setattr(
+        "agitrack.system_tools.install_system_tool", lambda name: pytest.fail(f"must not install {name}")
+    )
+
+    prompts: list[str] = []
+
+    def _bare_enter(prompt: str) -> str:
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr(cli, "_ask", _bare_enter)
+
+    assert cli._maybe_install_tool("gh", required=False) is False
+    assert "[y/N]" in prompts[0]
+
+
+def test_a_required_tool_install_still_defaults_to_yes(monkeypatch):
+    installed: list[str] = []
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("agitrack.system_tools.can_install_tool", lambda name: True)
+    monkeypatch.setattr("agitrack.system_tools.install_system_tool", lambda name: installed.append(name) or True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt: "")
+
+    assert cli._maybe_install_tool("git", required=True) is True
+    assert installed == ["git"]
+
+
+def test_yes_makes_the_startup_prompts_non_interactive(monkeypatch):
+    """`agitrack -b` on a fresh config blocked on three startup questions whenever it ran ON a
+    terminal — despite -b being the documented "no TUI, returns to your shell" path — so a
+    scripted or CI use inside a terminal simply hung. There was no --yes at all, and `-b status`
+    skipping the wizard made the two inconsistent."""
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    monkeypatch.setattr(cli, "backend_installed", lambda name: name == "claude")
+    monkeypatch.setattr(
+        cli, "select_default_backend", lambda *a, **k: pytest.fail("--yes must not open the backend chooser")
+    )
+    monkeypatch.setattr(
+        cli,
+        "select_default_summarizer_model",
+        lambda *a, **k: pytest.fail("--yes must not open the summarizer chooser"),
+    )
+
+    assert cli.main(["--yes"]) == 0
+    assert captured["backend"] == "claude"
+
+
+def test_without_yes_a_terminal_still_gets_the_first_run_prompts(monkeypatch):
+    """--yes is opt-in: an ordinary interactive first run must still be walked through setup."""
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True, raising=False)
+    _no_configured_backend(monkeypatch)
+    asked: list[str] = []
+    monkeypatch.setattr(cli, "select_default_backend", lambda *a, **k: asked.append("backend") or "claude")
+    monkeypatch.setattr(cli, "select_default_summarizer_model", lambda *a, **k: asked.append("model"))
+    monkeypatch.setattr(cli, "_installed_via_msi", lambda: False)
+
+    cli.main(["-i"])  # a mode is named, so the bare-`agitrack` menu stays out of the way
+
+    assert asked == ["backend", "model"]
+
+
+def _fake_repo(tmp_path):
+    return type("R", (), {"repo": tmp_path})()
+
+
+def test_share_sessions_without_a_terminal_refuses_and_says_so_in_its_exit_code(tmp_path, monkeypatch, capsys):
+    """A CI job that asked to publish its conversations and got exit 0 back would report
+    success having published nothing. `--daemons stop` already makes this split; the refusal
+    for want of a terminal is an error, the user answering "no" at the prompt is not."""
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False, raising=False)
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 1
+
+    out = capsys.readouterr().out
+    assert "--yes" in out  # and it names the way to do it deliberately
+
+
+def test_share_sessions_answered_no_at_the_prompt_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "_ask", lambda *a, **k: "n")
+
+    assert cli._run_share_sessions(_fake_repo(tmp_path)) == 0
+
+
+# --------------------------------------------------------------------------------------
+# A git failure is never a traceback.
+# --------------------------------------------------------------------------------------
+
+
+def test_an_unhandled_git_failure_is_a_message_not_a_traceback(monkeypatch, capsys):
+    """Every command guards the ``GitRepo.discover()`` that OPENS the repository, but nothing
+    guarded the git commands that follow — and git can fail long after discovery succeeds. On a
+    Windows box with neither ``core.longpaths`` nor the OS long-path opt-in, a repository whose
+    path passes MAX_PATH opens fine and then fails on the first read of ``.git/packed-refs``:
+    ``agitrack --repo <deep path> -d text`` printed a raw traceback ending in
+    ``agitrack.git.repo.GitError: … fatal: couldn't read .git/packed-refs: Filename too long``."""
+    from agitrack.git import GitError
+
+    def _explode(argv=None):
+        raise GitError("Command failed: git for-each-ref\nfatal: couldn't read .git/packed-refs: Filename too long")
+
+    monkeypatch.setattr(cli, "_dispatch", _explode)
+
+    assert cli.main(["-d", "text"]) == 1
+
+    out = capsys.readouterr().out
+    assert "Filename too long" in out
+    assert "Traceback" not in out
+    # ...and on Windows, where this has a cause aGiTrack can name, it names the two things that
+    # actually fix it. `core.longpaths` is a Windows-only git setting and ENAMETOOLONG elsewhere
+    # is the filesystem's own far larger limit, so the advice is deliberately not offered there.
+    assert ("core.longpaths" in out and "MAX_PATH" in out) is (sys.platform == "win32")
+
+
+def test_an_ordinary_git_failure_gets_no_long_path_advice(monkeypatch, capsys):
+    """The hint is only right for one cause. Offering `core.longpaths` for an unrelated git
+    error would send the user to change a setting that has nothing to do with it."""
+    from agitrack.git import GitError
+
+    monkeypatch.setattr(cli, "_dispatch", lambda argv=None: (_ for _ in ()).throw(GitError("fatal: bad object HEAD")))
+
+    assert cli.main(["-s"]) == 1
+
+    out = capsys.readouterr().out
+    assert "bad object HEAD" in out
+    assert "core.longpaths" not in out

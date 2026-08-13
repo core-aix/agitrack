@@ -109,10 +109,17 @@ def is_available() -> bool:
 # Backend agent self-update carve-out
 # ----------------------------------------------------------------------------
 
+
 # The coding-agent CLIs aGiTrack drives. Their self-update writes land under a small
 # set of well-known per-user trees, plus wherever the executable itself resolves
 # (covers npm-global / Homebrew / custom prefixes the static list can't predict).
-_BACKEND_EXES = ("claude", "opencode")
+def _backend_exes() -> tuple[str, ...]:
+    """The backend CLI executables, from the backend registry — not a hand-written tuple,
+    which silently omits a newly added agent and denies it its self-update carve-out."""
+    from agitrack.backends.proxy_agents import available_backends
+    from agitrack.backends.setup import _executable
+
+    return tuple(_executable(name) for name in available_backends())
 
 
 def _xdg_dir(var: str, *default: str) -> str:
@@ -126,7 +133,7 @@ def agent_writable_dirs() -> list[str]:
     Returned paths are realpath-resolved (so a symlinked ``~/.claude`` matches the
     real path the kernel checks writes against) and de-duplicated. The sandbox keeps
     these writable so a backend self-update is never blocked by worktree confinement.
-    Covers Claude Code and OpenCode across native, npm-global, and Homebrew installs:
+    Covers Claude Code, Codex and OpenCode across native, npm-global, and Homebrew installs:
     the static XDG/HOME roots they use, plus the resolved location of each CLI on PATH.
     """
     home = os.path.expanduser("~")
@@ -139,12 +146,17 @@ def agent_writable_dirs() -> list[str]:
         os.path.join(home, ".local", "bin"),  # native launcher symlink (claude)
         os.path.join(home, ".claude"),  # claude config + ~/.claude/downloads staging
         os.path.join(home, ".opencode"),  # opencode install root (bin + node_modules)
+        # codex keeps BOTH its config and its versioned standalone install here
+        # (~/.codex/packages/standalone/releases/<version>/), so `codex update` writes
+        # under this root; the ~/.local/bin launcher it repoints is already covered above.
+        os.path.join(home, ".codex"),
     ]
-    for tool in _BACKEND_EXES:
+    backend_exes = _backend_exes()
+    for tool in backend_exes:
         candidates += [os.path.join(root, tool) for root in (data, state, config, cache)]
     # Wherever the CLIs actually resolve — the launcher dir and the install dir the
     # launcher points at (e.g. claude's versioned native install, an npm-global bin).
-    for exe in _BACKEND_EXES:
+    for exe in backend_exes:
         found = shutil.which(exe)
         if not found:
             continue
@@ -270,6 +282,22 @@ def build_bwrap_command(base: str, worktree: str, allowed_paths: list[str] | Non
 # ----------------------------------------------------------------------------
 
 
+def will_confine(*, base: str, worktree: str) -> bool:
+    """Whether :func:`wrap_command` will actually confine a command for this base/worktree pair.
+
+    Callers need to know this BEFORE building the command, because confinement changes what the
+    command itself should say: a backend that runs its own OS sandbox (Codex's seatbelt) has to
+    be told to stand down, since sandboxes don't nest — see
+    ``ProxyRunner._relax_nested_backend_sandbox``. Asking after the fact means comparing command
+    lists, which is exactly the kind of check that breaks the moment a wrapper changes shape.
+    """
+    if not is_enabled():
+        return False
+    if os.path.realpath(worktree) == os.path.realpath(base):
+        return False  # legacy in-place session: nothing to isolate
+    return _have_sandbox_exec() or _have_bwrap()
+
+
 def wrap_command(command: list[str], *, base: str, worktree: str, allowed_paths: list[str] | None = None) -> list[str]:
     """Wrap ``command`` so its writes are confined to ``worktree`` (plus the
     repo's ``.git`` and any ``allowed_paths``) within ``base``. Returns the command
@@ -284,3 +312,36 @@ def wrap_command(command: list[str], *, base: str, worktree: str, allowed_paths:
     if _have_bwrap():
         return [*build_bwrap_command(base, worktree, allowed_paths), *command]
     return command
+
+
+def status_line() -> str:
+    """One line describing what confinement is ACTUALLY in effect right now.
+
+    C11: on stock Ubuntu 24.04 (``kernel.apparmor_restrict_unprivileged_userns=1``) bwrap cannot
+    create a sandbox, aGiTrack silently falls back to the advisory path, and nothing in the TUI,
+    in ``-s``, or in the status bar said which mode was in effect — so a whole run looked
+    confined while a ``!``-bash write into the base checkout succeeded. What looked like
+    enforcement was the agent choosing to comply. The fallback is a reasonable degradation; being
+    unable to find out which one you are in is not.
+    """
+    if not is_enabled():
+        return "Confinement: off (AGITRACK_SANDBOX)."
+    if is_available():
+        mechanism = "sandbox-exec" if _have_sandbox_exec() else "bubblewrap"
+        return f"Confinement: enforced by the OS sandbox ({mechanism}) — the agent can only write its own worktree."
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        why = (
+            "bubblewrap is installed but cannot create a sandbox here (unprivileged user "
+            "namespaces are denied — e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+        )
+    elif sys.platform.startswith("linux"):
+        why = "bubblewrap (bwrap) is not installed"
+    elif os.name == "nt":
+        why = "Windows has no equivalent sandbox"
+    else:
+        why = "no sandbox is available on this platform"
+    return (
+        f"Confinement: ADVISORY only — {why}.\n"
+        "  A commit-time guard still stops the agent committing into the base repo, but nothing "
+        "prevents it WRITING there."
+    )

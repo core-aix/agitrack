@@ -6,13 +6,42 @@ from pathlib import Path
 import pytest
 
 from agitrack.backends.claude import ClaudeBackend
-from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.backends.proxy_agents import available_backends, backend_phrase, make_proxy_agent
 from agitrack.config import GlobalConfig
 from agitrack.config import AgitrackState
 
 
-def test_available_backends_includes_opencode_and_claude():
-    assert set(available_backends()) == {"opencode", "claude"}
+def test_available_backends_includes_every_registered_backend():
+    assert set(available_backends()) == {"opencode", "claude", "codex"}
+
+
+def _label(name: str) -> str:
+    from agitrack.backends.proxy_agents import _AGENTS
+
+    return str(getattr(_AGENTS[name], "label"))
+
+
+def test_backend_phrase_names_every_registered_backend():
+    # The prose the user reads must list the backends that actually exist. Hardcoded lists rot
+    # silently and rot in the worst direction: before this was derived from the registry, the
+    # empty-backtrace message told Codex users "Backtrace reconstructs past Claude or OpenCode
+    # sessions", i.e. that their own sessions were unsupported, while sitting on a working
+    # Codex parser. Asserting against the registry makes a new backend fail here, loudly.
+    phrase = backend_phrase()
+    for name in available_backends():
+        assert _label(name) in phrase, f"{name} missing from {phrase!r}"
+    assert phrase.count(" or ") == 1, "only the final backend is joined by the conjunction"
+    assert backend_phrase("and").endswith("and OpenCode")
+
+
+def test_user_facing_backtrace_text_names_every_backend():
+    # The two strings a user hits when backtrace finds nothing — the place the stale list was
+    # actually reaching people.
+    from agitrack.metrics.backtrace import _empty_message
+
+    message = _empty_message(Path("/tmp/somewhere"))
+    for name in available_backends():
+        assert _label(name) in message, f"{name} missing from the empty-backtrace message"
 
 
 def test_opencode_proxy_agent_spawn_command():
@@ -23,6 +52,52 @@ def test_opencode_proxy_agent_spawn_command():
     assert agent.new_session_id() is None
     assert agent.spawn_command(repo, session_id=None, resume=False) == ["opencode", repo_s]
     assert agent.spawn_command(repo, session_id="s1", resume=True) == ["opencode", "--session", "s1", repo_s]
+
+
+def test_codex_proxy_agent_spawn_command():
+    agent = make_proxy_agent("codex")
+    repo = Path("/repo")
+    assert agent.name == "codex"
+    # Codex mints its own (UUIDv7) thread id and exposes no flag to pin one, so aGiTrack
+    # discovers the id after the run rather than choosing it up front.
+    assert agent.new_session_id() is None
+    # `-C <dir>`, never a positional: Codex's positional argument is the PROMPT, so passing the
+    # repo there would submit the directory name as the user's first message.
+    assert agent.spawn_command(repo, session_id=None, resume=False) == ["codex", "-C", str(repo)]
+    # Resume is a SUBCOMMAND, and it precedes the options.
+    assert agent.spawn_command(repo, session_id="019f-abc", resume=True) == [
+        "codex",
+        "resume",
+        "019f-abc",
+        "-C",
+        str(repo),
+    ]
+    # A session id without resume must NOT be passed: Codex cannot start a new session under a
+    # chosen id, and `codex <id>` would be read as the prompt.
+    assert agent.spawn_command(repo, session_id="019f-abc", resume=False) == ["codex", "-C", str(repo)]
+
+
+def test_codex_proxy_agent_spawn_command_has_no_system_prompt_append():
+    # Codex's only system-prompt lever (experimental_instructions_file) REPLACES the agent
+    # prompt rather than appending, so sending aGiTrack's note would delete Codex's own coding
+    # instructions. The note is therefore not delivered on this backend — a documented gap.
+    agent = make_proxy_agent("codex")
+    cmd = agent.spawn_command(Path("/repo"), session_id=None, resume=False, commit_guidance=True)
+    assert "--append-system-prompt" not in cmd
+    assert not any("instructions" in part for part in cmd)
+
+
+def test_codex_spawn_command_honours_a_launch_wrapper():
+    agent = make_proxy_agent("codex")
+    repo = Path("/repo")
+    assert agent.spawn_command(repo, session_id="s1", resume=True, executable=["w", "codex"]) == [
+        "w",
+        "codex",
+        "resume",
+        "s1",
+        "-C",
+        str(repo),
+    ]
 
 
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
@@ -665,3 +740,93 @@ def test_use_worktrees_config_opt_out(tmp_path, monkeypatch):
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
     (tmp_path / "config.json").write_text('{"use_worktrees": false}')
     assert GlobalConfig().use_worktrees is False
+
+
+# --- no hand-written backend lists anywhere the user can see one ---------------------------
+# Adding Codex left a trail of literal "claude / opencode" lists that nothing failed on: the
+# settings menu offered three backends under a label that said the choice was Claude or
+# OpenCode, `--help` advertised two, the learn page's engine picker could not offer a backend
+# it did not list, and the learn page told Codex users their sessions were unsupported. Each of
+# these pins a list to the registry so the next backend cannot repeat it.
+
+
+def test_the_settings_menu_backend_label_names_every_backend():
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    entry = next(item for item in runner._settings_specs() if item["key"] == "default_backend")
+
+    assert entry["options"] == available_backends()
+    for name in available_backends():
+        assert _label(name) in entry["label"]
+
+
+def test_the_cli_help_epilog_names_every_backend(capsys):
+    from agitrack.cli import main
+
+    main(["--help"])  # argparse prints help and main returns; it does not raise
+    help_text = capsys.readouterr().out
+
+    for name in available_backends():
+        assert name in help_text.split("Unrecognized arguments")[-1]
+
+
+def test_the_backend_help_passthrough_resolves_every_backend():
+    # `agitrack -- --help` used a literal name->executable map; a backend missing from it was
+    # rejected as "Unknown backend" even though the rest of aGiTrack ran it fine.
+    from agitrack.cli import _backend_command
+
+    for name in available_backends():
+        assert _backend_command(name)
+    assert _backend_command("not-a-backend") is None
+
+
+def test_the_sandbox_self_update_carve_out_covers_every_backend():
+    from agitrack.proxy import sandbox
+
+    assert set(sandbox._backend_exes()) == {
+        make_proxy_agent(name).spawn_command(Path("."), session_id=None, resume=False)[0]
+        for name in available_backends()
+    }
+
+
+def test_the_learn_pages_engine_picker_offers_every_backend(tmp_path):
+    from agitrack.metrics.learn import learn_html
+
+    html = learn_html(tmp_path)
+
+    for name in available_backends():
+        assert f'<option value="{name}">{name}</option>' in html
+
+
+def test_the_storyline_engine_picker_offers_every_backend(tmp_path):
+    from agitrack.metrics.story import story_html
+
+    html = story_html(tmp_path)
+
+    for name in available_backends():
+        assert f'<option value="{name}">{name}</option>' in html
+
+
+def test_the_learn_page_never_tells_a_backends_user_they_are_unsupported(tmp_path):
+    # Both copies of the "run --backtrace instead" notice — the server-rendered one and the
+    # browser-side one — named only Claude Code and OpenCode, i.e. told a Codex user their
+    # sessions could not be reconstructed. They can.
+    from agitrack.metrics.learn import _no_trace_message, learn_html
+
+    message = _no_trace_message(0)
+    html = learn_html(tmp_path)
+    for name in available_backends():
+        assert _label(name) in message
+        assert _label(name) in html
+
+
+def test_every_registered_backend_has_a_live_smoke_model():
+    # The live suite (tests/test_live_backends.py, opt-in via `-m live`) is the only thing that
+    # notices a backend CLI changing its output format. A backend added without an entry in its
+    # model map gets no live coverage at all — and this guard runs in the default suite, where
+    # the live tests themselves are deselected.
+    import test_live_backends
+
+    assert set(test_live_backends._SMOKE_MODELS) == set(test_live_backends._BACKENDS)
+    assert set(test_live_backends._BACKENDS) == set(available_backends())

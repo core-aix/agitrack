@@ -175,3 +175,72 @@ def combine_patches(edits: list[FileEdit]) -> str:
 def total_lines(edits: list[FileEdit]) -> tuple[int, int]:
     """Summed (insertions, deletions) across a turn's file edits."""
     return (sum(edit.insertions for edit in edits), sum(edit.deletions for edit in edits))
+
+
+# OpenAI's `apply_patch` envelope. The whole patch arrives as ONE string (payload key
+# ``patchText``) rather than as a per-file tool call, so it needs its own reader.
+_APPLY_PATCH_FILE = re.compile(r"^\*\*\*\s+(Add|Update|Delete)\s+File:\s*(.+?)\s*$")
+_APPLY_PATCH_MOVE = re.compile(r"^\*\*\*\s+Move\s+to:\s*(.+?)\s*$")
+
+
+def edits_from_apply_patch(state: dict[str, str], patch_text: str) -> list[FileEdit]:
+    """The file edits described by an ``apply_patch`` payload, diffed through ``tracked_edit``.
+
+    ``apply_patch`` is what OpenAI-family models reach for, and it was simply not recognised:
+    the OpenCode reader matched only ``write``/``edit``/``patch``, so a session that used it
+    reported ``+0/-0`` lines and ``--backtrace commit`` exited 128 with "every agent-made commit
+    here is user commits with no agent-made edits to attribute" — seconds after ``--backtrace
+    text`` had reported that same commit as ``agent 1 … 1/1 (100.0%)``. The ``write`` tool worked
+    fine, so the failure looked model-specific and random.
+
+    The format is a sequence of ``*** Add|Update|Delete File: <path>`` sections between
+    ``*** Begin Patch`` / ``*** End Patch``. Update sections carry ``@@`` hunks with
+    ``+``/``-``/context lines; Add sections carry ``+`` lines only.
+    """
+    out: list[FileEdit] = []
+    path: str | None = None
+    action = ""
+    old: list[str] = []
+    new: list[str] = []
+
+    def flush() -> None:
+        nonlocal path, action, old, new
+        if path is None:
+            return
+        if action == "Delete":
+            edit = make_edit(path, state.pop(path, "\n".join(old)), "", status="deleted")
+        elif action == "Add":
+            edit = tracked_edit(state, path, write="\n".join(new) + ("\n" if new else ""))
+        else:
+            edit = tracked_edit(state, path, subedits=[("\n".join(old), "\n".join(new))])
+        if edit is not None:
+            out.append(edit)
+        path, action, old, new = None, "", [], []
+
+    # Strip the ONE trailing newline the envelope always ends with, so the split does not yield a
+    # phantom final "" that would be counted as an empty context/added line.
+    for line in str(patch_text or "").rstrip("\n").split("\n"):
+        header = _APPLY_PATCH_FILE.match(line)
+        if header:
+            flush()
+            action, path = header.group(1), header.group(2)
+            continue
+        if line.startswith("*** "):
+            flush()  # "*** End Patch" (or any other directive) closes the section being read
+            continue
+        if path is None or _APPLY_PATCH_MOVE.match(line):
+            continue
+        if line.startswith("@@"):
+            continue  # a hunk header; its context lines follow and anchor the replacement
+        if line.startswith("+"):
+            new.append(line[1:])
+        elif line.startswith("-"):
+            old.append(line[1:])
+        else:
+            # Context: kept on BOTH sides so the pair is an anchored replacement (see
+            # tracked_edit), not a bag of changed lines.
+            body = line[1:] if line.startswith(" ") else line
+            old.append(body)
+            new.append(body)
+    flush()
+    return out

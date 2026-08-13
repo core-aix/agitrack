@@ -12,8 +12,11 @@ from agitrack import daemons
 
 
 class _Info:
-    def __init__(self, pid: int, function: str = "repo dashboard", repo_name: str = "proj"):
+    def __init__(self, pid: int, function: str = "repo dashboard", repo_name: str = "proj", kind: str = "dashboard"):
         self.pid, self.function, self.repo_name = pid, function, repo_name
+        # `kind` decides whether `--daemons stop` may act on it at all: an interactive session is
+        # LISTED but never signalled (daemons._STOPPABLE_KINDS).
+        self.kind = kind
         self.repo, self.url, self.cmd = f"/tmp/{repo_name}", "", []
 
 
@@ -21,7 +24,8 @@ def _fake_registry(monkeypatch, infos, *, alive_after: set[int] = frozenset()):
     """Registry of *infos*; pids in *alive_after* ignore SIGTERM."""
     signalled: list[int] = []
     deregistered: list[int] = []
-    monkeypatch.setattr(daemons, "list_running", lambda: list(infos))
+    monkeypatch.setattr(daemons, "list_running", lambda **kw: list(infos))
+    monkeypatch.setattr(daemons, "_signal_targets", lambda infos: infos)
     monkeypatch.setattr(daemons, "terminate_pid", lambda pid: signalled.append(pid))
     monkeypatch.setattr(daemons, "pid_alive", lambda pid: pid in alive_after)
     monkeypatch.setattr(daemons, "deregister", lambda pid=None: deregistered.append(pid))
@@ -65,7 +69,7 @@ def test_stop_all_with_nothing_running(monkeypatch):
 
 def _cli_registry(monkeypatch, infos, *, tty: bool, answer: str = ""):
     """CLI-level fake: registry contents, whether stdin is a terminal, and the typed answer."""
-    monkeypatch.setattr("agitrack.daemons.list_running", lambda: list(infos))
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: list(infos))
     monkeypatch.setattr("sys.stdin.isatty", lambda: tty, raising=False)
 
     def _input(prompt: str = "") -> str:
@@ -80,7 +84,7 @@ def test_cli_reports_what_it_stopped(monkeypatch, capsys):
 
     _cli_registry(monkeypatch, [_Info(11), _Info(22), _Info(33)], tty=False)
     monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: (3, []))
-    assert cli.main(["--daemons", "stop"]) == 0
+    assert cli.main(["--daemons", "stop", "--yes"]) == 0
     assert "Stopped 3" in capsys.readouterr().out
 
 
@@ -90,7 +94,7 @@ def test_cli_exits_nonzero_when_a_daemon_survives(monkeypatch, capsys):
 
     _cli_registry(monkeypatch, [_Info(22)], tty=False)
     monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: (1, ["repo dashboard for proj (pid 22)"]))
-    assert cli.main(["--daemons", "stop"]) == 1
+    assert cli.main(["--daemons", "stop", "--yes"]) == 1
     assert "Could not stop" in capsys.readouterr().out
 
 
@@ -147,7 +151,7 @@ def test_bare_daemons_flag_still_lists(monkeypatch, capsys):
     """`--daemons` on its own keeps its old read-only meaning — no surprise shutdowns."""
     from agitrack import cli
 
-    monkeypatch.setattr("agitrack.daemons.list_running", lambda: [])
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: [])
     monkeypatch.setattr(
         "agitrack.daemons.stop_all", lambda **kw: pytest.fail("bare --daemons must never stop anything")
     )
@@ -162,12 +166,12 @@ def test_the_listing_says_how_to_stop_them_all(monkeypatch, capsys):
     it asks first so nobody has to try it to find out."""
     from agitrack import cli
 
-    monkeypatch.setattr("agitrack.daemons.list_running", lambda: [_Info(11), _Info(22), _Info(33)])
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: [_Info(11), _Info(22), _Info(33)])
     assert cli.main(["--daemons"]) == 0
 
     out = capsys.readouterr().out
     assert "agitrack --daemons stop" in out
-    assert "all 3 of them" in out  # the count, so the reach is concrete
+    assert "all 3 background daemon(s)" in out  # the count, so the reach is concrete
     assert "in every repository" in out  # ...and that it is not scoped to this project
     assert "asks first" in out
 
@@ -175,9 +179,135 @@ def test_the_listing_says_how_to_stop_them_all(monkeypatch, capsys):
 def test_the_stop_all_hint_is_not_shown_when_nothing_is_running(monkeypatch, capsys):
     from agitrack import cli
 
-    monkeypatch.setattr("agitrack.daemons.list_running", lambda: [])
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: [])
     assert cli.main(["--daemons"]) == 0
 
     out = capsys.readouterr().out
     assert "No aGiTrack daemons" in out
     assert "--daemons stop" not in out  # nothing to stop, so no instructions for stopping it
+
+
+def test_an_unattended_stop_all_refuses_instead_of_killing_everything(monkeypatch, capsys):
+    """The confirmation used to be gated on `sys.stdin.isatty()` and simply SKIPPED without a
+    terminal — so a script, a CI job, or an agent harness silently killed every daemon on the
+    machine, including the developer's own live session, while `--daemons list` still advertised
+    "(lists them and asks first)". Unattended destruction has to be asked for explicitly."""
+    from agitrack import cli
+
+    _cli_registry(monkeypatch, [_Info(11), _Info(22)], tty=False)
+    monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: pytest.fail("no tty, no --yes ⇒ must not stop"))
+
+    assert cli.main(["--daemons", "stop"]) == 1
+
+    out = capsys.readouterr().out
+    assert "no terminal to confirm on" in out
+    assert "--yes" in out
+    assert "--repo" in out  # the scoped alternative, offered where the reach is being explained
+
+
+def test_daemons_stop_can_be_scoped_to_one_repo(monkeypatch, capsys):
+    """Stopping five daemons one `--repo` at a time was the only scoped option, and the confirmed
+    blast radius of the unscoped form reached across other repositories mid-run."""
+    from agitrack import cli
+
+    seen: dict = {}
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: seen.setdefault("list", kw) and [] or [_Info(11)])
+    monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: (seen.update(stop=kw), (1, []))[1])
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+
+    assert cli.main(["--repo", "/tmp/proj", "--daemons", "stop", "--yes"]) == 0
+
+    assert seen["list"]["repo"].endswith("proj")
+    assert seen["stop"]["repo"].endswith("proj")
+
+
+def test_the_listing_offers_the_scoped_stop(monkeypatch, capsys):
+    from agitrack import cli
+
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: [_Info(11), _Info(22)])
+    assert cli.main(["--daemons"]) == 0
+
+    out = capsys.readouterr().out
+    assert "--repo <path> --daemons stop" in out
+
+
+def test_a_reused_pid_is_never_signalled(monkeypatch):
+    """`pid_alive()` is not identity. A registry entry survives a crash and, after a reboot, the
+    OS reassigns that number to something else entirely — an editor, a browser, a build. Stop-all
+    must require proof the process is actually an aGiTrack daemon before signalling it."""
+    signalled: list[int] = []
+    deregistered: list[int] = []
+    monkeypatch.setattr(daemons, "list_running", lambda **kw: [_Info(11), _Info(22)])
+    monkeypatch.setattr(daemons, "terminate_pid", lambda pid: signalled.append(pid))
+    monkeypatch.setattr(daemons, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(daemons, "deregister", lambda pid=None: deregistered.append(pid))
+    # 22's number now belongs to something that is not ours.
+    monkeypatch.setattr(
+        daemons, "_process_command_lines", lambda: ["11 python -m agitrack --dashboard-serve", "22 vim"]
+    )
+
+    stopped, survivors = daemons.stop_all(exclude_pid=999)
+
+    assert signalled == [11]
+    assert stopped == 1 and survivors == []
+    assert 22 in deregistered  # the stale entry is reaped rather than left to mislead again
+
+
+def test_the_process_scan_stands_down_under_an_isolated_config_dir(monkeypatch, tmp_path):
+    """`AGITRACK_CONFIG_DIR` is how every caller asks for a private aGiTrack universe — the test
+    suite, a CI job, one slot of a parallel live-test run. The registry honoured it; the process
+    scan did not, so `--daemons stop` under isolation still found and killed every daemon on the
+    machine. Isolation one half ignores is not isolation."""
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(
+        daemons, "_process_command_lines", lambda: ["4242 python -m agitrack --dashboard-serve --repo /somebody/else"]
+    )
+
+    assert daemons._scan_daemon_processes() == []
+    assert daemons.list_running() == []
+
+
+def test_an_interactive_session_is_listed_but_never_stopped(monkeypatch, capsys):
+    """`--daemons list` showed only detached daemons, so someone asking "what is aGiTrack
+    running?" — usually because something is holding a repo lock — got half the answer, and no
+    mention of the very session holding it. Listing it is the point; terminating someone's live
+    conversation from a bulk sweep is not."""
+    from agitrack import cli
+
+    running = [_Info(11), _Info(22, "interactive session", kind="session")]
+    monkeypatch.setattr("agitrack.daemons.list_running", lambda **kw: list(running))
+
+    assert cli.main(["--daemons"]) == 0
+
+    out = capsys.readouterr().out
+    assert "interactive session" in out
+    assert "quit it in its own terminal" in out
+    assert "never touches one" in out
+    assert "all 1 background daemon(s)" in out  # the session is not counted as stoppable
+
+
+def test_a_session_is_not_shown_in_the_about_to_stop_listing(monkeypatch, capsys):
+    from agitrack import cli
+
+    _cli_registry(monkeypatch, [_Info(11), _Info(22, "interactive session", kind="session")], tty=False)
+    monkeypatch.setattr("agitrack.daemons.stop_all", lambda **kw: (1, []))
+
+    assert cli.main(["--daemons", "stop", "--yes"]) == 0
+
+    out = capsys.readouterr().out
+    assert "About to stop 1 aGiTrack daemon(s)" in out
+
+
+def test_stop_all_skips_sessions_even_if_one_reaches_it(monkeypatch):
+    """Belt and braces at the library level, not only in the CLI listing."""
+    signalled: list[int] = []
+    monkeypatch.setattr(daemons, "list_running", lambda **kw: [_Info(11), _Info(22, kind="session")])
+    monkeypatch.setattr(daemons, "terminate_pid", lambda pid: signalled.append(pid))
+    monkeypatch.setattr(daemons, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(daemons, "deregister", lambda pid=None: None)
+    monkeypatch.setattr(daemons, "_signal_targets", lambda infos: infos)
+
+    stopped, _survivors = daemons.stop_all(exclude_pid=999)
+
+    assert signalled == [11]
+    assert stopped == 1

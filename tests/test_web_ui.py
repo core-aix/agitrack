@@ -286,3 +286,185 @@ def test_the_banner_command_is_set_apart_from_the_explanation():
     # The plain-text form (terminal output, `--backtrace text`) keeps its quotes and no markup.
     assert f"'{bt.BAKE_COMMAND}'" in view.banner_text() and "<code" not in view.banner_text()
     assert ".backtracebanner code.cmd,.btbanner code.cmd,.updatebanner code.cmd{color:var(--phosphor)" in ui.BANNER_CSS
+
+
+# --- the repository picker in the page header --------------------------------------------------
+
+
+def _hub_pages():
+    """The three pages, rendered as a browser sees them."""
+    from pathlib import Path
+
+    from agitrack.metrics import ui
+    from agitrack.metrics.learn import learn_html
+    from agitrack.metrics.story import story_html
+    from agitrack.metrics.web import _TEMPLATE
+
+    return {
+        "dashboard": ui.render(_TEMPLATE, __UI_HUBBAR_PAGE__=""),
+        "learn": learn_html(Path(".")),
+        "story": story_html(Path(".")),
+    }
+
+
+def test_every_page_carries_the_same_repo_picker_and_view_toggle():
+    # One strip, three pages: the controls answer the same question wherever you are, and moving
+    # between pages must not move them.
+    for name, html in _hub_pages().items():
+        assert 'id="hub-repo-btn"' in html, name
+        assert 'id="hub-repo-menu"' in html, name
+        assert 'id="hub-active"' in html and 'id="hub-backtrace"' in html, name
+        assert 'id="hub-state"' in html, name
+
+
+def test_the_repo_list_scrolls_instead_of_growing_past_the_window():
+    html = _hub_pages()["dashboard"]
+
+    # The SCROLLING part is the list alone, so the "show another repository" action below it
+    # never scrolls out of reach...
+    assert ".repolist{overflow-y:auto;max-height:min(52vh,340px)" in html
+    # ...and the bound is the viewport, not a fixed pixel count, or a short window pushes the
+    # footer off the bottom of the screen.
+    assert "52vh" in html
+    assert ".repolist::-webkit-scrollbar" in html  # a visible scrollbar, not an invisible one
+
+
+def test_the_picker_offers_a_way_to_add_a_repository():
+    html = _hub_pages()["dashboard"]
+
+    assert 'id="hub-repo-help"' in html
+    assert 'id="hub-help"' in html  # ...and it opens a dialog, not a link to nowhere
+    assert "Showing another repository here" in html
+    assert "agitrack -d" in html and "agitrack --backtrace" in html  # the commands that add one
+    assert "agitrack stop" in html  # ...and the one that removes it
+
+
+def test_the_picker_navigates_through_the_view_choosing_url():
+    html = _hub_pages()["dashboard"]
+
+    # Switching repository must not carry the current view across (see hub.choose_path).
+    assert 'return "/go/" + encodeURIComponent(slug)' in html
+    assert "hubGoUrl(el.dataset.slug)" in html
+
+
+def test_the_picker_is_keyboard_navigable_and_closable():
+    html = _hub_pages()["dashboard"]
+
+    assert 'e.key === "ArrowDown"' in html and 'e.key === "Enter"' in html
+    assert 'e.key === "Escape"' in html
+    # Bound to the CONTROL, never to the document: a page-wide keydown scheme is the kind
+    # nobody can discover and everybody trips over, and the story page forbids one outright.
+    assert 'picker.addEventListener("keydown"' in html
+    assert 'document.addEventListener("keydown"' not in html
+
+
+def test_the_header_shows_whether_agitrack_is_running_here():
+    html = _hub_pages()["dashboard"]
+
+    assert 'fetch("state"' in html
+    assert "refreshHubState" in html
+    # Polled, because the whole point of the answer is that it changes while the page is open.
+    assert "setInterval(refreshHubState" in html
+
+
+def test_every_dropdown_row_shows_whether_that_repo_is_being_tracked():
+    html = _hub_pages()["dashboard"]
+
+    assert 'class="ri-state' in html and 'class="ri-dot"' in html
+    assert "r.state_detail" in html  # the full sentence as the row's tooltip
+    # Lit when running, so the answer is legible without reading a word.
+    assert ".repoitem .ri-state.live .ri-dot{background:var(--phosphor)" in html
+
+
+def test_the_dropdown_rereads_the_states_each_time_it_opens():
+    html = _hub_pages()["dashboard"]
+
+    # A tracker can start or stop while the page sits open.
+    assert "refreshStates" in html
+    # Updated in place: rebuilding the list would move the reader's cursor and scroll position.
+    assert "chip.classList.toggle" in html
+
+
+def test_the_header_status_is_refreshed_often_enough_to_be_trusted():
+    html = _hub_pages()["dashboard"]
+
+    # A status that is stale is worse than no status: it is read as fact.
+    assert "const HUB_STATE_MS = 5000;" in html
+    assert "setInterval(refreshHubState, HUB_STATE_MS)" in html
+
+
+def test_the_header_status_catches_up_when_the_tab_comes_forward():
+    html = _hub_pages()["dashboard"]
+
+    # A tab backgrounded for an hour shows an hour-old answer the instant it is looked at again.
+    assert 'document.addEventListener("visibilitychange"' in html
+    assert 'window.addEventListener("focus", refreshHubState)' in html
+
+
+def test_the_dashboard_refreshes_the_status_on_the_same_beat_as_new_commits():
+    from agitrack.metrics import ui
+    from agitrack.metrics.web import _TEMPLATE
+
+    html = ui.render(_TEMPLATE, __UI_HUBBAR_PAGE__="")
+
+    # Tracking starting and new commits appearing have the same causes, so the header must not
+    # drift out of step with the numbers under it.
+    assert 'if(typeof refreshHubState === "function") refreshHubState();' in html
+
+
+def test_the_status_refresh_is_optional_on_a_page_without_the_hub_bar():
+    # The dashboard also serves from a standalone daemon and from the static export, where the
+    # hub bar removes itself; the data poll must not throw looking for a function that is there.
+    from agitrack.metrics.web import _TEMPLATE
+
+    assert 'typeof refreshHubState === "function"' in _TEMPLATE
+
+
+def test_every_page_tells_the_hub_it_is_open():
+    # The hub cannot see the browser, so an open page says so; a launcher then steers this tab
+    # rather than opening yet another on the same port.
+    for name, html in _hub_pages().items():
+        assert "HUB_CLIENT_ID" in html, name
+        assert "wireHubPresence" in html, name
+        assert '"/clients"' in html, name
+
+
+def test_a_page_follows_a_navigation_it_is_given():
+    html = _hub_pages()["dashboard"]
+
+    assert "answer.navigate" in html
+    assert "location.href = answer.navigate" in html
+
+
+def test_a_closing_page_says_goodbye_so_it_cannot_swallow_a_navigation():
+    html = _hub_pages()["dashboard"]
+
+    # A beacon, not a fetch: the page is being torn down and a normal request would be cancelled.
+    assert "navigator.sendBeacon" in html
+    assert '"pagehide"' in html
+    # ...but not when WE told it to navigate: the page it lands on re-registers.
+    assert "if(hubNavigating) return;" in html
+
+
+def test_presence_stops_once_the_tab_is_on_its_way_elsewhere():
+    html = _hub_pages()["dashboard"]
+
+    assert "if(!HUB || hubNavigating) return;" in html
+
+
+def test_a_page_tells_the_hub_which_browser_it_is_in():
+    html = _hub_pages()["dashboard"]
+
+    assert "hubBrowserFamily" in html
+    # Order matters: every Chromium browser also says "Chrome".
+    assert html.index("Edg\\/") < html.index("Chrome\\/")
+    assert html.index("Firefox\\/") < html.index("Chrome\\/")
+    assert html.index("Chrome\\/") < html.index("Safari\\/")
+
+
+def test_a_steered_page_also_asks_to_be_focused():
+    html = _hub_pages()["dashboard"]
+
+    # Ignored in most browsers without a user gesture, and that is fine: the real raise comes
+    # from aGiTrack's own process. Asking costs nothing and works where it is allowed.
+    assert "window.focus();" in html

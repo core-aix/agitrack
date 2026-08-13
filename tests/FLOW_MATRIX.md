@@ -144,7 +144,7 @@ because it is trusted.
 | Both hooks install and remove together; a project's own hook is chained, receives its stdin, can still veto, and survives removal | `test_both_hooks_are_installed_and_removed_together`, `test_an_existing_project_reference_transaction_hook_is_chained_not_destroyed`, `test_a_chained_project_hook_still_runs_and_receives_its_stdin`, `test_a_chained_hook_can_still_veto`, `test_installing_twice_does_not_clobber_the_backup`, `test_removal_leaves_a_foreign_hook_untouched` | real-git |
 | Neither hook names git's bypass flag (the refusal is only ever shown to the agent) | `test_the_guard_never_names_gits_bypass_flag` | mock |
 
-## 6c. Repos that TRACK the agent scaffolding dirs (`.claude/`, `.opencode/`, `.agitrack/`)
+## 6c. Repos that TRACK the agent scaffolding dirs (`.claude/`, `.codex/`, `.opencode/`, `.agitrack/`)
 Committing `.claude/settings.json` or a `.claude/commands/` dir is ordinary practice — a team
 shares its agent setup like an editorconfig. But every "has the working tree changed?" question
 in manual / no-worktree / background mode is a comparison between `snapshot_worktree_tree()` and
@@ -238,6 +238,11 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |
 | Daemon / proxy write a user event log (`--log-file` / `log_file`): daemon-start, ai-change-detected, commit | `test_background_writes_event_log`, `tests/test_events.py::*` | real-git + unit |
 | `agitrack --status` / `-s` reports the running mode (background / interactive / not running; auto/manual; worktree/no-worktree) | `test_repo_status_reports_each_mode`, `test_proxy_status_write_and_clear` | real-git |
+| Commit guidance in `-b`: the daemon installs a Claude Code SessionStart hook into `.claude/settings.local.json` (the note proxy mode passes with `--append-system-prompt`, which has no spawn to attach to here) and removes it on stop; `--no-commit-guidance` installs nothing; a non-Claude backend is left alone; every part of the hook command is quoted so a Windows path survives the shell Claude runs hooks through; the hook stays silent when no tracker is running | `test_the_daemon_installs_and_removes_the_commit_guidance_hook`, `test_no_commit_guidance_installs_nothing`, `test_a_non_claude_backend_is_left_alone`, `tests/test_claude_settings.py::*` | real-git + unit |
+| Auto-start on new CODE (no commit needed): a finished agent turn that left the tree changed starts the tracker; a turn that changed nothing does not; the opt-out and a lock held by any other aGiTrack both prevent it | `test_a_finished_turn_that_changed_code_starts_the_tracker`, `_a_turn_that_changed_nothing_starts_nothing`, `_auto_start_respects_the_opt_out`, `_auto_start_never_creates_a_second_writer` | real-git |
+| `-b stop` disarms every restart path (git pre-commit hook, Claude Stop hook, session note) but leaves the user's standing `autotrack_hook` preference alone | `test_stop_disarms_every_way_tracking_could_restart`, `_stop_does_not_revoke_the_users_standing_auto_start_choice` | real-git |
+| One git-editing aGiTrack per repo: `--backtrace commit` refuses while another holds the lock, and gives the lock back when it is done | `tests/test_backtrace_commit.py::test_backtrace_commit_refuses_while_another_agitrack_holds_the_repo`, `_takes_the_lock_and_gives_it_back` | real-git |
+| The user's own `.claude/settings.local.json` survives install and removal: other hooks and settings kept, unparsable JSON never rewritten, no empty file or directory left behind | `test_install_keeps_every_other_setting_and_hook`, `_a_settings_file_that_is_not_json_is_never_touched`, `_remove_leaves_no_litter_in_a_repo_that_had_no_claude_dir` | unit |
 
 ## 9c. Persistent auto-track pre-commit hook (remind / auto-start on commit)
 | Sequence | Test(s) | Kind |
@@ -317,9 +322,10 @@ correct and only the order or the wiring is wrong. The recorded precedent is a f
 
 ## 11c. Backend parity (`tests/test_backend_parity.py`, `tests/test_turn_end_detection.py`)
 Structural checks that every registered backend implements the same contract, so "works on Claude"
-can no longer silently mean "does nothing on OpenCode". The runner reaches most backend methods via
+can no longer silently mean "does nothing on Codex or OpenCode". The runner reaches most backend methods via
 `getattr(..., None)`, which turns a missing one into a SILENT degradation. Parameterized over
-`available_backends()`, so a third backend is covered the moment it is registered.
+`available_backends()`, so a new backend is covered the moment it is registered — which is exactly how
+Codex arrived with no edit to this file's parity rows.
 
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -329,17 +335,23 @@ can no longer silently mean "does nothing on OpenCode". The runner reaches most 
 | Liveness lookups answer None (never raise) for an empty/unknown session — they are polled from the reactor | `test_liveness_signals_are_safe_on_an_unknown_session` | mock |
 | Unknown backend name raises rather than substituting one | `test_unknown_backend_raises_rather_than_substituting_one` | mock |
 | Spawn command starts with the backend binary and honours a launch wrapper | `test_spawn_command_starts_with_the_backend_binary`, `test_spawn_command_honours_a_launch_wrapper` | mock |
-| **Turn end: a quiet sub-agent must not read as the turn ending** (else a half-finished turn is committed) — both backends | `test_a_quiet_subagent_does_not_read_as_the_turn_ending` | mock |
-| **Turn end: a chattering idle heartbeat must not prevent it** (else NOTHING is ever committed) — both backends | `test_a_chattering_idle_heartbeat_does_not_prevent_the_turn_from_ending` | mock |
+| **Turn end: a quiet sub-agent must not read as the turn ending** (else a half-finished turn is committed) — every backend | `test_a_quiet_subagent_does_not_read_as_the_turn_ending` | mock |
+| **Turn end: a chattering idle heartbeat must not prevent it** (else NOTHING is ever committed) — every backend | `test_a_chattering_idle_heartbeat_does_not_prevent_the_turn_from_ending` | mock |
 | OpenCode's signal is session-scoped, read-only, and degrades to None on any store problem | `test_opencode_reports_activity_from_its_session_store`, `test_opencode_activity_is_none_when_the_store_is_unusable`, `test_opencode_never_writes_to_the_users_database` | mock |
 | OpenCode's model comes from its session store (its event stream names none) | `test_opencode_resolves_the_model_from_its_session_store`, `test_opencode_model_lookup_tolerates_an_unexpected_store_shape` | mock |
+| Codex: the interactive TUI's record shape (role messages, not the `exec` events) yields the prompt, reply and edits | `test_a_tui_turn_recovers_the_prompt_from_role_messages`, `test_the_tui_records_file_edits_as_item_completed_filechange` | mock |
+| Codex: harness context blocks injected as `role: user` are not the user's prompt | `test_concatenated_context_blocks_are_not_the_users_prompt`, `test_prose_that_merely_contains_a_tag_is_still_a_prompt` | mock |
+| Codex: cached input and reasoning are split out of the totals they are nested inside | `test_usage_splits_cached_input_and_reasoning_out_of_their_totals`, `test_a_turn_sums_its_token_counts_and_keeps_the_last_context` | mock |
+| Codex: a spawned sub-agent's own thread is counted but never listed as a resumable session | `test_a_spawned_subagent_is_recorded_and_its_tokens_folded_in`, `test_a_subagent_thread_is_never_listed_as_a_resumable_session` | mock |
+| Codex: worktree trust is propagated only from an already-trusted base repo | `test_trust_is_only_propagated_from_an_already_trusted_base_repo` | mock |
 
 ## 11d. Live backend smoke (`tests/test_live_backends.py`, `-m live`)
 The only tests that call the REAL backend CLIs, and therefore the only ones that can catch a CLI
 changing its output format under us — mocks assert the shape we believed was true when we wrote
 them. Excluded from the default run and from CI (they need the backend installed and
 authenticated and cost real tokens); each skips itself when its binary is absent. Run `pytest -m
-live`. They found OpenCode reporting no model on the very first run.
+live`. They found OpenCode reporting no model on the very first run, and cover Claude, Codex and
+OpenCode (each pinned to its cheapest model tier so a smoke test never bills a frontier model).
 
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -374,7 +386,8 @@ directory that is not a git repo still gets the full page, with progress sync re
 |---|---|---|
 | The page fits a phone exactly (no horizontal scrollbar): progress rows wrap and their titles shrink, and the stat tooltip anchors to the stats ROW capped at its width — an absolutely positioned bubble adds scrollable overflow even while invisible | `test_learn_page_fits_a_phone_width_exactly` | real-git |
 | Engine resolution: config keys > latest session backend/model; cross-backend model dropped; none → clear error | `test_resolve_prefers_config_over_latest_session`, `_falls_back_to_latest_session`, `_config_model_wins`, `_without_any_backend_raises` | real-git |
-| Engine picker persists to / clears from the repo config overlay; unknown backend refused | `test_set_learning_config_roundtrip`, `_rejects_unknown_backend` | real-git |
+| Engine resolution when nothing is configured and no session ever ran here (backtrace mode): the single installed agent CLI is used; two installed are not guessed between and the payload routes the page to its picker; none installed says install one | `test_the_only_installed_backend_is_used_when_nothing_is_configured`, `_two_installed_backends_are_not_guessed_between`, `_an_unresolvable_backend_offers_the_picker_instead_of_a_dead_end`, `_no_backend_installed_at_all_says_install_one` | real-git |
+| Engine picker persists to / clears from the config; global by default so the choice covers the next repo too, per-repo when asked or when the repo already pins it; a global save clears a shadowing repo pin; unknown backend or scope refused | `test_set_learning_config_roundtrip`, `_the_engine_choice_defaults_to_every_repo`, `_a_repo_that_already_pins_the_engine_keeps_its_own`, `_saving_globally_clears_a_repo_pin_that_would_shadow_it`, `_the_panel_is_told_which_file_holds_the_pin`, `_rejects_unknown_backend` | real-git |
 | Check-in → suggestions: digest covers prompts/insights/files/README/progress; capped; persisted per GitHub user; agent failure and empty window surface as in-page errors; one agent call at a time | `test_digest_*`, `test_suggest_persists_profile_per_user`, `_reports_agent_failure_as_error`, `_with_no_turns_explains_instead_of_calling_agent`, `test_agent_lock_reports_busy` | real-git |
 | Suggestion → lesson: normalized (bad links dropped, quiz validated, exercise attached), stored under the learner | `test_lesson_generation_normalizes_and_persists`, `test_unknown_suggestion_is_an_error` | real-git |
 | Automatic progress: time accumulates, quiz results stored, completion closes the linked gap | `test_progress_tracks_time_quiz_completion_and_closes_gap` | real-git |
@@ -521,6 +534,22 @@ a URL. Every row here is about that record staying honest — a stale one makes 
 | Background tracker restart leaves an in-flight turn for the replacement (no force-capture at the swap); a real stop still captures it | `test_background_restart_leaves_in_flight_turns_for_the_replacement`, `test_background_run_execs_replacement_after_update` | mock |
 | Ctrl-G dashboard is a free-standing daemon like `-d`: it keeps serving after aGiTrack quits AND after the terminal closes, until `-d stop` (popup says so); exit never kills it | `test_proxy_dashboard.py::test_dashboard_command_spawns_process_and_opens_browser`, `test_dashboard_is_never_stopped_by_agitrack_exit` | mock |
 
+## 13b. Terminal appearance: the background behind the agent (`tests/test_agent_theme.py`)
+The terminal's own colours are the default and the fallback; only an explicit
+`agent_background` of `dark`/`light` overrides them, and then for the whole session. aGiTrack
+used to INFER the agent's scheme from the colours on screen, which made the background follow
+the screen's content and flip every few seconds — most of this section is the absence of that.
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Every terminal profile keeps its own colours, whatever the agent paints (white, cream, 50% grey, black, blue, green x dark/light/plain agent) | `test_the_terminals_own_colours_are_kept_whatever_the_agent_paints`, `test_an_unknown_terminal_background_changes_nothing_either`, `test_the_frame_is_emitted_exactly_as_it_would_be_without_the_feature` | unit |
+| A turn's changing content (prose → code block → prose) never moves the background — the oscillation bug | `test_a_turns_worth_of_changing_content_never_moves_the_background`, `test_a_forced_background_is_just_as_immovable`, `test_painting_a_frame_cannot_touch_the_canvas` | unit |
+| Nothing samples the screen on a timer, and a frame builds it exactly once (the per-tick, screen-sized cost on the stdin thread) | `test_nothing_samples_the_screen_on_a_timer_any_more`, `test_a_frame_builds_the_visible_screen_exactly_once` | unit |
+| A forced `dark`/`light` fills the unpainted cells and aGiTrack's own chrome, from before the first frame | `test_a_forced_background_fills_the_cells_the_agent_left_alone`, `test_agitracks_own_chrome_sits_on_a_forced_canvas`, `test_a_forced_background_is_in_place_before_the_first_frame`, `test_a_forced_background_needs_no_answer_from_the_terminal`, `test_the_runner_fills_the_cleared_screen_for_a_forced_background`, `test_the_default_setting_writes_nothing_to_the_screen` | unit |
+| The backend is told the terminal's REAL background (so a self-theming agent agrees with it), or the forced one | `test_the_terminals_real_colour_is_what_the_backend_is_told`, `test_a_forced_background_is_reported_in_place_of_the_terminals`, `test_what_the_runner_answers_the_backend_with`, `test_the_backend_is_answered_before_the_reactor_starts` | mock + real-proc |
+| `agent_background` setting: default, choices, and old configs holding the removed `auto` | `test_the_default_is_the_terminals_own_colours`, `test_a_config_still_holding_the_old_auto_reads_as_terminal`, `test_setting_it_to_something_unknown_falls_back_to_terminal`, `test_an_unrecognised_setting_falls_back_to_the_terminals_colours`, `test_agent_background_defaults_to_the_terminals_own_colours`, `test_agent_background_is_offered_in_the_settings_menu` | unit |
+| Every renderer hook the frame needs is re-exported by the runner (else the screen freezes); a broken config never blocks startup | `test_the_runner_exposes_every_canvas_hook_the_renderer_calls`, `test_a_missing_or_broken_config_never_blocks_startup` | unit |
+| Startup hands stdin to the capability round trip at once (no poll-cycle wait) | `test_handing_stdin_over_does_not_wait_out_the_pumps_poll_cycle`, `test_the_pause_pipe_never_swallows_a_keystroke` | real-proc |
+
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -536,7 +565,7 @@ Flows that run on an interactive launch when a required tool, config, or login i
 |---|---|---|
 | Missing **git** (required) → offer install, gate launch if declined | `test_maybe_install_tool_accepts_and_installs`, `test_maybe_install_tool_declined_returns_false` | mock |
 | Missing **gh** (optional) → offer install, continue if declined | `test_gh_check_missing_does_not_offer_login`, `test_maybe_install_tool_*` | mock |
-| **gh unauthenticated** → offer `gh auth login` / continue / quit | `test_gh_check_login_runs_gh_auth_login`, `test_gh_check_unauthenticated_continue`, `test_gh_check_quit_aborts_startup` | mock |
+| **gh unauthenticated** → sign in by DEFAULT (Enter), skip with `s`, or quit | `test_gh_check_unauthenticated_defaults_to_login`, `test_gh_check_unauthenticated_skip_continues_without_login`, `test_gh_check_login_runs_gh_auth_login`, `test_gh_check_quit_aborts_startup` | mock |
 | gh already authed / no GitHub remote → silent | `test_gh_check_silent_when_authenticated`, `test_gh_check_silent_without_a_github_remote` | mock |
 | Missing **git identity** (`user.name`/`user.email`) → prompt and set both | `test_ensure_git_identity_prompts_and_sets_both`, `test_ensure_git_identity_noop_when_already_set` | mock |
 | Missing **backend CLI** → install / switch to installed / manual hint / gate | `test_ensure_installed_backend_returns_installed_backend`, `_switches_to_installed_alternative`, `_quit_raises`, `_is_a_gate_not_an_installer` | mock |
@@ -547,6 +576,13 @@ Flows that run on an interactive launch when a required tool, config, or login i
 | Manual install hints cover all platforms | `test_git_install_hint_covers_all_platforms`, `test_gh_install_hint_covers_all_platforms`, `test_install_hint_claude_mentions_*`, `test_install_hint_opencode_mentions_*` | mock |
 | Scripted / non-TTY run → never prompts | `test_maybe_install_tool_non_tty_returns_false`, `test_gh_check_non_interactive_does_not_prompt`, `test_ensure_installed_backend_non_interactive_raises` | mock |
 | Custom launch command bypasses the install gate | `test_custom_launch_command_bypasses_install_gate` | mock |
+| Installed backend not on the user's PATH → offer to persist it, write the profile entry | `test_install_backend_offers_the_path_entry_after_a_successful_install`, `test_accepting_the_offer_writes_the_entry`, `test_persist_appends_a_marked_line_and_creates_a_missing_profile` | mock |
+| PATH offer declined → profile untouched, manual instructions shown | `test_declining_leaves_the_profile_alone_but_says_how_to_do_it` | mock |
+| PATH write FAILS → reason shown and the user must acknowledge | `test_a_failed_write_is_reported_and_must_be_acknowledged` | mock |
+| PATH already usable (inherited, or written by an earlier run) → nothing asked | `test_nothing_is_asked_when_the_users_shells_already_find_it`, `test_an_entry_written_by_an_earlier_run_is_not_duplicated` | mock |
+| PATH offer on a non-TTY run → instructions only, no prompt, no write | `test_a_piped_run_prints_instructions_instead_of_prompting`, `test_without_a_terminal_the_instructions_are_printed_and_nothing_is_asked` | mock |
+| Every install question drains keys pressed during the previous step | `test_maybe_install_tool_drains_input_before_asking`, `test_first_run_prompts_drain_stale_keypresses_by_default`, `test_ask_drains_before_reading` | mock |
+| Long install announces itself and separates its output from the next question | `test_install_backend_announces_a_slow_step_and_closes_the_installers_output`, `test_install_system_tool_announces_a_slow_step_and_closes_its_output`, `test_maybe_install_tool_question_starts_its_own_block` | mock |
 
 ---
 

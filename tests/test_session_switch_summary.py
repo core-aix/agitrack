@@ -25,12 +25,15 @@ import subprocess
 
 import pytest
 
+from agitrack.backends.proxy_agents import available_backends
 from agitrack.config import AgitrackState
 from agitrack.git import GitRepo
 from agitrack.transcripts.types import SessionRef
 from proxy_helpers import make_runner
 
-BACKENDS = ["claude", "opencode"]
+# Every registered backend, so a newly added one is covered the moment it is registered
+# (the pattern test_backend_parity.py already uses).
+BACKENDS = available_backends()
 
 
 def _init_repo(path):

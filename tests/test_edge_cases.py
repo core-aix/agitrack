@@ -453,6 +453,176 @@ def test_opencode_extract_json_object_rejects_a_truncated_export():
     assert _extract_json_object('noise {"a": 1} trailing') == '{"a": 1}'
 
 
+# --- the Codex parser under the same damage ---------------------------------
+#
+# Codex's rollout is line-oriented JSONL like Claude's and is APPENDED TO by the live Codex
+# process, so it is read mid-write on every poll: the last line is routinely half-written. It
+# is also the only backend whose transcript carries a HEADER row (`session_meta`) the rest of
+# the file depends on for identity — and a shared copy trimmed to fit git's blob limit can
+# arrive without it. Every kind of damage must degrade to "fewer turns", never to an exception:
+# this runs on the commit path, where a raised error means the turn is never committed and the
+# user is told nothing.
+
+_CODEX_SESSION = "019fe8dc-ca6c-7951-9225-73513aadf083"
+
+
+@pytest.fixture(autouse=True)
+def _codex_home(tmp_path_factory, monkeypatch):
+    """Redirect CODEX_HOME for every test in this module.
+
+    The Codex parser resolves a session's model and its sub-agent rollouts out of the store, so
+    parsing a fixture file would otherwise read (and index) the developer's real ``~/.codex``.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex-home")))
+
+
+def _codex_row(kind, payload, stamp="2026-08-09T23:30:12.005Z"):
+    # The two-level (record type, payload type) discriminator every rollout row carries — the
+    # shape captured from real codex-cli rollouts in tests/test_codex_session.py.
+    return {"timestamp": stamp, "type": kind, "payload": payload}
+
+
+def _codex_turn(turn_id, prompt, reply):
+    return [
+        _codex_row("event_msg", {"type": "task_started", "turn_id": turn_id}),
+        _codex_row("turn_context", {"turn_id": turn_id, "model": "gpt-5.4-mini", "cwd": "/repo"}),
+        _codex_row("event_msg", {"type": "user_message", "message": prompt}),
+        _codex_row("event_msg", {"type": "agent_message", "message": reply, "phase": "final"}),
+        _codex_row("event_msg", {"type": "task_complete", "turn_id": turn_id, "last_agent_message": reply}),
+    ]
+
+
+def _codex_meta():
+    return _codex_row("session_meta", {"session_id": _CODEX_SESSION, "id": _CODEX_SESSION, "cwd": "/repo"})
+
+
+def _write_rollout(tmp_path, rows, *, trailing="", raw=None):
+    """A rollout file named the way Codex names one (the id lives in the file name)."""
+    path = tmp_path / f"rollout-2026-08-10T00-30-11-{_CODEX_SESSION}.jsonl"
+    if raw is not None:
+        path.write_bytes(raw)
+        return path
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows) + trailing, encoding="utf-8")
+    return path
+
+
+def test_a_half_written_trailing_rollout_line_does_not_lose_the_completed_turns(tmp_path):
+    # The common case, and the reason the reader is tolerant by construction: aGiTrack polls
+    # the rollout WHILE Codex appends to it, so a turn could never be committed mid-session if
+    # a torn final line invalidated the file.
+    from agitrack.transcripts import codex
+
+    path = _write_rollout(
+        tmp_path, [_codex_meta(), *_codex_turn("t1", "add subtract", "Added subtract.")], trailing='{"timestamp":"20'
+    )
+
+    session = codex.export_session_at(path)
+
+    assert [t.user_prompt for t in session.turns] == ["add subtract"]
+    assert session.turns[0].final_response == "Added subtract."
+
+
+def test_a_corrupt_rollout_line_in_the_middle_does_not_discard_what_follows(tmp_path):
+    # A torn line must cost that line, not the rest of the file. Stopping at the first bad row
+    # would silently drop every later turn — including the one being committed right now.
+    from agitrack.transcripts import codex
+
+    rows = [_codex_meta(), *_codex_turn("t1", "first", "one")]
+    text = "".join(json.dumps(row) + "\n" for row in rows)
+    text += "{not json at all\n"
+    text += "".join(json.dumps(row) + "\n" for row in _codex_turn("t2", "second", "two"))
+    path = _write_rollout(tmp_path, [], raw=text.encode("utf-8"))
+
+    session = codex.export_session_at(path)
+
+    assert [t.user_prompt for t in session.turns] == ["first", "second"]
+
+
+@pytest.mark.parametrize("content,label", [("", "a rollout with nothing in it yet"), ("\n\n   \n\n", "blank lines")])
+def test_an_empty_or_blank_rollout_is_not_an_error(tmp_path, content, label):
+    # The file exists from the moment Codex starts, before any turn. Treating that as a parse
+    # failure would make every fresh session look broken.
+    from agitrack.transcripts import codex
+
+    path = _write_rollout(tmp_path, [], raw=content.encode("utf-8"))
+
+    session = codex.export_session_at(path)
+
+    assert session is None or session.turns == [], label
+
+
+def test_a_missing_rollout_returns_nothing_rather_than_raising(tmp_path):
+    # Polled from the reactor for a session id that may name nothing yet.
+    from agitrack.transcripts import codex
+
+    assert codex.export_session_at(tmp_path / "rollout-nope.jsonl") is None
+
+
+def test_rollout_lines_that_are_not_objects_are_skipped_rather_than_unpacked(tmp_path):
+    # A JSON line is not necessarily a record: a truncated write can leave a bare array or
+    # string that parses fine and then explodes on `.get`.
+    from agitrack.transcripts import codex
+
+    text = "[1, 2, 3]\n" + '"just a string"\n' + "null\n"
+    text += "".join(json.dumps(row) + "\n" for row in [_codex_meta(), *_codex_turn("t1", "go", "done")])
+    path = _write_rollout(tmp_path, [], raw=text.encode("utf-8"))
+
+    session = codex.export_session_at(path)
+
+    assert [t.user_prompt for t in session.turns] == ["go"]
+
+
+def test_a_rollout_that_lost_its_session_meta_header_still_yields_its_turns(tmp_path):
+    # `session_meta` is the first row and the only one carrying the session's identity, so it
+    # is exactly what a size-capped shared copy can arrive without. The turns are the work; a
+    # missing header must not cost them (the id is recoverable from the file name).
+    from agitrack.transcripts import codex
+
+    path = _write_rollout(tmp_path, list(_codex_turn("t1", "headerless", "still parsed")))
+
+    session = codex.export_session_at(path)
+
+    assert [t.user_prompt for t in session.turns] == ["headerless"]
+    assert session.session_id == _CODEX_SESSION  # recovered from the rollout file name
+
+
+def test_a_lone_surrogate_in_a_rollout_does_not_crash_the_parser(tmp_path):
+    # Surrogates reach a transcript from pasted or mis-decoded input and cannot be decoded as
+    # UTF-8. The reader opens with errors="replace"; this pins that it never raises.
+    from agitrack.transcripts import codex
+
+    good = "".join(json.dumps(row) + "\n" for row in [_codex_meta(), *_codex_turn("t1", "before", "ok")])
+    path = _write_rollout(tmp_path, [], raw=good.encode("utf-8") + b'{"broken": "\xed\xa0\x80"}\n')
+
+    session = codex.export_session_at(path)  # must not raise
+
+    assert [t.user_prompt for t in session.turns] == ["before"]
+
+
+@pytest.mark.parametrize(
+    "data,label",
+    [
+        ("", "an empty shared transcript"),
+        ("   \n\n", "whitespace only"),
+        ("not json at all", "not JSON"),
+        ('{"timestamp": "2026-08-09T23:30:12.005Z", "type": "sess', "a share cut off mid-line"),
+        ([], "already-split rows, but none of them"),
+        ([1, "two", None], "rows of the wrong type"),
+        ({}, "a single empty object"),
+    ],
+)
+def test_a_damaged_shared_codex_transcript_yields_no_turns_rather_than_raising(data, label):
+    # The share path hands whatever arrived over the wire (text, or already-split rows) to the
+    # parser. A shared copy is redacted, capped and pushed by another machine, so "damaged" is
+    # an ordinary state — and this runs while deciding whether to import, where an exception
+    # would abort the resume instead of declining it.
+    from agitrack.transcripts.codex import parse_exported_session
+
+    session = parse_exported_session(data)
+
+    assert session.turns == [], label
+
+
 # --- terminal state under stress --------------------------------------------
 #
 # The stdin state machine sees bytes in whatever chunks the kernel delivers, and the terminal

@@ -1,5 +1,8 @@
 import json
+import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -14,6 +17,30 @@ from agitrack.transcripts.claude import (
     parse_rows,
     session_belongs_to_repo,
 )
+
+
+@pytest.fixture
+def short_tmp_path(tmp_path):
+    """A temp directory short enough for the project-dir names these tests build.
+
+    Claude Code names a project directory after the WHOLE absolute working directory
+    (``_encode_repo`` replaces every non-alphanumeric character with a dash), so a config dir
+    nested under pytest's ``tmp_path`` ends up storing a ~120-character name inside an already
+    ~110-character path. For the tests whose repo is itself deep — a worktree under
+    ``.agitrack/worktrees/<name>`` — that crosses Windows' MAX_PATH and ``mkdir`` fails with
+    ``WinError 206``. It only shows up under ``-n auto``, where xdist's ``popen-gwN`` segment is
+    the last straw, so the same tests pass in isolation and fail in the suite.
+
+    A short root sidesteps it without weakening what is under test. POSIX has no such limit and
+    keeps the ordinary ``tmp_path``."""
+    if os.name != "nt":
+        yield tmp_path
+        return
+    root = Path(tempfile.mkdtemp(prefix="agt"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_session_cwd_reads_last_recorded_cwd(monkeypatch, tmp_path):
@@ -243,7 +270,8 @@ def test_session_cwd_since_ignores_stale_pre_launch_rows(monkeypatch, tmp_path):
     assert claude_session.session_cwd("s") == "/the/worktree"
 
 
-def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
+def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, short_tmp_path):
+    tmp_path = short_tmp_path  # a worktree project-dir name under pytest's tmp_path busts MAX_PATH
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     repo_root = tmp_path / "repo"
@@ -271,7 +299,8 @@ def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
     assert claude_session.prepare_resume(worktree, "missing") is False
 
 
-def test_prepare_resume_refreshes_stale_staged_copy(monkeypatch, tmp_path):
+def test_prepare_resume_refreshes_stale_staged_copy(monkeypatch, short_tmp_path):
+    tmp_path = short_tmp_path  # a worktree project-dir name under pytest's tmp_path busts MAX_PATH
     # Regression: a prior resume staged the transcript into the target dir, then cwd-retargeting
     # broke the hardlink — freezing that staged copy while the live copy elsewhere kept growing.
     # prepare_resume must REPLACE the stale snapshot with the newest copy, or --no-worktree
@@ -321,7 +350,8 @@ def test_prepare_resume_keeps_fresh_staged_copy(monkeypatch, tmp_path):
     assert (base_proj / "s.jsonl").stat().st_ino == before  # untouched (no source is newer)
 
 
-def test_link_session_surfaces_worktree_conversation_in_base(monkeypatch, tmp_path):
+def test_link_session_surfaces_worktree_conversation_in_base(monkeypatch, short_tmp_path):
+    tmp_path = short_tmp_path  # a worktree project-dir name under pytest's tmp_path busts MAX_PATH
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     repo_root = tmp_path / "repo"
@@ -1804,3 +1834,17 @@ def test_session_last_activity_falls_back_to_a_full_read(monkeypatch, tmp_path):
 
     assert stamp is not None
     assert time.strftime("%Y-%m-%dT%H:%M", time.gmtime(stamp)) == "2026-08-04T20:04"
+
+
+def test_overlong_project_dir_does_not_raise(tmp_path, monkeypatch):
+    """Claude keys transcripts by flattening the repo's cwd into ONE filename, so a repo nested
+    ~225 characters deep produces a path component past Linux's 255-byte limit. `Path.is_dir()`
+    swallows "not found" but NOT ENAMETOOLONG, so the probe raised `OSError: [Errno 36] File name
+    too long` — a raw traceback, exit 1, TUI never started, from a call whose only job was to ask
+    whether a directory exists."""
+    from agitrack.transcripts import claude as claude_transcripts
+
+    deep = tmp_path / ("d" * 200 + "/" + "e" * 200)
+    # Never created on disk: the point is that merely LOOKING at it must not raise.
+    assert claude_transcripts._refs_in_project_dir(deep) == []
+    assert claude_transcripts.list_sessions(deep) == []

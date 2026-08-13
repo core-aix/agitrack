@@ -2,14 +2,14 @@
 
 Every other test in this suite mocks the backend. That is right for logic, and it is blind to
 the one thing mocks cannot see: **the backend CLI changing its output format under us.** A new
-Claude Code release renaming a JSON field, or an OpenCode version changing its event shape,
+Claude Code release renaming a JSON field, or a Codex/OpenCode version changing its event shape,
 breaks aGiTrack for every user of that backend while the whole mocked suite stays green — the
 mocks assert the shape we *believed* was true when we wrote them.
 
 Run them deliberately::
 
-    pytest -m live                 # both backends, whichever are installed
-    pytest -m live -k opencode     # one of them
+    pytest -m live                 # every backend, whichever are installed
+    pytest -m live -k codex        # one of them
 
 They are excluded from the default run (and therefore from CI) because they need the backend
 installed and authenticated, cost real tokens, and take seconds to tens of seconds. Each is
@@ -27,16 +27,24 @@ import shutil
 
 import pytest
 
-from agitrack.backends.claude import ClaudeBackend
-from agitrack.backends.opencode import OpenCodeBackend
+from agitrack.backends import headless_backends
+from agitrack.backends.setup import _executable
 
 pytestmark = pytest.mark.live
 
-_BACKENDS = {"claude": ClaudeBackend, "opencode": OpenCodeBackend}
+# Straight from the registry: a hand-written map means a newly added backend gets no live
+# smoke test at all — exactly the backend whose CLI contract nobody has verified yet.
+_BACKENDS = headless_backends()
+
+# Cheapest tier per backend, so a smoke test never bills a frontier model. None = the CLI's own
+# default (OpenCode fronts arbitrary providers, so there is no id that is valid everywhere).
+_SMOKE_MODELS = {"claude": "claude-haiku-4-5-20251001", "codex": "gpt-5.4-mini", "opencode": None}
 
 
 def _backend_or_skip(name, tmp_path):
-    if shutil.which(name) is None:
+    # The backend's own executable, not its registry key: they coincide today but the key is
+    # aGiTrack's name for the agent, not a promise about the binary on PATH.
+    if shutil.which(_executable(name)) is None:
         pytest.skip(f"{name} is not installed on this machine")
     return _BACKENDS[name](tmp_path)
 
@@ -49,7 +57,7 @@ def test_a_bare_run_returns_usable_text(backend_name, tmp_path):
 
     result = backend.run(
         "Reply with exactly the word: pineapple",
-        model=None,
+        model=_SMOKE_MODELS[backend_name],
         session_id=None,
         bare=True,
         system_prompt="Follow the instruction exactly. Output only what is asked, no preamble.",
@@ -70,7 +78,7 @@ def test_a_bare_run_reports_its_model_and_token_usage(backend_name, tmp_path):
 
     result = backend.run(
         "Say OK.",
-        model=None,
+        model=_SMOKE_MODELS[backend_name],
         session_id=None,
         bare=True,
         system_prompt="Reply with just: OK",

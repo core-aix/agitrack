@@ -195,30 +195,141 @@ def test_resolve_config_model_wins(tmp_path):
     assert choice.model_source == "config"
 
 
-def test_resolve_without_any_backend_raises(tmp_path):
+def test_resolve_without_any_backend_raises(tmp_path, monkeypatch):
+    # No config, no session, and no agent CLI on the machine: nothing left to resolve from.
+    # `installed_backends` is stubbed because otherwise this test asserts something about the
+    # DEVELOPER'S machine — it passed in CI and failed on any laptop with claude installed.
+    monkeypatch.setattr(learn, "installed_backends", lambda: [])
     repo = _init_repo(tmp_path)
     with pytest.raises(learn.LearnAgentError):
         learn.resolve_learning_backend(repo.repo)
 
 
+def test_the_only_installed_backend_is_used_when_nothing_is_configured(tmp_path, monkeypatch):
+    """#233: backtrace mode serves repos aGiTrack never drove, so every other tier is empty.
+
+    The config keys are unset, `.agitrack/state.json` does not exist (no session ever ran
+    here) and `default_backend` is None on a fresh install — yet the machine has a working
+    `claude`. Before the detection tier that combination was a hard error whose advice ("run
+    an aGiTrack session in this repo first") contradicted the mode the user was in.
+    """
+    monkeypatch.setattr(learn, "installed_backends", lambda: ["claude"])
+    repo = _init_repo(tmp_path)
+
+    choice = learn.resolve_learning_backend(repo.repo)
+
+    assert choice.backend_name == "claude"
+    assert choice.backend_source == "detected"
+
+
+def test_two_installed_backends_are_not_guessed_between(tmp_path, monkeypatch):
+    # With two CLIs there is no right answer to pick, so the user is asked — and the error
+    # names the panel that asks, rather than a remedy backtrace mode cannot follow.
+    monkeypatch.setattr(learn, "installed_backends", lambda: ["claude", "opencode"])
+    repo = _init_repo(tmp_path)
+
+    with pytest.raises(learn.LearnAgentError) as excinfo:
+        learn.resolve_learning_backend(repo.repo)
+
+    message = str(excinfo.value)
+    assert "coach engine" in message and "claude, opencode" in message
+    assert "session in this repo first" not in message
+
+
+def test_an_unresolvable_backend_offers_the_picker_instead_of_a_dead_end(tmp_path, monkeypatch):
+    # The second half of #233: the panel that fixes this is on the page, and the payload has
+    # to say so or the page has no way to know it should open it.
+    monkeypatch.setattr(learn, "installed_backends", lambda: ["claude", "opencode"])
+    repo = _init_repo(tmp_path)
+
+    info = learn.describe_learning_backend(repo.repo)
+
+    assert info["error"] and info["needs_choice"] is True
+    assert info["installed"] == ["claude", "opencode"]
+
+
+def test_no_backend_installed_at_all_says_install_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(learn, "installed_backends", lambda: [])
+    repo = _init_repo(tmp_path)
+
+    info = learn.describe_learning_backend(repo.repo)
+
+    assert "Install" in info["error"]
+    assert info["needs_choice"] is False  # nothing to choose between; the picker cannot help
+
+
 def test_set_learning_config_roundtrip(tmp_path):
     repo = _init_repo(tmp_path)
     _write_state(tmp_path, backend="claude")
-    result = learn.set_learning_config(repo.repo, backend="opencode", model="anthropic/claude-haiku-4-5")
+    result = learn.set_learning_config(repo.repo, backend="opencode", model="anthropic/claude-haiku-4-5", scope="repo")
     assert result["backend_info"]["backend"] == "opencode"
     stored = json.loads((tmp_path / ".agitrack" / "config.json").read_text())
     assert stored["learning_backend"] == "opencode"
     assert stored["learning_model"] == "anthropic/claude-haiku-4-5"
     # Unsetting falls back to the session backend and removes the keys.
-    result = learn.set_learning_config(repo.repo, backend="", model="")
+    result = learn.set_learning_config(repo.repo, backend="", model="", scope="repo")
     stored = json.loads((tmp_path / ".agitrack" / "config.json").read_text())
     assert "learning_backend" not in stored and "learning_model" not in stored
     assert result["backend_info"]["backend"] == "claude"
 
 
+def test_the_engine_choice_defaults_to_every_repo(tmp_path):
+    """#233: the in-page fix has to STICK, and a repo-scoped write does not.
+
+    The reporter fixed the "no backend configured" error in one repo, served the next one,
+    and hit the identical error — while an `.agitrack/config.json` was left behind in every
+    repo they had opened, including repos aGiTrack only reconstructed and never tracked.
+    """
+    repo = _init_repo(tmp_path)
+
+    result = learn.set_learning_config(repo.repo, backend="claude", model="")
+
+    assert result["scope"] == "global"
+    assert not (tmp_path / ".agitrack" / "config.json").exists()
+    assert learn.resolve_learning_backend(repo.repo).backend_name == "claude"
+
+
+def test_a_repo_that_already_pins_the_engine_keeps_its_own(tmp_path):
+    # An existing per-repo pin is a deliberate choice, so "auto" must not silently promote
+    # the next save to every repo the user has.
+    repo = _init_repo(tmp_path)
+    learn.set_learning_config(repo.repo, backend="claude", model="", scope="repo")
+
+    result = learn.set_learning_config(repo.repo, backend="opencode", model="")
+
+    assert result["scope"] == "repo"
+    stored = json.loads((tmp_path / ".agitrack" / "config.json").read_text())
+    assert stored["learning_backend"] == "opencode"
+
+
+def test_saving_globally_clears_a_repo_pin_that_would_shadow_it(tmp_path):
+    # Otherwise "apply to all repos" appears to do nothing in the very repo you set it from:
+    # the overlay wins, and the page shows a backend the user did not just choose.
+    repo = _init_repo(tmp_path)
+    learn.set_learning_config(repo.repo, backend="claude", model="", scope="repo")
+
+    learn.set_learning_config(repo.repo, backend="opencode", model="", scope="global")
+
+    stored = json.loads((tmp_path / ".agitrack" / "config.json").read_text())
+    assert "learning_backend" not in stored
+    assert learn.resolve_learning_backend(repo.repo).backend_name == "opencode"
+
+
+def test_the_panel_is_told_which_file_holds_the_pin(tmp_path):
+    repo = _init_repo(tmp_path)
+    assert learn.describe_learning_backend(repo.repo).get("pinned_scope") == ""
+
+    learn.set_learning_config(repo.repo, backend="claude", model="", scope="global")
+    assert learn.describe_learning_backend(repo.repo)["pinned_scope"] == "global"
+
+    learn.set_learning_config(repo.repo, backend="claude", model="", scope="repo")
+    assert learn.describe_learning_backend(repo.repo)["pinned_scope"] == "repo"
+
+
 def test_set_learning_config_rejects_unknown_backend(tmp_path):
     repo = _init_repo(tmp_path)
     assert "error" in learn.set_learning_config(repo.repo, backend="cursor", model="")
+    assert "error" in learn.set_learning_config(repo.repo, backend="claude", model="", scope="everywhere")
 
 
 # --------------------------------------------------------------------- JSON parsing
@@ -846,3 +957,19 @@ def test_norm_lesson_falls_back_to_single_step_for_a_blob():
     lesson = learn._norm_lesson(raw, {"minutes": 5})
     assert lesson["steps"] == [{"title": "", "content_md": "### A\nbody text"}]
     assert lesson["content_md"] == "### A\nbody text"
+
+
+def test_the_learn_page_names_the_config_file_actually_in_use(tmp_path, monkeypatch):
+    """The page hardcoded `~/.agitrack/config.json`, which is simply the wrong file whenever
+    AGITRACK_CONFIG_DIR is set — the user is told to edit something that has no effect on
+    them."""
+    from agitrack.metrics.learn import global_config_display_path
+
+    monkeypatch.delenv("AGITRACK_CONFIG_DIR", raising=False)
+    assert global_config_display_path() == "~/.agitrack/config.json"
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "elsewhere"))
+    shown = global_config_display_path()
+    assert shown.endswith("config.json")
+    assert "elsewhere" in shown
+    assert "~/.agitrack" not in shown

@@ -256,14 +256,19 @@ def current_disk_files(directory: Path) -> set[str]:
     Prefers ``git ls-files`` (tracked + untracked-but-not-ignored) so a repo's listing matches what
     git considers part of the project. Falls back to a bounded walk for a plain directory, because
     ``--backtrace`` must work where there is no git history at all."""
+    from agitrack.proc import UTF8_TEXT, console_isolation_kwargs
+
     try:
         done = subprocess.run(
             ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=str(directory),
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=30,
             check=False,
+            # The dashboard and backtrace daemons are console-less too: without this, every
+            # refresh that recomputes the file listing flashes a console window (proc.py).
+            **console_isolation_kwargs(),
         )
         if done.returncode == 0:
             names = {name for name in done.stdout.split("\x00") if name}

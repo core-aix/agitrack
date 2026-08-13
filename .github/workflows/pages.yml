@@ -98,9 +98,10 @@ jobs:
         uses: actions/deploy-pages@v5
         with:
           artifact_name: github-pages-${{ github.run_attempt }}
-          # 30 minutes, up from the 10-minute default. GitHub parks a deployment in
-          # `deployment_queued` and only then starts publishing; when that queue is slow the
-          # default expires mid-wait, and the action then CANCELS the deployment it was waiting
-          # for — a queue delay is reported as a failed deploy. Waiting longer costs only runner
-          # minutes on a bad day and turns those into successful publishes.
-          timeout: 1800000
+          # NOTE: `timeout` is NOT worth setting. 600000 ms (10 minutes) is the action's hard
+          # MAXIMUM, not its default-with-headroom: a larger value is silently clamped back to
+          # it ("Warning: timeout value is greater than the allowed maximum"). So when GitHub
+          # takes longer than ten minutes to publish — as it did repeatedly on 2026-08-06, first
+          # sitting in `deployment_queued` and later in `deployment_in_progress` — there is no
+          # way to wait it out, and the action CANCELS the deployment it was waiting for. The
+          # only remedy is to re-run, which is what the per-attempt artifact name above buys.

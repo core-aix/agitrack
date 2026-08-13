@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import json
 import os
 import subprocess
@@ -78,9 +80,16 @@ class ClaudeBackend:
         verbose: bool = False,
         backend_args: list[str] | None = None,
         launch_command: list[str] | None = None,
+        console_stream=None,
     ) -> None:
         self.repo = repo
         self.verbose = verbose
+        # Where this backend echoes the agent's streamed output. Defaults to stdout, which is
+        # right for a terminal — but under `--json-events`/`--ui-bridge` stdout carries ONLY
+        # protocol lines, and a raw echo there is a non-JSON line in the middle of the stream
+        # (the live test saw exactly that: a bare "OK" between `ready` and `response`). The
+        # shell hands us its own prose stream so the echo follows the rest of the prose.
+        self._console = console_stream if console_stream is not None else sys.stdout
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
         # Command that launches the backend, replacing the "claude" executable with a user
         # wrapper (e.g. ["somewrapper", "claude"]); empty ⇒ run "claude" directly.
@@ -127,6 +136,19 @@ class ClaudeBackend:
 
             note = agent_system_note(use_worktrees=False)
             command.extend(["--append-system-prompt", _flatten(note) if to_stdin else note])
+            # LET IT EDIT. `claude -p` has no terminal to approve a Write/Edit on, so with no
+            # permission flag every one of them is auto-DECLINED: `agitrack --prompt` spent real
+            # tokens, changed nothing, and exited 0 through an invisible `no_changes` — 2 of 4
+            # billed turns produced zero work, and the agent's actual reply ("I need permission
+            # to create the file") was written to state.json and never shown.
+            #
+            # `acceptEdits` is the narrowest mode that makes the command mean anything: file
+            # edits inside the working directory, still no unattended shell. It is added only
+            # for a CODING run — never for `bare`, which is the summarizer and must not touch
+            # files at all — and never when the user passed their own permission flag, whose
+            # choice wins.
+            if not any(arg.startswith("--permission-mode") for arg in self.backend_args):
+                command.extend(["--permission-mode", "acceptEdits"])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate

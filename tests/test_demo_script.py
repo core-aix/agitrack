@@ -31,7 +31,7 @@ def test_demo_script_help_documents_the_backend_choice():
     result = _run("--help")
 
     assert result.returncode == 0
-    assert "--backend claude|opencode" in result.stdout
+    assert "--backend claude|codex|opencode" in result.stdout
     assert "--model" in result.stdout
     assert "--dir" in result.stdout
 

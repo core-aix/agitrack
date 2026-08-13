@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from agitrack.fileio import ensure_state_dir
 
 # Keep the directory from growing forever: a crash loop should leave evidence, not a mess.
 _KEEP_REPORTS = 5
@@ -34,7 +35,7 @@ def write_crash_report(root: Path, error: BaseException, *, context: dict[str, o
     on the way out of a session."""
     try:
         directory = crash_dir(root)
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(directory)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = directory / f"crash-{stamp}.log"
         lines = [
@@ -68,11 +69,11 @@ def write_stall_note(root: Path, phase: str, seconds: float) -> None:
     not be able to take down the session it is describing."""
     try:
         directory = crash_dir(root)
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_state_dir(directory)
         path = directory / _STALL_LOG
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{stamp} reactor stalled {seconds:.1f}s in phase {phase} (v{_version()})\n")
+            handle.write(f"{stamp} reactor stalled {seconds:.3f}s in phase {phase} (v{_version()})\n")
         lines = path.read_text(encoding="utf-8").splitlines()
         if len(lines) > _MAX_STALL_LINES:  # keep the file from growing forever
             path.write_text("\n".join(lines[-_MAX_STALL_LINES:]) + "\n", encoding="utf-8")

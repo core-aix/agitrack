@@ -61,6 +61,10 @@ class BridgeServer:
         self._write_lock = threading.Lock()
         self._reader = threading.Thread(target=self._read_loop, name="agitrack-bridge-reader", daemon=True)
         self._started = False
+        # Set once stdin is gone: no further request OR answer can ever arrive. wait_answer()
+        # consults it so a question raised after the driver disconnected fails fast instead of
+        # blocking forever.
+        self._closed = threading.Event()
 
     def start(self) -> None:
         if not self._started:
@@ -88,9 +92,28 @@ class BridgeServer:
                     self._requests.put(message)
                     if kind == "exit":
                         break
+                else:
+                    # SAY what was ignored. Unknown types were dropped in complete silence, so a
+                    # developer who read "--ui-bridge speaks JSON-RPC" in `--help` and wrote a
+                    # JSON-RPC 2.0 client ({"jsonrpc": "2.0", "method": …}) got nothing back at
+                    # all and no way to tell a protocol mismatch from a hang. (The help no longer
+                    # calls this JSON-RPC; see cli.py.)
+                    self.emit(
+                        {
+                            "type": "notice",
+                            "level": "warn",
+                            "message": (
+                                f"Ignored a message of unknown type {kind!r}. This protocol is "
+                                "newline-delimited JSON, not JSON-RPC 2.0; the accepted types are "
+                                + ", ".join(sorted(_REQUEST_TYPES | {"answer"}))
+                                + "."
+                            ),
+                        }
+                    )
         except (OSError, ValueError):
             pass
         # Closed stdin or a read error both mean "no more requests": tell the loop to stop.
+        self._closed.set()
         self._requests.put({"type": "exit"})
 
     def emit(self, event: dict[str, Any]) -> None:
@@ -107,9 +130,22 @@ class BridgeServer:
     def wait_answer(self, ask_id: str) -> Any:
         """Block until the editor answers the question with ``ask_id``. Stale
         answers (a different id, e.g. a cancelled earlier question) are skipped.
-        Returns the ``value`` field, or ``None`` if the editor signalled exit."""
+        Returns the ``value`` field, or ``None`` if the editor signalled exit.
+
+        Gives up the moment the transport is GONE. This was an unbounded
+        ``self._answers.get()``, so an `ask` raised after stdin had already closed — a driver
+        that piped one prompt and exited, a harness whose stdin was ``/dev/null`` — waited on an
+        answer that could never arrive. The session deadlocked forever (killed after 7 minutes
+        at ``{"type":"ask","id":"ask-1",…}``) while the reader thread had already queued its
+        exit. ``None`` is the same answer a cancelled question gives, and every caller already
+        handles it."""
         while True:
-            message = self._answers.get()
+            try:
+                message = self._answers.get(timeout=0.2)
+            except queue.Empty:
+                if self._closed.is_set():
+                    return None  # nobody left to answer
+                continue
             if message.get("type") == "answer" and message.get("id") == ask_id:
                 return message.get("value")
             # A terminal control message can also arrive on the request queue; an

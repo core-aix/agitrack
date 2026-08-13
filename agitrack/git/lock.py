@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from agitrack.fileio import ensure_state_dir
 
 # Single-writer locking primitive, chosen per platform. POSIX uses an advisory
 # ``flock`` on the open file description; native Windows has no ``fcntl``, so it uses a
@@ -131,12 +132,33 @@ class RepoLock:
         self.path = Path(path)
         self._fd: int | None = None
 
-    def acquire(self) -> bool:
+    def acquire(self, *, retry_seconds: float = 0.0) -> bool:
         """Try to take the lock. Returns True on success, False if another live
-        process already holds it."""
+        process already holds it.
+
+        ``retry_seconds`` re-tries for up to that long before giving up — needed ONLY when the
+        caller has just terminated the previous holder. On Windows a killed process's
+        ``msvcrt.locking`` byte-range lock outlives the process itself by the time it takes the
+        kernel to tear its handles down: measured at ``pid_alive`` False at 0.000 s but the lock
+        still held at 0.102 s. ``agitrack -b -m`` did ``replace_running_tracker(...) and
+        acquire()`` with no retry and lost that race 9 times out of 9 — then printed "already
+        running (PID N)" naming the PID it had just killed, and told the user to stop a process
+        that no longer existed. Net result: ZERO writers on the repo, silently."""
         if self._fd is not None:
             return True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + max(0.0, retry_seconds)
+        while True:
+            if self._try_acquire_once():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    def _try_acquire_once(self) -> bool:
+        # The lock lives in `.agitrack/`, and acquiring it is often the FIRST thing a run
+        # does — before `.git/info/exclude` is written. A run that then exits (no TTY, a
+        # refused second writer, an abort) used to leave `?? .agitrack/` behind for good.
+        ensure_state_dir(self.path.parent)
         try:
             fd = _open_lock_file(str(self.path))
         except OSError:
@@ -179,6 +201,20 @@ class RepoLock:
         except OSError:
             pass
         self._fd = None
+
+    def clear_owner_record(self) -> None:
+        """Truncate the lock FILE without holding the lock — for a process that stopped another
+        one and knows it is gone.
+
+        ``release()`` does this for a daemon that shuts itself down, but on Windows `-b stop` is
+        ``TerminateProcess``, so the daemon's teardown never runs and the file kept its owner
+        record: on disk a clean stop was indistinguishable from a crash, and the next reader saw
+        a plausible-looking dead owner."""
+        try:
+            with open(self.path, "r+b") as handle:
+                handle.truncate(0)
+        except OSError:
+            pass
 
     def owner_pid(self) -> int | None:
         pid = self._read_info().get("pid")

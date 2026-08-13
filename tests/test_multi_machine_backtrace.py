@@ -28,10 +28,26 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from agitrack.git import GitRepo
 from agitrack.metrics import backtrace as bt
 from agitrack.sessions import SharedSessionStore
 from agitrack.sessions.bulk import discover_local_sessions, share_all
+from agitrack.transcripts import codex
+
+
+@pytest.fixture(autouse=True)
+def codex_home(tmp_path, monkeypatch):
+    """Redirect Codex's store, as tests/test_codex_session.py does.
+
+    Both the local discovery pass and the shared-transcript exporter read ``$CODEX_HOME``
+    (defaulting to ``~/.codex``), so without this a test that merely built a backtrace of a temp
+    repo scanned — and reconstructed from — the developer's own Codex history.
+    """
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home
 
 
 def _repo(tmp_path: Path) -> GitRepo:
@@ -99,7 +115,72 @@ def _claude_transcript(cwd: str, *, file_path: str, text: str, msg_id: str) -> s
     return "\n".join(json.dumps(r) for r in rows) + "\n"
 
 
-def _publish(repo: GitRepo, *, owner: str, name: str, session_id: str, transcript: str) -> None:
+def _codex_transcript(cwd: str, *, file_path: str, text: str, msg_id: str) -> str:
+    """A Codex rollout — the transcript Codex shares, verbatim (its own on-disk JSONL).
+
+    Same shape as the records tests/test_codex_session.py captured from codex-cli 0.147.0: the
+    ``session_meta`` header carries the cwd a reconstruction must relativize against, and the
+    applied patch is what the turn's edits are recovered from.
+    """
+    rows = [
+        {
+            "timestamp": "2026-08-06T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"session_id": msg_id, "cwd": cwd, "source": "cli", "thread_source": "user"},
+        },
+        {
+            "timestamp": "2026-08-06T09:00:01.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1"},
+        },
+        {
+            "timestamp": "2026-08-06T09:00:02.000Z",
+            "type": "turn_context",
+            "payload": {"turn_id": "t1", "model": "gpt-5.4-codex", "cwd": cwd},
+        },
+        {
+            "timestamp": "2026-08-06T09:00:03.000Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "write the doc"},
+        },
+        {
+            "timestamp": "2026-08-06T09:00:30.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "success": True,
+                "changes": {file_path: {"type": "add", "content": text}},
+            },
+        },
+        {
+            "timestamp": "2026-08-06T09:00:40.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"last_token_usage": {"input_tokens": 10, "output_tokens": 5}},
+            },
+        },
+        {
+            "timestamp": "2026-08-06T09:00:45.000Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1", "last_agent_message": "done"},
+        },
+    ]
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+# The transcript each backend shares, and an id shaped the way that backend issues them (Codex
+# resolves a conversation by the UUID in its rollout file name, so a shared Codex session must
+# carry a real UUID or nothing on the receiving side can file it).
+_SHARED = {
+    "claude": (_claude_transcript, "remote-claude-1"),
+    "codex": (_codex_transcript, "019fe8dc-ca6c-7951-9225-73513aadf083"),
+}
+
+
+def _publish(
+    repo: GitRepo, *, owner: str, name: str, session_id: str, transcript: str, backend: str = "claude"
+) -> None:
     store = SharedSessionStore(repo)
     store.publish(
         github_id=owner,
@@ -109,7 +190,7 @@ def _publish(repo: GitRepo, *, owner: str, name: str, session_id: str, transcrip
             "github_id": owner,
             "name": name,
             "contributors": [owner],
-            "backend": "claude",
+            "backend": backend,
             "session_id": session_id,
             "updated": int(time.time()),
             "transcript_rows": transcript.count("\n"),
@@ -117,22 +198,25 @@ def _publish(repo: GitRepo, *, owner: str, name: str, session_id: str, transcrip
     )
 
 
-def test_a_shared_session_is_reconstructed_and_attributed_to_its_sharer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", sorted(_SHARED))
+def test_a_shared_session_is_reconstructed_and_attributed_to_its_sharer(tmp_path, monkeypatch, backend):
     repo = _repo(tmp_path)
+    make_transcript, session_id = _SHARED[backend]
     _publish(
         repo,
         owner="dana-eng",
         name="contributing-docs",
-        session_id="remote-1",
-        transcript=_claude_transcript(
-            "/home/dana/proj", file_path="/home/dana/proj/CONTRIBUTING.md", text="a\nb\nc\n", msg_id="msg_dana"
+        session_id=session_id,
+        backend=backend,
+        transcript=make_transcript(
+            "/home/dana/proj", file_path="/home/dana/proj/CONTRIBUTING.md", text="a\nb\nc\n", msg_id=session_id
         ),
     )
     monkeypatch.setattr(bt, "_state_dir", lambda: tmp_path / "state")
 
     sources = bt._remote_sources(Path(repo.repo), local_ids=set())
 
-    assert [s.ref_id for s in sources] == ["remote-1"]
+    assert [s.ref_id for s in sources] == [session_id]
     assert sources[0].owner == "dana-eng"
     assert sources[0].shared is True
     # The sharer's own checkout root, so their absolute edit paths still relativize.
@@ -153,17 +237,23 @@ def test_a_session_present_locally_is_not_pulled_again_from_origin(tmp_path, mon
     assert bt._remote_sources(Path(repo.repo), local_ids={"both-1"}) == []
 
 
-def test_a_shared_session_contributes_its_edits_and_its_author(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", sorted(_SHARED))
+def test_a_shared_session_contributes_its_edits_and_its_author(tmp_path, monkeypatch, backend):
     # End to end through the view: the collaborator's lines are counted (they relativize against
     # THEIR root) and the turn carries their id as its author.
     repo = _repo(tmp_path)
+    make_transcript, session_id = _SHARED[backend]
     _publish(
         repo,
         owner="dana-eng",
         name="docs",
-        session_id="remote-2",
-        transcript=_claude_transcript(
-            "/home/dana/proj", file_path="/home/dana/proj/CONTRIBUTING.md", text="one\ntwo\nthree\n", msg_id="msg_d2"
+        session_id=session_id,
+        backend=backend,
+        transcript=make_transcript(
+            "/home/dana/proj",
+            file_path="/home/dana/proj/CONTRIBUTING.md",
+            text="one\ntwo\nthree\n",
+            msg_id=session_id,
         ),
     )
     monkeypatch.setattr(bt, "_state_dir", lambda: tmp_path / "state")
@@ -171,9 +261,56 @@ def test_a_shared_session_contributes_its_edits_and_its_author(tmp_path, monkeyp
     view = bt.build_backtrace(Path(repo.repo))
 
     assert view.shared_sessions == 1
+    assert view.backends == [backend]
     assert view.contributors == ["dana-eng"]
     assert [stat.author for stat in view.dashboard.stats] == ["dana-eng"]
     assert sum(stat.insertions for stat in view.dashboard.stats) == 3
+    # The shared session's id reaches the reconstructed metadata: it is what ties a turn back to
+    # the conversation it came from, and what its virtual sha is derived from. (Each backend
+    # recovers it from the cached transcript's PATH — Claude from the file stem, Codex from the
+    # uuid in its rollout name — so the recorded id embeds, rather than equals, the shared id.)
+    anchor = next(
+        line for line in view.dashboard.stats[0].message.splitlines() if line.startswith("backend_session_id:")
+    )
+    assert session_id in anchor
+
+
+def test_a_shared_codex_transcript_is_cached_under_a_name_codex_can_read(tmp_path):
+    """A materialized Codex share must be named like the rollout it IS.
+
+    ``codex.export_session_at`` takes the conversation's id off the rollout FILE NAME and only
+    falls back to the ``session_meta`` header — so cached as ``<owner>--<id>.json`` the id rested
+    entirely on that fallback. A transport-capped share (or a header a future Codex stops
+    emitting) then exports with an EMPTY session id, which collides every one of its turns'
+    virtual shas with the next such session's (a sha is ``backend:session:index:message``) and
+    drops ``backend_session_id`` from the reconstructed metadata.
+    """
+    session_id = "019fe8dc-ca6c-7951-9225-73513aadf083"
+    full = _codex_transcript("/home/dana/proj", file_path="/x.md", text="a\n", msg_id=session_id)
+    # Dropped `session_meta` line: a transcript trimmed for transport can start after the header,
+    # and that is precisely the case the fallback has no answer for.
+    transcript = "".join(line + "\n" for line in full.splitlines()[1:])
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    legacy = cache / f"dana-eng--{session_id}.json"  # what the cache used to be named
+    legacy.write_text(transcript, encoding="utf-8")
+    assert codex.export_session_at(legacy).session_id == ""  # …and the id was simply lost
+
+    class _Entry:
+        github_id = "dana-eng"
+
+    class _Store:
+        def read_transcript(self, entry):
+            return transcript
+
+    path = bt._materialize_shared(_Store(), _Entry(), cache, "codex", session_id)
+
+    assert path is not None and path.suffix == ".jsonl"  # it is a rollout, not a JSON export
+    assert codex._id_from_path(path) == session_id  # recovered from the PATH alone
+    exported = bt._shared_export("codex", path)()
+    assert exported is not None and exported.session_id == session_id
+    assert exported.turns[0].user_prompt == "write the doc"
 
 
 def test_a_single_machine_backtrace_names_nobody(tmp_path, monkeypatch):
@@ -190,7 +327,7 @@ def test_a_single_machine_backtrace_names_nobody(tmp_path, monkeypatch):
     assert called == [], "resolved a GitHub login for a backtrace that shows no authors"
 
 
-def test_bulk_share_publishes_every_local_session_then_skips_unchanged(tmp_path, monkeypatch):
+def test_bulk_share_publishes_every_local_session_then_skips_unchanged(tmp_path, monkeypatch, codex_home):
     repo = _repo(tmp_path)
     root = Path(repo.repo)
     from agitrack.transcripts.types import SessionRef
@@ -206,16 +343,27 @@ def test_bulk_share_publishes_every_local_session_then_skips_unchanged(tmp_path,
         path = store_dir / f"{sid}.jsonl"
         path.write_text(text)
         listed.append((SessionRef(id=sid, updated=100.0, label="work"), path))
+    # A Codex conversation for the same repo, discovered the way Codex is really discovered:
+    # from a rollout under $CODEX_HOME whose header records this repo as its cwd. A bulk share
+    # that only walked the other backends would leave a machine's Codex work unshared, and the
+    # backtraces built from origin would be missing it on every OTHER machine.
+    codex_id = "019fe8dc-ca6c-7951-9225-73513aadf083"
+    rollout_dir = codex_home / "sessions" / "2026" / "08" / "06"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / f"rollout-2026-08-06T09-00-00-{codex_id}.jsonl").write_text(
+        _codex_transcript(str(root), file_path=str(root / "c.md"), text="c\n", msg_id=codex_id), encoding="utf-8"
+    )
     monkeypatch.setattr("agitrack.transcripts.claude.sessions_under", lambda directory: listed)
     monkeypatch.setattr("agitrack.transcripts.opencode.sessions_under", lambda directory: [])
     monkeypatch.setattr("agitrack.sessions.bulk.github_login", lambda repo=None: "shiqiangw")
 
-    assert {c.session_id for c in discover_local_sessions(root)} == {"s-one", "s-two"}
+    found = {c.session_id: c.backend for c in discover_local_sessions(root)}
+    assert found == {"s-one": "claude", "s-two": "claude", codex_id: "codex"}
 
     first = share_all(repo)
-    assert [o.status for o in first.outcomes] == ["shared", "shared"]
+    assert [o.status for o in first.outcomes] == ["shared", "shared", "shared"]
 
-    # Re-running must be cheap and idempotent, not two more pushes of identical blobs.
+    # Re-running must be cheap and idempotent, not three more pushes of identical blobs.
     second = share_all(repo)
-    assert [o.status for o in second.outcomes] == ["unchanged", "unchanged"]
+    assert [o.status for o in second.outcomes] == ["unchanged", "unchanged", "unchanged"]
     assert second.shared == []

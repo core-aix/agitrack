@@ -243,6 +243,13 @@ class Summarizer:
         # committed trace keeps the summary faithful to it. It is also deliberately
         # not seeded with the rolling session summary (that folded earlier,
         # unrelated work in); the rolling summary is maintained separately.
+        if not self._has_agent_evidence(trace):
+            # Nothing but the request to go on — see `_has_agent_evidence`. Refusing keeps the
+            # honest prompt-led subject instead of spending tokens on an invented one.
+            raise UnusableSummaryError(
+                "the interaction trace records no agent activity (an interrupted turn), so any "
+                "summary of what was DONE would be invented"
+            )
         return self._run(*self._build_commit_prompt(trace))
 
     def update_session_summary(
@@ -308,6 +315,25 @@ class Summarizer:
             ]
         )
         return COMMIT_SUMMARY_SYSTEM, user
+
+    @staticmethod
+    def _has_agent_evidence(trace: str) -> bool:
+        """Whether ``trace`` records anything the AGENT did, as opposed to only the request.
+
+        On an INTERRUPTED turn the summarizer is handed a trace containing the user's prompt and
+        no tool records at all — and a model asked to summarize a request produces the request
+        as though it were an outcome. One real commit's subject claimed four files created when
+        only `t1.txt` existed; another claimed zero files written when `t1.txt` was in that very
+        commit. The subject is the line people read, so a fabricated one is worse than none:
+        callers already treat a raising summarizer as "no summary" and keep the honest
+        prompt-led message."""
+        for line in trace.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## Agent"):
+                return True
+            if stripped.startswith("## ") and not stripped.startswith("## User"):
+                return True  # any other recorded role/tool section is evidence too
+        return False
 
     def _build_session_update_prompt(
         self,

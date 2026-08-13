@@ -1944,21 +1944,34 @@ def test_declined_directory_survives_new_files_inside(tmp_path):
     assert promptable == []  # nothing new to ask about — the directory stays muted
 
 
-def test_untracked_listings_exclude_agent_scaffolding_dirs(tmp_path):
-    # Agent/tooling folders (.agitrack, .claude, .opencode) must never be surfaced as untracked
-    # changes — the user should never be asked to stage an agent's own directory.
+def test_untracked_listings_exclude_every_agent_scaffolding_dir(tmp_path):
+    # Agent/tooling folders (.agitrack, .claude, .codex, .opencode) must never be surfaced as
+    # untracked changes — the user should never be asked to stage an agent's own directory.
+    # Driven off the SOURCE constant rather than a hand-written tuple: this test listed only
+    # .claude/.opencode long after Codex's `.codex/` had been added to _NEVER_STAGE_PREFIXES,
+    # so the new backend's dir was filtered in production with nothing pinning it. Reading the
+    # constant means a fourth backend is covered here the moment it is registered.
+    from agitrack.git.repo import _NEVER_STAGE_PREFIXES
+
     repo = _init_repo(tmp_path)
     (tmp_path / "real.txt").write_text("x\n")
-    for d in (".claude", ".opencode", ".agitrack"):
-        (tmp_path / d).mkdir()
-        (tmp_path / d / "f.json").write_text("{}\n")
+    for prefix in _NEVER_STAGE_PREFIXES:
+        (tmp_path / prefix.rstrip("/")).mkdir()
+        (tmp_path / prefix.rstrip("/") / "f.json").write_text("{}\n")
 
     entries = repo.untracked_entries()
     files = repo.untracked_files()
 
+    assert ".codex/" in _NEVER_STAGE_PREFIXES  # Codex's per-project config dir is one of them
+    # git itself DOES report them, so the assertions below test the filter, not an empty tree.
+    raw = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"], cwd=tmp_path, capture_output=True, text=True
+    ).stdout.splitlines()
+    assert all(f"{prefix}f.json" in raw for prefix in _NEVER_STAGE_PREFIXES)
+
     assert "real.txt" in entries and "real.txt" in files
-    assert not any(e.startswith((".claude/", ".opencode/", ".agitrack/")) for e in entries)
-    assert not any(f.startswith((".claude/", ".opencode/", ".agitrack/")) for f in files)
+    assert not any(e.startswith(_NEVER_STAGE_PREFIXES) for e in entries)
+    assert not any(f.startswith(_NEVER_STAGE_PREFIXES) for f in files)
 
 
 def test_copy_back_skips_collapsed_dir_copied_from_base_via_watermark(tmp_path):
@@ -2180,8 +2193,8 @@ def test_user_commit_box_labels_base_vs_worktree_target(tmp_path):
 def test_copy_base_environment_includes_dot_and_underscore_files(tmp_path):
     # base→worktree must carry ALL untracked/ignored content, including names starting with
     # "." or "_" (.env, _private, .config/) — unlike the worktree→base copy-back, which skips
-    # those as scaffolding. Only the agent/tooling dirs (.git/.agitrack/.claude/.opencode) are
-    # excluded.
+    # those as scaffolding. Only the agent/tooling dirs (.git/.agitrack, plus the backends'
+    # own .claude/.codex/.opencode, which never reach the listing at all) are excluded.
     repo = _init_repo(tmp_path)
     (tmp_path / ".env").write_text("SECRET=1\n")  # dotfile, untracked
     (tmp_path / "_private.txt").write_text("p\n")  # underscore file

@@ -202,3 +202,77 @@ def test_lock_released_by_os_when_owner_dies(tmp_path):
     else:
         pytest.fail("the lock was not released when its holder died")
     lock.release()
+
+
+def test_acquire_retries_for_a_lock_the_previous_holder_has_not_released_yet(tmp_path, monkeypatch):
+    """Windows, deterministic 9/9: `agitrack -b -m` did `replace_running_tracker(...) and
+    acquire()` with no retry. `TerminateProcess` flips `pid_alive` to False instantly, but the
+    dead process's `msvcrt.locking` byte-range lock survives ~100 ms of handle teardown
+    (measured: pid_alive False at 0.000 s, lock still held at 0.102 s), so the un-retried
+    acquire lost — and it then printed "already running (PID N)" naming the PID it had just
+    killed. Net result: ZERO writers on the repo, silently."""
+    from agitrack.git import lock as lock_mod
+
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+    attempts = {"n": 0}
+    real_try_lock = lock_mod._try_lock
+
+    def _held_briefly(fd):
+        attempts["n"] += 1
+        if attempts["n"] < 3:  # the departing holder still owns it for the first few tries
+            return False
+        return real_try_lock(fd)
+
+    monkeypatch.setattr(lock_mod, "_try_lock", _held_briefly)
+
+    assert lock.acquire(retry_seconds=2.0) is True
+    assert attempts["n"] >= 3
+    lock.release()
+
+
+def test_acquire_without_retry_still_fails_fast(tmp_path, monkeypatch):
+    """The default stays non-blocking: an ordinary second instance must be refused at once, not
+    after a wait. Only the just-terminated-the-holder path asks for a retry."""
+    import time as _time
+
+    from agitrack.git import lock as lock_mod
+
+    monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+
+    started = _time.monotonic()
+    assert lock.acquire() is False
+    assert _time.monotonic() - started < 0.5
+
+
+def test_acquire_gives_up_when_the_lock_is_genuinely_held(tmp_path, monkeypatch):
+    import time as _time
+
+    from agitrack.git import lock as lock_mod
+
+    monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+
+    started = _time.monotonic()
+    assert lock.acquire(retry_seconds=0.3) is False
+    assert 0.25 <= _time.monotonic() - started < 3.0
+
+
+def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
+    """`release()` truncates the file for a daemon that shuts itself down, but on Windows
+    `-b stop` is TerminateProcess, so the teardown never runs and the file kept its owner
+    record: on disk a clean stop was indistinguishable from a crash, and the next reader saw a
+    plausible-looking dead owner."""
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+    assert lock.acquire()
+    assert lock.owner_pid() == os.getpid()
+
+    # A DIFFERENT process (the one that ran `-b stop`) clears the record it left behind.
+    RepoLock(tmp_path / ".agitrack" / "lock").clear_owner_record()
+
+    assert RepoLock(tmp_path / ".agitrack" / "lock").owner_pid() is None
+    lock.release()
+
+
+def test_clearing_a_missing_lock_file_is_harmless(tmp_path):
+    RepoLock(tmp_path / "nope" / "lock").clear_owner_record()  # must not raise

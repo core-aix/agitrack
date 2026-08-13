@@ -1,24 +1,110 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
-from agitrack.proc import console_isolation_kwargs
+from agitrack.proc import _IS_WINDOWS, UTF8_TEXT, console_isolation_kwargs, fs_path
 
 
 class GitError(RuntimeError):
     pass
 
 
+# --- short-lived read cache -------------------------------------------------------------
+#
+# WHY THIS EXISTS: A SINGLE ENTER COSTS 19 GIT SUBPROCESSES, and five of them ask the same
+# question. Measured through the real reactor on native Windows, on an empty repo with a clean
+# tree: `rev-parse --abbrev-ref HEAD` five times, `diff --quiet` three times, `diff --cached
+# --quiet` three times, `ls-files --others` three times — 740 ms, which was 100% of the delay
+# between pressing Enter and the prompt reaching the backend. Nothing was slow; there were just
+# a lot of process spawns, and a process spawn costs ~38 ms on Windows against ~5 ms on
+# macOS/Linux. That is the whole reason "Enter takes a long time" is a Windows report: the same
+# path costs about 120 ms there and passes for instant.
+#
+# The submit path asks its questions through half a dozen collaborating helpers
+# (`_pre_agent_commit_if_needed`, `has_pre_agent_user_changes`, `_base_user_edits_pending`,
+# `_begin_agent_turn`, `_integrate_committed_turn_before_new_turn`, `_ensure_turn_branch`), and
+# threading one answer through all of them would couple every one of them to the caller. So the
+# de-duplication lives at the single choke point every one of them goes through instead.
+#
+# WHAT MAKES IT SAFE:
+#   * It is OFF unless a caller explicitly opens a `read_cache()` scope, and those scopes are
+#     milliseconds long. Nothing outside one ever sees a cached answer.
+#   * Only unambiguously read-only plumbing is cached (below). Anything else — every commit,
+#     stage, switch, merge, fetch — DROPS the whole cache as it runs, so a read that follows a
+#     write in the same scope always re-runs. That is the invariant the callers depend on:
+#     `_offer_pre_agent_user_commit` commits, and everything after it must see the new tree.
+#   * It is THREAD-LOCAL, but invalidation is PROCESS-WIDE. The git worker thread commits and
+#     merges on the very repos the reactor is reading, and a thread-local clear could never see
+#     that. So every write anywhere in the process bumps a counter, and a cached answer is only
+#     reused while that counter is unchanged — which makes "the worker committed while the
+#     submit path was mid-flight" a cache miss rather than a stale answer.
+_read_cache_state = threading.local()
+
+# Bumped by every git command that can write, on any thread, for any repo. Read on every cache
+# hit. A single counter (rather than one per repo) because git writes are not confined to the
+# repo they run in: a commit in a worktree moves refs the base repo reads, and vice versa.
+_write_epoch = 0
+_write_epoch_lock = threading.Lock()
+
+
+def _bump_write_epoch() -> None:
+    global _write_epoch
+    with _write_epoch_lock:
+        _write_epoch += 1
+
+
+# Read-only git subcommands. Deliberately a short list of ones that CANNOT write, rather than
+# everything that happens to be a read today: `branch`, `symbolic-ref`, `stash` and friends all
+# mutate depending on their arguments, and a cache is the wrong place to be clever about that.
+_CACHEABLE_SUBCOMMANDS = frozenset(
+    {"cat-file", "diff", "for-each-ref", "log", "ls-files", "merge-base", "rev-list", "rev-parse", "show-ref", "status"}
+)
+
+
+@contextlib.contextmanager
+def read_cache() -> Iterator[None]:
+    """De-duplicate repeated read-only git commands for the duration of the block.
+
+    Re-entrant: nested scopes share the outermost one, and the cache is dropped when the
+    outermost exits, so nothing survives the block.
+    """
+    depth = getattr(_read_cache_state, "depth", 0)
+    if depth == 0:
+        _read_cache_state.entries = {}
+    _read_cache_state.depth = depth + 1
+    try:
+        yield
+    finally:
+        _read_cache_state.depth -= 1
+        if _read_cache_state.depth == 0:
+            _read_cache_state.entries = None
+
+
 # Machine-managed scaffolding directories aGiTrack must never surface as untracked changes to
-# stage: its own state (.agitrack) and the backends' local config/state (.claude, .opencode).
-# These belong to the tooling, not the user's source, so they must never appear in the
-# "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
-_NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".opencode/")
+# stage: its own state (.agitrack) and the backends' local config/state (.claude, .codex,
+# .opencode). These belong to the tooling, not the user's source, so they must never appear in
+# the "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
+_NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".codex/", ".opencode/")
+
+# git's per-repo comment character while aGiTrack manages the repo. See
+# GitRepo.ensure_comment_char_preserves_headings for why it is not "#" and not "auto".
+_COMMENT_CHAR = ";"
+
+
+def _PARTIAL_CLONE_KEYS(remote: str) -> list[str]:
+    """Every config key a ``git fetch --filter=…`` writes behind the caller's back."""
+    return [
+        f"remote.{remote}.partialclonefilter",
+        f"remote.{remote}.promisor",
+        "core.repositoryformatversion",
+    ]
 
 
 def _is_scaffolding(path: str) -> bool:
@@ -42,19 +128,39 @@ class GitRepo:
         self._run(["git", "rev-parse", "--show-toplevel"])
 
     @classmethod
-    def discover(cls, path: Path) -> "GitRepo":
-        process = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=path,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
-        )
+    def discover(cls, path: Path | str) -> "GitRepo":
+        # Coerce first: the annotation says Path, but `cwd=` accepted a plain string for years,
+        # so callers (and scripts) pass one. The existence checks below are Path methods, and
+        # without this they turned a working call into `AttributeError: 'str' object has no
+        # attribute 'exists'` — a worse failure than the one they were added to fix.
+        path = Path(path)
+        # Check the path OURSELVES before handing it to git as `cwd`. A missing directory made
+        # subprocess raise FileNotFoundError, and a file made it raise NotADirectoryError (on
+        # Windows both arrive as `[WinError 267] The directory name is invalid`) — raw OSErrors
+        # that reached the user verbatim, leaking `PosixPath('…')` / a bare WinError with no path,
+        # no mention of `--repo`, and no way to tell the two cases apart. One line from the good
+        # sibling message that the not-a-repo case already had.
+        if not path.exists():
+            raise GitError(f"Not a Git repository: {path} (no such directory)")
+        if not path.is_dir():
+            raise GitError(f"Not a Git repository: {path} (that is a file, not a directory)")
+        try:
+            process = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=path,
+                **UTF8_TEXT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
+            )
+        except OSError as error:  # unreadable directory, permissions, a path git cannot chdir into
+            raise GitError(f"Cannot read the Git repository at {path}: {error}") from error
         if process.returncode != 0:
             raise GitError(f"Not a Git repository: {path}")
-        return cls(Path(process.stdout.strip()))
+        # fs_path, not Path: git printed UTF-8, and this string is about to be `resolve()`d and
+        # handed to the OS as `cwd`. See proc.fs_path.
+        return cls(fs_path(process.stdout.strip()))
 
     @classmethod
     def init(cls, path: Path) -> "GitRepo":
@@ -68,7 +174,7 @@ class GitRepo:
         process = subprocess.run(
             ["git", "init"],
             cwd=path,
-            text=True,
+            **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -125,7 +231,22 @@ class GitRepo:
         return self._run(["git", "diff", "HEAD"], check=False).stdout
 
     def add_tracked(self) -> None:
-        self._run(["git", "add", "-u"])
+        """Stage every modification to already-tracked files — EXCEPT the agent scaffolding dirs.
+
+        The untracked path has always filtered ``_NEVER_STAGE_PREFIXES``; this one did not, and
+        `git add -u` has no such notion. In a repo that TRACKS ``.claude/`` — committing
+        ``settings.json`` or a ``commands/`` dir is ordinary team practice — that meant aGiTrack's
+        OWN edit to ``.claude/settings.local.json`` (the Stop/SessionStart hooks it installs) was
+        swept into the user's history, complete with this machine's absolute venv path, in a file
+        the whole team shares. Stopping then left the repo dirty with a change the user never
+        made. "Nothing aGiTrack writes is ever staged" has to hold on both sides of tracked."""
+        excludes = [f":(exclude){prefix.rstrip('/')}" for prefix in _NEVER_STAGE_PREFIXES]
+        result = self._run(["git", "add", "-u", "--", ".", *excludes], check=False)
+        if result.returncode != 0:
+            # A pathspec excluding a directory that is ALSO git-ignored can error on older git.
+            # Falling back to the unfiltered add is still better than failing the commit; the
+            # scaffolding is then dropped from the snapshot by comparable_tree() anyway.
+            self._run(["git", "add", "-u"])
 
     def staged_paths(self) -> list[str]:
         """Paths currently in the index (names only). Used to snapshot the index BEFORE a
@@ -183,7 +304,8 @@ class GitRepo:
         ``dir/`` is kept only when it actually contains a genuinely-untracked file — cross-checked
         against the accurate per-file list (which descends and honours every nested ``.gitignore``).
 
-        Agent/tooling scaffolding (``.agitrack/``, ``.claude/``, ``.opencode/``) is filtered out
+        Agent/tooling scaffolding (``_NEVER_STAGE_PREFIXES``: ``.agitrack/``, ``.claude/``,
+        ``.codex/``, ``.opencode/``) is filtered out
         so the user is never asked to stage an agent's own folder."""
         output = self._run(["git", "ls-files", "--others", "--exclude-standard", "--directory"]).stdout
         entries = [line for line in output.splitlines() if line and not _is_scaffolding(line)]
@@ -281,7 +403,7 @@ class GitRepo:
         index or working tree, and return its SHA. Uses a throwaway index seeded from
         HEAD, so ``git add -A`` records the full working-tree delta the agent produced
         this turn — tracked edits, new untracked files, and deletions — minus the agent
-        scaffolding dirs (``.agitrack/`` / ``.claude/`` / ``.opencode/``). This is how
+        scaffolding dirs (``_NEVER_STAGE_PREFIXES``). This is how
         manual-commit mode captures a turn as a hidden latent commit while HEAD never
         moves and the user's own index/staging is left completely untouched."""
         scaffolding = [prefix.rstrip("/") for prefix in _NEVER_STAGE_PREFIXES]
@@ -310,7 +432,7 @@ class GitRepo:
 
         Every "has the working tree changed?" test in manual/no-worktree/background mode is a
         comparison between a snapshot and some commit's tree. The snapshot deliberately drops
-        ``.agitrack/`` / ``.claude/`` / ``.opencode/``; a raw ``rev^{tree}`` does not. So in a repo
+        every ``_NEVER_STAGE_PREFIXES`` entry; a raw ``rev^{tree}`` does not. So in a repo
         that TRACKS any of those — committing ``.claude/settings.json`` or a ``.claude/commands/``
         dir is ordinary practice — the two could never be equal and every one of those tests
         answered "dirty" forever: the daemon stopped covering the agent's own commits, stale and
@@ -339,6 +461,20 @@ class GitRepo:
                 check=False,
             )
             return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def tree_diff_names(self, base: str, tree: str) -> list[str]:
+        """The paths that differ between two trees (or revs), in git's own order.
+
+        The counterpart of :meth:`staged_paths` for the commit paths that never touch the
+        index: every ``--no-worktree`` mode records its turn as a latent commit built from a
+        working-tree snapshot, so "what will this commit carry?" has to be answered by
+        comparing trees. Never raises — an unreadable rev answers "nothing known", which
+        callers treat as "say less" rather than as an error."""
+        try:
+            output = self._run(["git", "diff", "--name-only", base, tree], check=False).stdout
+        except Exception:
+            return []
+        return [line for line in output.splitlines() if line]
 
     def commit_tree(self, tree: str, *, parents: list[str], message: str) -> str:
         """Create a commit object for ``tree`` with the given ``parents`` and return its
@@ -398,8 +534,20 @@ class GitRepo:
     # --- branches / worktrees / merges (used by concurrent-session support) ---
 
     def current_branch(self) -> str:
-        # Returns the branch name, or "HEAD" when detached.
-        return self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        """The branch name, ``"HEAD"`` when detached, or the branch HEAD *points at* on an
+        UNBORN branch — a fresh ``git init`` with no commits, the very first state a new user
+        can be in.
+
+        Never raises. ``git rev-parse --abbrev-ref HEAD`` fails outright on an unborn branch
+        (``fatal: ambiguous argument 'HEAD'``), and because this ran with ``check=True`` that
+        GitError escaped as a raw traceback out of ``agitrack -d text`` — while ``-d html`` was
+        worse, reporting success and then serving a page that spun forever while every ``/data``
+        request crashed server-side."""
+        process = self._run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        if process.returncode == 0:
+            return process.stdout.strip()
+        unborn = self._run(["git", "symbolic-ref", "--short", "HEAD"], check=False)
+        return unborn.stdout.strip() if unborn.returncode == 0 else ""
 
     def rev_parse(self, ref: str) -> str:
         return self._run(["git", "rev-parse", ref]).stdout.strip()
@@ -431,19 +579,58 @@ class GitRepo:
         reads as untracked to the dashboard/story. It is silent and unrecoverable from the new
         commit alone.
 
-        ``auto`` (git ≥ 2.11) picks a character the message doesn't already use at line start, so
-        git's own editor comments still work and nothing else changes. Set with ``--local``: it is
-        scoped to the repo aGiTrack manages and never touches the user's global config. Idempotent,
-        and it never overrides a value the user (or another tool) already chose.
-        """
+        An EXPLICIT character, not ``auto``. ``auto`` reads better — it picks a character the
+        message does not already use at line start — but git 2.54 deprecates it: every subsequent
+        `git commit` prints a deprecation warning plus 8-9 hint lines, FOREVER, including long
+        after the user has removed aGiTrack entirely, and the hint tells them to run
+        `git config unset core.commentChar`, i.e. to undo aGiTrack's own heading guard. It breaks
+        outright in Git 3.0. Six independent live-test scenarios found it.
+
+        ``;`` is the replacement: a line-initial ``;`` is rare in prose and in the languages
+        aGiTrack's traces quote, where a line-initial ``#`` is near-universal (markdown headings,
+        shell, Python, YAML) — which is the whole reason the default is unusable here.
+
+        Set with ``--local``: scoped to the repo aGiTrack manages, never the user's global config.
+        Idempotent, and it never overrides a value the user (or another tool) already chose.
+        ``agitrack.commentchar`` records that WE set it, so teardown can put the repo back exactly
+        as it found it and never unset a value that was the user's."""
         try:
-            if self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip():
-                return False  # already configured here — never override the user's choice
+            existing = self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip()
+            ours = self._run(["git", "config", "--local", "--get", "agitrack.commentchar"], check=False).stdout.strip()
+            if existing:
+                # Migrate the deprecated `auto` we ourselves wrote in an earlier version; anything
+                # else in there is the user's and stays untouched.
+                if existing == "auto" and ours:
+                    self._run(["git", "config", "--local", "core.commentChar", _COMMENT_CHAR], check=False)
+                return False
             if self._run(["git", "config", "--get", "core.commentChar"], check=False).stdout.strip():
                 return False  # a global/system value the user picked already protects (or is theirs)
-            return self._run(["git", "config", "--local", "core.commentChar", "auto"], check=False).returncode == 0
+            if self._run(["git", "config", "--local", "core.commentChar", _COMMENT_CHAR], check=False).returncode != 0:
+                return False
+            self._run(["git", "config", "--local", "agitrack.commentchar", _COMMENT_CHAR], check=False)
+            return True
         except Exception:
             return False  # never let a config tweak block startup
+
+    def restore_comment_char(self) -> bool:
+        """Undo :meth:`ensure_comment_char_preserves_headings`, if aGiTrack was the one that set
+        it. Returns True when something was unset.
+
+        Teardown has to include this: the config was written into every tracked repo and never
+        removed — not by ``-b stop``, not by ``--remove-hooks`` — so it outlived a full uninstall.
+        The ``agitrack.commentchar`` marker is what makes this safe: a value the user chose (or
+        one another tool set afterwards) is left alone."""
+        try:
+            ours = self._run(["git", "config", "--local", "--get", "agitrack.commentchar"], check=False).stdout.strip()
+            if not ours:
+                return False
+            current = self._run(["git", "config", "--local", "--get", "core.commentChar"], check=False).stdout.strip()
+            self._run(["git", "config", "--local", "--unset", "agitrack.commentchar"], check=False)
+            if current and current != ours:
+                return False  # somebody else owns it now
+            return self._run(["git", "config", "--local", "--unset", "core.commentChar"], check=False).returncode == 0
+        except Exception:
+            return False
 
     def unlanded_commits(self, ref: str) -> list[str]:
         """Commits on *ref* that no branch, tag or remote-tracking ref contains — oldest first.
@@ -806,11 +993,36 @@ class GitRepo:
         # the background (and on the exit path), where a prompt would hang with no
         # way to answer. Cached creds / credential helpers still work. The timeout
         # bounds a stalled fetch; cancel kills it immediately on user request.
+        # A `--filter` fetch does not just set `partialclonefilter`: git also writes
+        # `remote.<r>.promisor=true` and bumps `core.repositoryformatversion` to 1 — and it does
+        # NOT write the matching `extensions.partialClone`, so the repo is left in a state git
+        # itself would not have produced. Only the filter was ever undone, so a documented
+        # READ-ONLY report (`--backtrace text`) permanently mutated the user's git config,
+        # reproduced from pristine; in a submodule setup it edited the vendored dependency's own
+        # config. Snapshot all three and put them back exactly as they were — including doing
+        # nothing at all in a repo that genuinely IS a partial clone.
+        restore = self._config_snapshot(_PARTIAL_CLONE_KEYS(remote)) if filter_blobs else None
         ok = self._run_bounded(cmd, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout, cancel=cancel) == 0
-        if filter_blobs and ok:
-            # Don't turn the user's remote into a permanently-filtered clone.
-            self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
+        if restore is not None:
+            self._restore_config(restore)
         return ok
+
+    def _config_snapshot(self, keys: list[str]) -> dict[str, str | None]:
+        """Each key's current local value, or None when unset. Local scope only: this is for
+        restoring config aGiTrack is about to disturb, and a global/system value is not ours."""
+        snapshot: dict[str, str | None] = {}
+        for key in keys:
+            result = self._run(["git", "config", "--local", "--get", key], check=False)
+            snapshot[key] = result.stdout.strip() if result.returncode == 0 else None
+        return snapshot
+
+    def _restore_config(self, snapshot: dict[str, str | None]) -> None:
+        """Put every key back to its snapshotted value (unsetting the ones that were absent)."""
+        for key, value in snapshot.items():
+            if value is None:
+                self._run(["git", "config", "--local", "--unset-all", key], check=False)
+            else:
+                self._run(["git", "config", "--local", key, value], check=False)
 
     def resolve_blob_oid(self, ref: str, path: str) -> str | None:
         """The blob id at ``ref:path``, read from the (present) tree — so it resolves even when
@@ -855,6 +1067,7 @@ class GitRepo:
         (a ``threading.Event``-like object with ``is_set()``) is set, or *timeout*
         elapses. The process is terminated (then killed) so the network work really
         stops. Returns the exit code, or 124 when cancelled/timed out."""
+        _bump_write_epoch()  # fetch/push moves refs; no earlier read can be trusted after it
         # Discard output: callers only use the exit code, and piping a long fetch's
         # progress (stderr) without reading it would fill the pipe buffer and wedge
         # the process — the opposite of "bounded".
@@ -935,12 +1148,13 @@ class GitRepo:
         would. Returns ``(exit_code, stderr)``; ``(124, partial-stderr)`` when
         cancelled or timed out. Retrying ``communicate`` after a ``TimeoutExpired``
         does not lose output (documented behaviour), so the poll loop is safe."""
+        _bump_write_epoch()  # a push moves refs; no earlier read can be trusted after it
         process = subprocess.Popen(
             command,
             cwd=self.repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            **UTF8_TEXT,
             env={**os.environ, **env} if env else None,
             # A cancellable network git (push) run from the console-less background daemon
             # would flash its own console window on Windows without this (proc.py).
@@ -1002,7 +1216,7 @@ class GitRepo:
         raw = self._run(["git", "rev-parse", "--git-path", "objects"], check=False).stdout.strip()
         if not raw:
             return 0
-        objects = Path(raw) if os.path.isabs(raw) else (self.repo / raw)
+        objects = fs_path(raw) if os.path.isabs(raw) else (self.repo / raw)
         removed = 0
         for sha in orphaned:
             if len(sha) < 4 or any(ch not in "0123456789abcdef" for ch in sha):
@@ -1064,12 +1278,61 @@ class GitRepo:
         # is NOT honoured for a ``git log --numstat`` walk (it still fetches every blob), whereas
         # the env var reliably keeps the walk to local objects. The config is set too, as a
         # harmless second line of defence on git builds where it does take effect.
+
+        # De-duplicate repeated reads, and invalidate on anything that can write. Off unless a
+        # caller opened a `read_cache()` scope; see the module header for why the Enter path
+        # needs it. Only the plain form is cacheable — a call carrying stdin, a custom env or a
+        # timeout is doing something specific enough that it should just run.
+        cache_key: tuple | None = None
+        cacheable_read = (
+            input_text is None
+            and not env
+            and timeout is None
+            and len(command) >= 2
+            and command[0] == "git"
+            and command[1] in _CACHEABLE_SUBCOMMANDS
+        )
+        if not cacheable_read:
+            # Everything else invalidates. That over-invalidates slightly — a read carrying a
+            # custom env or a timeout is not a write — and it is the right direction to err in:
+            # the cost is one repeated read, where the cost of the opposite mistake is acting on
+            # a tree that has changed.
+            _bump_write_epoch()
+        elif getattr(_read_cache_state, "depth", 0):
+            cache_key = (str(self.repo), tuple(command), check, allow_lazy_fetch)
+            epoch, cached = (_read_cache_state.entries or {}).get(cache_key, (None, None))
+            if cached is not None and epoch == _write_epoch:
+                return cached
         extra_env: dict[str, str] = dict(env) if env else {}
+        flags: list[str] = []
+        if command and command[0] == "git":
+            # PATHS MUST COME BACK VERBATIM. With git's default ``core.quotePath=true`` every
+            # listing command (``ls-files``, ``status --short``, ``diff --name-only``) prints a
+            # path containing non-ASCII characters C-QUOTED — `"my file \303\251\344\270\255.txt"`,
+            # complete with the surrounding double quotes. aGiTrack feeds those names straight
+            # back to ``git add --``, which then fails ("pathspec ... did not match any files")
+            # and, because staging fails, the whole agent turn is LOST: no commit, no trace, no
+            # tokens. Any agent that creates a file with an accented or CJK name hit this. Turning
+            # quoting off makes git emit the real UTF-8 bytes, which round-trip.
+            flags += ["-c", "core.quotePath=false"]
+            if _IS_WINDOWS:
+                # WINDOWS LONG PATHS. Without `core.longpaths` — the state every real user is in,
+                # since aGiTrack never set it — git refuses any path over MAX_PATH, and aGiTrack
+                # read those refusals as "nothing there": `-d text` printed a confident
+                # `branch master, 0 commits` / 0% coverage and exit 0 on a 3-commit repo, while
+                # git on the same repo said `Filename too long` / `fatal: bad object HEAD`. A
+                # silently EMPTY report is the worst possible answer.
+                #
+                # Passed per-invocation with `-c` rather than written into the user's config:
+                # aGiTrack does not get to change how the user's own `git` behaves, only how the
+                # git IT runs behaves.
+                flags += ["-c", "core.longpaths=true"]
         if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
-            flags = ["-c", "core.commitGraph=false"]
+            flags += ["-c", "core.commitGraph=false"]
             if not allow_lazy_fetch or not _git_read_needs_blobs(command):
                 flags += ["-c", "fetch.disableLazyFetch=true"]
                 extra_env["GIT_NO_LAZY_FETCH"] = "1"
+        if flags:
             command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
@@ -1119,4 +1382,8 @@ class GitRepo:
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()
             raise GitError(f"Command failed: {' '.join(command)}\n{detail}")
+        if cache_key is not None and _read_cache_state.entries is not None:
+            # Stamped with the epoch AFTER the read, so a write that landed while git was
+            # running invalidates this answer rather than being papered over by it.
+            _read_cache_state.entries[cache_key] = (_write_epoch, process)
         return process

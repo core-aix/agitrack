@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from typing import Protocol
 
 from agitrack.commits.message import build_user_commit_message
@@ -26,6 +28,18 @@ class InteractiveUI(Protocol):
 # an empty answer must keep re-prompting, since a stray Enter should never be read as a decision
 # to leave the user's work uncommitted.
 _SKIP_WORD = "skip"
+# Typed at a prompt that cannot be skipped, this ABANDONS the run instead — so the user is never
+# trapped in a question with no answer. See create_user_commit.
+_QUIT_WORD = "quit"
+
+
+class UserCommitAborted(Exception):
+    """The user asked to abandon the run at the mandatory pre-agent commit prompt.
+
+    Worktree mode requires this commit, and the prompt had NO way out at all: `skip` was not
+    recognised (it became the commit MESSAGE — a commit literally named `skip` landed on main),
+    an empty Enter re-asked forever, and Ctrl-C was swallowed; one live run spent 150 s and six
+    Ctrl-C without escaping. A required question still has to have an exit."""
 
 
 class AgitrackActions:
@@ -37,6 +51,7 @@ class AgitrackActions:
         verbose: bool = False,
         interactive: bool = True,
         ui: InteractiveUI | None = None,
+        human_stream=None,
     ) -> None:
         self.repo = repo
         self.state = state
@@ -48,6 +63,16 @@ class AgitrackActions:
         # editor as menus/popups instead of the terminal. A BridgeUI-shaped object
         # exposing select/multiselect/text/confirm/info; None keeps terminal I/O.
         self.ui = ui
+        # WHERE PROSE GOES. Under --json-events stdout carries one JSON object per line and
+        # nothing else, so these notices ("Staged untracked files: …", "Created user commit.")
+        # have to follow the shell's own prose stream rather than being printed straight to
+        # stdout — one of them landing there is enough to break a driver's json.loads(line).
+        self._out = human_stream if human_stream is not None else sys.stdout
+
+    def _say(self, *args, **kwargs) -> None:
+        """print() onto this run's prose stream (stdout normally, stderr under --json-events)."""
+        kwargs.setdefault("file", self._out)
+        print(*args, **kwargs)
 
     def _staged_paths(self) -> list[str]:
         """The staged files this commit would contain, for showing before the message
@@ -85,7 +110,7 @@ class AgitrackActions:
         self.review_untracked(include_declined=False)
         if not self.repo.has_staged_changes():
             if self.verbose:
-                print("No staged user changes to commit.")
+                self._say("No staged user changes to commit.")
             restore_index()
             return False
         # Show WHAT is about to be committed before asking for a message: the answer is a
@@ -97,11 +122,13 @@ class AgitrackActions:
         skip_hint = (
             "Esc to continue without committing"
             if allow_skip
-            else "a commit is required: the agent's worktree is checked out from HEAD, so "
-            "uncommitted changes would not be in it"
+            else "a commit is required here: the agent's worktree is checked out from HEAD, so "
+            "uncommitted changes would not be in it. Run with --no-worktree to work in this tree "
+            f"instead, or type '{_QUIT_WORD}' to stop aGiTrack"
         )
         if self.ui is not None:
             message = ""
+            cancelled = False
             while not message.strip():
                 # Cancelling (Esc) returns None — continue without committing.
                 # Folded into the message rather than passed as a separate field: a UI
@@ -112,46 +139,75 @@ class AgitrackActions:
                 entered = self.ui.text(question)
                 if entered is None:
                     if not allow_skip:
-                        self.ui.info(f"Cannot skip — {skip_hint}.", level="warn")
+                        # Cancelling twice is not indecision — it is someone with no other way
+                        # out. Honour the second one rather than looping forever.
+                        if cancelled:
+                            restore_index()
+                            raise UserCommitAborted
+                        cancelled = True
+                        self.ui.info(f"Cannot skip — {skip_hint}. Cancel again to stop aGiTrack.", level="warn")
                         continue
                     self.ui.info("Continuing without committing.", level="warn")
                     restore_index()
                     return False
                 message = entered
+                if message.strip().lower() in (_SKIP_WORD, _QUIT_WORD) and not allow_skip:
+                    if message.strip().lower() == _QUIT_WORD:
+                        restore_index()
+                        raise UserCommitAborted
+                    self.ui.info(f"Cannot skip — {skip_hint}.", level="warn")
+                    message = ""
+                    continue
                 if not message.strip():
                     self.ui.info("User commit message is required.", level="warn")
         else:
             message = "" if self.interactive else "Save user changes"
             if self.interactive and staged:
-                print(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
-                print(listing)
+                self._say(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
+                self._say(listing)
             # An explicit word, not an empty line, is the way out. Empty deliberately re-prompts
             # (a stray Enter must never be read as "don't commit my work"), so without a
             # sentinel this loop had no exit at all — which is how a --no-worktree start became
             # impossible with a dirty tree.
             prompt = f"User commit message (or type '{_SKIP_WORD}' to continue without committing): "
             if not allow_skip:
-                prompt = "User commit message: "
+                prompt = f"User commit message (or '{_QUIT_WORD}' to stop aGiTrack): "
             while not message.strip():
                 try:
                     message = input(prompt)
                 except (EOFError, KeyboardInterrupt):
-                    print()  # no usable stdin, or interrupted: end cleanly rather than spinning
+                    self._say()  # no usable stdin, or interrupted
                     restore_index()
+                    if not allow_skip:
+                        # Ctrl-C at a question that cannot be answered any other way means
+                        # "get me out", not "commit nothing and carry on into a worktree that
+                        # is missing my work". It was previously swallowed into `return False`.
+                        raise UserCommitAborted
                     return False
-                if allow_skip and message.strip().lower() == _SKIP_WORD:
-                    print("Continuing without committing.")
+                typed = message.strip().lower()
+                if typed == _SKIP_WORD:
+                    if allow_skip:
+                        self._say("Continuing without committing.")
+                        restore_index()
+                        return False
+                    # NEVER commit the sentinel. Typing `skip` where skipping is impossible
+                    # produced a commit literally named `skip` on the user's branch — the same
+                    # word means "back out" one mode over, so people reach for it here too.
+                    self._say(f"Cannot skip — {skip_hint}.")
+                    message = ""
+                    continue
+                if typed == _QUIT_WORD and not allow_skip:
                     restore_index()
-                    return False
+                    raise UserCommitAborted
                 if not message.strip():
-                    print(
+                    self._say(
                         "User commit message is required."
                         if allow_skip
                         else f"User commit message is required — {skip_hint}."
                     )
         self.repo.commit(build_user_commit_message(message=message, agitrack_session_id=self.state.session_id))
         self.state.clear_trace()
-        print("Created user commit.")
+        self._say("Created user commit.")
         return True
 
     def create_agent_commit_from_turns(
@@ -176,7 +232,7 @@ class AgitrackActions:
 
         def on_commit_fn(sha, _trace, _is_cover):
             if not quiet:
-                print("Created <aGiTrack> commit.")
+                self._say("Created <aGiTrack> commit.")
 
         # Imported lazily: agitrack.proxy's package __init__ imports runner, which
         # imports this module — a top-level import here is circular and breaks
@@ -209,12 +265,12 @@ class AgitrackActions:
             # agent's work instead of silently dropping it.
             self.repo.stage_paths(candidates)
             self.state.remove_declined(candidates)
-            print("Staged untracked files: " + ", ".join(candidates))
+            self._say("Staged untracked files: " + ", ".join(candidates))
             return
 
-        print("Untracked files:")
+        self._say("Untracked files:")
         for index, path in enumerate(candidates, start=1):
-            print(f"  {index}. {path}")
+            self._say(f"  {index}. {path}")
         answer = input("Stage untracked files? [y/N/select]: ").strip().lower()
         if answer in {"y", "yes"}:
             self.repo.stage_paths(candidates)

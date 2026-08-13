@@ -166,12 +166,20 @@ def install_system_tool(
         output_fn(f"Could not install {info['label']} automatically (no supported package manager found).\n")
         return False
     description, command = plan
-    output_fn(f"\nInstalling {info['label']} — {description}\n")
+    # Blank line before the step, a "please wait" note, and a periodic tick while it runs:
+    # a package manager can be silent for minutes, which otherwise reads as a hang (and
+    # tempts the user into keypresses that would land on the next question).
+    output_fn(f"\nInstalling {info['label']} — {description}")
+    output_fn("This can take a few minutes. Please wait…\n")
     try:
-        result = run(command, timeout=900)
+        from agitrack.console import progress_ticker
+
+        with progress_ticker(f"still installing {info['label']}", output_fn=output_fn):
+            result = run(command, timeout=900)
     except (OSError, subprocess.SubprocessError) as error:
-        output_fn(f"  install failed: {error}\n")
+        output_fn(f"\n  install failed: {error}\n")
         return False
+    output_fn("")  # close any partial line the package manager left behind
     if getattr(result, "returncode", 1) != 0:
         output_fn(f"  {info['label']} install did not complete successfully.\n")
         return False

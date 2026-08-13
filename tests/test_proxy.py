@@ -1,3 +1,4 @@
+import base64
 import errno
 import os
 import re
@@ -13,7 +14,7 @@ _posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.opencode import SessionTurn
-from agitrack.backends.proxy_agents import make_proxy_agent
+from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 from agitrack.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _short_session, detect_color_mode
 from agitrack.proxy.integration import MergeContext, MergePhase
 from agitrack.proxy.session import Session
@@ -2547,8 +2548,11 @@ def test_render_frame_colour_conversion_is_bounded_by_distinct_colours():
     try:
         renderer_module._nearest_256 = counting_nearest
         renderer_module.write_frame = frames.append
-        # Start from a cold cache so the first frame's conversions are all counted.
-        for cached in (renderer_module._hex_color_code, renderer_module._color_code):
+        # Start from a cold cache so the first frame's conversions are all counted. `_cell_sgr`
+        # belongs in this list even though it converts nothing itself: it sits IN FRONT of
+        # `_color_code`, so a style another test already rendered would skip the conversion
+        # entirely and make `cold` depend on test order.
+        for cached in (renderer_module._hex_color_code, renderer_module._color_code, renderer_module._cell_sgr):
             if hasattr(cached, "cache_clear"):
                 cached.cache_clear()
 
@@ -2963,7 +2967,7 @@ def test_a_reactor_stall_is_recorded_without_debug_being_enabled(tmp_path):
 
     runner._note_phase("timers", time.monotonic() - 30.0)  # the reported symptom
     logged = (tmp_path / ".agitrack" / "stalls.log").read_text(encoding="utf-8")
-    assert "30.0s" in logged and "timers" in logged
+    assert "30.000s" in logged and "timers" in logged  # ms precision: see STALL_WARN_SECONDS
     assert runner._stall_worst >= 30.0  # and it reaches a crash report's context
 
 
@@ -3729,18 +3733,32 @@ def test_pageup_pagedown_scroll_history():
     assert runner.scroll_back == 0
 
 
-def test_mouse_drag_does_not_copy_or_hijack_selection():
-    # Text selection is the terminal's job. A left-button drag must NOT trigger aGiTrack's
-    # own copy: that only ran in terminals that forward the drag to the app (mouse mode
-    # 1000), where it suppressed native selection and popped an unwanted "Copied N char(s)
-    # to clipboard" message (#112). aGiTrack now ignores left-button events entirely.
-    runner = _history_runner()
+def _selection_runner():
+    """A runner with a screen holding 'hello world', ready to receive mouse reports."""
     import pyte
 
+    runner = _history_runner()
     runner.screen = pyte.HistoryScreen(20, 4, history=50, ratio=0.5)
     pyte.ByteStream(runner.screen).feed(b"hello world\r\n")
+    runner.rows, runner.cols = 5, 20
     runner.sel_active = False
     runner.sel_anchor = runner.sel_point = None
+    return runner
+
+
+def test_mouse_drag_copies_the_selection():
+    """A left drag must put the swept text on the clipboard.
+
+    THE REGRESSION THIS GUARDS: aGiTrack enables mouse reporting (?1000h) for wheel
+    scrollback, and a terminal that honours it stops doing its OWN selection and forwards the
+    drag here instead. #112 removed this handler on the reasoning that the terminal owns
+    selection — true only in terminals that never forward the drag. In every terminal that
+    DOES (the common case on Linux: VTE/gnome-terminal, konsole, xterm, alacritty, foot),
+    selecting text stopped working altogether: the terminal had stood down and aGiTrack was
+    no longer copying either. Receiving these events at all is the proof the terminal is not
+    selecting for us.
+    """
+    runner = _selection_runner()
     copied: list[str] = []
     messages: list[str] = []
     runner._copy_to_clipboard = lambda text: copied.append(text)
@@ -3749,9 +3767,134 @@ def test_mouse_drag_does_not_copy_or_hijack_selection():
     runner._intercept_scroll(b"\x1b[<0;1;1M")  # press at col 1, row 1
     runner._intercept_scroll(b"\x1b[<32;5;1M")  # drag to col 5
     runner._intercept_scroll(b"\x1b[<0;5;1m")  # release at a different cell (a real drag)
-    assert copied == []  # nothing was copied
-    assert messages == []  # no "Copied N chars" popup
-    assert runner.sel_active is False  # aGiTrack never started a selection
+
+    assert copied == ["hello"]
+    assert messages and "Copied" in messages[0]
+    assert runner.sel_active is False  # the selection is released, not left armed
+    assert runner.sel_anchor is None
+
+
+def test_mouse_drag_copies_even_when_the_terminal_reports_no_motion():
+    # Mouse mode 1000 reports press and release but NOT motion, so a drag arrives as two
+    # events with different coordinates and nothing in between. The release point alone is
+    # enough to know what was swept; keying the copy on having seen motion would mean no
+    # copy at all in exactly the mode aGiTrack asks the terminal for.
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<0;1;1M")
+    runner._intercept_scroll(b"\x1b[<0;5;1m")
+
+    assert copied == ["hello"]
+
+
+def test_a_drag_paints_one_frame_per_read_not_one_per_report():
+    """A drag arrives as a RUN of motion reports in one read; the highlight is painted once.
+
+    Same budget the wheel already respects: one read can hold dozens of reports, and a full
+    repaint per report is the storm that holds the GIL and starves the stdin reader (AGENTS.md,
+    "Scrolling and repaint budget"). Counted, not timed, so it holds on any machine.
+    """
+    runner = _selection_runner()
+    frames: list[int] = []
+    runner._render = lambda: frames.append(1)
+    runner._copy_to_clipboard = lambda text: None
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<0;1;1M")  # press
+    frames.clear()
+    runner._intercept_scroll(b"".join(b"\x1b[<32;%d;1M" % col for col in range(2, 18)))  # 16 motion reports
+
+    assert frames == [1], f"one frame per read, got {len(frames)}"
+
+
+def test_a_plain_click_copies_nothing():
+    # Press and release on the SAME cell is a click, not a selection. Copying there is what
+    # made the "Copied N char(s) to clipboard" popup appear unbidden (#112).
+    runner = _selection_runner()
+    copied: list[str] = []
+    messages: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda msg, **k: messages.append(msg)
+
+    runner._intercept_scroll(b"\x1b[<0;3;1M")
+    runner._intercept_scroll(b"\x1b[<0;3;1m")
+
+    assert copied == []
+    assert messages == []
+
+
+def test_a_modified_drag_is_left_to_the_terminal():
+    # Shift+drag is the chord terminals use for their own selection while an application is
+    # tracking the mouse. aGiTrack must not also select on it, or the user gets two
+    # selections at once.
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<4;1;1M")  # button 0 + Shift (4)
+    runner._intercept_scroll(b"\x1b[<4;5;1m")
+
+    assert copied == []
+    assert runner.sel_active is False
+
+
+def test_the_wheel_scrolls_without_starting_a_selection():
+    # The wheel and selection share the report format; scrollback must not arm a selection
+    # (a later click would then "release" one that was never dragged).
+    runner = _selection_runner()
+    copied: list[str] = []
+    runner._copy_to_clipboard = lambda text: copied.append(text)
+    runner._set_message = lambda *a, **k: None
+
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+
+    assert runner.sel_active is False
+    assert copied == []
+
+
+def test_copy_to_clipboard_always_emits_osc52(monkeypatch):
+    """OSC 52 goes out even when a native clipboard tool ran.
+
+    They reach DIFFERENT clipboards over SSH — the native helper sets the one on the machine
+    aGiTrack runs on, OSC 52 travels back to the terminal the user will paste into — so
+    stopping at the first success silently copies to the wrong machine on a remote session,
+    which is where a TUI most often runs.
+    """
+    import agitrack.proxy.runner as runner_module
+
+    runner = _selection_runner()
+    ran: list[list[str]] = []
+    written: list[bytes] = []
+    monkeypatch.setattr(runner_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda cmd, **kw: ran.append(list(cmd)))
+    monkeypatch.setattr(runner_module.os, "write", lambda fd, data: written.append(data) or len(data))
+
+    runner._copy_to_clipboard("hello")
+
+    assert len(ran) == 1, f"only the first available helper should run, got {ran}"
+    assert b"\x1b]52;c;" in written[0]
+    assert base64.b64encode(b"hello") in written[0]
+
+
+def test_linux_clipboard_falls_through_to_the_next_tool(monkeypatch):
+    # Linux ships none of wl-copy/xclip/xsel by default and which one exists depends on
+    # Wayland vs X11, so the list must be tried in order rather than assuming one.
+    import agitrack.proxy.runner as runner_module
+
+    runner = _selection_runner()
+    ran: list[list[str]] = []
+    monkeypatch.setattr(runner_module.sys, "platform", "linux")
+    monkeypatch.setattr(runner_module.shutil, "which", lambda name: "/usr/bin/xclip" if name == "xclip" else None)
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda cmd, **kw: ran.append(list(cmd)))
+    monkeypatch.setattr(runner_module.os, "write", lambda fd, data: len(data))
+
+    runner._copy_to_clipboard("hello")
+
+    assert ran == [["xclip", "-selection", "clipboard"]]
 
 
 def test_mouse_events_are_stripped_from_forwarded_input():
@@ -8392,13 +8535,22 @@ def _base_edit_runner(tmp_path, answers):
         return scripted.pop(0) if scripted else None
 
     def select(title, options, **kwargs):
-        # Option questions are selections; a scripted "y" picks the affirmative option
-        # (always first), anything else picks the second.
+        # Option questions are selections; a scripted "y" picks the AFFIRMATIVE option and
+        # anything else the other one.
+        #
+        # By meaning, not by position. This used to assume "affirmative is always first",
+        # which stopped being true when the untracked-files popup was reordered to lead with
+        # "Leave them unstaged" — a bare Enter there must not sweep the user's own files into
+        # the commit. A positional stub silently answered the OPPOSITE question and the tests
+        # still "passed" until the behaviour changed under them.
         runner.prompts.append((title, options))
         answer = scripted.pop(0) if scripted else None
         if answer is None:
             return None
-        return options[0] if str(answer).strip().lower() in {"y", "yes"} else options[1]
+        affirmative = next((option for option in options if option.startswith(("Stage", "Yes", "Commit"))), options[0])
+        if str(answer).strip().lower() in {"y", "yes"}:
+            return affirmative
+        return next(option for option in options if option != affirmative)
 
     runner._prompt_popup = prompt
     runner._select_popup = select
@@ -9044,12 +9196,25 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
 # --- issue #21: stopped backends are reaped, not left as zombies ----------------
 
 
+def _spawn_dummy_child(program: str, *args: str) -> int:
+    """A real child process to reap, WITHOUT forking this process.
+
+    These tests need a raw pid they can `os.waitpid` themselves, so `subprocess` is out — its
+    own bookkeeping would reap the child first and turn the assertions into `ChildProcessError`.
+    They used a bare `os.fork()`, which is the hazard: a pytest-xdist worker is multi-threaded,
+    and CPython already warns here ("This process is multi-threaded, use of fork() may lead to
+    deadlocks in the child"). A child forked out of a multi-threaded process can inherit a lock
+    held by a thread that does not exist in it and hang before reaching `os._exit`, still
+    holding the worker's execnet socket — and in 3.14 `os.fork()` in a multi-threaded process
+    becomes an error outright. `posix_spawn` runs no Python in the child at all.
+    """
+    return os.posix_spawn(program, [program, *args], os.environ)
+
+
 @_posix_only
 def test_terminate_child_queues_pid_and_reaper_collects_it():
     runner = make_runner(master_fd=None)
-    pid = os.fork()
-    if pid == 0:
-        os._exit(0)  # the "backend" exits as soon as it is signalled
+    pid = _spawn_dummy_child("/usr/bin/true")  # the "backend" exits at once
     runner.child_pid = pid
 
     runner._terminate_child()
@@ -9072,10 +9237,7 @@ def test_reaper_keeps_still_running_children():
     import signal as signal_mod
 
     runner = make_runner()
-    pid = os.fork()
-    if pid == 0:
-        time.sleep(30)
-        os._exit(0)
+    pid = _spawn_dummy_child("/bin/sleep", "30")
     runner._reap_pids = [pid]
 
     runner._reap_stopped_children()
@@ -9318,6 +9480,34 @@ def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
     assert b"\x1b[<u" not in writes  # kitty pop suppressed
     assert b"\x1b[>4;2m" in writes  # modifyOtherKeys still mirrored
     assert b"\x1b[>4;0m" in writes
+
+
+def test_sync_terminal_modes_rejects_a_chunk_that_cannot_contain_a_mode(monkeypatch):
+    """Heavy scroll output must not be scanned thirty times over.
+
+    Every sequence this method looks for is `ESC [` + one of `? > < =`; without a presence
+    check in front, each of the twelve mouse modes cost two full substring scans of the whole
+    chunk (plus three more modes, plus a regex) on the reactor thread that also reads stdin —
+    measured 4.46 ms per megabyte of ordinary output with no escape sequence in it at all,
+    against 0.26 ms with the check. What it DETECTS is unchanged, so both halves are asserted:
+    a chunk with no introducer does no work, and one with a mode is still mirrored in full.
+    """
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = True
+    writes: list[bytes] = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    # SGR colour and cursor motion are `ESC [` sequences too, and none of them is a mode:
+    # the guard has to let this through without mirroring anything.
+    runner._sync_terminal_modes(b"\x1b[1;32mgreen\x1b[0m\r\n\x1b[12;40Hplain scrollback\x1b[K")
+    assert writes == []
+    assert runner.child_mouse is False
+
+    runner._sync_terminal_modes(b"before\x1b[?1002h between \x1b[>1u after")
+    assert b"\x1b[?1002h" in writes and b"\x1b[>1u" in writes
+    assert runner.child_mouse is True
 
 
 def test_sync_terminal_modes_windows_drops_hover_motion_keeps_drag(monkeypatch):
@@ -10420,11 +10610,135 @@ def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypa
     runner._restart_agent = lambda msg: None
     runner._set_message = lambda *a, **k: None
     runner._render = lambda *a, **k: None
+    # Nothing is stored for opencode here, so this switch opens a fresh conversation and asks
+    # for its name; answer it, because the subject of this test is the SCOPE of the write.
+    runner._prompt_session_name = lambda title, *, default: "picked"
 
     runner._switch_backend("opencode")
 
     assert ("default_backend", "opencode", "repo") in sets
     assert not any(scope == "global" for _, _, scope in sets)  # global default left alone
+
+
+# Every ordered pair of registered backends, so the switch flows are exercised for EVERY
+# agent rather than for the one pair someone happened to write the test with. A backend
+# added to the registry is covered here the moment it lands.
+BACKEND_PAIRS = [(a, b) for a in available_backends() for b in available_backends() if a != b]
+
+
+def _switchable_runner(tmp_path, monkeypatch, *, backend="claude", target="opencode", stored=None):
+    """A no-worktree runner on *backend*, ready to switch, with the naming prompt observable."""
+    import agitrack.proxy.runner as rm
+
+    state = AgitrackState(tmp_path)
+    if stored:
+        state.backend = target
+        state.backend_session_id = stored
+        state.remember_backend_session()
+    state.backend = backend
+    runner = make_runner(state=state, worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    runner.backend = types.SimpleNamespace(name=backend)
+    runner.name = "original"
+    runner.global_config = types.SimpleNamespace(set=lambda key, value, *, scope: None, default_backend=backend)
+    monkeypatch.setattr(rm, "backend_installed", lambda name: True)
+    monkeypatch.setattr(rm, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    runner._restart_agent = lambda msg: None
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_a_no_worktree_session_records_names_through_its_own_state(tmp_path):
+    # THE CLOBBER. `AgitrackState.save()` writes its whole `data` dict with no merge, and without
+    # a worktree the session state and the repo-root state are THE SAME FILE. Writing a name
+    # through a second instance therefore survived only until the session state saved next —
+    # which it does on every property setter — and `session_names` came back empty, leaving the
+    # conversation unnamed in the resume list. Seen in a real state file before this was fixed.
+    runner = make_runner(state=AgitrackState(tmp_path), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    runner.name = "alpha"
+
+    runner._persist_session_name("sess-1")
+    runner.state.model = "some-model"  # any setter → save() → used to overwrite the name away
+
+    assert AgitrackState(tmp_path).session_name_for("sess-1") == "alpha"
+
+
+def test_root_state_is_shared_without_a_worktree_and_separate_with_one(tmp_path):
+    # The rule behind the fix, stated once: same file => same object; different files => a fresh
+    # read is right and nothing can collide.
+    shared = make_runner(state=AgitrackState(tmp_path), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path))
+    assert shared._root_state() is shared.state
+
+    worktree_dir = tmp_path / "wt"
+    worktree_dir.mkdir()
+    separate = make_runner(
+        state=AgitrackState(worktree_dir), worktree=None, base_repo=types.SimpleNamespace(repo=tmp_path)
+    )
+    assert separate._root_state() is not separate.state
+
+
+@pytest.mark.parametrize("backend,target", BACKEND_PAIRS)
+def test_switching_backend_to_a_fresh_conversation_asks_for_a_session_name(backend, target, tmp_path, monkeypatch):
+    # A backend switch with nothing to resume starts a DIFFERENT conversation — another agent,
+    # another transcript, no shared history. It is new work and is named like new work; silently
+    # inheriting the outgoing backend's name left two unrelated conversations sharing one label.
+    runner = _switchable_runner(tmp_path, monkeypatch, backend=backend, target=target)
+    asked: list = []
+
+    def prompt(title, *, default):
+        asked.append((title, default))
+        return "fresh-name"
+
+    runner._prompt_session_name = prompt
+
+    runner._switch_backend(target)
+
+    assert asked, "a fresh conversation on the new backend must be named"
+    assert target in asked[0][0]
+    assert runner.name == "fresh-name"
+    # Durable immediately, as at startup. The new backend has not spawned, so there is no
+    # conversation id yet and the name is held PENDING. Leaving this out kept the OUTGOING
+    # session's name pending, so a crash before the first turn linked the old name to the new
+    # conversation — seen live in a real state file before this was added.
+    assert AgitrackState(runner.base_repo.repo).pending_session_name == "fresh-name"
+
+
+@pytest.mark.parametrize("backend,target", BACKEND_PAIRS)
+def test_switching_backend_back_to_a_remembered_conversation_restores_its_name(backend, target, tmp_path, monkeypatch):
+    # The mirror case: going BACK to a conversation this backend already had is not new work, so
+    # it is never asked for a name — it gets back the one it was given. The real
+    # `_restore_or_ask_session_name` runs here rather than a stub, because the thing worth
+    # asserting is that the NAME returns, not that a helper was called.
+    runner = _switchable_runner(tmp_path, monkeypatch, backend=backend, target=target, stored="sess-abc")
+    # Named through the session's OWN state object. A second AgitrackState on the same path
+    # would be clobbered by the switch's own saves — the hazard this branch works around.
+    runner.state.name_session("sess-abc", "alpha")
+    runner._prompt_session_name = lambda *a, **k: pytest.fail("a resumed conversation must not be named again")
+
+    runner._switch_backend(target)
+
+    assert runner.state.backend_session_id == "sess-abc"
+    assert runner.name == "alpha", "switching back must restore the name that conversation had"
+
+
+@pytest.mark.parametrize("backend,target", BACKEND_PAIRS)
+def test_backing_out_of_the_name_leaves_the_backend_switch_undone(backend, target, tmp_path, monkeypatch):
+    # Cancelling the name cancels the SWITCH, as it already did in worktree mode. The repo
+    # default is written per branch, after that branch commits to the switch, so a cancelled
+    # switch cannot leave the repo pointed at a backend it never moved to.
+    runner = _switchable_runner(tmp_path, monkeypatch, backend=backend, target=target)
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(
+        set=lambda key, value, *, scope: sets.append((key, value, scope)), default_backend=backend
+    )
+    runner._prompt_session_name = lambda *a, **k: None
+
+    runner._switch_backend(target)
+
+    assert runner.backend.name == backend
+    assert runner.state.backend == backend
+    assert runner.name == "original"
+    assert sets == [], "a cancelled switch must not record a new repo default"
 
 
 def test_no_worktree_mode_keeps_leftover_worktrees_and_resumes_newest(tmp_path):
@@ -11377,7 +11691,10 @@ def test_untracked_files_prompt_is_a_selection():
 
     def _select(title, options, *, detail=None):
         asked.update(title=title, options=options, detail=detail)
-        return options[1]  # "Leave them unstaged"
+        # By NAME, not by index: the safe option leads the list now (a bare Enter must not
+        # stage the user's own untracked files), so an index here would silently test the
+        # opposite answer.
+        return next(option for option in options if option.startswith("Leave"))
 
     runner._select_popup = _select
     runner._prompt_popup = lambda *a, **k: pytest.fail("an option question must not be typed")
@@ -12169,3 +12486,105 @@ def test_restart_ignores_a_conversation_that_is_only_a_newer_FILE(tmp_path):
     runner._resync_pin_to_the_live_conversation()
 
     assert state.backend_session_id == "the-real-one"
+
+
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
+def test_handing_stdin_over_does_not_wait_out_the_pumps_poll_cycle(monkeypatch):
+    """The pump sits in a 0.2s select; `_pause_pump_and_wait` used to just set `_paused` and
+    wait for the pump to notice, so every hand-over cost up to a full cycle. At startup that
+    is paid right before the capability round trip — dead time on a blank screen, and the
+    reason the session took a visible beat to appear in the agent's colours. A pause pipe
+    breaks the select at once."""
+    import pty
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved_in = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+
+        class _Stdin:
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host._start_reader()
+        assert host._reader is not None and host._reader.is_alive()
+        time.sleep(0.05)  # let the pump reach its select
+
+        started = time.monotonic()
+        assert host._pause_pump_and_wait() is True
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.1  # a whole poll cycle is 0.2s; this must not wait for one
+        assert host._parked.is_set()  # and stdin really is handed over, not just flagged
+        host._paused.clear()
+    finally:
+        host._stop_reader()
+        os.dup2(saved_in, 0)
+        os.close(saved_in)
+        os.close(master)
+        os.close(slave)
+
+
+@_posix_only  # drives a real pty through PosixHostTerminal; Windows has neither
+def test_the_pause_pipe_never_swallows_a_keystroke(monkeypatch):
+    """Waking the pump must not cost input. While it is parked the tty belongs to whoever
+    paused it (the capability round trip, a cooked-mode prompt), so bytes typed then must be
+    left ON the tty for that reader — not taken into the pump's buffer — and once the pump is
+    resumed it must go back to draining normally."""
+    import pty
+    import tty as _tty
+
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    master, slave = pty.openpty()
+    _tty.setraw(slave)
+    saved_in = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+
+        class _Stdin:
+            @staticmethod
+            def fileno() -> int:
+                return 0
+
+            @staticmethod
+            def isatty() -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stdin", _Stdin)
+        host = PosixHostTerminal(make_runner())
+        host._start_reader()
+        time.sleep(0.05)
+
+        host._pause_pump_and_wait()
+        os.write(master, b"typed while paused")
+        time.sleep(0.1)
+        with host._lock:
+            assert bytes(host._buffer) == b""  # the pump kept its hands off the tty…
+        assert host.read_stdin(65536) == b"typed while paused"  # …and left them for its owner
+
+        host._paused.clear()  # resume, exactly as detect_host_terminal does
+        os.write(master, b"typed after resume")
+        deadline = time.monotonic() + 2.0
+        seen = b""
+        while time.monotonic() < deadline and b"typed after resume" not in seen:
+            seen += host.read_stdin(65536)
+            time.sleep(0.02)
+        assert b"typed after resume" in seen  # draining again, through the pump
+    finally:
+        host._stop_reader()
+        os.dup2(saved_in, 0)
+        os.close(saved_in)
+        os.close(master)
+        os.close(slave)

@@ -257,6 +257,7 @@ def build_agent_commit_message(
     origin_event: dict | None = None,
     capabilities: dict[str, list[str]] | None = None,
     interrupted: bool = False,
+    changed_paths: list[str] | None = None,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
@@ -297,6 +298,7 @@ def build_agent_commit_message(
             origin_event=origin_event,
             capabilities=capabilities,
             interrupted=interrupted,
+            changed_paths=changed_paths,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -438,7 +440,13 @@ def _trace_role_lines(item: dict) -> list[str]:
     return [f"## {label}", "", *_body_lines(content), ""]
 
 
-def render_interaction_trace(trace: list[dict], trace_turn_limit: int, *, interrupted: bool = False) -> str:
+def render_interaction_trace(
+    trace: list[dict],
+    trace_turn_limit: int,
+    *,
+    interrupted: bool = False,
+    changed_paths: list[str] | None = None,
+) -> str:
     """The interaction-trace body exactly as it is appended to an aGiTrack commit:
     role headings plus masked, heading-nested content (same as the commit's
     ``# Interaction Trace`` section, without the header). This is the *sole* input
@@ -447,8 +455,10 @@ def render_interaction_trace(trace: list[dict], trace_turn_limit: int, *, interr
 
     ``interrupted`` carries the one fact the trace cannot show on its own: that the user
     cancelled the turn. Without it the summarizer reads an agent's "I'll do X now" as X
-    having been done."""
-    lines: list[str] = list(_interrupted_note_lines(interrupted))
+    having been done. ``changed_paths`` carries the second one — what the commit actually
+    contains — because a cancelled turn's messages stop before its last edits (see
+    ``_interrupted_changes_sentence``). Both are ignored unless the turn was interrupted."""
+    lines: list[str] = list(_interrupted_note_lines(interrupted, changed_paths))
     for item in _limit_trace_turns(trace, trace_turn_limit):
         lines.extend(_trace_role_lines(item))
     return "\n".join(lines).strip()
@@ -474,11 +484,12 @@ def _trace_and_metadata_lines(
     origin_event: dict | None = None,
     capabilities: dict[str, list[str]] | None = None,
     interrupted: bool = False,
+    changed_paths: list[str] | None = None,
 ) -> list[str]:
     lines: list[str] = [TRACE_HEADER, ""]
     # The interruption leads every other note: it changes how the whole trace below
     # should be read (a request stated is not a request carried out).
-    lines.extend(_interrupted_note_lines(interrupted))
+    lines.extend(_interrupted_note_lines(interrupted, changed_paths))
     # Session-level events (a fork/copy this session began from, any context
     # compactions in these turns) lead the trace as a note, so the conversation log
     # itself shows when the context — and the token counts riding on it — changed.
@@ -575,7 +586,34 @@ def _capability_lines(capabilities: dict[str, list[str]] | None) -> list[str]:
     return lines
 
 
-def _interrupted_note_lines(interrupted: bool) -> list[str]:
+# How many paths the interrupted-turn note spells out before it starts counting. Long
+# enough to be useful, short enough that a hundred-file turn does not bury the trace.
+_INTERRUPTED_NOTE_PATH_LIMIT = 12
+
+
+def _interrupted_changes_sentence(changed_paths: list[str] | None) -> str:
+    """The one thing the trace of an interrupted turn cannot be trusted about: what landed.
+
+    The trace holds the agent's MESSAGES, and a cancelled turn's last message is typically
+    its opening "I'll create the ten files one at a time" — the tool calls that followed are
+    not in it. Reading that trace under the note above, the summarizer concluded the opposite
+    of the truth: `<aGiTrack> (interrupted) Requested creation of f1.txt–f10.txt was
+    interrupted before any writes`, on a commit whose own diff adds f1.txt through f8.txt.
+    A subject that contradicts its diff is worse than a vague one, and neither the human nor
+    the summarizer can tell without being told, so the file list goes in the note."""
+    if not changed_paths:
+        return ""
+    shown = changed_paths[:_INTERRUPTED_NOTE_PATH_LIMIT]
+    listed = ", ".join(shown)
+    if len(changed_paths) > len(shown):
+        listed += f", and {len(changed_paths) - len(shown)} more"
+    return (
+        " The agent's messages below stop where it was cancelled and may not mention its last"
+        f" edits, so take the changes from this commit itself: it changes {listed}."
+    )
+
+
+def _interrupted_note_lines(interrupted: bool, changed_paths: list[str] | None = None) -> list[str]:
     """Lead-in note for a turn the user CANCELLED (Esc) before the agent finished.
 
     Such a turn still commits — the partial edits are real work and dropping them would
@@ -588,10 +626,9 @@ def _interrupted_note_lines(interrupted: bool) -> list[str]:
     if not interrupted:
         return []
     note = (
-        "The user interrupted this turn before the agent finished it. Only the changes "
-        "already made at that point are recorded here, so the request as stated in the "
-        "trace below was NOT completed."
-    )
+        "The user interrupted this turn before the agent finished it, so the request as "
+        "stated in the trace below was NOT completed."
+    ) + _interrupted_changes_sentence(changed_paths)
     return [*_note_block(_mask_secrets(note)), ""]
 
 

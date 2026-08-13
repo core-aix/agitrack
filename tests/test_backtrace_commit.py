@@ -17,6 +17,18 @@ import pytest
 from agitrack.metrics.backtrace_commit import backtrace_commit
 
 
+@pytest.fixture(autouse=True)
+def codex_home(tmp_path, monkeypatch):
+    """Redirect Codex's store, as tests/test_codex_session.py does.
+
+    Reconstruction walks every backend, so without this each test read the developer's (or the
+    CI runner's) real ``~/.codex`` history — planting whatever conversations happened to be
+    there into the repo the test had just built."""
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home
+
+
 def _git(repo, *args, date=None):
     env = {
         "GIT_AUTHOR_NAME": "Dev",
@@ -157,6 +169,99 @@ def test_backtrace_commit_dashboard_sees_the_ai_commit(repo_with_history):
     assert "claude-opus-4-8" in dash.by_model
 
 
+def _plant_codex_session(codex_home, repo, session_id, *, prompt, path, content, when):
+    """A Codex rollout for ``repo``, in the record shapes tests/test_codex_session.py captured
+    from codex-cli 0.147.0. Unlike Claude, Codex files rollouts by DATE and links them to a
+    directory only through the ``cwd`` in the header — so that header is what scopes it here."""
+    rows = [
+        {
+            "timestamp": f"{when}.000Z",
+            "type": "session_meta",
+            "payload": {"session_id": session_id, "cwd": str(repo), "source": "cli", "thread_source": "user"},
+        },
+        {"timestamp": f"{when}.100Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "t1"}},
+        {
+            "timestamp": f"{when}.200Z",
+            "type": "turn_context",
+            "payload": {"turn_id": "t1", "model": "gpt-5.4-codex", "model_reasoning_effort": "medium"},
+        },
+        {"timestamp": f"{when}.300Z", "type": "event_msg", "payload": {"type": "user_message", "message": prompt}},
+        {
+            "timestamp": f"{when}.400Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "success": True,
+                "changes": {str(repo / path): {"type": "add", "content": content}},
+            },
+        },
+        {
+            "timestamp": f"{when}.500Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"last_token_usage": {"input_tokens": 100, "output_tokens": 40}},
+            },
+        },
+        {
+            "timestamp": f"{when}.600Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "t1", "last_agent_message": f"Done: {prompt}"},
+        },
+    ]
+    directory = codex_home / "sessions" / "2026" / "07" / "02"
+    directory.mkdir(parents=True, exist_ok=True)
+    rollout = directory / f"rollout-2026-07-02T09-00-00-{session_id}.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return rollout
+
+
+def test_a_codex_made_commit_is_annotated_from_its_rollout(tmp_path, monkeypatch, codex_home):
+    """The same reconstruction, for a repo whose agent was Codex.
+
+    Nothing here is Claude-shaped: the turn is bounded by Codex's own task_started/task_complete
+    events, its file changes come from an applied patch rather than tool-call arguments, and the
+    conversation is located by the cwd its rollout header records. A commit whose files that turn
+    produced must still gain the same metadata and trace.
+    """
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    from agitrack.metrics import backtrace as bt
+
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("# Proj\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "initial: add README", date="2026-07-01T10:00:00+00:00")
+
+    session_id = "019fe8dc-ca6c-7951-9225-73513aadf083"
+    _plant_codex_session(
+        codex_home,
+        repo,
+        session_id,
+        prompt="Create calc.py",
+        path="calc.py",
+        content="def add(a, b):\n    return a + b\n",
+        when="2026-07-02T09:00:00",
+    )
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add calc module", date="2026-07-02T10:00:00+00:00")
+
+    assert backtrace_commit(repo, "agitrack-history", _input=lambda _p: "y") == 0
+
+    body = _git(repo, "log", "-1", "--format=%B", "agitrack-history").stdout
+    assert "# aGiTrack Metadata" in body and "commit_type: agent" in body
+    assert "backend: codex" in body and "model: gpt-5.4-codex" in body
+    assert f"backend_session_id: {session_id}" in body
+    assert "reasoning_effort: medium" in body
+    assert "tokens_since_last_commit_output: 40" in body
+    assert "# Interaction Trace" in body and "Create calc.py" in body
+    assert body.splitlines()[0] == "add calc module"  # the user's own subject survives
+
+
 def test_backtrace_commit_requires_git_repo(tmp_path, capsys):
     rc = backtrace_commit(tmp_path, "newb", _input=lambda p: "y")
     assert rc == 1
@@ -207,6 +312,21 @@ def test_backtrace_commit_declined_makes_no_changes(repo_with_history, capsys):
     assert "Aborted" in capsys.readouterr().out
     after = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
     assert before == after  # no branch created
+
+
+def test_backtrace_commit_with_no_stdin_cancels_instead_of_crashing(repo_with_history, capsys):
+    # Run from a script or CI (`agitrack --backtrace commit --branch x < /dev/null`) the
+    # confirmation `input()` raises EOFError. It escaped as a raw Python traceback instead of a
+    # message; and since the "yes" answer REWRITES history, no answer must mean no.
+    def _eof(_prompt):
+        raise EOFError
+
+    before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+    rc = backtrace_commit(repo_with_history, "unattended", _input=_eof)
+
+    assert rc == 0
+    assert "Aborted" in capsys.readouterr().out
+    assert _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split() == before
 
 
 def test_backtrace_commit_no_ai_history(tmp_path, monkeypatch, capsys):
@@ -537,3 +657,38 @@ def test_a_genuinely_tracked_agent_commit_is_still_left_alone(repo_ai_commit_at_
     assert "Nothing to add: every agent-made commit here is already tracked" in capsys.readouterr().out
     assert "recon" not in _git(repo, "branch", "--format=%(refname:short)").stdout.split()
     assert _git(repo, "log", "-1", "--format=%B").stdout.count("tokens_since_last_commit_output:") == 1
+
+
+def test_backtrace_commit_refuses_while_another_agitrack_holds_the_repo(repo_with_history, capsys):
+    """One git-editing aGiTrack per repo, and this is the heaviest writer there is.
+
+    It replays every commit onto a new branch and switches to it. Beside a live tracker or a
+    TUI that means a reconstruction built from a tree the tracker is still committing into, or
+    a `git switch` under a session mid-commit. It was the one writing path that took no lock;
+    read-only paths (the dashboards, `--backtrace` serving) still take none.
+    """
+    from agitrack.git import RepoLock
+
+    before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
+    holder = RepoLock(repo_with_history / ".agitrack" / "lock")
+    assert holder.acquire()
+    try:
+        rc = backtrace_commit(repo_with_history, "reconstructed", _input=lambda _prompt: "y")
+    finally:
+        holder.release()
+
+    assert rc == 1
+    assert "already" in capsys.readouterr().out.lower()
+    assert _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split() == before
+
+
+def test_backtrace_commit_takes_the_lock_and_gives_it_back(repo_with_history):
+    # Held for the whole run, released at the end: a command that kept the lock would block
+    # every later aGiTrack on the repo, which is the same failure in the other direction.
+    from agitrack.git import RepoLock
+
+    assert backtrace_commit(repo_with_history, "reconstructed", _input=lambda _prompt: "y") == 0
+
+    lock = RepoLock(repo_with_history / ".agitrack" / "lock")
+    assert lock.acquire()
+    lock.release()

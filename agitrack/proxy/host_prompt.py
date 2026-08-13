@@ -19,6 +19,8 @@ import shutil
 import subprocess
 import sys
 
+from agitrack.proc import UTF8_TEXT
+
 # Outcomes of the forced-exit prompt.
 QUIT = "quit"  # default button, dismissal, timeout, or no GUI available
 REOPEN = "reopen"  # the user asked to keep working in a fresh window
@@ -62,7 +64,7 @@ def confirm_forced_exit(detail: str, *, timeout: float = 25.0) -> str:
         result = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=timeout + 5,
         )
     except Exception:
