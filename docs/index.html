@@ -211,11 +211,10 @@ a.more:hover{background:var(--amber);color:var(--ink);border-bottom-color:var(--
   padding:9px 13px;font-size:13.5px;color:var(--phosphor);
 }
 .step .note{font-size:12.5px;color:var(--fg-dim);margin-top:5px}
-/* A step that is something aGiTrack DOES, not something you type. Same rhythm as the commands
-   above it (one line, same weight), but no terminal box and no green: a boxed monospace string
-   reads as "type this", and the first two steps have already taught the reader that it does. */
-.step .happens{display:block;padding:9px 0;font-size:14.5px;color:var(--fg);font-family:var(--display)}
-.step .happens .arrow{color:var(--phosphor);margin-right:8px}
+/* A step that is something aGiTrack DOES, not something you type. Plain prose, in the same font
+   and size as the note under it: no terminal box and no green (a boxed monospace string reads as
+   "type this"), and no display face either, which read as decoration rather than as text. */
+.step .happens{display:block;padding:9px 0;font-size:12.5px;color:var(--fg)}
 
 footer{
   padding:34px 0 60px;color:var(--fg-dim);font-size:13px;
@@ -322,7 +321,7 @@ footer .sha{font-size:12px}
           <div class="note">asks which mode you want: arrow keys, Enter</div>
         </div></div>
         <div class="step"><div>
-          <span class="happens"><span class="arrow">&rarr;</span>your dashboard opens</span>
+          <span class="happens">your dashboard opens</span>
           <div class="note">automatically, whichever mode you picked</div>
         </div></div>
       </div>
