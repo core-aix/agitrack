@@ -233,8 +233,43 @@ def forget(path: str | os.PathLike[str]) -> bool:
     return True
 
 
+def last_activity(entry: "RepoEntry") -> float:
+    """When this repository was last ACTIVE, as epoch seconds — the value the dashboard orders by.
+
+    ``last_seen`` alone is "when aGiTrack last started here", which is not the same question and
+    answers it badly: eight trackers restarting together (a self-update sweep does exactly that)
+    all stamp the same second, so the switcher's order collapses to a tie broken by file position
+    — arbitrary, and it moves on its own.
+
+    The signal is the mtime of the repo's ``.git/logs/HEAD`` (the reflog), which git rewrites on
+    every commit and ref move. One ``stat``, no subprocess and no walk of git history — this is
+    read to draw a dropdown — and it counts the user's own commits, not just aGiTrack's, which is
+    what "last updated" means to the person reading the list.
+
+    ``.agitrack/state.json`` was the obvious candidate and is the WRONG one: the tracker rewrites
+    it on every poll that finds a backend session, so on a repo with a live conversation its mtime
+    advances every few seconds whether or not anything happened. Ordering by it sorted the list by
+    which daemon polled most recently, which is noise wearing the costume of activity (measured:
+    idle repos with a session advanced 15s apart while genuinely idle ones stood still).
+
+    The reflog WINS where it exists rather than being maxed with ``last_seen``; ``last_seen`` is
+    only the fallback. Taking the later of the two put every repo back on the tie it was meant to
+    break, because a start stamp is almost always more recent than the last commit — one
+    self-update sweep restarts every tracker and re-stamps them all within the same second.
+    ``last_seen`` still orders a repo opened with ``-d`` alone, one with reflogs turned off, and
+    one that is not a git repository at all (a directory listed for its reconstruction)."""
+    try:
+        return float((entry.directory / ".git" / "logs" / "HEAD").stat().st_mtime)
+    except OSError:
+        return float(entry.last_seen or 0)
+
+
 def list_repos(*, existing_only: bool = True, served_only: bool = True) -> list[RepoEntry]:
-    """Every repository the dashboard should offer, most recently used first.
+    """Every repository the dashboard should offer, MOST RECENTLY ACTIVE FIRST.
+
+    That order is the switcher's documented convention and is used by every reader (the switcher,
+    ``/`` redirecting to a repo, ``--daemons``-style listings) so they cannot disagree. See
+    :func:`last_activity` for what "active" means and why it is not ``last_seen``.
 
     Directories that have gone are dropped: the list exists to be switched between, and offering
     a repo the dashboard cannot open is worse than not offering it. Repos stopped with
@@ -244,10 +279,10 @@ def list_repos(*, existing_only: bool = True, served_only: bool = True) -> list[
         entries = [entry for entry in entries if entry.served]
     if existing_only:
         entries = [entry for entry in entries if _is_dir(entry.directory)]
-    # Latest-in-file first, then a STABLE sort by timestamp: within one second (which is as fine
-    # as ``last_seen`` gets) the order repos were last opened in decides.
+    # Latest-in-file first, then a STABLE sort: two repos genuinely active in the same instant
+    # are ordered by which was worked on last, rather than by wherever they sit in the file.
     entries.reverse()
-    entries.sort(key=lambda entry: entry.last_seen, reverse=True)
+    entries.sort(key=last_activity, reverse=True)
     return entries
 
 
