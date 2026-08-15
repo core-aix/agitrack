@@ -740,11 +740,17 @@ class CommitEngine:
         if exported_session.model:
             self.state.model = exported_session.model
 
-        # Remember which background tasks are still running so the pre-agent user-commit
-        # dialog knows the tree may have a concurrent writer (see the runner's
-        # _offer_pre_agent_user_commit). Best-effort: sessions without the field skip it.
+        # Remember which of the agent's background work is still running so the pre-agent
+        # user-commit dialog knows the tree may have a concurrent writer (see the runner's
+        # _offer_pre_agent_user_commit) and the auto-fold keeps waiting for the tree to settle.
+        # Backgrounded tasks and async SUB-AGENTS both qualify: each keeps editing this tree
+        # after the launching turn ended, which is exactly what makes ownership of an
+        # uncommitted change unknowable. Best-effort: sessions without the field skip it.
         try:
-            session.live_background_task_ids = list(getattr(exported_session, "live_background_task_ids", []) or [])
+            session.live_background_task_ids = [
+                *(getattr(exported_session, "live_background_task_ids", []) or []),
+                *(getattr(exported_session, "live_subagent_ids", []) or []),
+            ]
         except AttributeError:
             pass
 
@@ -793,6 +799,24 @@ class CommitEngine:
 
         if require_complete and all_turns and not all_turns[-1].complete:
             debug_fn(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
+            return None, awaited
+
+        # ASYNC SUB-AGENTS still working. The main agent can spawn sub-agents that outlive the
+        # turn that launched them, then post what reads as a final answer while they are doing
+        # the actual job. Committing there records a trace whose closing message says the work
+        # is done over a tree the sub-agents are still writing to — and the summarizer, whose
+        # only input is that trace, describes the request as finished. So the launching turn
+        # WAITS: nothing is lost, the watermark stays put, and once the sub-agents report back
+        # their work and the agent's follow-up land in the same commit. The exit/stop finalize
+        # (require_complete=False) still captures everything, and the liveness signal itself
+        # expires (see SUBAGENT_LIVE_HORIZON_SECONDS) so a sub-agent that died without
+        # reporting cannot hold commits forever.
+        live_subagents = list(getattr(exported_session, "live_subagent_ids", []) or [])
+        if require_complete and all_turns and live_subagents:
+            debug_fn(
+                f"deferring agent commit: {len(live_subagents)} async sub-agent(s) still running "
+                f"session_id={new_session_id}"
+            )
             return None, awaited
 
         # ENFORCED: a commit's trace never ends with an unanswered user message. A

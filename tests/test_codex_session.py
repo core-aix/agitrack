@@ -13,11 +13,13 @@ developer's real ``~/.codex`` session store.
 from __future__ import annotations
 
 import json
+import os
+import time
 
 import pytest
 
 from agitrack.transcripts import codex
-from agitrack.transcripts.types import turns_after
+from agitrack.transcripts.types import SUBAGENT_LIVE_HORIZON_SECONDS, turns_after
 
 SESSION = "019fe8dc-ca6c-7951-9225-73513aadf083"
 
@@ -325,6 +327,133 @@ def test_a_spawn_without_a_wait_still_reports_that_a_subagent_ran(codex_home):
     path = _write(codex_home, rows)
 
     assert codex.export_session_at(path).turns[0].subagents == ["spawn_agent"]
+
+
+def _spawn_result(child, *, kind="function_call_output"):
+    """The rollout row carrying what `spawn_agent` RETURNED. Codex records it as a plain
+    ``function_call_output`` for a direct call and as a ``custom_tool_call_output`` when the model
+    drives the tool from the ``exec`` JS sandbox; the printed payload is identical (both captured
+    from live runs), and the sandbox shape wraps it in the ``input_text`` block list."""
+    payload = json.dumps({"agent_id": child, "nickname": "Popper"})
+    output = payload if kind == "function_call_output" else [{"type": "input_text", "text": payload}]
+    return _row("response_item", {"type": kind, "output": output})
+
+
+def _subagent_notification(child):
+    return _row(
+        "response_item",
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": f'<subagent_notification>\n{{"agent_path":"{child}","status":{{"completed":null}}}}\n'
+                    "</subagent_notification>",
+                }
+            ],
+        },
+    )
+
+
+@pytest.mark.parametrize("result_kind", ["function_call_output", "custom_tool_call_output"])
+def test_an_unfinished_spawned_subagent_is_reported_as_live(codex_home, result_kind):
+    # `spawn_agent` is asynchronous and `wait_agent` is optional, so the agent can spawn a
+    # sub-agent, reply "kicked it off", and leave it editing the tree. The turn looks finished by
+    # every other measure, so without this the commit lands over half-done work.
+    child = "019fe8e3-7a9d-7d12-8e2b-da1425a793ce"
+    path = _write(
+        codex_home,
+        [
+            _meta(),
+            _row("event_msg", {"type": "task_started", "turn_id": "t1"}),
+            _row("event_msg", {"type": "user_message", "message": "delegate it"}),
+            _row("response_item", {"type": "function_call", "name": "spawn_agent", "arguments": '{"message":"go"}'}),
+            _spawn_result(child, kind=result_kind),
+            _row("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": "Kicked it off."}),
+        ],
+    )
+    # The child's own rollout has a turn OPEN — it is working right now.
+    _write(
+        codex_home,
+        [
+            _meta(session_id=child, thread_source="subagent"),
+            _row("event_msg", {"type": "task_started", "turn_id": "c1"}),
+        ],
+        session_id=child,
+    )
+
+    session = codex.export_session_at(path, session_id=SESSION)
+
+    assert session.turns[-1].complete and session.turns[-1].final_response == "Kicked it off."
+    assert session.live_subagent_ids == [child]
+
+
+def test_a_spawned_subagent_stops_being_live_once_it_finishes(codex_home):
+    # Two independent ends to a sub-agent's life, both of which must clear it: its own rollout
+    # closing the turn, and the `<subagent_notification>` the harness feeds back to the parent.
+    child = "019fe8e3-7a9d-7d12-8e2b-da1425a793ce"
+    spawn_rows = [
+        _meta(),
+        _row("event_msg", {"type": "task_started", "turn_id": "t1"}),
+        _row("event_msg", {"type": "user_message", "message": "delegate it"}),
+        _row("response_item", {"type": "function_call", "name": "spawn_agent", "arguments": '{"message":"go"}'}),
+        _spawn_result(child),
+        _row("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": "Kicked it off."}),
+    ]
+    path = _write(codex_home, spawn_rows)
+    _write(
+        codex_home,
+        [
+            _meta(session_id=child, thread_source="subagent"),
+            _row("event_msg", {"type": "task_started", "turn_id": "c1"}),
+            _row("event_msg", {"type": "task_complete", "turn_id": "c1"}),
+        ],
+        session_id=child,
+    )
+    assert codex.export_session_at(path, session_id=SESSION).live_subagent_ids == []
+
+    # The child was killed mid-turn and never closed its own rollout, but it reported back:
+    # the notification is enough on its own.
+    _write(
+        codex_home,
+        [
+            _meta(session_id=child, thread_source="subagent"),
+            _row("event_msg", {"type": "task_started", "turn_id": "c1"}),
+        ],
+        session_id=child,
+    )
+    notified = _write(codex_home, [*spawn_rows, _subagent_notification(child)])
+    assert codex.export_session_at(notified, session_id=SESSION).live_subagent_ids == []
+
+
+def test_a_stale_spawned_subagent_stops_deferring_commits(codex_home):
+    # A sub-agent killed so hard it never closed its rollout and never reported back would defer
+    # this repo's commits forever. Once its transcript has been silent past the horizon it is
+    # presumed dead — the whole reason the horizon exists.
+    child = "019fe8e3-7a9d-7d12-8e2b-da1425a793ce"
+    path = _write(
+        codex_home,
+        [
+            _meta(),
+            _row("event_msg", {"type": "task_started", "turn_id": "t1"}),
+            _row("event_msg", {"type": "user_message", "message": "delegate it"}),
+            _spawn_result(child),
+            _row("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": "Kicked it off."}),
+        ],
+    )
+    child_path = _write(
+        codex_home,
+        [
+            _meta(session_id=child, thread_source="subagent"),
+            _row("event_msg", {"type": "task_started", "turn_id": "c1"}),
+        ],
+        session_id=child,
+    )
+    stale = time.time() - SUBAGENT_LIVE_HORIZON_SECONDS - 60
+    os.utime(child_path, (stale, stale))
+
+    assert codex.export_session_at(path, session_id=SESSION).live_subagent_ids == []
 
 
 def test_a_built_in_tool_is_never_mistaken_for_an_mcp_tool(codex_home):
