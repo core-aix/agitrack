@@ -192,48 +192,49 @@ def test_agent_commit_message_contains_trace_and_metadata():
     assert "token_note" not in message
 
 
-def test_trace_message_headings_are_nested_two_levels_under_role():
-    # A message's own Markdown headings are pushed TWO levels below its "## User"/"## Agent"
-    # role heading, so a `##` a model wrote renders as `####`. One level nested correctly but
-    # did not READ correctly: in plain-text `git log` a message's own sections sat a single
-    # '#' away from the role scaffolding, so a reader had to count hashes to tell the trace's
-    # structure from the conversation's content.
+def test_trace_message_headings_are_pushed_down_two_levels():
+    # Every heading inside a trace message moves down by exactly two: `#` → `###`,
+    # `##` → `####`. A UNIFORM shift, not a re-basing of the shallowest heading to some
+    # floor — the levels are the message author's own and must survive as written. Two
+    # levels rather than one because one nested correctly but did not READ correctly: in
+    # plain-text `git log` a message's sections sat a single '#' from the role scaffolding,
+    # so telling the trace's structure from the conversation's content meant counting hashes.
     message = build_agent_commit_message(
         latest_prompt="do it",
         trace=[
             {"role": "user", "content": "# Big ask\nplease\n## Detail\nmore"},
-            {"role": "agent", "content": "### Already deep\nkept as-is"},
+            {"role": "agent", "content": "### Already deep\nkept relative"},
         ],
         backend="claude",
         backend_session_id="ses-1",
         agitrack_session_id="agit-1",
         model="m",
     )
-    # User content's shallowest heading was level 1, so everything shifts +3 to land it at 4.
-    assert "## User\n\n#### Big ask" in message
-    assert "##### Detail" in message
+    assert "## User\n\n### Big ask" in message  # level 1 -> 3, never outranking the role
+    assert "#### Detail" in message  # level 2 -> 4
     # The original level-1/level-2 headings must no longer appear as such.
     assert "\n# Big ask" not in message
     assert "\n## Detail" not in message
-    # Agent content started at level 3 — still above the floor, so it is pushed to 4 too.
-    assert "## Agent\n\n#### Already deep" in message
+    # A message that already nested deeper moves by the SAME two levels; it is not re-based
+    # onto the same floor as the message above, so its author's relative depth is preserved.
+    assert "## Agent\n\n##### Already deep" in message
 
 
-def test_a_message_heading_already_deep_enough_is_left_alone():
-    # Headings are only ever pushed DEEPER, never promoted: a message whose own sections
-    # already start at level 4 keeps them, so its internal hierarchy is not needlessly
-    # driven toward the level-6 Markdown cap (where distinct levels would collapse).
+def test_a_deeply_nested_message_heading_is_capped_at_six():
+    # Markdown has no level 7. A message already nesting near the bottom loses some depth
+    # there rather than the shift being abandoned — the rare case, and preferable to
+    # re-basing every message's headings onto a fixed floor.
     message = build_agent_commit_message(
         latest_prompt="x",
-        trace=[{"role": "agent", "content": "#### Four\nbody\n##### Five"}],
+        trace=[{"role": "agent", "content": "##### Five\nbody\n###### Six"}],
         backend="claude",
         backend_session_id="ses-1",
         agitrack_session_id="agit-1",
         model="m",
     )
 
-    assert "## Agent\n\n#### Four" in message
-    assert "##### Five" in message
+    assert "## Agent\n\n###### Five" in message
+    assert "####### " not in message  # never emits an invalid level-7 heading
 
 
 def test_trace_heading_nesting_skips_fenced_code_comments():
@@ -250,7 +251,7 @@ def test_trace_heading_nesting_skips_fenced_code_comments():
         agitrack_session_id="agit-1",
         model="m",
     )
-    assert "#### Heading" in message
+    assert "### Heading" in message
     assert "# just a comment" in message  # the comment kept its single '#'
 
 
