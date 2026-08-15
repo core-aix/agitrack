@@ -769,9 +769,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
     # whether the installed CLI has self-updated past it — can read it cheaply.
     if args.version:
-        from agitrack import __version__
-
-        print(__version__)
+        print(_version_line())
         return 0
 
     if args.hub_serve:
@@ -2513,6 +2511,48 @@ def _refuse_during_merge_conflict(repo: GitRepo) -> bool:
         "`git merge --abort`. Then start aGiTrack again."
     )
     return True
+
+
+def _version_line() -> str:
+    """What ``agitrack --version`` prints.
+
+    A package install prints the release version alone, exactly as before. A SOURCE checkout
+    prints the commit too — ``0.6.12 (source 06b6eb9a)``, with ``-dirty`` when the tree has
+    uncommitted changes — because on a checkout the release version is ambiguous: every commit
+    between two releases reports the same one, so "0.6.12" cannot answer "which code is this?",
+    which is the question anyone asks --version to settle. The release version stays FIRST and
+    unadorned so a prefix read (`--version | cut -d" " -f1`) still yields exactly what it did.
+
+    Side-effect-free by contract, like the caller: this looks only at aGiTrack's OWN install
+    directory and never discovers or touches the user's repository. Any failure degrades to the
+    bare version — reporting a version must not be something that can fail."""
+    from agitrack import __version__
+
+    try:
+        from agitrack.update.updater import detect_source_repo
+
+        root = detect_source_repo()
+        if root is None:
+            return __version__
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if not rev:
+            return __version__
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        return f"{__version__} (source {rev}{'-dirty' if dirty else ''})"
+    except Exception:
+        return __version__
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:
