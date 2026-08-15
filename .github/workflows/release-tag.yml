@@ -38,7 +38,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v7
 
       - name: Extract version from tag
         id: version
@@ -162,7 +162,7 @@ jobs:
       # CLI release and its extension move together. Skipped when VSCE_TOKEN is unset.
       - name: Set up Node
         if: ${{ env.VSCE_TOKEN != '' }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -196,7 +196,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
 
       - name: Install runtime + build deps
         run: uv sync --group build

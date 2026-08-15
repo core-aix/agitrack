@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/dependency-review-action@v5
         with:
           # Block the merge on high and critical only. Moderate findings are surfaced in the
           # comment for a human to weigh: this project's dependency tree is small, and a
