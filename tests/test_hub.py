@@ -9,6 +9,7 @@ reconstruction of its past agent sessions.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,52 @@ def test_remembering_a_repo_lists_it_most_recent_first(tmp_path):
 
     listed = [entry.name for entry in repo_registry.list_repos()]
     assert listed[0] == "b" and set(listed) == {"a", "b"}
+
+
+def test_repos_are_ordered_by_when_they_were_last_updated(tmp_path):
+    # The switcher's documented convention: most recently UPDATED first, read from each repo's
+    # reflog (`.git/logs/HEAD`), which git rewrites on every commit. `last_seen` alone could not
+    # order this list — it is "when a tracker last started here", and one self-update sweep
+    # restarts every tracker within the same second, collapsing the order to a tie broken by
+    # position in the file.
+    for name, when in (("stale", 1_000_000), ("newest", 3_000_000), ("middle", 2_000_000)):
+        _repo(tmp_path, name)
+        repo_registry.remember(tmp_path / name)
+        reflog = tmp_path / name / ".git" / "logs" / "HEAD"
+        os.utime(reflog, (when, when))
+
+    assert [entry.name for entry in repo_registry.list_repos()] == ["newest", "middle", "stale"]
+
+
+def test_a_repo_with_no_commits_is_ordered_by_when_it_was_last_worked_on(tmp_path):
+    # A directory with no reflog — opened with `-d` alone, reflogs disabled, or not a git repo at
+    # all (listed for its reconstruction) — still has to sit somewhere sensible, so it falls back
+    # to `last_seen` rather than to the bottom of the list forever.
+    _repo(tmp_path, "committed")
+    repo_registry.remember(tmp_path / "committed")
+    reflog = tmp_path / "committed" / ".git" / "logs" / "HEAD"
+    os.utime(reflog, (1_000_000, 1_000_000))
+    (tmp_path / "justopened").mkdir()
+    entry = repo_registry.remember(tmp_path / "justopened")  # remembered now, so: most recent
+
+    assert entry.last_seen > 1_000_000
+    assert [e.name for e in repo_registry.list_repos()] == ["justopened", "committed"]
+
+
+def test_a_tracker_restart_does_not_reshuffle_the_switcher(tmp_path):
+    # The regression the reflog signal exists for: `remember` bumps `last_seen`, and a tracker
+    # records its repo at startup, so a restart sweep re-stamped every repo at once. Ordering on
+    # `max(last_seen, reflog)` would have put the whole list back on that tie.
+    for name, when in (("older", 1_000_000), ("newer", 2_000_000)):
+        _repo(tmp_path, name)
+        repo_registry.remember(tmp_path / name)
+        reflog = tmp_path / name / ".git" / "logs" / "HEAD"
+        os.utime(reflog, (when, when))
+    before = [entry.name for entry in repo_registry.list_repos()]
+
+    repo_registry.remember(tmp_path / "older")  # its tracker restarts; nothing was committed
+
+    assert [entry.name for entry in repo_registry.list_repos()] == before == ["newer", "older"]
 
 
 def test_a_repo_whose_directory_is_gone_is_not_offered(tmp_path):

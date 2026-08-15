@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -75,6 +76,49 @@ def _runner(tmp_path, *, manual: bool):
 
 
 # --- manual mode ------------------------------------------------------------
+
+
+def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
+    # A tracker that outlives its repo has nothing to do and NO WAY to be told so: `-b stop` and
+    # `agitrack stop` both work through files under `<repo>/.agitrack/`, which went with the
+    # directory. It polls a missing path every few seconds until the machine reboots. Temp-dir
+    # repos make this routine — a scratch clone or a test run under /tmp is removed while its
+    # tracker keeps going (six such daemons were found alive on a developer's machine).
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    shutil.rmtree(repo.repo)
+
+    runner._loop()  # returns rather than polling forever
+
+    assert runner._stop.is_set()
+    # `_explicit_stop` so the update-restart path does not resurrect a tracker for a repo that
+    # no longer exists.
+    assert runner._explicit_stop is True
+
+
+def test_a_tracker_keeps_running_when_only_git_was_removed(tmp_path):
+    # Only the DIRECTORY disappearing is unambiguous. A repo whose `.git` was removed is one the
+    # user still has and may be about to re-init, and quitting there would throw away the pending
+    # turn this tracker holds.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    shutil.rmtree(repo.repo / ".git")
+
+    assert runner._repo_is_gone() is False
+
+
+def test_a_tracker_never_stops_because_the_check_itself_failed(tmp_path, monkeypatch):
+    # A permission error or a stalled network mount is not an answer. Treating "cannot tell" as
+    # "gone" would stop a tracker on a repo that is merely slow to reach.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, _repo, _state, _backend = _runner(proj, manual=False)
+    monkeypatch.setattr(Path, "exists", lambda _self: (_ for _ in ()).throw(OSError("mount stalled")))
+
+    assert runner._repo_is_gone() is False
 
 
 def test_a_tracker_remembers_its_repo_for_the_dashboard_switcher(tmp_path, monkeypatch):
