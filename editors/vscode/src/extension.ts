@@ -21,7 +21,7 @@ import { execFile, spawn } from "child_process";
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { mkdtemp, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
-import { basename, join } from "path";
+import { join } from "path";
 
 import { GhStatus, hasGithubRemoteUrl, shouldPromptGithubSignIn } from "./github";
 import { dedupe, exeCandidatesFromScriptDirs, exeName, staticExeCandidates } from "./installPaths";
@@ -1180,10 +1180,12 @@ async function fetchLatestMsiAsset(repo: string): Promise<MsiAsset | undefined> 
  *    is predictable, so anything able to write there could pre-create or symlink that name and
  *    have the installer run its file instead. A fresh `mkdtemp` directory is unguessable and
  *    created with owner-only permissions.
- *  - `basename` of the asset name. The name comes from the GitHub releases API — data from off
- *    the machine — and `join` happily walks out of the directory given `..` segments. The asset
- *    pattern in msi.ts already refuses separators; this is the second lock on the same door,
- *    where the value is actually used. */
+ *  - A FIXED filename. The asset's own name comes from the GitHub releases API — data from off
+ *    the machine — and `join` walks out of the directory given `..` segments. It also buys
+ *    nothing: this path is passed to msiexec and never shown, so nothing downstream needs the
+ *    remote name. Not deriving the path from remote data at all is stronger than sanitising it,
+ *    and leaves no tainted value to reason about. (msi.ts independently refuses an asset name
+ *    containing a separator, which is where that contract belongs.) */
 async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
   const resp = await fetch(asset.url, {
     headers: { Accept: "application/octet-stream", "User-Agent": "agitrack-vscode" },
@@ -1193,7 +1195,7 @@ async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
   }
   const bytes = Buffer.from(await resp.arrayBuffer());
   const dir = await mkdtemp(join(tmpdir(), "agitrack-msi-"));
-  const dest = join(dir, basename(asset.name));
+  const dest = join(dir, "agitrack.msi");
   await writeFile(dest, bytes);
   return dest;
 }
