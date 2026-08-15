@@ -54,6 +54,25 @@ test("pickMsiAsset is defensive about malformed asset shapes", () => {
   assert.equal(pickMsiAsset([{ name: "agitrack-1-windows-x64.msi" }, null, 7]), undefined); // no url
 });
 
+test("pickMsiAsset rejects an asset name carrying a path separator", () => {
+  // The name is joined onto a temp directory and the result is handed to `msiexec /i`, which
+  // self-elevates through UAC — so a name that walks out of that directory chooses what runs as
+  // administrator. The old pattern used `.+`, which matches `/` and `\\`, so these passed.
+  const url = "https://example.invalid/a.msi";
+  for (const name of [
+    "agitrack-..\\..\\..\\Startup\\evil-windows-x64.msi",
+    "agitrack-../../../tmp/evil-windows-x64.msi",
+    "agitrack-a/b-windows-x64.msi",
+  ]) {
+    assert.equal(pickMsiAsset([{ name, browser_download_url: url }]), undefined, name);
+  }
+  // ...while the real asset name is still accepted.
+  assert.deepEqual(pickMsiAsset([{ name: "agitrack-0.6.12-windows-x64.msi", browser_download_url: url }]), {
+    name: "agitrack-0.6.12-windows-x64.msi",
+    url,
+  });
+});
+
 test("programFilesDirs prefers ProgramW6432, includes (x86), dedupes, and falls back", () => {
   const dirs = programFilesDirs({
     ProgramW6432: "C:\\Program Files",

@@ -2,16 +2,24 @@ version: 2
 
 # Version updates, grouped and throttled. The goal is a small number of reviewable PRs, not a
 # notification stream: this repository releases on every merge into main, so an ungrouped
-# dependabot would cut a release per bumped pin.
+# dependabot would cut a release per bumped pin once these reach it.
 #
 # Security updates (advisories against what we already depend on) are a separate GitHub setting
 # and are not configured here; they open PRs regardless of these schedules, which is the point.
+
+# TARGET BRANCH: dev, for every ecosystem below. Dependabot defaults to the repository's default
+# branch, and that used to be `main` — where a merge cuts a release, so the dependency-review and
+# CodeQL gates ran at the same moment as the publish rather than before it. Everything now lands on
+# dev first, is checked there by CI + CodeQL (push) and dependency review (PR), and reaches main
+# through the normal release. Stated explicitly rather than relying on the default so that flipping
+# the default branch back cannot silently re-point the bots at the release branch.
 
 updates:
   # The Python package itself. `uv` is the ecosystem for a uv.lock project; it updates
   # pyproject.toml and the lockfile together, which pip-style updates would leave inconsistent.
   - package-ecosystem: uv
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday
@@ -32,6 +40,7 @@ updates:
   # release-tag.yml has publish rights to PyPI and the Marketplace. Worth keeping current.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
       day: monday
@@ -47,6 +56,7 @@ updates:
   # they exist here so that a real advisory still surfaces rather than sitting unseen.
   - package-ecosystem: npm
     directory: /editors/vscode
+    target-branch: dev
     schedule:
       interval: monthly
     open-pull-requests-limit: 3

@@ -788,9 +788,16 @@ def _session_to_stats(
 def _virtual_sha(backend: str, session_id: str, index: int, assistant_id: str) -> str:
     """A stable, unique 40-hex id for a turn — used as the dashboard row key and the
     ``/diff`` lookup key. It looks like a git sha (so the front-end treats it as one and
-    offers the diff button) but is a hash of the turn's identity, never a real object."""
+    offers the diff button) but is a hash of the turn's identity, never a real object.
+
+    SHA-256 truncated to git-sha width, not SHA-1. Nothing here depends on the hash being
+    strong — this is a display and lookup key, and an attacker who could pick colliding turn
+    identities would gain nothing but a merged dashboard row — so the change is not a fix for a
+    vulnerability. It is free (the value is recomputed on every read and persisted nowhere), and
+    it keeps a standing "weak hashing" alert off the Security tab, where a known-benign finding
+    costs more in the attention it takes from real ones than the swap costs here."""
     raw = f"{backend}:{session_id}:{index}:{assistant_id}".encode()
-    return hashlib.sha1(raw).hexdigest()
+    return hashlib.sha256(raw).hexdigest()[:40]
 
 
 _SUBJECT_MAX = 100

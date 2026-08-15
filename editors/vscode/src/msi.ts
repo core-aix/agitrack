@@ -35,8 +35,14 @@ export interface MsiAsset {
   url: string;
 }
 
-/** The release asset filename the build produces: `agitrack-<version>-windows-x64.msi`. */
-const MSI_ASSET_RE = /^agitrack-.+-windows-x64\.msi$/i;
+/** The release asset filename the build produces: `agitrack-<version>-windows-x64.msi`.
+ *
+ * The middle is `[^/\\]+`, NOT `.+`: this name is joined onto a temp directory and the result is
+ * handed to `msiexec /i`, which self-elevates through UAC. `.` matches a path separator, so
+ * `agitrack-..\..\..\evil-windows-x64.msi` satisfied the old pattern and escaped the directory it
+ * was supposed to land in. Rejecting separators here states the contract where it belongs — an
+ * asset name is a FILE name — and the download path defends itself again with `basename`. */
+const MSI_ASSET_RE = /^agitrack-[^/\\]+-windows-x64\.msi$/i;
 
 /** Pick the Windows x64 MSI asset out of a GitHub release `assets` array, or `undefined`
  * when the release carries none. Defensive about shape — the value comes straight off the
