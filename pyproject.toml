@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=83 for GHSA/CVE coverage, not for a feature: below it, `MANIFEST.in` exclusions can be
+# bypassed when building an sdist through a Unicode normalization collision (NFC vs NFD) on
+# macOS APFS/HFS+ — so a file this project deliberately excludes could still ship. Releases are
+# built on macOS runners, which is exactly the affected filesystem. The lockfile pins the
+# resolved version for everything else; this is the floor the PEP 517 build environment gets.
+requires = ["setuptools>=83"]
 build-backend = "setuptools.build_meta"
 
 # Ship ONLY the import package (and its subpackages). Without this, setuptools'
