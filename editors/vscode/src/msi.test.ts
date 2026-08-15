@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "crypto";
 import { test } from "node:test";
 
 import {
@@ -7,6 +8,7 @@ import {
   latestReleasePageUrl,
   msiInstallCandidates,
   pickMsiAsset,
+  verifyMsiDigest,
   programFilesDirs,
   releasesApiUrl,
 } from "./msi";
@@ -71,6 +73,39 @@ test("pickMsiAsset rejects an asset name carrying a path separator", () => {
     name: "agitrack-0.6.12-windows-x64.msi",
     url,
   });
+});
+
+test("pickMsiAsset carries the release asset's sha256 digest through", () => {
+  // The digest is what the download path verifies the installer against before running it with
+  // UAC elevation, so it has to survive asset selection — and be absent, not invented, when the
+  // API does not supply one.
+  const url = "https://example.invalid/a.msi";
+  const withDigest = pickMsiAsset([
+    { name: "agitrack-0.6.12-windows-x64.msi", browser_download_url: url, digest: "sha256:abc123" },
+  ]);
+  assert.equal(withDigest?.digest, "sha256:abc123");
+  const without = pickMsiAsset([{ name: "agitrack-0.6.12-windows-x64.msi", browser_download_url: url }]);
+  assert.equal(without?.digest, undefined);
+});
+
+test("verifyMsiDigest accepts bytes matching the published sha256", () => {
+  const bytes = Buffer.from("installer bytes");
+  const hex = createHash("sha256").update(bytes).digest("hex");
+  verifyMsiDigest(bytes, `sha256:${hex}`);
+  verifyMsiDigest(bytes, `SHA256:${hex.toUpperCase()}`); // case is not significant
+});
+
+test("verifyMsiDigest refuses a mismatch, and refuses when there is no digest at all", () => {
+  // This runs before the bytes reach disk or msiexec, which self-elevates through UAC — so the
+  // absent-digest case FAILS CLOSED too. An unverifiable installer run as administrator is not a
+  // trade worth making for the convenience of an automatic install; the caller turns the throw
+  // into an error with an "Open Releases Page" button.
+  const bytes = Buffer.from("installer bytes");
+  const wrong = createHash("sha256").update("something else").digest("hex");
+  assert.throws(() => verifyMsiDigest(bytes, `sha256:${wrong}`), /did not match the digest/);
+  assert.throws(() => verifyMsiDigest(bytes, undefined), /no sha256 digest/);
+  assert.throws(() => verifyMsiDigest(bytes, ""), /no sha256 digest/);
+  assert.throws(() => verifyMsiDigest(bytes, "md5:abc"), /no sha256 digest/);
 });
 
 test("programFilesDirs prefers ProgramW6432, includes (x86), dedupes, and falls back", () => {

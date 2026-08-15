@@ -31,6 +31,7 @@ import {
   MsiAsset,
   msiInstallCandidates,
   pickMsiAsset,
+  verifyMsiDigest,
   releasesApiUrl,
 } from "./msi";
 import { sessionLooksLive } from "./liveness";
@@ -1194,11 +1195,13 @@ async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
     throw new Error(`downloading the installer returned ${resp.status} ${resp.statusText}`);
   }
   const bytes = Buffer.from(await resp.arrayBuffer());
+  verifyMsiDigest(bytes, asset.digest);
   const dir = await mkdtemp(join(tmpdir(), "agitrack-msi-"));
   const dest = join(dir, "agitrack.msi");
   await writeFile(dest, bytes);
   return dest;
 }
+
 
 /** Run the downloaded MSI. `msiexec /i` self-elevates (UAC) for the perMachine install; we
  * wait for it and tolerate exit 3010 (success, reboot advised) as success. The long timeout
