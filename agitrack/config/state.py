@@ -420,16 +420,46 @@ class AgitrackState:
     def backend_message_id_for(self, session_id: str | None) -> str | None:
         """The committed high-water assistant message id to use when parsing *session_id*.
 
-        The conversation aGiTrack is currently tracking (``backend_session_id``) keeps using
-        the primary single watermark, so behavior is IDENTICAL when no switch happens and
-        every existing reset of ``last_backend_message_id`` still governs it. Only a
-        DIFFERENT conversation — one the user switched to inside the backend — reads its own
-        remembered mark from the per-conversation map (``None`` if it was never committed, so
-        all of its turns are new). This is what makes switching between conversations exact:
-        switching back to a prior one no longer replays and re-counts its committed turns."""
-        if not session_id or session_id == self.backend_session_id:
+        A conversation reads its OWN remembered mark from the per-conversation map, and
+        ``None`` when it has never committed — every one of its turns is then new. Only that
+        makes switching between conversations exact: switching back to a prior one no longer
+        replays and re-counts its committed turns.
+
+        **A conversation must never inherit ANOTHER conversation's mark.** The map used to be
+        consulted only for a conversation OTHER than the tracked one, so a brand-new
+        conversation — ``backend_session_id`` already reassigned to it, nothing of its own
+        committed yet — read the global ``last_backend_message_id`` still holding the PREVIOUS
+        conversation's id. That id matches no turn boundary in the new conversation, and
+        ``backend_message_marked_at_for`` (rightly per-conversation) returns None for it, so
+        ``turns_after`` fell through to its last-resort ``turns[-1:]`` branch and silently
+        discarded every earlier turn — prompt, tokens and trace never reaching any commit.
+        Seen live: commit bccd5332 in this repo covers the second of two turns and the first
+        was never recorded anywhere (2026-08-15).
+
+        Two things still hold, which is why the global is not simply ignored:
+
+        * **An explicit reset still clears the watermark.** Several paths do
+          ``state.last_backend_message_id = None`` to mean "start tracking from scratch"; a
+          falsy global therefore short-circuits to None before the map is ever read.
+        * **Legacy state keeps working.** ``set_backend_message_id`` always writes the global
+          and the map entry together, so a global that appears NOWHERE in the map predates the
+          map (an upgrade) and is the tracked conversation's own mark — it is honoured. A
+          global that IS in the map belongs to whichever conversation recorded it, and is
+          never lent to a different one."""
+        if not session_id:
             return self.last_backend_message_id
-        value = (self.data.get("backend_message_ids") or {}).get(str(session_id))
+        ids = self.data.get("backend_message_ids") or {}
+        if session_id == self.backend_session_id:
+            current = self.last_backend_message_id
+            if not current:
+                return None  # an existing "recompute from scratch" reset still governs
+            own = ids.get(str(session_id))
+            if own:
+                return str(own)
+            if current in {str(known) for known in ids.values() if known}:
+                return None  # the global is ANOTHER conversation's mark; this one has none
+            return current  # pre-map legacy state: the global is this conversation's own mark
+        value = ids.get(str(session_id))
         return str(value) if value else None
 
     def set_backend_message_id(

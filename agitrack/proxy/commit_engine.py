@@ -905,17 +905,44 @@ class CommitEngine:
             # Advance the watermark for THIS conversation so the next parse cycle only
             # exports its new turns — keyed per conversation so a later switch back to a
             # different conversation reads its own mark, never this one's. Prefer the last turn
-            # that actually carried a response; fall back to the last turn's ids for a no-text
-            # finished turn (its assistant id is empty, so the user id anchors the watermark).
+            # that actually carried a response; fall back to the last turn for a no-text
+            # finished turn. Which of the turn's two ids anchors the mark is decided below.
             watermark = complete_turns[-1] if complete_turns else last_turn
-            mark_id = watermark.assistant_message_id or watermark.user_message_id if watermark else None
+            # A turn captured MID-FLIGHT is anchored on its USER id — never on whatever
+            # assistant id it happens to carry at this instant. A backend mints a NEW message
+            # id for each assistant response within a turn, so the id a force capture (the
+            # exit/stop finalize, `require_complete=False`) reads is TRANSIENT: when the turn
+            # continues, its `assistant_message_id` becomes a later one, the stored mark then
+            # matches no turn boundary, and turns_after's marked_at fallback drops the turn
+            # for having STARTED before the mark. Its prompt, tokens and trace are then in no
+            # commit at all. The user id is stable for the turn's whole life and is exactly
+            # what turns_after re-exports INCLUSIVELY once the turn finishes.
+            #
+            # This used to key off `not watermark.assistant_message_id`, which caught only a
+            # turn captured before it had said ANYTHING — every mid-flight turn that had
+            # already spoken (the common case; a daemon restart mid-turn) fell through to the
+            # transient id. Easy to hit: `uv run` reinstalls the editable package, the tracker
+            # reads that as "aGiTrack updated on disk" and restarts. Reproduced by replaying a
+            # real transcript truncated at 25/50/75% through a turn — the turn vanished from
+            # every later commit each time (2026-08-15).
+            anchor_on_user = (
+                watermark is not None
+                and bool(watermark.user_message_id)
+                and (not watermark.assistant_message_id or not watermark.complete)
+            )
+            if watermark is None:
+                mark_id = None
+            elif anchor_on_user:
+                mark_id = watermark.user_message_id
+            else:
+                mark_id = watermark.assistant_message_id or watermark.user_message_id
             if watermark is not None and mark_id:
                 self.state.set_backend_message_id(
                     self.state.backend_session_id,
                     mark_id,
                     marked_at=(watermark.ended_at or watermark.started_at or time.time()),
                 )
-            if watermark is not None and not watermark.assistant_message_id and watermark.user_message_id:
+            if watermark is not None and anchor_on_user:
                 # Force-captured mid-turn: the next parse re-exports this turn INCLUSIVELY
                 # once it finishes. Remember the usage counted SO FAR (cumulative, so a
                 # second force-capture of the same still-running turn updates it) and

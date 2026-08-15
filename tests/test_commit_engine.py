@@ -16,6 +16,7 @@ from agitrack.transcripts.opencode import SessionTurn
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.session import Session
 from agitrack.transcripts import ExportedSession
+from agitrack.transcripts.types import turns_after
 from agitrack.config import AgitrackState
 
 
@@ -1689,7 +1690,15 @@ def test_finish_parse_exit_commits_dangling_no_text_turn(tmp_path):
     )
     assert result is True
     assert len(commits) == 1
-    assert state.last_backend_message_id == "a1"
+    # Anchored on the USER id, not the assistant id the turn happens to carry: the turn is
+    # captured MID-FLIGHT (complete=False) and has sent no reply, so per the force-capture
+    # contract it must re-export INCLUSIVELY if the backend resumes and finishes it. Keying on
+    # "a1" instead lost that turn outright — a resumed turn's real final message and edits
+    # matched no boundary and the marked_at fallback dropped it for having started earlier.
+    # While it stays dangling both anchors behave identically (turns_after excludes a user-id
+    # watermarked turn that still has no final_response).
+    assert state.last_backend_message_id == "u1"
+    assert state.partial_turn_usage()["user_id"] == "u1"  # tokens counted once, via the delta
 
 
 def test_finish_parse_discards_stale_session_result(tmp_path):
@@ -1899,6 +1908,96 @@ def test_watermark_advance_records_the_mark_timestamp(tmp_path):
     )
     assert result is True
     assert state.backend_message_marked_at_for("ses-mark") == 1010
+
+
+def test_a_midflight_capture_anchors_on_the_user_id_not_a_transient_assistant_id(tmp_path):
+    # THE BUG (2026-08-15): a backend mints a NEW message id per assistant response within a
+    # turn, so the assistant id a force capture (exit/stop finalize, e.g. the tracker
+    # restarting mid-turn) reads is TRANSIENT. Anchoring on it meant that once the turn
+    # continued, its assistant_message_id became a later id, the stored mark matched no turn
+    # boundary, and turns_after's marked_at fallback dropped the turn for having STARTED
+    # before the mark — prompt, tokens and trace in no commit at all. The old guard keyed on
+    # `not assistant_message_id`, so it caught only a turn captured before it had said
+    # ANYTHING; every mid-flight turn that had already spoken (the common case) fell through.
+    session = Session.bare()
+    midflight = SessionTurn(
+        "u1",
+        "msg_transient",  # the id it happens to carry right now
+        "rewrite the parser",
+        "Working on it…",  # it HAS already spoken, which is what defeated the old guard
+        TokenUsage(total=40, output=40),
+        None,
+        complete=False,
+        started_at=1000,
+        ended_at=1200,
+    )
+    exported = ExportedSession("ses-mid", "m", None, [midflight])
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    state.data["backend_session_id"] = "ses-mid"
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,  # the stop finalize: capture the in-flight turn
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert state.backend_message_id_for("ses-mid") == "u1"  # stable for the turn's whole life
+    assert state.partial_turn_usage()["user_id"] == "u1"  # so tokens are counted exactly once
+
+    # The turn finishes under the restarted tracker, with a DIFFERENT assistant id. It must
+    # still be exported (and so committed), carrying the user's prompt with it.
+    finished = SessionTurn(
+        "u1",
+        "msg_final",
+        "rewrite the parser",
+        "Done.",
+        TokenUsage(total=90, output=90),
+        None,
+        started_at=1000,
+        ended_at=1500,
+    )
+    later = ExportedSession("ses-mid", "m", None, [finished])
+    remaining = turns_after(
+        later,
+        state.backend_message_id_for("ses-mid"),
+        marked_at=state.backend_message_marked_at_for("ses-mid"),
+    )
+    assert [t.user_prompt for t in remaining] == ["rewrite the parser"]
+    # Only the delta is added on the re-commit, so the re-export cannot inflate the tokens.
+    engine._add_turn_usage(finished)
+    assert state.pending_token_usage()["output"] == 50
+
+
+def test_a_conversations_own_lost_watermark_still_reaches_the_bounded_fallback(tmp_path):
+    # Guard for the guard. Bug A's fix makes a conversation with no mark of its own report
+    # None (all turns new). It must NOT also blank a mark that genuinely BELONGS to this
+    # conversation but has stopped matching a boundary (a compaction reshaping turns) —
+    # that watermark has to survive so turns_after still reaches its bounded fallback. Blanking
+    # it would re-export the whole conversation, which is exactly the 31M-token 20-day commit
+    # of 2026-07-25 that test_lost_watermark_never_reexports_the_whole_session pins.
+    state = AgitrackState(tmp_path)
+    state.data["backend_session_id"] = "ses-own"
+    state.set_backend_message_id("ses-own", "msg_now_vanished", marked_at=500)
+
+    assert state.backend_message_id_for("ses-own") == "msg_now_vanished"
+    assert state.backend_message_marked_at_for("ses-own") == 500
+
+    old = SessionTurn("u1", "a1", "ancient", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    newer = SessionTurn("u2", "a2", "recent", "done", TokenUsage(output=10), None, started_at=900, ended_at=950)
+    exported = ExportedSession("ses-own", "m", None, [old, newer])
+    remaining = turns_after(
+        exported,
+        state.backend_message_id_for("ses-own"),
+        marked_at=state.backend_message_marked_at_for("ses-own"),
+    )
+    assert remaining == [newer]  # bounded by time — the ancient turn is never re-exported
 
 
 def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):
