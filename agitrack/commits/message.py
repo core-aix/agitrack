@@ -148,14 +148,16 @@ ATX_HEADING_RE = re.compile(r"^(#{1,6})(\s.*)$")
 CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # The role heading for each trace turn ("## User" / "## Agent") is level 2.
 TRACE_ROLE_HEADING_LEVEL = 2
-# ...and a message's own headings start TWO levels below it, at level 4, so a `##` a model
-# wrote inside its reply renders as `####`. One level (the original) was enough for correct
-# Markdown nesting but not enough to READ correctly: at level 3 a message's own sections sat
-# only one `#` away from the `## User`/`## Agent` scaffolding, and in `git log` — plain text,
-# no rendering — a reader scanning for role headings had to count hashes to tell the trace's
-# own structure from the conversation's content. Two levels makes the scaffolding visually
-# distinct at a glance. Only ever pushes deeper: a message already at level 4+ is untouched.
-TRACE_CONTENT_HEADING_LEVEL = TRACE_ROLE_HEADING_LEVEL + 2
+# Every heading inside a trace message moves down by exactly this much: `#` → `###`,
+# `##` → `####`. A FIXED shift, not a normalization of the shallowest heading to some floor —
+# the message's own levels are its author's, and re-basing them changes what the author wrote
+# about their own structure. Two levels because one nested correctly but did not READ
+# correctly: at level 3 a message's own sections sat a single `#` from the `## User`/`## Agent`
+# scaffolding, and in plain-text `git log` telling the trace's structure from the
+# conversation's content meant counting hashes. Levels are capped at the Markdown maximum of
+# 6, so a message already nesting 5 deep loses some depth at the bottom — the rare case, and
+# preferable to re-basing every message.
+TRACE_HEADING_SHIFT = 2
 
 
 # Section header that marks a commit as carrying aGiTrack metadata. Detection of
@@ -993,18 +995,17 @@ def _body_lines(text: str) -> list[str]:
 
 
 def _nest_headings_under_role(content: str) -> str:
-    """Shift the Markdown headings inside one trace message so the shallowest one sits
-    :data:`TRACE_CONTENT_HEADING_LEVEL` (level 4) deep — two below its ``## User`` /
-    ``## Agent`` role heading, so a message's own ``##`` renders as ``####``. The relative
-    hierarchy is preserved — every heading moves by the same amount — so the rendered commit
-    log nests the message's own sections under its role instead of letting a message ``#``
-    outrank the role it belongs to, and keeps the trace's scaffolding readable at a glance in
-    plain-text `git log`.
+    """Push every Markdown heading inside one trace message down by
+    :data:`TRACE_HEADING_SHIFT` levels: ``#`` becomes ``###``, ``##`` becomes ``####``.
 
-    Headings are only ever pushed deeper, never promoted; a message already nested at level
-    4+ is left as-is. Fenced code blocks are skipped, since a leading ``#`` there is content
-    being QUOTED — a shell comment, or a Markdown example — and rewriting it would falsify
-    what the message showed. Levels are capped at the Markdown maximum of 6."""
+    A uniform shift, so the message's own hierarchy survives exactly as its author wrote it
+    and nothing it wrote can outrank the ``## User`` / ``## Agent`` role heading it belongs
+    to (the shallowest possible result is level 3). Two levels rather than one keeps the
+    trace's scaffolding distinguishable at a glance in plain-text ``git log``.
+
+    Fenced code blocks are skipped, since a leading ``#`` there is content being QUOTED — a
+    shell comment, or a Markdown example — and rewriting it would falsify what the message
+    showed. Levels are capped at the Markdown maximum of 6."""
     lines = content.splitlines()
     in_fence = False
     fence_marker = ""
@@ -1025,12 +1026,8 @@ def _nest_headings_under_role(content: str) -> str:
             headings.append((index, len(heading.group(1)), heading.group(2)))
     if not headings:
         return content
-    shallowest = min(level for _, level, _ in headings)
-    shift = max(0, TRACE_CONTENT_HEADING_LEVEL - shallowest)
-    if not shift:
-        return content
     for index, level, rest in headings:
-        lines[index] = "#" * min(6, level + shift) + rest
+        lines[index] = "#" * min(6, level + TRACE_HEADING_SHIFT) + rest
     return "\n".join(lines)
 
 
