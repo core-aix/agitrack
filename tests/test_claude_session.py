@@ -832,6 +832,156 @@ def test_parse_rows_tracks_live_background_tasks_from_the_notification_stream():
     assert session.live_background_task_ids == ["task-live"]
 
 
+def _async_launch(uuid, tool_id, agent_id, **extra):
+    """The tool result Claude Code returns for an ASYNC Agent/Task call: the sub-agent's id
+    and a note that it keeps working in the background."""
+    row = {
+        "type": "user",
+        "uuid": uuid,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Async agent launched successfully. (This tool result is internal metadata.)\n"
+                                f"agentId: {agent_id} (internal ID - do not mention to user.)\n"
+                                "The agent is working in the background."
+                            ),
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    row.update(extra)
+    return row
+
+
+def test_parse_rows_tracks_async_subagents_until_they_report_back():
+    # An async sub-agent outlives the turn that launched it: the main agent posts what reads
+    # as a final answer and the sub-agent keeps editing the tree. Recording the launch is what
+    # lets the commit engine wait (see finish_parse_if_ready) instead of committing a
+    # finished-sounding trace over half-done work.
+    import datetime
+
+    def _iso(seconds_ago):
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+        return moment.isoformat().replace("+00:00", "Z")
+
+    rows = [
+        _user("u1", "rewrite the parser", timestamp=_iso(300)),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}], stop_reason="tool_use"
+        ),
+        _async_launch("r1", "t1", "agent-live", timestamp=_iso(240)),
+        _assistant("m2", "Agent is running in the background.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-sub", rows)
+
+    # The launching turn looks entirely finished — which is exactly why the liveness signal
+    # has to come from somewhere other than the turn itself.
+    assert session.turns[-1].complete and session.turns[-1].final_response
+    assert session.live_subagent_ids == ["agent-live"]
+
+    # Its terminal notification ends it, whichever row shape the harness used to deliver it.
+    done = rows + [
+        _user(
+            "tn1",
+            "<task-notification>\n<task-id>agent-live</task-id>\n<status>completed</status>\n</task-notification>",
+        ),
+        _assistant("m3", "Agent finished; verified its claims.", stop_reason="end_turn"),
+    ]
+    assert parse_rows("sess-sub", done).live_subagent_ids == []
+
+
+def test_parse_rows_async_subagent_liveness_expires_and_follows_its_transcript():
+    # Two guards on the deferral. A sub-agent still WRITING its own transcript stays live
+    # however long it runs (the mtime keeps refreshing), while one that died without ever
+    # reporting back — killed process, crashed harness — goes stale and stops holding this
+    # repo's commits hostage.
+    import datetime
+
+    def _iso(seconds_ago):
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+        return moment.isoformat().replace("+00:00", "Z")
+
+    rows = [
+        _user("u1", "long job", timestamp=_iso(9000)),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}], stop_reason="tool_use"
+        ),
+        _async_launch("r1", "t1", "agent-old", timestamp=_iso(9000)),
+        _assistant("m2", "Running in the background.", stop_reason="end_turn"),
+    ]
+
+    # Launched hours ago and silent ever since: presumed dead, no longer deferring.
+    assert parse_rows("sess-sub2", rows).live_subagent_ids == []
+    # Same launch, but its transcript was written to a minute ago: still working.
+    fresh = {"agent-old": int(time.time()) - 60}
+    assert parse_rows("sess-sub2", rows, subagent_activity=fresh).live_subagent_ids == ["agent-old"]
+
+
+def test_parse_rows_reads_a_task_notification_delivered_as_an_attachment():
+    # A task that reports back while the agent is BUSY is queued, and Claude Code records a
+    # queued notification as a `type:"attachment"` row rather than a user message. Reading only
+    # the user shape missed those entirely — so the sub-agent stayed "live" forever and the work
+    # the agent did in response was folded into the prior, already-committed turn.
+    rows = [
+        _user("u1", "rewrite the parser"),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}], stop_reason="tool_use"
+        ),
+        _async_launch("r1", "t1", "agent-queued"),
+        _assistant("m2", "Agent is running in the background.", stop_reason="end_turn"),
+        {
+            "type": "attachment",
+            "uuid": "att1",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "task-notification",
+                "prompt": (
+                    "<task-notification>\n<task-id>agent-queued</task-id>\n"
+                    "<status>completed</status>\n<result>Done.</result>\n</task-notification>"
+                ),
+            },
+        },
+        _assistant("m3", "Agent finished; verified its claims.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-sub3", rows)
+
+    assert session.live_subagent_ids == []
+    assert [t.user_prompt for t in session.turns] == ["rewrite the parser", "(background task completed)"]
+
+
+def test_parse_rows_ignores_a_synchronous_subagent_call():
+    # A synchronous Agent/Task call returns the sub-agent's finished report as its tool result:
+    # the work is over when the turn ends, so nothing should defer the commit.
+    rows = [
+        _user("u1", "review this"),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}], stop_reason="tool_use"
+        ),
+        {
+            "type": "user",
+            "uuid": "r1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Here is the review: looks fine."}],
+            },
+        },
+        _assistant("m2", "The reviewer found nothing.", stop_reason="end_turn"),
+    ]
+
+    assert parse_rows("sess-sub4", rows).live_subagent_ids == []
+
+
 def test_parse_rows_monitor_event_notification_gets_the_update_label():
     # A Monitor streams intermediate events from a still-running job: its notifications
     # carry an <event> payload (and no terminal <status>). Such wake-ups get their own

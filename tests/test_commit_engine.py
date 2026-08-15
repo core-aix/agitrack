@@ -1262,6 +1262,107 @@ def test_finish_parse_exit_finalize_commits_monitor_update_only_turns(tmp_path):
     assert result is True and len(commits) == 1
 
 
+def test_finish_parse_defers_while_async_subagents_are_still_running(tmp_path):
+    # The reported bug: the agent spawns async sub-agents, then posts what READS as a final
+    # answer ("kicked it off, here's the plan") while the sub-agents are doing the actual job.
+    # The turn is complete by every other measure, so aGiTrack committed there — recording a
+    # finished-sounding trace (and a summary built from it) over a tree the sub-agents were
+    # still writing. While any sub-agent is live the commit WAITS and the watermark stays put.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "rewrite the parser", "Launched two agents on it.", TokenUsage(total=9), None)],
+        live_subagent_ids=["a40f517ebe10c670c", "ab6501a5bf1f3589d"],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is None and commits == []
+    assert state.backend_message_id_for("ses-sub") is None
+    # The live sub-agents also count as background writers of the tree, so the pre-agent
+    # user-commit dialog stands down rather than claiming their edits as the user's.
+    assert session.live_background_task_ids == ["a40f517ebe10c670c", "ab6501a5bf1f3589d"]
+
+
+def test_finish_parse_commits_once_the_sub_agents_have_reported_back(tmp_path):
+    # Same session one parse later: the sub-agents reported back, the agent did its follow-up
+    # work, and nothing is live any more — so the deferred launch turn and the follow-up turn
+    # commit TOGETHER, which is the point of deferring rather than dropping.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub2",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "rewrite the parser", "Launched two agents on it.", TokenUsage(total=9), None),
+            SessionTurn(
+                "tn1", "a2", "(background task completed)", "Both agents landed; verified.", TokenUsage(total=40), None
+            ),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is True and len(commits) == 1
+    assert [t.user_prompt for t in commits[0]["turns"]] == ["rewrite the parser", "(background task completed)"]
+    assert state.backend_message_id_for("ses-sub2") == "a2"
+
+
+def test_finish_parse_exit_finalize_commits_despite_live_sub_agents(tmp_path):
+    # The exit/stop finalize (require_complete=False) never defers: a sub-agent that is still
+    # running when the session ends must not take the work already on disk with it.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub3",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "rewrite the parser", "Launched an agent on it.", TokenUsage(total=9), None)],
+        live_subagent_ids=["a40f517ebe10c670c"],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is True and len(commits) == 1
+
+
 def test_finish_parse_returns_none_when_no_result(tmp_path):
     state = AgitrackState(tmp_path)
     session = Session.bare()
