@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,23 @@ def _init_repo(path: Path) -> GitRepo:
     subprocess.run(["git", "-C", str(path), "add", "."], check=True)
     subprocess.run(["git", "-C", str(path), "commit", "-qm", "init"], check=True)
     return GitRepo(path)
+
+
+def _delete_tree(path: Path) -> None:
+    """Delete a directory that may contain git objects, on every OS.
+
+    git writes loose objects READ-ONLY and Windows enforces that on delete, so a plain
+    `shutil.rmtree` over a real repository raises ``PermissionError: [WinError 5]`` — which is
+    exactly how these tests first failed on Windows CI while passing on macOS and Linux. Making
+    every FILE writable first is the portable fix; directories are left alone, since stripping
+    their execute bit on POSIX would stop rmtree descending into them."""
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                child.chmod(stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass  # best-effort: rmtree reports anything that actually blocks the delete
+    shutil.rmtree(path)
 
 
 def _git(repo: GitRepo, *args: str) -> str:
@@ -88,7 +107,7 @@ def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
     proj.mkdir()
     runner, repo, _state, _backend = _runner(proj, manual=False)
     runner._explicit_stop = False
-    shutil.rmtree(repo.repo)
+    _delete_tree(repo.repo)
 
     runner._loop()  # returns rather than polling forever
 
@@ -105,18 +124,26 @@ def test_a_tracker_keeps_running_when_only_git_was_removed(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()
     runner, repo, _state, _backend = _runner(proj, manual=False)
-    shutil.rmtree(repo.repo / ".git")
+    _delete_tree(repo.repo / ".git")
 
     assert runner._repo_is_gone() is False
 
 
-def test_a_tracker_never_stops_because_the_check_itself_failed(tmp_path, monkeypatch):
+def test_a_tracker_never_stops_because_the_check_itself_failed(tmp_path):
     # A permission error or a stalled network mount is not an answer. Treating "cannot tell" as
     # "gone" would stop a tracker on a repo that is merely slow to reach.
     proj = tmp_path / "proj"
     proj.mkdir()
     runner, _repo, _state, _backend = _runner(proj, manual=False)
-    monkeypatch.setattr(Path, "exists", lambda _self: (_ for _ in ()).throw(OSError("mount stalled")))
+
+    class _Unreachable:
+        def exists(self):
+            raise OSError("mount stalled")
+
+    # Swapped on the runner rather than monkeypatching Path.exists for the whole process: that
+    # patch also fires for anything else touching a path while the test runs (pytest's own
+    # reporting included), which is a lot of blast radius for one call.
+    runner.repo = types.SimpleNamespace(repo=_Unreachable())
 
     assert runner._repo_is_gone() is False
 

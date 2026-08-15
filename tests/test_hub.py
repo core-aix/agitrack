@@ -73,6 +73,10 @@ def test_repos_are_ordered_by_when_they_were_last_updated(tmp_path):
         _repo(tmp_path, name)
         repo_registry.remember(tmp_path / name)
         reflog = tmp_path / name / ".git" / "logs" / "HEAD"
+        # Stated rather than assumed: the ordering reads this file, so an environment where git
+        # does not write it (reflogs disabled) must fail HERE, saying so, instead of further down
+        # with an unexplained order.
+        assert reflog.is_file(), "git wrote no reflog; last_activity has nothing to order by"
         os.utime(reflog, (when, when))
 
     assert [entry.name for entry in repo_registry.list_repos()] == ["newest", "middle", "stale"]
