@@ -77,6 +77,40 @@ def _runner(tmp_path, *, manual: bool):
 # --- manual mode ------------------------------------------------------------
 
 
+def test_a_tracker_remembers_its_repo_for_the_dashboard_switcher(tmp_path, monkeypatch):
+    # THE BUG: the user-wide repo list was written ONLY by `ensure_hub_for`, i.e. only when a
+    # dashboard was opened. `_open_dashboard_on_start` returns early for a scripted run, a
+    # non-TTY stdout (the autotrack hook, a script, SSH) or `open_dashboard_on_start: false`, so
+    # those trackers ran for days without their repo ever appearing in the switcher. Tracking a
+    # repo is what makes it worth listing, so the tracker records it itself.
+    from agitrack import repos as repo_registry
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    runner, repo, _state, _backend = _runner(tmp_path, manual=False)
+    assert repo_registry.entry_for(repo.repo) is None  # nothing has opened a dashboard here
+
+    runner._remember_repo()
+
+    entry = repo_registry.entry_for(repo.repo)
+    assert entry is not None and entry.served is True
+    assert [e.path for e in repo_registry.list_repos()] == [str(repo.repo)]
+
+
+def test_remembering_the_repo_never_breaks_the_tracker(tmp_path, monkeypatch):
+    # Best-effort by design: a read-only or full home directory must not stop a repo being
+    # tracked, so a registry that raises is swallowed rather than taking the daemon down.
+    runner, _repo, _state, _backend = _runner(tmp_path, manual=False)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("home is read-only")
+
+    monkeypatch.setattr("agitrack.repos.remember", boom)
+
+    runner._remember_repo()  # must not raise
+
+
 def test_background_manual_records_latent_and_freezes_head(tmp_path):
     runner, repo, state, backend = _runner(tmp_path, manual=True)
     runner._manual.setup()
