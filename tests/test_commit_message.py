@@ -192,10 +192,12 @@ def test_agent_commit_message_contains_trace_and_metadata():
     assert "token_note" not in message
 
 
-def test_trace_message_headings_are_nested_under_role():
-    # A message's own Markdown headings must be pushed one level below its
-    # "## User"/"## Agent" role heading so they nest (and render) correctly,
-    # instead of a message "# Title" outranking the role it belongs to.
+def test_trace_message_headings_are_nested_two_levels_under_role():
+    # A message's own Markdown headings are pushed TWO levels below its "## User"/"## Agent"
+    # role heading, so a `##` a model wrote renders as `####`. One level nested correctly but
+    # did not READ correctly: in plain-text `git log` a message's own sections sat a single
+    # '#' away from the role scaffolding, so a reader had to count hashes to tell the trace's
+    # structure from the conversation's content.
     message = build_agent_commit_message(
         latest_prompt="do it",
         trace=[
@@ -207,20 +209,39 @@ def test_trace_message_headings_are_nested_under_role():
         agitrack_session_id="agit-1",
         model="m",
     )
-    # User content's shallowest heading was level 1, so everything shifts +2: the
-    # role stays "## User" and the message's headings start one level below it.
-    assert "## User\n\n### Big ask" in message
-    assert "#### Detail" in message
+    # User content's shallowest heading was level 1, so everything shifts +3 to land it at 4.
+    assert "## User\n\n#### Big ask" in message
+    assert "##### Detail" in message
     # The original level-1/level-2 headings must no longer appear as such.
     assert "\n# Big ask" not in message
     assert "\n## Detail" not in message
-    # Agent content already started at level 3 (one below the role) — left intact.
-    assert "## Agent\n\n### Already deep" in message
+    # Agent content started at level 3 — still above the floor, so it is pushed to 4 too.
+    assert "## Agent\n\n#### Already deep" in message
+
+
+def test_a_message_heading_already_deep_enough_is_left_alone():
+    # Headings are only ever pushed DEEPER, never promoted: a message whose own sections
+    # already start at level 4 keeps them, so its internal hierarchy is not needlessly
+    # driven toward the level-6 Markdown cap (where distinct levels would collapse).
+    message = build_agent_commit_message(
+        latest_prompt="x",
+        trace=[{"role": "agent", "content": "#### Four\nbody\n##### Five"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="m",
+    )
+
+    assert "## Agent\n\n#### Four" in message
+    assert "##### Five" in message
 
 
 def test_trace_heading_nesting_skips_fenced_code_comments():
-    # A leading '#' inside a fenced code block is a comment, not a heading, and
-    # must be left untouched even while real headings around it are shifted.
+    # A leading '#' inside a fenced code block is CONTENT BEING QUOTED — a shell comment, or
+    # a Markdown example — not a heading of the message. It must be left untouched even while
+    # real headings around it are shifted: rewriting it would falsify what the message showed.
+    # (This is also why a trace can still contain a literal "## User" line: quoted, inside a
+    # fence, where it is code rather than structure.)
     message = build_agent_commit_message(
         latest_prompt="x",
         trace=[{"role": "agent", "content": "# Heading\n```sh\n# just a comment\n```"}],
@@ -229,7 +250,7 @@ def test_trace_heading_nesting_skips_fenced_code_comments():
         agitrack_session_id="agit-1",
         model="m",
     )
-    assert "### Heading" in message
+    assert "#### Heading" in message
     assert "# just a comment" in message  # the comment kept its single '#'
 
 

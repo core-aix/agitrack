@@ -146,9 +146,16 @@ ATX_HEADING_RE = re.compile(r"^(#{1,6})(\s.*)$")
 # A fenced code block delimiter; a leading '#' inside such a fence is a comment,
 # not a heading, so heading-nesting must skip fenced regions.
 CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
-# The role heading for each trace turn ("## User" / "## Agent") is level 2, so a
-# message's own headings are nested one level deeper, starting at level 3.
+# The role heading for each trace turn ("## User" / "## Agent") is level 2.
 TRACE_ROLE_HEADING_LEVEL = 2
+# ...and a message's own headings start TWO levels below it, at level 4, so a `##` a model
+# wrote inside its reply renders as `####`. One level (the original) was enough for correct
+# Markdown nesting but not enough to READ correctly: at level 3 a message's own sections sat
+# only one `#` away from the `## User`/`## Agent` scaffolding, and in `git log` — plain text,
+# no rendering — a reader scanning for role headings had to count hashes to tell the trace's
+# own structure from the conversation's content. Two levels makes the scaffolding visually
+# distinct at a glance. Only ever pushes deeper: a message already at level 4+ is untouched.
+TRACE_CONTENT_HEADING_LEVEL = TRACE_ROLE_HEADING_LEVEL + 2
 
 
 # Section header that marks a commit as carrying aGiTrack metadata. Detection of
@@ -986,16 +993,18 @@ def _body_lines(text: str) -> list[str]:
 
 
 def _nest_headings_under_role(content: str) -> str:
-    """Shift the Markdown headings inside one trace message so the shallowest one
-    sits a single level below its ``## User`` / ``## Agent`` role heading (i.e. at
-    level 3). The relative hierarchy is preserved — every heading moves by the same
-    amount — so the rendered commit log nests the message's own sections under its
-    role instead of letting a message ``#`` outrank the role it belongs to.
+    """Shift the Markdown headings inside one trace message so the shallowest one sits
+    :data:`TRACE_CONTENT_HEADING_LEVEL` (level 4) deep — two below its ``## User`` /
+    ``## Agent`` role heading, so a message's own ``##`` renders as ``####``. The relative
+    hierarchy is preserved — every heading moves by the same amount — so the rendered commit
+    log nests the message's own sections under its role instead of letting a message ``#``
+    outrank the role it belongs to, and keeps the trace's scaffolding readable at a glance in
+    plain-text `git log`.
 
-    Headings are only ever pushed deeper, never promoted; a message already nested
-    at level 3+ is left as-is. Fenced code blocks are skipped, since a leading
-    ``#`` there is a comment, not a heading. Levels are capped at the Markdown
-    maximum of 6."""
+    Headings are only ever pushed deeper, never promoted; a message already nested at level
+    4+ is left as-is. Fenced code blocks are skipped, since a leading ``#`` there is content
+    being QUOTED — a shell comment, or a Markdown example — and rewriting it would falsify
+    what the message showed. Levels are capped at the Markdown maximum of 6."""
     lines = content.splitlines()
     in_fence = False
     fence_marker = ""
@@ -1017,7 +1026,7 @@ def _nest_headings_under_role(content: str) -> str:
     if not headings:
         return content
     shallowest = min(level for _, level, _ in headings)
-    shift = max(0, (TRACE_ROLE_HEADING_LEVEL + 1) - shallowest)
+    shift = max(0, TRACE_CONTENT_HEADING_LEVEL - shallowest)
     if not shift:
         return content
     for index, level, rest in headings:
