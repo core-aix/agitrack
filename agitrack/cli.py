@@ -2523,7 +2523,13 @@ def _version_line() -> str:
     which is the question anyone asks --version to settle. The release version stays FIRST and
     unadorned so a prefix read (`--version | cut -d" " -f1`) still yields exactly what it did.
 
-    Side-effect-free by contract, like the caller: this looks only at aGiTrack's OWN install
+    Runs git through :class:`GitRepo`, never a bare ``subprocess.run``: that is what carries the
+    repo-wide invariants an audited test enforces — UTF-8 decoding rather than the platform code
+    page, and console isolation so a Windows spawn opens no window. Hand-rolling the two calls
+    here broke both (caught by ``test_utf8_text_is_used_everywhere_git_output_is_decoded`` and
+    ``test_every_spawn_keeps_its_console_window_off_the_desktop``).
+
+    Side-effect-free by contract, like the caller: it looks only at aGiTrack's OWN install
     directory and never discovers or touches the user's repository. Any failure degrades to the
     bare version — reporting a version must not be something that can fail."""
     from agitrack import __version__
@@ -2534,23 +2540,12 @@ def _version_line() -> str:
         root = detect_source_repo()
         if root is None:
             return __version__
-        rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.strip()
+        source = GitRepo(root)
+        rev = source.short_sha("HEAD")
         if not rev:
             return __version__
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.strip()
-        return f"{__version__} (source {rev}{'-dirty' if dirty else ''})"
+        dirty = "-dirty" if source.status_short().strip() else ""
+        return f"{__version__} (source {rev}{dirty})"
     except Exception:
         return __version__
 

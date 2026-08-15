@@ -216,7 +216,6 @@ def _fake_msvcrt(monkeypatch, presses):
     # A stand-in msvcrt for the native-Windows menu-key probe so it's testable on POSIX
     # (the real path has no termios; #118). getch pops the queued keypresses in order.
     import sys
-    import types
 
     queue = list(presses)
     monkeypatch.setitem(
@@ -961,6 +960,22 @@ def test_delay_merge_off_by_default(monkeypatch):
     assert captured["delay_merge"] is False
 
 
+def _stub_source_repo(monkeypatch, *, rev: str, status: str) -> None:
+    """Stand in for aGiTrack's own source checkout in the --version tests."""
+
+    class _Source:
+        def __init__(self, root):
+            self.repo = root
+
+        def short_sha(self, ref="HEAD"):
+            return rev
+
+        def status_short(self):
+            return status
+
+    monkeypatch.setattr(cli, "GitRepo", _Source)
+
+
 def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
     # `agitrack --version` is cheap and side-effect-free: no repo discovery, no
     # privacy prompt. The VSCode extension reads it to detect a self-updated CLI.
@@ -982,12 +997,7 @@ def test_version_flag_names_the_commit_on_a_source_checkout(monkeypatch, capsys,
     import agitrack
 
     monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
-    outputs = iter(["c3eba7d7\n", ""])  # rev-parse, then a CLEAN status
-    monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda *a, **k: types.SimpleNamespace(stdout=next(outputs), returncode=0),
-    )
+    _stub_source_repo(monkeypatch, rev="c3eba7d7", status="")  # a CLEAN checkout
 
     assert cli.main(["--version"]) == 0
     out = capsys.readouterr().out.strip()
@@ -1000,12 +1010,7 @@ def test_version_flag_marks_a_dirty_source_checkout(monkeypatch, capsys, tmp_pat
     # "which code is this?" is only half-answered by a sha when the tree carries uncommitted
     # work — which, on the aGiTrack checkout itself, is most of the time.
     monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
-    outputs = iter(["c3eba7d7\n", " M agitrack/cli.py\n"])
-    monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda *a, **k: types.SimpleNamespace(stdout=next(outputs), returncode=0),
-    )
+    _stub_source_repo(monkeypatch, rev="c3eba7d7", status=" M agitrack/cli.py\n")
 
     assert cli.main(["--version"]) == 0
     assert capsys.readouterr().out.strip().endswith("(source c3eba7d7-dirty)")
@@ -1016,7 +1021,7 @@ def test_version_flag_falls_back_to_the_bare_version_when_git_fails(monkeypatch,
     import agitrack
 
     monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no git")))
+    monkeypatch.setattr(cli, "GitRepo", lambda root: (_ for _ in ()).throw(OSError("no git")))
 
     assert cli.main(["--version"]) == 0
     assert capsys.readouterr().out.strip() == agitrack.__version__
