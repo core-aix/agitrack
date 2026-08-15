@@ -428,15 +428,40 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
     return lines + list(extra)
 
 
+TRACE_EVENT_ROLE = "event"
+"""Trace role for something that HAPPENED rather than something someone said.
+
+The harness wakes the agent when a task it backgrounded reports back, and the transcript
+parser labels the resulting turn with a synthetic prompt (``BACKGROUND_PROMPT_LABELS`` in
+transcripts/claude.py). Recording that label under the ``user`` role put words in the user's
+mouth: every such commit's trace carried a ``## User`` / ``(background task completed)`` block
+indistinguishable from something they typed — and that trace is the summarizer's sole input, so
+the summary read the wake-up as a request. It is an event; it renders as one."""
+
+
 def _trace_role_lines(item: dict) -> list[str]:
-    """The rendered lines for one trace turn — its "## User"/"## Agent" role heading plus the
+    """The rendered lines for one trace entry — its "## User"/"## Agent" role heading plus the
     masked, heading-nested body — or an EMPTY list when the entry has no textual content. A
     blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while the
-    agent was busy) must never produce a bare "## User" heading with nothing under it."""
+    agent was busy) must never produce a bare "## User" heading with nothing under it.
+
+    An :data:`TRACE_EVENT_ROLE` entry is NOT a speaker and gets no role heading: it renders as a
+    note (the same blockquote form the lead-in notes use) naming the event, so a reader — and the
+    summarizer — can see the agent continued on its own rather than answering anybody."""
     content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
     if not content.strip():
         return []
-    label = "User" if item.get("role", "").strip().lower() == "user" else "Agent"
+    role = item.get("role", "").strip().lower()
+    if role == TRACE_EVENT_ROLE:
+        # Phrased generically over the label rather than mapping each known one, so a new
+        # harness event kind renders correctly the day it appears instead of silently
+        # reverting to "the user said this".
+        note = (
+            f"The agent was woken here by a background event {' '.join(content.split())}, not by "
+            "a user message. What follows is its response to that event."
+        )
+        return [*_note_block(note), ""]
+    label = "User" if role == "user" else "Agent"
     return [f"## {label}", "", *_body_lines(content), ""]
 
 
@@ -1001,11 +1026,19 @@ def _nest_headings_under_role(content: str) -> str:
 
 
 def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
+    # A turn STARTS at whatever prompted it — a user message, or a background event that woke
+    # the agent with nobody saying anything (TRACE_EVENT_ROLE). Both count here: an event-driven
+    # turn is a turn, and counting only `user` entries would let a long run of background wake-ups
+    # read as ONE turn and keep the whole run in the trace, well past the limit.
     limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
-    user_indexes = [index for index, item in enumerate(trace) if str(item.get("role", "")).strip().lower() == "user"]
-    if len(user_indexes) <= limit:
+    starts = [
+        index
+        for index, item in enumerate(trace)
+        if str(item.get("role", "")).strip().lower() in ("user", TRACE_EVENT_ROLE)
+    ]
+    if len(starts) <= limit:
         return trace
-    return trace[user_indexes[-limit] :]
+    return trace[starts[-limit] :]
 
 
 def mask_paths(text: str) -> str:
