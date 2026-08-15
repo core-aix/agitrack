@@ -187,6 +187,72 @@ def test_the_repo_list_is_what_the_switcher_is_built_from(tmp_path):
     assert payload["repos"][0]["backtrace_url"] == f"/b/{entry.slug}/"
 
 
+def test_a_repo_with_a_live_tracker_is_offered_even_if_nothing_remembered_it(tmp_path, monkeypatch):
+    # THE BUG: `repos.remember` was reachable only through `ensure_hub_for`, so a tracker that
+    # opened no dashboard — the autotrack hook, a scripted or non-TTY start, or
+    # `open_dashboard_on_start` off — never got an entry and its repo was missing from the
+    # switcher for as long as it ran (seen live: a tracker running for hours on a repo the
+    # dropdown did not list). A repository aGiTrack is demonstrably tracking is always offered.
+    _repo(tmp_path, "headless")
+    monkeypatch.setattr("agitrack.daemons.running_repos", lambda **_: [str(tmp_path / "headless")])
+    router = hub.HubRouter()
+
+    payload = json.loads(router.get("/repos", {}).body)
+
+    assert [row["name"] for row in payload["repos"]] == ["headless"]
+    # ...and it was REMEMBERED as it was added, so the repair happens once and the repo then
+    # behaves like any other — it outlives its tracker, exactly like a `-d`-opened repo.
+    remembered = repo_registry.entry_for(tmp_path / "headless")
+    assert remembered is not None and remembered.served is True
+    monkeypatch.setattr("agitrack.daemons.running_repos", lambda **_: [])
+    assert [entry.name for entry in repo_registry.list_repos()] == ["headless"]
+
+
+def test_a_stopped_repo_is_not_resurrected_by_a_surviving_daemon(tmp_path, monkeypatch):
+    # `agitrack stop` clearing `served` is an explicit decision, and a switcher that keeps
+    # offering a project the user just stopped is ignoring them. Only a repo with NO entry is
+    # adopted from the daemon registry, so the outcome does not depend on whether the stop
+    # managed to kill the daemon before it cleared the flag.
+    _repo(tmp_path, "stopped")
+    repo_registry.remember(tmp_path / "stopped")
+    repo_registry.set_served(tmp_path / "stopped", False)
+    monkeypatch.setattr("agitrack.daemons.running_repos", lambda **_: [str(tmp_path / "stopped")])
+    router = hub.HubRouter()
+
+    payload = json.loads(router.get("/repos", {}).body)
+
+    assert payload["repos"] == []
+    assert repo_registry.entry_for(tmp_path / "stopped").served is False
+
+
+def test_the_switcher_still_draws_when_the_daemon_registry_cannot_be_read(tmp_path, monkeypatch):
+    # The union is an enhancement, never a precondition: a daemon registry that raises must not
+    # cost the user the repositories that ARE remembered.
+    _repo(tmp_path, "proj")
+    repo_registry.remember(tmp_path / "proj")
+
+    def boom(**_):
+        raise OSError("registry unreadable")
+
+    monkeypatch.setattr("agitrack.daemons.running_repos", boom)
+    router = hub.HubRouter()
+
+    payload = json.loads(router.get("/repos", {}).body)
+
+    assert [row["name"] for row in payload["repos"]] == ["proj"]
+
+
+def test_a_live_daemon_for_a_vanished_directory_is_not_offered(tmp_path, monkeypatch):
+    # The list exists to be switched between; offering a repo the dashboard cannot open is worse
+    # than not offering it (the same rule `list_repos` applies to remembered entries).
+    monkeypatch.setattr("agitrack.daemons.running_repos", lambda **_: [str(tmp_path / "gone")])
+    router = hub.HubRouter()
+
+    payload = json.loads(router.get("/repos", {}).body)
+
+    assert payload["repos"] == []
+
+
 def test_a_mounted_repo_serves_the_same_routes_it_would_serve_alone(tmp_path):
     _repo(tmp_path, "proj")
     entry = repo_registry.remember(tmp_path / "proj")

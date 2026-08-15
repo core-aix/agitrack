@@ -201,8 +201,17 @@ def _update(path: str | os.PathLike[str], mutate, *, touch: bool = False) -> Rep
 def remember(path: str | os.PathLike[str], *, view: str = "") -> RepoEntry:
     """Record that aGiTrack is (or was just) working on ``path``, and return its entry.
 
-    Called from every mode's startup, so the dashboard's repo list is "everywhere you have used
-    aGiTrack" rather than "wherever a daemon happens to be running"."""
+    Called from every mode's startup — the background tracker and the interactive session as they
+    register themselves, the shell/scripted runner, and `ensure_hub_for` for a repo opened with
+    `-d` alone — so the list is "everywhere you have used aGiTrack" rather than "wherever a daemon
+    happens to be running".
+
+    That breadth is load-bearing and was missing: for a long time the ONLY caller was
+    `ensure_hub_for`, so a repo was remembered only if a dashboard was opened for it. Every
+    headless start (`_open_dashboard_on_start` returns early when scripted, without a TTY, or with
+    `open_dashboard_on_start` off) therefore tracked a repository that never appeared in the
+    switcher. The hub also unions in repos with a live daemon (see `hub._served_repos`) so such a
+    repo is offered — and remembered — even when the tracker predates this fix."""
 
     def mutate(entry: RepoEntry) -> None:
         entry.last_seen = int(time.time())

@@ -1176,6 +1176,26 @@ class BackgroundRunner:
             daemons.register("background", self.repo.repo)
         except Exception as error:
             self._debug(f"daemon registry write failed: {error!r}")
+        self._remember_repo()
+
+    def _remember_repo(self) -> None:
+        """Record this repository in the user-wide list the dashboard's switcher offers.
+
+        Tracking a repo is what makes it worth listing, so it is recorded HERE rather than left
+        to whoever opens a dashboard. It used to be reachable only through `ensure_hub_for`, so a
+        tracker that never opened one — started by the autotrack hook, from a script, over SSH,
+        or with `open_dashboard_on_start` off, all of which return early from
+        `_open_dashboard_on_start` — ran for days without ever appearing in the switcher.
+        Recording it at startup also outlives the daemon: the repo stays listed after tracking
+        stops, which is the whole point of a list that is history rather than process state.
+
+        Best-effort: a repo that cannot be remembered is still tracked."""
+        try:
+            from agitrack import repos as repo_registry
+
+            repo_registry.remember(self.repo.repo)
+        except Exception as error:
+            self._debug(f"remembering repo for the dashboard switcher failed: {error!r}")
 
     def _remove_handshake(self) -> None:
         try:
