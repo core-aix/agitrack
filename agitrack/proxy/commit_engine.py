@@ -914,9 +914,15 @@ class CommitEngine:
             # exit/stop finalize, `require_complete=False`) reads is TRANSIENT: when the turn
             # continues, its `assistant_message_id` becomes a later one, the stored mark then
             # matches no turn boundary, and turns_after's marked_at fallback drops the turn
-            # for having STARTED before the mark. Its prompt, tokens and trace are then in no
-            # commit at all. The user id is stable for the turn's whole life and is exactly
-            # what turns_after re-exports INCLUSIVELY once the turn finishes.
+            # for having STARTED before the mark. What survives is then only the PARTIAL
+            # snapshot the capture took: everything the turn did afterwards — its real final
+            # response, its remaining tokens — is recorded nowhere, and its later edits reach
+            # history only as unattributed diff in whatever commit next sweeps the tree. (The
+            # prompt itself does survive, in that partial record; the watermark only advances
+            # when the capture actually committed. Losing the prompt outright is the SEPARATE
+            # inherited-watermark bug, see AgitrackState.backend_message_id_for.) The user id
+            # is stable for the turn's whole life and is exactly what turns_after re-exports
+            # INCLUSIVELY once the turn finishes.
             #
             # This used to key off `not watermark.assistant_message_id`, which caught only a
             # turn captured before it had said ANYTHING — every mid-flight turn that had

@@ -1916,9 +1916,11 @@ def test_a_midflight_capture_anchors_on_the_user_id_not_a_transient_assistant_id
     # restarting mid-turn) reads is TRANSIENT. Anchoring on it meant that once the turn
     # continued, its assistant_message_id became a later id, the stored mark matched no turn
     # boundary, and turns_after's marked_at fallback dropped the turn for having STARTED
-    # before the mark — prompt, tokens and trace in no commit at all. The old guard keyed on
-    # `not assistant_message_id`, so it caught only a turn captured before it had said
-    # ANYTHING; every mid-flight turn that had already spoken (the common case) fell through.
+    # before the mark — so history kept only the PARTIAL snapshot the capture took, and the
+    # turn's real final response and remaining tokens were recorded nowhere. The old guard
+    # keyed on `not assistant_message_id`, so it caught only a turn captured before it had
+    # said ANYTHING; every mid-flight turn that had already spoken (the common case) fell
+    # through.
     session = Session.bare()
     midflight = SessionTurn(
         "u1",
