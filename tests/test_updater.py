@@ -15,7 +15,7 @@ import pytest
 from agitrack.update.updater import (
     KIND_PACKAGE,
     KIND_SOURCE,
-    METHOD_HOMEBREW,
+    METHOD_BREW_PYTHON,
     METHOD_MSI,
     Updater,
     _github_slug,
@@ -417,24 +417,33 @@ def test_launch_msi_bootstrapper_noop_off_windows(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_apply_package_brew_upgrade_called_on_homebrew_install(monkeypatch):
-    # PEP 668 / Homebrew is a POSIX condition; pin the platform off the Windows deferral.
+def test_apply_package_never_shells_out_to_brew_on_a_homebrew_python(monkeypatch):
+    # THE BUG this replaces: on PEP 668 the updater ran `brew upgrade agitrack`, on the stated
+    # belief that Homebrew "ships aGiTrack". It does not — there is no agitrack formula or cask —
+    # so the command could only fail. And it fired on the COMMON macOS setup, because the
+    # detection matches a Homebrew-managed PYTHON (the README's `brew install python` +
+    # `pip3 install agitrack`), not a Homebrew-installed aGiTrack. The old test asserted the brew
+    # call was made, so it pinned the bug in place.
     monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = _make_updater_package()
-    # Simulate pip refusing with PEP 668, then brew succeeding.
-    pip_result = _completed(1, stderr="externally-managed-environment error")
-    brew_result = _completed(0)
-    call_results = iter([pip_result, brew_result])
+    ran: list[list[str]] = []
+
+    def record(cmd, *a, **k):
+        ran.append(list(cmd))
+        return _completed(1, stderr="externally-managed-environment error")
+
     with (
         patch.object(updater, "_pip_invocation", return_value=["pip"]),
-        patch.object(updater, "_install_method", return_value=METHOD_HOMEBREW),
+        patch.object(updater, "_install_method", return_value=METHOD_BREW_PYTHON),
         patch("agitrack.update.updater.shutil.which", return_value="/usr/local/bin/brew"),
-        patch("agitrack.update.updater.subprocess.run", side_effect=lambda *a, **k: next(call_results)),
-        patch.object(updater, "_installed_version", return_value="1.9.0"),
+        patch("agitrack.update.updater.subprocess.run", side_effect=record),
     ):
         status = updater._apply_package()
-    assert status.error is None
-    assert status.current == "1.9.0"
+
+    assert not any("brew" in part for cmd in ran for part in cmd), ran
+    # It reports instead, naming the one route that actually works for this install.
+    assert "pipx install agitrack" in (status.error or "")
+    assert "brew upgrade" not in (status.error or "")
 
 
 # ---------------------------------------------------------------------------

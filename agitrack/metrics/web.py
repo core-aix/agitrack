@@ -154,6 +154,23 @@ def shell_html(repo: GitRepo) -> str:
     )
 
 
+def _needs_user_sentence(record) -> str:
+    """The lead sentence of the "you have to update this yourself" notice.
+
+    A SOURCE checkout and a PACKAGE install are updated in different units, and saying "aGiTrack
+    <x> is available" for both was wrong for one of them: on a source install the recorded
+    current/latest are short COMMIT HASHES (see `Updater._check_source`), so that sentence read
+    "aGiTrack a1b2c3d is available", which looks like a version and says nothing about what
+    changed or how far behind the checkout is. Naming the span makes it a commit, and reads the
+    way `git log a1b2c3d..e4f5g6h` does."""
+    from agitrack.update.updater import KIND_SOURCE
+
+    if record.method == KIND_SOURCE:
+        span = f"{record.current} → {record.latest}" if record.current else record.latest
+        return f"A newer aGiTrack commit is available ({span}) and has to be pulled by you"
+    return f"aGiTrack {record.latest} is available and has to be installed by you"
+
+
 def _update_banner_html(repo: "GitRepo | None" = None) -> str:
     """The update notices shown at the top of a dashboard. Empty when there is nothing to say.
 
@@ -176,7 +193,7 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
         if record.needs_user:
             detail = f" {record.instructions}" if record.instructions else ""
             reason = f" ({record.error})" if record.error else ""
-            parts.append(f"aGiTrack {record.latest} is available and has to be installed by you{reason}.{detail}")
+            parts.append(_needs_user_sentence(record) + f"{reason}.{detail}")
     except Exception:
         pass
     if repo is not None:

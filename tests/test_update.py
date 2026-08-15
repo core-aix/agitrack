@@ -304,7 +304,7 @@ def test_package_check_errors_when_index_unreachable(monkeypatch):
 import sys
 
 import agitrack
-from agitrack.update.updater import METHOD_HOMEBREW, METHOD_PIP, METHOD_PIPX
+from agitrack.update.updater import METHOD_BREW_PYTHON, METHOD_PIP, METHOD_PIPX
 
 
 def _detect_method(monkeypatch, *, install_path: str, prefix: str = "/usr") -> str:
@@ -323,7 +323,7 @@ def test_install_method_detects_pipx(monkeypatch):
 
 def test_install_method_detects_homebrew(monkeypatch):
     path = "/opt/homebrew/Cellar/python@3.12/3.12.4/lib/python3.12/site-packages/agitrack/__init__.py"
-    assert _detect_method(monkeypatch, install_path=path) == METHOD_HOMEBREW
+    assert _detect_method(monkeypatch, install_path=path) == METHOD_BREW_PYTHON
 
 
 def test_install_method_defaults_to_pip(monkeypatch):
@@ -431,51 +431,50 @@ def test_apply_package_pip_failure_reports_last_line(monkeypatch):
     assert len(calls) == 1  # no brew/second attempt
 
 
-def test_apply_package_pep668_under_homebrew_defers_to_brew(monkeypatch):
-    # Externally-managed (PEP 668) pip refusal + a Homebrew-owned install → brew upgrade.
-    # PEP 668 is a POSIX (Homebrew/distro) condition; pin the platform so this never hits
-    # the Windows deferral.
+def test_apply_package_pep668_on_a_homebrew_python_reports_instead_of_calling_brew(monkeypatch):
+    # Was: "PEP 668 refusal + a Homebrew-owned install -> brew upgrade". That hand-off was built
+    # on a false premise — Homebrew ships no agitrack formula, so `brew upgrade agitrack` always
+    # fails — and it triggered on the ordinary macOS setup, since the detection matches a
+    # Homebrew-managed PYTHON rather than a Homebrew-installed aGiTrack.
     monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
-    monkeypatch.setattr(updater, "_install_method", lambda: METHOD_HOMEBREW)
+    monkeypatch.setattr(updater, "_install_method", lambda: METHOD_BREW_PYTHON)
     monkeypatch.setattr("agitrack.update.updater.shutil.which", lambda name: "/opt/homebrew/bin/brew")
-    monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
 
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        # pip refuses (PEP 668); brew succeeds.
-        if cmd[-2:] == ["--upgrade", "agitrack"] and "pip" in " ".join(cmd):
-            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: externally-managed-environment")
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: externally-managed-environment")
 
     monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
     status = updater.apply()
-    assert status.ok and status.current == "2.0.0"
-    assert calls[-1] == ["/opt/homebrew/bin/brew", "upgrade", "agitrack"]
+
+    assert not any("brew" in part for cmd in calls for part in cmd), calls
+    assert "pipx install agitrack" in (status.error or "")
+    assert "brew upgrade" not in (status.error or "")
 
 
-def test_apply_package_pep668_without_manager_enumerates_routes(monkeypatch):
-    # PEP 668 refusal but not a recognisable Homebrew install → full enumeration.
+def test_apply_package_pep668_names_one_command_not_a_menu(monkeypatch):
+    # Was: "every supported route is named" — four of them, concatenated into one run-on line
+    # that included the non-existent `brew upgrade agitrack`. An update notice should say what to
+    # run, so it names the single command that fits the DETECTED install.
     monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     monkeypatch.setattr(updater, "_install_method", lambda: METHOD_PIP)
     _record_run(monkeypatch, returncode=1, stderr="error: externally-managed-environment")
+
     status = updater.apply()
+
     assert not status.ok
     error = status.error or ""
     assert "externally managed" in error
-    # Every supported route is named.
-    for token in (
-        "pip install --upgrade agitrack",
-        "pipx upgrade agitrack",
-        "brew upgrade agitrack",
-        "break-system-packages",
-    ):
-        assert token in error
+    assert "pip install --upgrade agitrack" in error
+    # ...and nothing else offered alongside it.
+    for absent in ("pipx upgrade agitrack", "brew upgrade agitrack"):
+        assert absent not in error
 
 
 def test_apply_package_no_pip_enumerates_routes(monkeypatch):
@@ -1018,10 +1017,26 @@ def test_apply_catches_exception_and_returns_manual_instructions(monkeypatch):
     assert "pip install --upgrade agitrack" in (status.error or "")  # manual routes included
 
 
-def test_manual_instructions_package_enumerates_routes():
-    text = Updater(source_repo=None).manual_update_instructions()
-    for token in ("pip install --upgrade agitrack", "pipx upgrade agitrack", "brew upgrade agitrack"):
-        assert token in text
+@pytest.mark.parametrize(
+    "method,expected,absent",
+    [
+        (METHOD_PIP, "pip install --upgrade agitrack", "pipx upgrade"),
+        (METHOD_PIPX, "pipx upgrade agitrack", "pip install --upgrade agitrack"),
+        (METHOD_BREW_PYTHON, "pipx install agitrack", "brew upgrade"),
+    ],
+)
+def test_manual_instructions_name_the_one_command_for_this_install(monkeypatch, method, expected, absent):
+    # One command, chosen from the detected install — not the old four-route enumeration, which
+    # made the reader pick and offered `brew upgrade agitrack` for a package Homebrew does not
+    # carry. The Homebrew-PYTHON case is the interesting one: pip cannot upgrade it in place
+    # (PEP 668), so the answer is pipx, never brew.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_install_method", lambda: method)
+
+    text = updater.manual_update_instructions()
+
+    assert expected in text
+    assert absent not in text
 
 
 def test_manual_instructions_source_points_at_git_pull(tmp_path: Path):
