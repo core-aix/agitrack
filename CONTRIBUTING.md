@@ -111,6 +111,7 @@ the TUI writes a report under `.agitrack/`; attaching it saves a lot of guessing
 If you think you have found a security issue, please do not open a public issue. Report it
 privately through GitHub's
 [security advisories](https://github.com/core-aix/agitrack/security/advisories/new).
+[SECURITY.md](SECURITY.md) says what counts as one, what is deliberate, and what to include.
 
 ## A note on agent-written contributions
 

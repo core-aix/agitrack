@@ -26,6 +26,30 @@ def test_register_list_deregister(monkeypatch, tmp_path):
     assert not any(i.pid == os.getpid() for i in daemons.list_running())
 
 
+def test_running_repos_reports_tracked_repos_without_a_process_scan(monkeypatch, tmp_path):
+    # The dashboard's switcher unions this in while drawing a dropdown the page header polls, so
+    # it must NOT cost a `ps` subprocess. Every daemon registers itself, so the registry alone is
+    # the complete answer in practice; the scan stays available for the rare caller that needs it.
+    monkeypatch.setattr(daemons, "_registry_dir", lambda: tmp_path / "daemons")
+
+    def fail_scan():
+        raise AssertionError("running_repos must not scan the process table by default")
+
+    monkeypatch.setattr(daemons, "_scan_daemon_processes", fail_scan)
+    (tmp_path / "myrepo").mkdir()
+    daemons.register("background", tmp_path / "myrepo")
+
+    assert daemons.running_repos() == [str((tmp_path / "myrepo").resolve())]
+
+
+def test_running_repos_excludes_the_hub_which_belongs_to_no_repo(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemons, "_registry_dir", lambda: tmp_path / "daemons")
+    monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])
+    daemons.register("hub", "", url="http://127.0.0.1:8765/")
+
+    assert daemons.running_repos() == []
+
+
 def test_list_running_prunes_dead_entries(monkeypatch, tmp_path):
     directory = tmp_path / "daemons"
     monkeypatch.setattr(daemons, "_registry_dir", lambda: directory)

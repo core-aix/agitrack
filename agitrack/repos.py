@@ -201,8 +201,17 @@ def _update(path: str | os.PathLike[str], mutate, *, touch: bool = False) -> Rep
 def remember(path: str | os.PathLike[str], *, view: str = "") -> RepoEntry:
     """Record that aGiTrack is (or was just) working on ``path``, and return its entry.
 
-    Called from every mode's startup, so the dashboard's repo list is "everywhere you have used
-    aGiTrack" rather than "wherever a daemon happens to be running"."""
+    Called from every mode's startup — the background tracker and the interactive session as they
+    register themselves, the shell/scripted runner, and `ensure_hub_for` for a repo opened with
+    `-d` alone — so the list is "everywhere you have used aGiTrack" rather than "wherever a daemon
+    happens to be running".
+
+    That breadth is load-bearing and was missing: for a long time the ONLY caller was
+    `ensure_hub_for`, so a repo was remembered only if a dashboard was opened for it. Every
+    headless start (`_open_dashboard_on_start` returns early when scripted, without a TTY, or with
+    `open_dashboard_on_start` off) therefore tracked a repository that never appeared in the
+    switcher. The hub also unions in repos with a live daemon (see `hub._served_repos`) so such a
+    repo is offered — and remembered — even when the tracker predates this fix."""
 
     def mutate(entry: RepoEntry) -> None:
         entry.last_seen = int(time.time())
@@ -224,8 +233,43 @@ def forget(path: str | os.PathLike[str]) -> bool:
     return True
 
 
+def last_activity(entry: "RepoEntry") -> float:
+    """When this repository was last ACTIVE, as epoch seconds — the value the dashboard orders by.
+
+    ``last_seen`` alone is "when aGiTrack last started here", which is not the same question and
+    answers it badly: eight trackers restarting together (a self-update sweep does exactly that)
+    all stamp the same second, so the switcher's order collapses to a tie broken by file position
+    — arbitrary, and it moves on its own.
+
+    The signal is the mtime of the repo's ``.git/logs/HEAD`` (the reflog), which git rewrites on
+    every commit and ref move. One ``stat``, no subprocess and no walk of git history — this is
+    read to draw a dropdown — and it counts the user's own commits, not just aGiTrack's, which is
+    what "last updated" means to the person reading the list.
+
+    ``.agitrack/state.json`` was the obvious candidate and is the WRONG one: the tracker rewrites
+    it on every poll that finds a backend session, so on a repo with a live conversation its mtime
+    advances every few seconds whether or not anything happened. Ordering by it sorted the list by
+    which daemon polled most recently, which is noise wearing the costume of activity (measured:
+    idle repos with a session advanced 15s apart while genuinely idle ones stood still).
+
+    The reflog WINS where it exists rather than being maxed with ``last_seen``; ``last_seen`` is
+    only the fallback. Taking the later of the two put every repo back on the tie it was meant to
+    break, because a start stamp is almost always more recent than the last commit — one
+    self-update sweep restarts every tracker and re-stamps them all within the same second.
+    ``last_seen`` still orders a repo opened with ``-d`` alone, one with reflogs turned off, and
+    one that is not a git repository at all (a directory listed for its reconstruction)."""
+    try:
+        return float((entry.directory / ".git" / "logs" / "HEAD").stat().st_mtime)
+    except OSError:
+        return float(entry.last_seen or 0)
+
+
 def list_repos(*, existing_only: bool = True, served_only: bool = True) -> list[RepoEntry]:
-    """Every repository the dashboard should offer, most recently used first.
+    """Every repository the dashboard should offer, MOST RECENTLY ACTIVE FIRST.
+
+    That order is the switcher's documented convention and is used by every reader (the switcher,
+    ``/`` redirecting to a repo, ``--daemons``-style listings) so they cannot disagree. See
+    :func:`last_activity` for what "active" means and why it is not ``last_seen``.
 
     Directories that have gone are dropped: the list exists to be switched between, and offering
     a repo the dashboard cannot open is worse than not offering it. Repos stopped with
@@ -235,10 +279,10 @@ def list_repos(*, existing_only: bool = True, served_only: bool = True) -> list[
         entries = [entry for entry in entries if entry.served]
     if existing_only:
         entries = [entry for entry in entries if _is_dir(entry.directory)]
-    # Latest-in-file first, then a STABLE sort by timestamp: within one second (which is as fine
-    # as ``last_seen`` gets) the order repos were last opened in decides.
+    # Latest-in-file first, then a STABLE sort: two repos genuinely active in the same instant
+    # are ordered by which was worked on last, rather than by wherever they sit in the file.
     entries.reverse()
-    entries.sort(key=lambda entry: entry.last_seen, reverse=True)
+    entries.sort(key=last_activity, reverse=True)
     return entries
 
 

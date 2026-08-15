@@ -33,7 +33,13 @@ from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 from agitrack.transcripts import capabilities as caps
 from agitrack.transcripts.edits import merge_edits_by_path, tracked_edit
-from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
+from agitrack.transcripts.types import (
+    SUBAGENT_LIVE_HORIZON_SECONDS,
+    ExportedSession,
+    FileEdit,
+    SessionRef,
+    SessionTurn,
+)
 
 # A rollout file name ends with the session uuid, so the id can be recovered from the path
 # alone. That is what makes the filesystem fallback possible when the SQLite index is
@@ -816,6 +822,129 @@ def _child_ids_in_rows(rows: list[dict]) -> list[str]:
     return found
 
 
+# A child thread's rollout brackets every turn it runs: ``task_started`` opens one and exactly
+# one of these closes it. A rollout whose last such event is a ``task_started`` is a sub-agent
+# that is still working right now. Read off real rollouts from this module's live runs — a
+# completed sub-agent ends on ``task_complete``, one killed with its parent on ``turn_aborted``.
+_TURN_TERMINAL_EVENTS = frozenset({"task_complete", "turn_aborted"})
+
+# ``spawn_agent`` returns the id of the thread it started, and the harness later feeds the parent
+# a ``<subagent_notification>`` naming that same id when the sub-agent reports back. Both land in
+# the PARENT'S OWN ROLLOUT, which is what makes async sub-agents trackable at all: the state db's
+# ``thread_spawn_edges`` is invisible mid-session (aGiTrack opens it ``immutable=1``, so rows
+# still in the un-checkpointed WAL are simply not there — verified live: a running sub-agent's
+# edge read back as no rows at all), and mid-session is the only time the answer matters.
+#
+# The spawn result reaches the rollout in two shapes depending on how the model called the tool —
+# a plain ``function_call_output`` for a direct ``spawn_agent`` call, or a
+# ``custom_tool_call_output`` when the model drives the tool from the ``exec`` JS sandbox — but
+# the payload it prints is the tool's own return value either way, so one pattern reads both.
+# Both shapes were captured from live runs of this module's own tests.
+_SPAWNED_AGENT_ID_RE = re.compile(r'"agent_id"\s*:\s*"([^"]+)"')
+_SUBAGENT_NOTIFICATION_TAG = "<subagent_notification>"
+_NOTIFIED_AGENT_ID_RE = re.compile(r'"agent_path"\s*:\s*"([^"]+)"')
+
+
+def _thread_is_running(path: Path) -> bool:
+    """Whether the thread recorded at *path* has a turn open right now."""
+    running = False
+    for row in _read_rows(path):
+        record_kind, payload_kind = _row_kind(row)
+        if record_kind != "event_msg":
+            continue
+        if payload_kind == "task_started":
+            running = True
+        elif payload_kind in _TURN_TERMINAL_EVENTS:
+            running = False
+    return running
+
+
+def _flat_text(value: object) -> str:
+    """A rollout field's text, whether Codex stored it as a bare string or as the
+    ``[{"type": "input_text", "text": …}, …]`` block list it uses elsewhere. Concatenated
+    rather than JSON-dumped: a dump escapes the inner quotes of an embedded JSON payload, so a
+    pattern written against what the tool actually printed would never match."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(part.get("text", "") for part in value if isinstance(part, dict))
+    return ""
+
+
+def _spawned_agent_ids_in_rows(rows: list[dict]) -> list[str]:
+    """Child thread ids this conversation's ``spawn_agent`` calls RETURNED (see the regex note)."""
+    found: list[str] = []
+    for row in rows:
+        _, payload_kind = _row_kind(row)
+        if payload_kind not in ("function_call_output", "custom_tool_call_output"):
+            continue
+        for match in _SPAWNED_AGENT_ID_RE.finditer(_flat_text(_payload(row).get("output"))):
+            found.append(match.group(1))
+    return found
+
+
+def _notified_agent_ids_in_rows(rows: list[dict]) -> set[str]:
+    """Child thread ids that have REPORTED BACK — the harness injects a
+    ``<subagent_notification>`` user message naming the sub-agent whose work is over."""
+    found: set[str] = set()
+    for row in rows:
+        _, payload_kind = _row_kind(row)
+        if payload_kind != "message":
+            continue
+        text = _flat_text(_payload(row).get("content"))
+        if _SUBAGENT_NOTIFICATION_TAG not in text:
+            continue
+        found.update(match.group(1) for match in _NOTIFIED_AGENT_ID_RE.finditer(text))
+    return found
+
+
+def live_subagent_ids(session_id: str, rows: list[dict], *, extra_children: list[str] | None = None) -> list[str]:
+    """Ids of this conversation's sub-agent threads that are STILL WORKING.
+
+    Codex's ``spawn_agent`` is asynchronous and ``wait_agent`` is optional, so the main agent can
+    spawn a sub-agent, post what reads as a final answer, and leave the sub-agent editing the tree
+    for minutes afterwards. Committing there records a finished-sounding trace over half-done
+    work, which is what ``ExportedSession.live_subagent_ids`` exists to prevent.
+
+    A candidate is dropped as soon as its ``<subagent_notification>`` arrives; the ones left are
+    confirmed against the CHILD'S OWN rollout (an unclosed ``task_started``) rather than the state
+    db's ``thread_spawn_edges.status``, which read ``open`` both for a sub-agent that had already
+    finished and for one that had been aborted — it records only that the spawn happened. The
+    mtime horizon is the safety valve for a sub-agent killed so hard it never recorded its own end
+    (see SUBAGENT_LIVE_HORIZON_SECONDS).
+
+    Nested spawns count too — a grandchild still writing is still writing — and ``visited`` keeps
+    a corrupt or self-referential edge from recursing forever, exactly as ``_subagent_work`` does.
+    """
+    reported = _notified_agent_ids_in_rows(rows)
+    queue = list(
+        dict.fromkeys(
+            [
+                *_spawned_agent_ids_in_rows(rows),
+                *(extra_children or []),
+                *_spawned_thread_ids(session_id),
+            ]
+        )
+    )
+    live: list[str] = []
+    visited: set[str] = set()
+    horizon = time.time() - SUBAGENT_LIVE_HORIZON_SECONDS
+    while queue:
+        child = queue.pop(0)
+        if child in visited:
+            continue
+        visited.add(child)
+        queue.extend(_spawned_thread_ids(child))
+        if child in reported:
+            continue  # already reported back: its work is in the conversation, not still coming
+        path = session_transcript_path(child)
+        if path is None:
+            continue  # no rollout to judge by: claiming it is running would defer on nothing
+        if _mtime(path) >= horizon and _thread_is_running(path):
+            live.append(child)
+    return sorted(live)
+
+
 def _spawned_thread_ids(session_id: str) -> list[str]:
     """Child thread ids Codex spawned from this conversation.
 
@@ -1220,6 +1349,7 @@ def export_session_at(
         model=session_model(resolved_id) if resolved_id else None,
         updated=int(_mtime(path)) or None,
         turns=turns,
+        live_subagent_ids=live_subagent_ids(resolved_id, rows, extra_children=_child_ids_in_rows(rows)),
     )
 
 

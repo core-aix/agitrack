@@ -222,5 +222,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Captured process output and editor backups
+*.stdout
+*.stderr
+*.bak
 
 .DS_Store

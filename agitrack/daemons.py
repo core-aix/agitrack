@@ -163,6 +163,33 @@ def list_running(*, repo: str | os.PathLike[str] | None = None) -> list[DaemonIn
     return out
 
 
+def running_repos(*, scan: bool = False) -> list[str]:
+    """Resolved paths of every repository an aGiTrack daemon is working on RIGHT NOW.
+
+    The dashboard's repo switcher unions this with the remembered list, so a repository aGiTrack
+    is demonstrably tracking is offered even when nothing ever recorded it in ``repos.json`` —
+    which used to happen for every headless start (see ``repos.remember``'s callers) and can
+    still happen to an entry lost by that file's deliberately unlocked write.
+
+    Registry-only by default, NOT the process-table scan: this is read while drawing a dropdown
+    that the page header polls, and the scan costs a ``ps`` subprocess. Every daemon registers
+    itself at startup, so the cheap source is also the complete one in practice; ``scan=True`` is
+    for the rare caller that must find a daemon which never registered.
+
+    The hub itself is excluded — it serves every repository and belongs to none."""
+    seen: dict[str, None] = {}
+    infos = list_running() if scan else _registry_entries()
+    for info in infos:
+        if info.kind == "hub" or not info.repo:
+            continue
+        try:
+            resolved = str(Path(info.repo).expanduser().resolve())
+        except OSError:
+            resolved = str(Path(info.repo).expanduser())
+        seen.setdefault(resolved, None)
+    return list(seen)
+
+
 def _serves_repo(info: DaemonInfo, repo: str | os.PathLike[str]) -> bool:
     """Whether ``info`` is a daemon for ``repo``. Paths are resolved so a symlinked or
     relatively-recorded repo still matches; a daemon with no recorded repo never does."""

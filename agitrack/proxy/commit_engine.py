@@ -70,6 +70,7 @@ import time
 from typing import Callable
 
 from agitrack.commits import build_agent_commit_message, render_interaction_trace
+from agitrack.commits.message import TRACE_EVENT_ROLE
 from agitrack.git import GitRepo
 from agitrack.transcripts.opencode import SessionTurn
 from agitrack.transcripts import capabilities
@@ -183,6 +184,20 @@ def _same_prompt(a: str, b: str) -> bool:
 # produced no agent reply and no edits. A real prompt that short does not exist, and a turn that
 # the agent actually answered is never discarded whatever it says.
 _DIALOG_KEYSTROKES = frozenset("0123456789yYnN")
+
+
+def _is_background_event(prompt: str | None) -> bool:
+    """Whether *prompt* is the harness's synthetic label for a turn the agent ran off a
+    BACKGROUND EVENT — a task it had started reporting back — rather than off anything the
+    user said (``BACKGROUND_PROMPT_LABELS`` in transcripts/claude.py).
+
+    Such a turn has no author. Recorded as a ``user`` trace entry it became a ``## User`` /
+    ``(background task completed)`` block that reads exactly like something the user typed,
+    and it reached the commit subject and the dashboard's per-commit prompt the same way.
+    It is instead recorded under ``TRACE_EVENT_ROLE`` and rendered as an event note."""
+    from agitrack.transcripts.claude import BACKGROUND_PROMPT_LABELS
+
+    return (prompt or "").strip() in BACKGROUND_PROMPT_LABELS
 
 
 def _is_dialog_keystroke(turn) -> bool:
@@ -341,7 +356,9 @@ class CommitEngine:
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    self.state.append_trace("user", turn.user_prompt)
+                    # A background wake-up is an EVENT, not something the user said.
+                    role = TRACE_EVENT_ROLE if _is_background_event(turn.user_prompt) else "user"
+                    self.state.append_trace(role, turn.user_prompt)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
@@ -350,7 +367,16 @@ class CommitEngine:
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self._add_turn_usage(turn)
-            prompts = [p for turn in turns for p in ([turn.user_prompt, *turn.queued_followups]) if p]
+            # The subject describes what was ASKED FOR, so a synthetic wake-up label is not a
+            # candidate: a commit whose turns were all background-driven falls back to
+            # "<backend> changes" rather than claiming the user asked for "(background task
+            # completed)".
+            prompts = [
+                p
+                for turn in turns
+                for p in ([turn.user_prompt, *turn.queued_followups])
+                if p and not _is_background_event(p)
+            ]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
@@ -368,8 +394,14 @@ class CommitEngine:
             entries: list[tuple[str, str]] = []
             for turn in turns:
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    subject_prompts.append(turn.user_prompt)
-                    entries.append(("user", turn.user_prompt))
+                    if _is_background_event(turn.user_prompt):
+                        # An EVENT woke the agent; nobody asked for anything. It belongs in the
+                        # trace (it explains a turn with no prompt) but never under the user's
+                        # name, and never as the commit's subject.
+                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt))
+                    else:
+                        subject_prompts.append(turn.user_prompt)
+                        entries.append(("user", turn.user_prompt))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
@@ -428,9 +460,13 @@ class CommitEngine:
             # messages — dropped the leftovers in between (or after) the agent's replies,
             # so a message the user sent mid-turn read as if it came after the agent's
             # final response (issue #8; the agent's answer actually covers all of them).
+            # The anchor is whatever STARTED the last turn — a user prompt, or the background
+            # event that woke the agent with nobody saying anything. Anchoring on "user" alone
+            # dropped a leftover typed during a background-driven turn past all of that turn's
+            # agent replies, reading as if it arrived after the agent's final answer.
             insert_at = len(entries)
             for index in range(len(entries) - 1, -1, -1):
-                if entries[index][0] == "user":
+                if entries[index][0] in ("user", TRACE_EVENT_ROLE):
                     insert_at = index + 1
                     break
             entries[insert_at:insert_at] = [("user", leftover) for leftover in leftovers]
@@ -740,11 +776,17 @@ class CommitEngine:
         if exported_session.model:
             self.state.model = exported_session.model
 
-        # Remember which background tasks are still running so the pre-agent user-commit
-        # dialog knows the tree may have a concurrent writer (see the runner's
-        # _offer_pre_agent_user_commit). Best-effort: sessions without the field skip it.
+        # Remember which of the agent's background work is still running so the pre-agent
+        # user-commit dialog knows the tree may have a concurrent writer (see the runner's
+        # _offer_pre_agent_user_commit) and the auto-fold keeps waiting for the tree to settle.
+        # Backgrounded tasks and async SUB-AGENTS both qualify: each keeps editing this tree
+        # after the launching turn ended, which is exactly what makes ownership of an
+        # uncommitted change unknowable. Best-effort: sessions without the field skip it.
         try:
-            session.live_background_task_ids = list(getattr(exported_session, "live_background_task_ids", []) or [])
+            session.live_background_task_ids = [
+                *(getattr(exported_session, "live_background_task_ids", []) or []),
+                *(getattr(exported_session, "live_subagent_ids", []) or []),
+            ]
         except AttributeError:
             pass
 
@@ -793,6 +835,24 @@ class CommitEngine:
 
         if require_complete and all_turns and not all_turns[-1].complete:
             debug_fn(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
+            return None, awaited
+
+        # ASYNC SUB-AGENTS still working. The main agent can spawn sub-agents that outlive the
+        # turn that launched them, then post what reads as a final answer while they are doing
+        # the actual job. Committing there records a trace whose closing message says the work
+        # is done over a tree the sub-agents are still writing to — and the summarizer, whose
+        # only input is that trace, describes the request as finished. So the launching turn
+        # WAITS: nothing is lost, the watermark stays put, and once the sub-agents report back
+        # their work and the agent's follow-up land in the same commit. The exit/stop finalize
+        # (require_complete=False) still captures everything, and the liveness signal itself
+        # expires (see SUBAGENT_LIVE_HORIZON_SECONDS) so a sub-agent that died without
+        # reporting cannot hold commits forever.
+        live_subagents = list(getattr(exported_session, "live_subagent_ids", []) or [])
+        if require_complete and all_turns and live_subagents:
+            debug_fn(
+                f"deferring agent commit: {len(live_subagents)} async sub-agent(s) still running "
+                f"session_id={new_session_id}"
+            )
             return None, awaited
 
         # ENFORCED: a commit's trace never ends with an unanswered user message. A
@@ -881,17 +941,50 @@ class CommitEngine:
             # Advance the watermark for THIS conversation so the next parse cycle only
             # exports its new turns — keyed per conversation so a later switch back to a
             # different conversation reads its own mark, never this one's. Prefer the last turn
-            # that actually carried a response; fall back to the last turn's ids for a no-text
-            # finished turn (its assistant id is empty, so the user id anchors the watermark).
+            # that actually carried a response; fall back to the last turn for a no-text
+            # finished turn. Which of the turn's two ids anchors the mark is decided below.
             watermark = complete_turns[-1] if complete_turns else last_turn
-            mark_id = watermark.assistant_message_id or watermark.user_message_id if watermark else None
+            # A turn captured MID-FLIGHT is anchored on its USER id — never on whatever
+            # assistant id it happens to carry at this instant. A backend mints a NEW message
+            # id for each assistant response within a turn, so the id a force capture (the
+            # exit/stop finalize, `require_complete=False`) reads is TRANSIENT: when the turn
+            # continues, its `assistant_message_id` becomes a later one, the stored mark then
+            # matches no turn boundary, and turns_after's marked_at fallback drops the turn
+            # for having STARTED before the mark. What survives is then only the PARTIAL
+            # snapshot the capture took: everything the turn did afterwards — its real final
+            # response, its remaining tokens — is recorded nowhere, and its later edits reach
+            # history only as unattributed diff in whatever commit next sweeps the tree. (The
+            # prompt itself does survive, in that partial record; the watermark only advances
+            # when the capture actually committed. Losing the prompt outright is the SEPARATE
+            # inherited-watermark bug, see AgitrackState.backend_message_id_for.) The user id
+            # is stable for the turn's whole life and is exactly what turns_after re-exports
+            # INCLUSIVELY once the turn finishes.
+            #
+            # This used to key off `not watermark.assistant_message_id`, which caught only a
+            # turn captured before it had said ANYTHING — every mid-flight turn that had
+            # already spoken (the common case; a daemon restart mid-turn) fell through to the
+            # transient id. Easy to hit: `uv run` reinstalls the editable package, the tracker
+            # reads that as "aGiTrack updated on disk" and restarts. Reproduced by replaying a
+            # real transcript truncated at 25/50/75% through a turn — the turn vanished from
+            # every later commit each time (2026-08-15).
+            anchor_on_user = (
+                watermark is not None
+                and bool(watermark.user_message_id)
+                and (not watermark.assistant_message_id or not watermark.complete)
+            )
+            if watermark is None:
+                mark_id = None
+            elif anchor_on_user:
+                mark_id = watermark.user_message_id
+            else:
+                mark_id = watermark.assistant_message_id or watermark.user_message_id
             if watermark is not None and mark_id:
                 self.state.set_backend_message_id(
                     self.state.backend_session_id,
                     mark_id,
                     marked_at=(watermark.ended_at or watermark.started_at or time.time()),
                 )
-            if watermark is not None and not watermark.assistant_message_id and watermark.user_message_id:
+            if watermark is not None and anchor_on_user:
                 # Force-captured mid-turn: the next parse re-exports this turn INCLUSIVELY
                 # once it finishes. Remember the usage counted SO FAR (cumulative, so a
                 # second force-capture of the same still-running turn updates it) and

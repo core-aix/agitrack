@@ -267,6 +267,12 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     # which are absent from this export and hidden from `session list`. Export each (by
     # the child id the parent's task part records) and fold its tokens into the turn that
     # launched it, so sub-agent consumption is fully accounted (issue: subagent tokens).
+    #
+    # `task` BLOCKS: the child's result comes back to the calling turn, so the turn cannot
+    # end while a sub-agent is still working and there is never anything to defer a commit
+    # for. That is why `live_subagent_ids` stays empty here while Claude and Codex — whose
+    # sub-agents outlive the launching turn — have to track it. Verified live against
+    # opencode 1.18.16: the sub-agent's file was already on disk when the turn's reply landed.
     subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
     return parse_exported_session(
         data,

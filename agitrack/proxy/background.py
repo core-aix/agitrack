@@ -1084,7 +1084,10 @@ class BackgroundRunner:
         # summary/settle waits during teardown. NOT on an update restart: the replacement
         # process keeps tracking, so an in-flight turn must wait for its real completion
         # instead of being force-committed half-done at the swap.
-        if not restarting:
+        # ...but not into a repo that is GONE (see `_repo_is_gone`): there is nothing left to
+        # commit into, and every git call would just raise its way through the handler below,
+        # slowly, on the way out.
+        if not restarting and not self._repo_is_gone():
             try:
                 self._process_once(require_complete=False)
                 if not self._manual_commits:
@@ -1176,6 +1179,26 @@ class BackgroundRunner:
             daemons.register("background", self.repo.repo)
         except Exception as error:
             self._debug(f"daemon registry write failed: {error!r}")
+        self._remember_repo()
+
+    def _remember_repo(self) -> None:
+        """Record this repository in the user-wide list the dashboard's switcher offers.
+
+        Tracking a repo is what makes it worth listing, so it is recorded HERE rather than left
+        to whoever opens a dashboard. It used to be reachable only through `ensure_hub_for`, so a
+        tracker that never opened one — started by the autotrack hook, from a script, over SSH,
+        or with `open_dashboard_on_start` off, all of which return early from
+        `_open_dashboard_on_start` — ran for days without ever appearing in the switcher.
+        Recording it at startup also outlives the daemon: the repo stays listed after tracking
+        stops, which is the whole point of a list that is history rather than process state.
+
+        Best-effort: a repo that cannot be remembered is still tracked."""
+        try:
+            from agitrack import repos as repo_registry
+
+            repo_registry.remember(self.repo.repo)
+        except Exception as error:
+            self._debug(f"remembering repo for the dashboard switcher failed: {error!r}")
 
     def _remove_handshake(self) -> None:
         try:
@@ -1348,8 +1371,39 @@ class BackgroundRunner:
             except (ValueError, OSError):  # pragma: no cover - not on the main thread
                 pass
 
+    def _repo_is_gone(self) -> bool:
+        """Whether the repository this tracker exists to watch has been deleted.
+
+        A tracker outliving its repo has nothing left to do and no way to be told so: `-b stop`
+        and `agitrack stop` both work through files under ``<repo>/.agitrack/``, which went with
+        the directory, so nothing short of `kill` could reach it. It polls a missing path every
+        few seconds for as long as the machine is up, and — because a deleted repo is deleted
+        for every reader — it is invisible in the dashboard's switcher too. Temp-directory repos
+        make this routine: a test run or a scratch clone under ``/tmp`` is removed while its
+        tracker keeps running.
+
+        Only the DIRECTORY disappearing counts. Removing ``.git`` alone leaves a directory the
+        user still has and may be about to re-init, and quitting there would throw away the
+        pending turn this tracker is holding; the whole path being gone is the one unambiguous
+        signal. An error while asking (a permission failure, a stalled network mount) is likewise
+        not an answer — a tracker must never stop because a `stat` was slow."""
+        try:
+            if self.repo.repo.exists():
+                return False
+        except OSError:
+            return False  # cannot tell (a permission error, a stalled mount): keep tracking
+        return True
+
     def _loop(self) -> None:
         while not self._stop.is_set():
+            if self._repo_is_gone():
+                # Not `_explicit_stop`: this is the tracker deciding, and the distinction matters
+                # for the update-restart path, which must not resurrect a tracker for a repo that
+                # no longer exists.
+                self._print(f"repository {self.repo.repo} no longer exists; stopping.")
+                self._explicit_stop = True
+                self._stop.set()
+                return
             try:
                 self._sample_worktree()  # the daemon's stand-in for the TUI's file watcher
                 self._process_once()  # records latently, or covers commits the agent made itself

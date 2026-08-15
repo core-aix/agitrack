@@ -146,9 +146,18 @@ ATX_HEADING_RE = re.compile(r"^(#{1,6})(\s.*)$")
 # A fenced code block delimiter; a leading '#' inside such a fence is a comment,
 # not a heading, so heading-nesting must skip fenced regions.
 CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
-# The role heading for each trace turn ("## User" / "## Agent") is level 2, so a
-# message's own headings are nested one level deeper, starting at level 3.
+# The role heading for each trace turn ("## User" / "## Agent") is level 2.
 TRACE_ROLE_HEADING_LEVEL = 2
+# Every heading inside a trace message moves down by exactly this much: `#` → `###`,
+# `##` → `####`. A FIXED shift, not a normalization of the shallowest heading to some floor —
+# the message's own levels are its author's, and re-basing them changes what the author wrote
+# about their own structure. Two levels because one nested correctly but did not READ
+# correctly: at level 3 a message's own sections sat a single `#` from the `## User`/`## Agent`
+# scaffolding, and in plain-text `git log` telling the trace's structure from the
+# conversation's content meant counting hashes. Levels are capped at the Markdown maximum of
+# 6, so a message already nesting 5 deep loses some depth at the bottom — the rare case, and
+# preferable to re-basing every message.
+TRACE_HEADING_SHIFT = 2
 
 
 # Section header that marks a commit as carrying aGiTrack metadata. Detection of
@@ -428,15 +437,40 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
     return lines + list(extra)
 
 
+TRACE_EVENT_ROLE = "event"
+"""Trace role for something that HAPPENED rather than something someone said.
+
+The harness wakes the agent when a task it backgrounded reports back, and the transcript
+parser labels the resulting turn with a synthetic prompt (``BACKGROUND_PROMPT_LABELS`` in
+transcripts/claude.py). Recording that label under the ``user`` role put words in the user's
+mouth: every such commit's trace carried a ``## User`` / ``(background task completed)`` block
+indistinguishable from something they typed — and that trace is the summarizer's sole input, so
+the summary read the wake-up as a request. It is an event; it renders as one."""
+
+
 def _trace_role_lines(item: dict) -> list[str]:
-    """The rendered lines for one trace turn — its "## User"/"## Agent" role heading plus the
+    """The rendered lines for one trace entry — its "## User"/"## Agent" role heading plus the
     masked, heading-nested body — or an EMPTY list when the entry has no textual content. A
     blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while the
-    agent was busy) must never produce a bare "## User" heading with nothing under it."""
+    agent was busy) must never produce a bare "## User" heading with nothing under it.
+
+    An :data:`TRACE_EVENT_ROLE` entry is NOT a speaker and gets no role heading: it renders as a
+    note (the same blockquote form the lead-in notes use) naming the event, so a reader — and the
+    summarizer — can see the agent continued on its own rather than answering anybody."""
     content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
     if not content.strip():
         return []
-    label = "User" if item.get("role", "").strip().lower() == "user" else "Agent"
+    role = item.get("role", "").strip().lower()
+    if role == TRACE_EVENT_ROLE:
+        # Phrased generically over the label rather than mapping each known one, so a new
+        # harness event kind renders correctly the day it appears instead of silently
+        # reverting to "the user said this".
+        note = (
+            f"The agent was woken here by a background event {' '.join(content.split())}, not by "
+            "a user message. What follows is its response to that event."
+        )
+        return [*_note_block(note), ""]
+    label = "User" if role == "user" else "Agent"
     return [f"## {label}", "", *_body_lines(content), ""]
 
 
@@ -961,16 +995,17 @@ def _body_lines(text: str) -> list[str]:
 
 
 def _nest_headings_under_role(content: str) -> str:
-    """Shift the Markdown headings inside one trace message so the shallowest one
-    sits a single level below its ``## User`` / ``## Agent`` role heading (i.e. at
-    level 3). The relative hierarchy is preserved — every heading moves by the same
-    amount — so the rendered commit log nests the message's own sections under its
-    role instead of letting a message ``#`` outrank the role it belongs to.
+    """Push every Markdown heading inside one trace message down by
+    :data:`TRACE_HEADING_SHIFT` levels: ``#`` becomes ``###``, ``##`` becomes ``####``.
 
-    Headings are only ever pushed deeper, never promoted; a message already nested
-    at level 3+ is left as-is. Fenced code blocks are skipped, since a leading
-    ``#`` there is a comment, not a heading. Levels are capped at the Markdown
-    maximum of 6."""
+    A uniform shift, so the message's own hierarchy survives exactly as its author wrote it
+    and nothing it wrote can outrank the ``## User`` / ``## Agent`` role heading it belongs
+    to (the shallowest possible result is level 3). Two levels rather than one keeps the
+    trace's scaffolding distinguishable at a glance in plain-text ``git log``.
+
+    Fenced code blocks are skipped, since a leading ``#`` there is content being QUOTED — a
+    shell comment, or a Markdown example — and rewriting it would falsify what the message
+    showed. Levels are capped at the Markdown maximum of 6."""
     lines = content.splitlines()
     in_fence = False
     fence_marker = ""
@@ -991,21 +1026,25 @@ def _nest_headings_under_role(content: str) -> str:
             headings.append((index, len(heading.group(1)), heading.group(2)))
     if not headings:
         return content
-    shallowest = min(level for _, level, _ in headings)
-    shift = max(0, (TRACE_ROLE_HEADING_LEVEL + 1) - shallowest)
-    if not shift:
-        return content
     for index, level, rest in headings:
-        lines[index] = "#" * min(6, level + shift) + rest
+        lines[index] = "#" * min(6, level + TRACE_HEADING_SHIFT) + rest
     return "\n".join(lines)
 
 
 def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
+    # A turn STARTS at whatever prompted it — a user message, or a background event that woke
+    # the agent with nobody saying anything (TRACE_EVENT_ROLE). Both count here: an event-driven
+    # turn is a turn, and counting only `user` entries would let a long run of background wake-ups
+    # read as ONE turn and keep the whole run in the trace, well past the limit.
     limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
-    user_indexes = [index for index, item in enumerate(trace) if str(item.get("role", "")).strip().lower() == "user"]
-    if len(user_indexes) <= limit:
+    starts = [
+        index
+        for index, item in enumerate(trace)
+        if str(item.get("role", "")).strip().lower() in ("user", TRACE_EVENT_ROLE)
+    ]
+    if len(starts) <= limit:
         return trace
-    return trace[user_indexes[-limit] :]
+    return trace[starts[-limit] :]
 
 
 def mask_paths(text: str) -> str:

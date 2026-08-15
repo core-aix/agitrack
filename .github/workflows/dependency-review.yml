@@ -1,0 +1,40 @@
+name: Dependency review
+
+# Catches a dependency with a known advisory at the moment a PR proposes it, which is the
+# cheapest point to say no. Dependabot (see .github/dependabot.yml) handles the other
+# direction: advisories published against dependencies we ALREADY have.
+#
+# Pull requests only. The action diffs the PR's dependency manifests against the base branch,
+# so it has nothing to compare on a push.
+
+on:
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: dep-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      # Lets the action post its summary as a PR comment instead of only in the job log.
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          # Block the merge on high and critical only. Moderate findings are surfaced in the
+          # comment for a human to weigh: this project's dependency tree is small, and a
+          # moderate advisory in a dev-only tool is not worth a red required check.
+          fail-on-severity: high
+          comment-summary-in-pr: always
+          # Apache 2.0 project (see LICENCE): a copyleft dependency would be a licensing
+          # problem, so name the ones that cannot be pulled in silently.
+          deny-licenses: GPL-3.0, AGPL-3.0, LGPL-3.0
