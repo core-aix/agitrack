@@ -14,7 +14,14 @@ from agitrack.fileio import safe_is_dir
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts import capabilities
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
-from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
+from agitrack.transcripts.types import (
+    SUBAGENT_LIVE_HORIZON_SECONDS,
+    ExportedSession,
+    FileEdit,
+    SessionRef,
+    SessionTurn,
+    turns_after,
+)
 
 __all__ = [
     "ExportedSession",
@@ -73,6 +80,14 @@ BACKGROUND_PROMPT_LABELS = (_BACKGROUND_TURN_LABEL, MONITOR_UPDATE_LABEL)
 # monitors; small enough that a task that died without a terminal notification stops
 # suppressing the user-commit dialog within the hour.
 _BACKGROUND_LIVE_HORIZON_SECONDS = 3600
+
+# The tool result Claude Code returns when the agent launches an ASYNC sub-agent: the call
+# returns immediately with the sub-agent's id, and the work continues in the background
+# until a terminal `<task-notification>` (keyed by that same id) reports it back. A
+# SYNCHRONOUS Agent/Task call returns the sub-agent's finished report instead and matches
+# neither pattern — it is already over when the turn ends, so it is not tracked here.
+_ASYNC_AGENT_LAUNCH_MARKER = "Async agent launched successfully"
+_ASYNC_AGENT_ID_RE = re.compile(r"\bagentId:\s*([0-9a-zA-Z_-]+)")
 
 # A typed slash command is recorded as a synthetic user row carrying a
 # <command-name>/foo</command-name> artifact (see `_slash_command_name`). For
@@ -969,6 +984,7 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
         rows,
         subagent_tokens=_subagent_token_map(path),
         unmatched_subagent_time=_subagent_unmatched_mtime(path),
+        subagent_activity=_subagent_activity(path),
         collect_edits=collect_edits,
     )
     if key is not None:
@@ -1024,6 +1040,35 @@ def _subagent_unmatched_mtime(session_path: Path) -> int | None:
         if newest is None or mtime > newest:
             newest = mtime
     return newest
+
+
+def _subagent_activity(session_path: Path) -> dict[str, int]:
+    """``agent id -> mtime`` (epoch seconds) for each sub-agent transcript of this session.
+
+    Claude Code names the file after the sub-agent itself (``agent-<agentId>.jsonl``) — the
+    very id its launch tool result reported and its terminal `<task-notification>` carries —
+    so the mtime is a direct read of when that sub-agent last produced anything. `parse_rows`
+    uses it as the liveness evidence behind ``live_subagent_ids``: a sub-agent still writing
+    is still working, and one silent past the horizon is presumed dead so it cannot defer
+    commits forever. Empty when the session has no sub-agents (or an older Claude Code that
+    keeps them inline, in which case liveness falls back to the launch time)."""
+    subdir = session_path.with_suffix("") / "subagents"
+    if not safe_is_dir(subdir):
+        return {}
+    out: dict[str, int] = {}
+    try:
+        agent_files = sorted(subdir.glob("agent-*.jsonl"))
+    except OSError:
+        return {}
+    for agent_path in agent_files:
+        agent_id = agent_path.name[len("agent-") : -len(".jsonl")]
+        if not agent_id:
+            continue
+        try:
+            out[agent_id] = int(agent_path.stat().st_mtime)
+        except OSError:
+            continue
+    return out
 
 
 def _subagent_tool_use_id(agent_path: Path) -> str | None:
@@ -1165,6 +1210,7 @@ def parse_rows(
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
     unmatched_subagent_time: int | None = None,
+    subagent_activity: dict[str, int] | None = None,
     collect_edits: bool = False,
 ) -> ExportedSession:
     # `subagent_tokens` maps a Task tool_use id -> the sub-agent's token usage (in the
@@ -1175,6 +1221,11 @@ def parse_rows(
     # `unmatched_subagent_time` (its file mtime), or the latest turn if that is unknown —
     # so its tokens are never lost, and are attributed to a STABLE turn that the commit
     # watermark can trim, instead of being re-attributed onto each new turn every re-parse.
+    #
+    # `subagent_activity` maps an async sub-agent's id -> the mtime of its own transcript
+    # file, the freshest evidence available that it is still working (see
+    # `_subagent_activity`). Injected rather than read here so parse_rows stays a pure
+    # function of `rows`.
     turns: list[SessionTurn] = []
     tool_ids_per_turn: list[set[str]] = []
     # Prompts the user edited before the agent answered: their rows are still in the file
@@ -1212,6 +1263,11 @@ def parse_rows(
     # that died notification-less from suppressing the user-commit dialog forever.
     background_last_event: dict[str, int] = {}
     background_terminated: set[str] = set()
+    # Async sub-agents this session launched -> the launch timestamp. A sub-agent leaves the
+    # set the moment a terminal `<task-notification>` names it (`background_terminated`); the
+    # ones still in it after the horizon check are `live_subagent_ids`, and while any exist the
+    # launching turn's closing message is not the end of the work it describes.
+    spawned_subagents: dict[str, int] = {}
     # Per-session running content of each edited file, so a Write/Edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
@@ -1236,12 +1292,38 @@ def parse_rows(
             tool_ids_per_turn.append(current.get("tool_ids") or set())
             current = None
 
+    def note_notification(row: dict) -> str | None:
+        """Record what a `<task-notification>` row says about the task it names, and return
+        its kind (or None when the row is not a notification). Called for BOTH row shapes —
+        the delivered ``user`` message and the queued ``attachment`` — because a task that
+        reports back while the agent is busy is only ever recorded as the latter, and that is
+        precisely the case that has to end a sub-agent's liveness."""
+        kind = _task_notification_kind(row)
+        if kind is None:
+            return None
+        task_id = _notification_task_id(row)
+        if task_id:
+            if kind == "completed":
+                background_terminated.add(task_id)
+                background_last_event.pop(task_id, None)
+                # An async sub-agent reports back through the same channel, keyed by the same
+                # id: its work is done, so it stops holding the launching turn's commit.
+                spawned_subagents.pop(task_id, None)
+            else:
+                background_last_event[task_id] = _row_timestamp(row) or 0
+        return kind
+
     for row in rows:
         stamp = _row_timestamp(row)
         if stamp is not None:
             updated = stamp if updated is None else max(updated, stamp)
         row_type = row.get("type")
         if row_type == "user":
+            for agent_id in _launched_async_agent_ids(row):
+                # The agent spawned a sub-agent that keeps working after this turn ends.
+                # Recorded FIRST, before any branch below can `continue` past this row: the
+                # launch acknowledgment is a tool_result, which every one of them discards.
+                spawned_subagents.setdefault(agent_id, stamp or 0)
             if str(row.get("uuid") or "") in superseded:
                 # A draft the user edited before the agent saw it: nothing in the
                 # conversation descends from this row, so it is not part of the history.
@@ -1265,18 +1347,11 @@ def parse_rows(
                 # their gist forward is not something the transcript says, so stop claiming them.
                 active_skills.clear()
                 continue
-            notification_kind = _task_notification_kind(row)
+            notification_kind = note_notification(row)
             if notification_kind is not None:
                 # A backgrounded task reported back. Not a prompt; defer to the assistant
                 # branch, which opens a NEW turn for any work the agent does in response (so
                 # it is committed and attributed on its own, not folded into the prior turn).
-                task_id = _notification_task_id(row)
-                if task_id:
-                    if notification_kind == "completed":
-                        background_terminated.add(task_id)
-                        background_last_event.pop(task_id, None)
-                    else:
-                        background_last_event[task_id] = _row_timestamp(row) or 0
                 pending_background = notification_kind
                 continue
             hot_loaded = _hot_loaded_skill(row)
@@ -1349,6 +1424,13 @@ def parse_rows(
             }
             pending_compactions = 0
         elif row_type == "attachment":
+            notification_kind = note_notification(row)
+            if notification_kind is not None:
+                # A task that reported back while the agent was still working: the harness
+                # QUEUES the notification, so it lands as an attachment rather than a user
+                # row. Same bookkeeping, same hand-off to the assistant branch.
+                pending_background = notification_kind
+                continue
             queued = _queued_human_prompt(row)
             if queued is not None:
                 if current is not None:
@@ -1476,12 +1558,24 @@ def parse_rows(
         for task_id, last_event in background_last_event.items()
         if task_id not in background_terminated and last_event >= horizon
     )
+    # Async sub-agents launched and never reported back. Each one's freshest sign of life is
+    # the later of its launch and the last write to its own transcript; past the horizon it is
+    # presumed dead (killed process, crashed harness) rather than allowed to defer this repo's
+    # commits indefinitely.
+    activity = subagent_activity or {}
+    subagent_horizon = time.time() - SUBAGENT_LIVE_HORIZON_SECONDS
+    live_subagents = sorted(
+        agent_id
+        for agent_id, launched_at in spawned_subagents.items()
+        if agent_id not in background_terminated and max(launched_at, activity.get(agent_id, 0)) >= subagent_horizon
+    )
     return ExportedSession(
         session_id=session_id,
         model=model,
         updated=updated,
         turns=turns,
         live_background_task_ids=live_ids,
+        live_subagent_ids=live_subagents,
     )
 
 
@@ -1509,19 +1603,45 @@ _NOTIFICATION_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
 def _notification_task_id(row: dict) -> str | None:
     """The harness task id a `<task-notification>` row refers to, if present. (The
     ``<task-id>`` tag appears in BOTH shapes; ``<tool-use-id>`` only in terminal ones,
-    so liveness bookkeeping keys on the task id.)"""
+    so liveness bookkeeping keys on the task id.)
+
+    An async sub-agent's task id IS its ``agentId`` — the same string its launch tool
+    result reported and its own transcript file is named after — so the launch and the
+    report-back match up without any extra bookkeeping."""
+    match = _NOTIFICATION_TASK_ID_RE.search(_notification_row_text(row))
+    return match.group(1) if match else None
+
+
+def _launched_async_agent_ids(row: dict) -> list[str]:
+    """Ids of async sub-agents whose LAUNCH this user row acknowledges.
+
+    An async ``Agent``/``Task`` call returns immediately with a tool result that names the
+    spawned sub-agent (``agentId: …``) and says the work continues in the background; the
+    sub-agent then keeps editing files long after the launching turn has posted what looks
+    like a final answer. Recording the launch is what lets `parse_rows` know that turn is
+    not really over (see ``live_subagent_ids``). A synchronous call returns the sub-agent's
+    finished report instead and produces no such marker."""
     message = _as_dict(row.get("message"))
     content = message.get("content")
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
-        text = "".join(
-            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
-        )
-    else:
-        return None
-    match = _NOTIFICATION_TASK_ID_RE.search(text)
-    return match.group(1) if match else None
+    if not isinstance(content, list):
+        return []
+    found: list[str] = []
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        result = block.get("content")
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, list):
+            text = "".join(part.get("text", "") for part in result if isinstance(part, dict))
+        else:
+            continue
+        if _ASYNC_AGENT_LAUNCH_MARKER not in text:
+            continue
+        match = _ASYNC_AGENT_ID_RE.search(text)
+        if match:
+            found.append(match.group(1))
+    return found
 
 
 def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
@@ -1806,8 +1926,37 @@ def _user_prompt(row: dict) -> str | None:
     return text
 
 
+def _notification_row_text(row: dict) -> str:
+    """The `<task-notification>` text carried by *row*, or ``""`` when it carries none.
+
+    The harness delivers a notification in one of TWO row shapes, and both occur in the
+    same transcript: as a ``user`` message once the agent is fed it, and as a
+    ``type:"attachment"`` row with ``commandMode == "task-notification"`` when it is
+    QUEUED behind a turn already in flight. Reading only the user shape (which is all this
+    did originally) missed every notification a task delivered while the agent was busy —
+    including, on newer Claude Code, most terminal ones."""
+    if row.get("type") == "attachment":
+        att = row.get("attachment")
+        if not isinstance(att, dict) or att.get("commandMode") != "task-notification":
+            return ""
+        prompt = att.get("prompt")
+        text = prompt.strip() if isinstance(prompt, str) else ""
+    else:
+        message = _as_dict(row.get("message"))
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = "".join(
+                block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+        else:
+            return ""
+    return text if text.startswith("<task-notification>") else ""
+
+
 def _task_notification_kind(row: dict) -> str | None:
-    """``"completed"``/``"update"`` for a harness `<task-notification>` user row, else None.
+    """``"completed"``/``"update"`` for a harness `<task-notification>` row, else None.
 
     The harness injects these rows when a task the agent backgrounded reports back. Two
     shapes exist: a TERMINAL notification (the task completed or failed) carries a
@@ -1817,17 +1966,8 @@ def _task_notification_kind(row: dict) -> str | None:
     that work instead of merging it into the prior, already-committed turn; the kind decides
     the turn's synthetic prompt label (and thereby the commit engine's defer-vs-commit
     choice for monitor ticks)."""
-    message = _as_dict(row.get("message"))
-    content = message.get("content")
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        text = "".join(
-            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
-        ).strip()
-    else:
-        return None
-    if not text.startswith("<task-notification>"):
+    text = _notification_row_text(row)
+    if not text:
         return None
     # Only an explicit ``<event>`` payload marks an intermediate monitor tick; anything
     # else (a ``<status>`` completion/failure, or an unknown shape from another harness

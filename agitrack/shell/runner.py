@@ -167,6 +167,16 @@ class AgitrackShell:
         if self._switch_to_backend:
             self.global_config.default_backend = self._switch_to_backend
         self.state.save()
+        # Record the repo in the user-wide list the dashboard's switcher offers. Shell/scripted
+        # runs make real commits, so this is a repository aGiTrack has worked on — and it opens
+        # no dashboard by definition, which is exactly the case that used to leave a repo out of
+        # the switcher entirely (see `repos.remember`). Best-effort; never blocks the run.
+        try:
+            from agitrack import repos as repo_registry
+
+            repo_registry.remember(self.repo.repo)
+        except Exception:
+            pass
         if self.verbose:
             print(f"aGiTrack session {self.state.session_id}", file=self._human)
             print(f"Repository: {self.repo.repo}", file=self._human)

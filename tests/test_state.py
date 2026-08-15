@@ -167,6 +167,52 @@ def test_per_conversation_watermark_isolates_conversations(tmp_path):
     assert state.backend_message_id_for("B") == "b-msg-5"
 
 
+def test_a_new_conversation_never_inherits_the_previous_conversations_watermark(tmp_path):
+    # THE BUG (2026-08-15, commit bccd5332): the map was consulted only for a conversation
+    # OTHER than the tracked one, so a brand-new conversation — backend_session_id already
+    # reassigned to it, nothing of its own committed — read the global watermark still holding
+    # the PREVIOUS conversation's id. That id matches no turn boundary in the new conversation
+    # and its marked_at is (rightly) absent, so turns_after fell through to its last-resort
+    # "newest turn only" branch and silently discarded every earlier turn: the user's prompt,
+    # its tokens and its trace reached no commit at all.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "old"
+    state.set_backend_message_id("old", "msg-from-old", marked_at=1000)
+
+    state.backend_session_id = "brand-new"  # aGiTrack adopts a fresh backend conversation
+
+    assert state.backend_message_id_for("brand-new") is None  # no mark of its own -> all new
+    assert state.backend_message_marked_at_for("brand-new") is None
+    assert state.backend_message_id_for("old") == "msg-from-old"  # the old one keeps its mark
+
+
+def test_a_watermark_predating_the_per_conversation_map_is_still_honoured(tmp_path):
+    # Upgrade continuity: set_backend_message_id always writes the global AND the map entry,
+    # so a global appearing NOWHERE in the map predates the map and is the tracked
+    # conversation's own mark. Dropping it would re-export that conversation's whole history
+    # on the first run after an upgrade — the very thing the watermark exists to prevent.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "A"
+    state.data["last_backend_message_id"] = "legacy-msg"  # written before the map existed
+    state.save()
+
+    assert state.backend_message_id_for("A") == "legacy-msg"
+
+
+def test_switching_back_reads_the_conversations_own_mark_not_the_global(tmp_path):
+    # The tracked conversation now reads its OWN map entry too, so a switch away and back is
+    # exact even while the global still holds whatever committed most recently.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "A"
+    state.set_backend_message_id("A", "a-msg", marked_at=100)
+    state.backend_session_id = "B"
+    state.set_backend_message_id("B", "b-msg", marked_at=200)
+    state.backend_session_id = "A"  # switched back; the global still says "b-msg"
+
+    assert state.last_backend_message_id == "b-msg"
+    assert state.backend_message_id_for("A") == "a-msg"
+
+
 def test_current_conversation_watermark_still_uses_single_value(tmp_path):
     # A plain reset of the legacy single watermark still governs the CURRENT conversation,
     # so all existing "recompute from scratch on resume" resets keep working.

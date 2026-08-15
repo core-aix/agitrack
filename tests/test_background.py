@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import stat
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -35,6 +38,23 @@ def _init_repo(path: Path) -> GitRepo:
     subprocess.run(["git", "-C", str(path), "add", "."], check=True)
     subprocess.run(["git", "-C", str(path), "commit", "-qm", "init"], check=True)
     return GitRepo(path)
+
+
+def _delete_tree(path: Path) -> None:
+    """Delete a directory that may contain git objects, on every OS.
+
+    git writes loose objects READ-ONLY and Windows enforces that on delete, so a plain
+    `shutil.rmtree` over a real repository raises ``PermissionError: [WinError 5]`` — which is
+    exactly how these tests first failed on Windows CI while passing on macOS and Linux. Making
+    every FILE writable first is the portable fix; directories are left alone, since stripping
+    their execute bit on POSIX would stop rmtree descending into them."""
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                child.chmod(stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass  # best-effort: rmtree reports anything that actually blocks the delete
+    shutil.rmtree(path)
 
 
 def _git(repo: GitRepo, *args: str) -> str:
@@ -75,6 +95,91 @@ def _runner(tmp_path, *, manual: bool):
 
 
 # --- manual mode ------------------------------------------------------------
+
+
+def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
+    # A tracker that outlives its repo has nothing to do and NO WAY to be told so: `-b stop` and
+    # `agitrack stop` both work through files under `<repo>/.agitrack/`, which went with the
+    # directory. It polls a missing path every few seconds until the machine reboots. Temp-dir
+    # repos make this routine — a scratch clone or a test run under /tmp is removed while its
+    # tracker keeps going (six such daemons were found alive on a developer's machine).
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    _delete_tree(repo.repo)
+
+    runner._loop()  # returns rather than polling forever
+
+    assert runner._stop.is_set()
+    # `_explicit_stop` so the update-restart path does not resurrect a tracker for a repo that
+    # no longer exists.
+    assert runner._explicit_stop is True
+
+
+def test_a_tracker_keeps_running_when_only_git_was_removed(tmp_path):
+    # Only the DIRECTORY disappearing is unambiguous. A repo whose `.git` was removed is one the
+    # user still has and may be about to re-init, and quitting there would throw away the pending
+    # turn this tracker holds.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    _delete_tree(repo.repo / ".git")
+
+    assert runner._repo_is_gone() is False
+
+
+def test_a_tracker_never_stops_because_the_check_itself_failed(tmp_path):
+    # A permission error or a stalled network mount is not an answer. Treating "cannot tell" as
+    # "gone" would stop a tracker on a repo that is merely slow to reach.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, _repo, _state, _backend = _runner(proj, manual=False)
+
+    class _Unreachable:
+        def exists(self):
+            raise OSError("mount stalled")
+
+    # Swapped on the runner rather than monkeypatching Path.exists for the whole process: that
+    # patch also fires for anything else touching a path while the test runs (pytest's own
+    # reporting included), which is a lot of blast radius for one call.
+    runner.repo = types.SimpleNamespace(repo=_Unreachable())
+
+    assert runner._repo_is_gone() is False
+
+
+def test_a_tracker_remembers_its_repo_for_the_dashboard_switcher(tmp_path, monkeypatch):
+    # THE BUG: the user-wide repo list was written ONLY by `ensure_hub_for`, i.e. only when a
+    # dashboard was opened. `_open_dashboard_on_start` returns early for a scripted run, a
+    # non-TTY stdout (the autotrack hook, a script, SSH) or `open_dashboard_on_start: false`, so
+    # those trackers ran for days without their repo ever appearing in the switcher. Tracking a
+    # repo is what makes it worth listing, so the tracker records it itself.
+    from agitrack import repos as repo_registry
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    runner, repo, _state, _backend = _runner(tmp_path, manual=False)
+    assert repo_registry.entry_for(repo.repo) is None  # nothing has opened a dashboard here
+
+    runner._remember_repo()
+
+    entry = repo_registry.entry_for(repo.repo)
+    assert entry is not None and entry.served is True
+    assert [e.path for e in repo_registry.list_repos()] == [str(repo.repo)]
+
+
+def test_remembering_the_repo_never_breaks_the_tracker(tmp_path, monkeypatch):
+    # Best-effort by design: a read-only or full home directory must not stop a repo being
+    # tracked, so a registry that raises is swallowed rather than taking the daemon down.
+    runner, _repo, _state, _backend = _runner(tmp_path, manual=False)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("home is read-only")
+
+    monkeypatch.setattr("agitrack.repos.remember", boom)
+
+    runner._remember_repo()  # must not raise
 
 
 def test_background_manual_records_latent_and_freezes_head(tmp_path):

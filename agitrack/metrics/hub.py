@@ -456,7 +456,8 @@ class HubRouter:
         return redirect(mount_path(entry.slug, preferred_view(entry.directory)))
 
     def repo_list(self) -> list[dict]:
-        """Every repository the hub can switch to, most recently used first.
+        """Every repository the hub can switch to, most recently used first (see
+        :func:`_served_repos` for what "every" means).
 
         Deliberately cheap: no dashboard is built to answer it. The page header polls this to fill
         its switcher, and a hub with ten projects mounted must not walk ten histories to draw a
@@ -466,7 +467,7 @@ class HubRouter:
         from agitrack.proxy.background import running_mode_for
 
         out = []
-        for entry in repo_registry.list_repos():
+        for entry in _served_repos():
             state = running_mode_for(entry.directory)
             out.append(
                 {
@@ -496,6 +497,54 @@ class HubRouter:
         # answer that did not move is pure IO on the hot path.
         if entry.view != view:
             repo_registry.set_view(entry.path, view)
+
+
+def _served_repos() -> list:
+    """The repositories the switcher offers: every one aGiTrack is RUNNING on right now, plus
+    every one it remembers having worked on (which is what keeps a repo listed after its tracker
+    stops, and what lists a repo opened with `-d` alone).
+
+    The remembered list is the primary source; live daemons are unioned in because a repository
+    aGiTrack is demonstrably tracking must never be missing from the switcher — and it was.
+    `repos.remember` was reachable only through `ensure_hub_for`, so a tracker that opened no
+    dashboard (the autotrack hook, a scripted or non-TTY start, `open_dashboard_on_start` off)
+    never got an entry; a live example ran for hours while its repo was absent from the dropdown.
+    The union also covers an entry lost to `repos.json`'s deliberately unlocked write.
+
+    A repo found only by its daemon is REMEMBERED as it is added, so the repair happens once and
+    the repo then behaves like any other — it survives its tracker stopping, and it keeps the
+    view the user last chose. Writes only on the first sighting, so the polling this endpoint
+    serves stays a read.
+
+    A repo the user stopped with `agitrack stop` is NOT resurrected, even if a daemon for it is
+    somehow still alive: `served=False` is an explicit decision, and a switcher that keeps
+    offering a project the user just stopped is ignoring them. Only a repo with no entry at all
+    is adopted. (`agitrack stop` stops the daemons before clearing the flag, so the two states
+    do not normally coexist; this makes the outcome independent of that ordering.)"""
+    entries = repo_registry.list_repos()
+    known = {str(Path(entry.path).expanduser()) for entry in entries}
+    try:
+        from agitrack import daemons
+
+        live = daemons.running_repos()
+    except Exception:
+        return entries  # the switcher must draw even if the daemon registry cannot be read
+    added = False
+    for path in live:
+        if path in known or not Path(path).is_dir():
+            continue
+        if repo_registry.entry_for(path) is not None:
+            continue  # known but unserved: the user stopped it, so leave it stopped
+        try:
+            repo_registry.remember(path)
+            added = True
+        except Exception:
+            continue  # a repo we cannot record is still not worth dropping from the list
+    if not added:
+        return entries
+    # Re-read rather than splicing: `remember` decides slug/name/order, and the list the switcher
+    # draws must be in the same order every caller sees.
+    return repo_registry.list_repos()
 
 
 def _short_state(state: dict) -> str:

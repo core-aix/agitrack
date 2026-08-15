@@ -5,6 +5,16 @@ from dataclasses import dataclass, field
 from agitrack.backends.base import TokenUsage
 
 
+# How long an async sub-agent may go without any recorded activity before it stops counting as
+# live (see ``ExportedSession.live_subagent_ids``). Every backend writes a sub-agent's own
+# transcript as it works, so a working sub-agent refreshes this constantly and only a genuinely
+# long tool call is silent for minutes. The horizon exists solely as a safety valve: a sub-agent
+# that died WITHOUT reporting back — killed process, crashed harness — must not defer a repo's
+# commits forever. Shared by every backend so the answer to "still running?" does not depend on
+# which one the user runs.
+SUBAGENT_LIVE_HORIZON_SECONDS = 1800
+
+
 @dataclass
 class SessionTurn:
     user_message_id: str
@@ -109,6 +119,17 @@ class ExportedSession:
     # the notification stream, not launches: a task finishing while the agent is mid-turn
     # never emits a terminal notification. Claude-only; other backends leave it empty.
     live_background_task_ids: list[str] = field(default_factory=list)
+    # Ids of ASYNC SUB-AGENTS the main agent launched that have not reported back yet.
+    # An async sub-agent is spawned mid-turn and keeps working after the launching turn
+    # ends, so the main agent's closing message reads as a final answer while the work it
+    # describes is still being done by someone else — and a commit made there records a
+    # finished-looking trace over a half-done tree. While any are live the commit engine
+    # DEFERS (see CommitEngine.finish_parse_if_ready), folding the launch turn into the
+    # commit that lands once the sub-agents have reported. Populated for the backends whose
+    # sub-agents can outlive the launching turn — Claude (async ``Agent``) and Codex
+    # (``spawn_agent`` with no ``wait_agent``); OpenCode's ``task`` returns the child's result
+    # to the calling turn, so its turn cannot end while a sub-agent runs and the list stays empty.
+    live_subagent_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -1,0 +1,57 @@
+version: 2
+
+# Version updates, grouped and throttled. The goal is a small number of reviewable PRs, not a
+# notification stream: this repository releases on every merge into main, so an ungrouped
+# dependabot would cut a release per bumped pin.
+#
+# Security updates (advisories against what we already depend on) are a separate GitHub setting
+# and are not configured here; they open PRs regardless of these schedules, which is the point.
+
+updates:
+  # The Python package itself. `uv` is the ecosystem for a uv.lock project; it updates
+  # pyproject.toml and the lockfile together, which pip-style updates would leave inconsistent.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 5
+    groups:
+      # Lint/type/test tooling moves constantly and breaks loudly (make check goes red) rather
+      # than subtly, so one PR for the lot is safe and saves four reviews.
+      dev-tooling:
+        dependency-type: development
+      runtime:
+        dependency-type: production
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
+
+  # Actions are the supply chain of the release pipeline: a compromised or abandoned action in
+  # release-tag.yml has publish rights to PyPI and the Marketplace. Worth keeping current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # The VS Code extension. Dev-only dependencies that ship in nothing, so monthly is enough:
+  # they exist here so that a real advisory still surfaces rather than sitting unseen.
+  - package-ecosystem: npm
+    directory: /editors/vscode
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      vscode-ext:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(vscode)"

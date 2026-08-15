@@ -10,12 +10,14 @@ from __future__ import annotations
 import threading
 import types
 
+import pytest
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.opencode import SessionTurn
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.session import Session
 from agitrack.transcripts import ExportedSession
+from agitrack.transcripts.types import turns_after
 from agitrack.config import AgitrackState
 
 
@@ -98,6 +100,55 @@ def test_commit_turns_records_latest_reasoning_effort(tmp_path):
     )
     assert repo.message is not None
     assert "reasoning_effort: high" in repo.message
+
+
+@pytest.mark.parametrize("label", ["(background task completed)", "(background monitor update)"])
+def test_a_background_wake_up_is_not_attributed_to_the_user(tmp_path, label):
+    # THE BUG: the harness's synthetic label for a turn the agent ran off a BACKGROUND EVENT was
+    # recorded as an ordinary user prompt, so the commit carried a "## User" block the user never
+    # wrote — and the same label reached the commit subject and the dashboard's per-commit prompt.
+    engine, repo, state = _engine(tmp_path)
+
+    engine.commit_turns(
+        turns=[_turn(label, "Verified the run and wrote the report.")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    assert "## User" not in repo.message
+    assert f"## User\n\n{label}" not in repo.message
+    # The subject describes what was ASKED FOR; nobody asked for this, so it falls back rather
+    # than claiming the user requested "(background task completed)".
+    assert repo.message.startswith("<aGiTrack> claude changes")
+    # The event itself survives — it is what explains a turn with no prompt.
+    note = " ".join(line.lstrip("> ") for line in repo.message.splitlines() if line.startswith(">"))
+    assert "woken here by a background event" in note
+    assert "## Agent\n\nVerified the run and wrote the report." in repo.message
+
+
+def test_a_real_prompt_alongside_a_background_wake_up_still_owns_the_subject(tmp_path):
+    # A commit routinely spans both kinds of turn (a deferred wake-up folds into the next real
+    # one). The real prompt must still be the user's, and still drive the subject.
+    engine, repo, state = _engine(tmp_path)
+
+    engine.commit_turns(
+        turns=[
+            _turn("(background task completed)", "Build finished."),
+            _turn("now ship it", "Shipped."),
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    assert repo.message.count("## User") == 1
+    assert "## User\n\nnow ship it" in repo.message
+    assert repo.message.startswith("<aGiTrack> now ship it")
 
 
 def test_commit_turns_omits_reasoning_effort_when_no_turn_records_it(tmp_path):
@@ -1262,6 +1313,107 @@ def test_finish_parse_exit_finalize_commits_monitor_update_only_turns(tmp_path):
     assert result is True and len(commits) == 1
 
 
+def test_finish_parse_defers_while_async_subagents_are_still_running(tmp_path):
+    # The reported bug: the agent spawns async sub-agents, then posts what READS as a final
+    # answer ("kicked it off, here's the plan") while the sub-agents are doing the actual job.
+    # The turn is complete by every other measure, so aGiTrack committed there — recording a
+    # finished-sounding trace (and a summary built from it) over a tree the sub-agents were
+    # still writing. While any sub-agent is live the commit WAITS and the watermark stays put.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "rewrite the parser", "Launched two agents on it.", TokenUsage(total=9), None)],
+        live_subagent_ids=["a40f517ebe10c670c", "ab6501a5bf1f3589d"],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is None and commits == []
+    assert state.backend_message_id_for("ses-sub") is None
+    # The live sub-agents also count as background writers of the tree, so the pre-agent
+    # user-commit dialog stands down rather than claiming their edits as the user's.
+    assert session.live_background_task_ids == ["a40f517ebe10c670c", "ab6501a5bf1f3589d"]
+
+
+def test_finish_parse_commits_once_the_sub_agents_have_reported_back(tmp_path):
+    # Same session one parse later: the sub-agents reported back, the agent did its follow-up
+    # work, and nothing is live any more — so the deferred launch turn and the follow-up turn
+    # commit TOGETHER, which is the point of deferring rather than dropping.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub2",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "rewrite the parser", "Launched two agents on it.", TokenUsage(total=9), None),
+            SessionTurn(
+                "tn1", "a2", "(background task completed)", "Both agents landed; verified.", TokenUsage(total=40), None
+            ),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is True and len(commits) == 1
+    assert [t.user_prompt for t in commits[0]["turns"]] == ["rewrite the parser", "(background task completed)"]
+    assert state.backend_message_id_for("ses-sub2") == "a2"
+
+
+def test_finish_parse_exit_finalize_commits_despite_live_sub_agents(tmp_path):
+    # The exit/stop finalize (require_complete=False) never defers: a sub-agent that is still
+    # running when the session ends must not take the work already on disk with it.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sub3",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "rewrite the parser", "Launched an agent on it.", TokenUsage(total=9), None)],
+        live_subagent_ids=["a40f517ebe10c670c"],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+
+    assert result is True and len(commits) == 1
+
+
 def test_finish_parse_returns_none_when_no_result(tmp_path):
     state = AgitrackState(tmp_path)
     session = Session.bare()
@@ -1588,7 +1740,15 @@ def test_finish_parse_exit_commits_dangling_no_text_turn(tmp_path):
     )
     assert result is True
     assert len(commits) == 1
-    assert state.last_backend_message_id == "a1"
+    # Anchored on the USER id, not the assistant id the turn happens to carry: the turn is
+    # captured MID-FLIGHT (complete=False) and has sent no reply, so per the force-capture
+    # contract it must re-export INCLUSIVELY if the backend resumes and finishes it. Keying on
+    # "a1" instead lost that turn outright — a resumed turn's real final message and edits
+    # matched no boundary and the marked_at fallback dropped it for having started earlier.
+    # While it stays dangling both anchors behave identically (turns_after excludes a user-id
+    # watermarked turn that still has no final_response).
+    assert state.last_backend_message_id == "u1"
+    assert state.partial_turn_usage()["user_id"] == "u1"  # tokens counted once, via the delta
 
 
 def test_finish_parse_discards_stale_session_result(tmp_path):
@@ -1798,6 +1958,98 @@ def test_watermark_advance_records_the_mark_timestamp(tmp_path):
     )
     assert result is True
     assert state.backend_message_marked_at_for("ses-mark") == 1010
+
+
+def test_a_midflight_capture_anchors_on_the_user_id_not_a_transient_assistant_id(tmp_path):
+    # THE BUG (2026-08-15): a backend mints a NEW message id per assistant response within a
+    # turn, so the assistant id a force capture (exit/stop finalize, e.g. the tracker
+    # restarting mid-turn) reads is TRANSIENT. Anchoring on it meant that once the turn
+    # continued, its assistant_message_id became a later id, the stored mark matched no turn
+    # boundary, and turns_after's marked_at fallback dropped the turn for having STARTED
+    # before the mark — so history kept only the PARTIAL snapshot the capture took, and the
+    # turn's real final response and remaining tokens were recorded nowhere. The old guard
+    # keyed on `not assistant_message_id`, so it caught only a turn captured before it had
+    # said ANYTHING; every mid-flight turn that had already spoken (the common case) fell
+    # through.
+    session = Session.bare()
+    midflight = SessionTurn(
+        "u1",
+        "msg_transient",  # the id it happens to carry right now
+        "rewrite the parser",
+        "Working on it…",  # it HAS already spoken, which is what defeated the old guard
+        TokenUsage(total=40, output=40),
+        None,
+        complete=False,
+        started_at=1000,
+        ended_at=1200,
+    )
+    exported = ExportedSession("ses-mid", "m", None, [midflight])
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    state.data["backend_session_id"] = "ses-mid"
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,  # the stop finalize: capture the in-flight turn
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert state.backend_message_id_for("ses-mid") == "u1"  # stable for the turn's whole life
+    assert state.partial_turn_usage()["user_id"] == "u1"  # so tokens are counted exactly once
+
+    # The turn finishes under the restarted tracker, with a DIFFERENT assistant id. It must
+    # still be exported (and so committed), carrying the user's prompt with it.
+    finished = SessionTurn(
+        "u1",
+        "msg_final",
+        "rewrite the parser",
+        "Done.",
+        TokenUsage(total=90, output=90),
+        None,
+        started_at=1000,
+        ended_at=1500,
+    )
+    later = ExportedSession("ses-mid", "m", None, [finished])
+    remaining = turns_after(
+        later,
+        state.backend_message_id_for("ses-mid"),
+        marked_at=state.backend_message_marked_at_for("ses-mid"),
+    )
+    assert [t.user_prompt for t in remaining] == ["rewrite the parser"]
+    # Only the delta is added on the re-commit, so the re-export cannot inflate the tokens.
+    engine._add_turn_usage(finished)
+    assert state.pending_token_usage()["output"] == 50
+
+
+def test_a_conversations_own_lost_watermark_still_reaches_the_bounded_fallback(tmp_path):
+    # Guard for the guard. Bug A's fix makes a conversation with no mark of its own report
+    # None (all turns new). It must NOT also blank a mark that genuinely BELONGS to this
+    # conversation but has stopped matching a boundary (a compaction reshaping turns) —
+    # that watermark has to survive so turns_after still reaches its bounded fallback. Blanking
+    # it would re-export the whole conversation, which is exactly the 31M-token 20-day commit
+    # of 2026-07-25 that test_lost_watermark_never_reexports_the_whole_session pins.
+    state = AgitrackState(tmp_path)
+    state.data["backend_session_id"] = "ses-own"
+    state.set_backend_message_id("ses-own", "msg_now_vanished", marked_at=500)
+
+    assert state.backend_message_id_for("ses-own") == "msg_now_vanished"
+    assert state.backend_message_marked_at_for("ses-own") == 500
+
+    old = SessionTurn("u1", "a1", "ancient", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    newer = SessionTurn("u2", "a2", "recent", "done", TokenUsage(output=10), None, started_at=900, ended_at=950)
+    exported = ExportedSession("ses-own", "m", None, [old, newer])
+    remaining = turns_after(
+        exported,
+        state.backend_message_id_for("ses-own"),
+        marked_at=state.backend_message_marked_at_for("ses-own"),
+    )
+    assert remaining == [newer]  # bounded by time — the ancient turn is never re-exported
 
 
 def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):

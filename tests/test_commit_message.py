@@ -6,7 +6,13 @@ from agitrack.commits import (
     carries_ai_history,
     render_interaction_trace,
 )
-from agitrack.commits.message import PATH_MASK, SECRET_MASK, apply_summary_to_message, mask_paths
+from agitrack.commits.message import (
+    PATH_MASK,
+    SECRET_MASK,
+    TRACE_EVENT_ROLE,
+    apply_summary_to_message,
+    mask_paths,
+)
 from agitrack.commits.message import _mask_secrets as _mask_secrets_for_test
 
 
@@ -41,6 +47,41 @@ def test_render_interaction_trace_respects_turn_limit():
     # Only the most recent 2 turns are kept (same limiting the commit applies).
     assert "turn 4" in rendered and "turn 3" in rendered
     assert "turn 0" not in rendered
+
+
+def test_a_background_event_is_never_rendered_as_a_user_message():
+    # THE BUG: the harness wakes the agent when a task it backgrounded reports back, and the
+    # parser labels that turn with a synthetic prompt. Recorded under the `user` role it became
+    # a "## User" / "(background task completed)" block — indistinguishable from something the
+    # user typed — in every such commit. It is an event, and the trace is also the summarizer's
+    # sole input, so it must not read as a request.
+    trace = [
+        {"role": "user", "content": "run the sweep in the background"},
+        {"role": "agent", "content": "Started it."},
+        {"role": TRACE_EVENT_ROLE, "content": "(background task completed)"},
+        {"role": "agent", "content": "Sweep finished: 62.5% accuracy."},
+    ]
+    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+
+    assert rendered.count("## User") == 1  # the real prompt, and only it
+    assert "## User\n\n(background task completed)" not in rendered
+    # Still present — it explains a turn nobody asked for — but plainly as an event. The note
+    # is a wrapped blockquote, so assert against its de-wrapped text rather than raw lines.
+    note = " ".join(line.lstrip("> ") for line in rendered.splitlines() if line.startswith(">"))
+    assert "woken here by a background event (background task completed), not by a user" in note
+
+
+def test_a_background_event_starts_a_turn_for_the_trace_limit():
+    # An event-driven turn IS a turn. Counting only `user` entries let a long run of background
+    # wake-ups read as ONE turn, keeping the whole run in the trace well past the limit.
+    trace = []
+    for i in range(5):
+        trace.append({"role": TRACE_EVENT_ROLE, "content": "(background monitor update)"})
+        trace.append({"role": "agent", "content": f"tick {i}"})
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    assert "tick 4" in rendered and "tick 3" in rendered
+    assert "tick 0" not in rendered
 
 
 def test_render_interaction_trace_drops_empty_role_entries():
@@ -151,35 +192,57 @@ def test_agent_commit_message_contains_trace_and_metadata():
     assert "token_note" not in message
 
 
-def test_trace_message_headings_are_nested_under_role():
-    # A message's own Markdown headings must be pushed one level below its
-    # "## User"/"## Agent" role heading so they nest (and render) correctly,
-    # instead of a message "# Title" outranking the role it belongs to.
+def test_trace_message_headings_are_pushed_down_two_levels():
+    # Every heading inside a trace message moves down by exactly two: `#` → `###`,
+    # `##` → `####`. A UNIFORM shift, not a re-basing of the shallowest heading to some
+    # floor — the levels are the message author's own and must survive as written. Two
+    # levels rather than one because one nested correctly but did not READ correctly: in
+    # plain-text `git log` a message's sections sat a single '#' from the role scaffolding,
+    # so telling the trace's structure from the conversation's content meant counting hashes.
     message = build_agent_commit_message(
         latest_prompt="do it",
         trace=[
             {"role": "user", "content": "# Big ask\nplease\n## Detail\nmore"},
-            {"role": "agent", "content": "### Already deep\nkept as-is"},
+            {"role": "agent", "content": "### Already deep\nkept relative"},
         ],
         backend="claude",
         backend_session_id="ses-1",
         agitrack_session_id="agit-1",
         model="m",
     )
-    # User content's shallowest heading was level 1, so everything shifts +2: the
-    # role stays "## User" and the message's headings start one level below it.
-    assert "## User\n\n### Big ask" in message
-    assert "#### Detail" in message
+    assert "## User\n\n### Big ask" in message  # level 1 -> 3, never outranking the role
+    assert "#### Detail" in message  # level 2 -> 4
     # The original level-1/level-2 headings must no longer appear as such.
     assert "\n# Big ask" not in message
     assert "\n## Detail" not in message
-    # Agent content already started at level 3 (one below the role) — left intact.
-    assert "## Agent\n\n### Already deep" in message
+    # A message that already nested deeper moves by the SAME two levels; it is not re-based
+    # onto the same floor as the message above, so its author's relative depth is preserved.
+    assert "## Agent\n\n##### Already deep" in message
+
+
+def test_a_deeply_nested_message_heading_is_capped_at_six():
+    # Markdown has no level 7. A message already nesting near the bottom loses some depth
+    # there rather than the shift being abandoned — the rare case, and preferable to
+    # re-basing every message's headings onto a fixed floor.
+    message = build_agent_commit_message(
+        latest_prompt="x",
+        trace=[{"role": "agent", "content": "##### Five\nbody\n###### Six"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="m",
+    )
+
+    assert "## Agent\n\n###### Five" in message
+    assert "####### " not in message  # never emits an invalid level-7 heading
 
 
 def test_trace_heading_nesting_skips_fenced_code_comments():
-    # A leading '#' inside a fenced code block is a comment, not a heading, and
-    # must be left untouched even while real headings around it are shifted.
+    # A leading '#' inside a fenced code block is CONTENT BEING QUOTED — a shell comment, or
+    # a Markdown example — not a heading of the message. It must be left untouched even while
+    # real headings around it are shifted: rewriting it would falsify what the message showed.
+    # (This is also why a trace can still contain a literal "## User" line: quoted, inside a
+    # fence, where it is code rather than structure.)
     message = build_agent_commit_message(
         latest_prompt="x",
         trace=[{"role": "agent", "content": "# Heading\n```sh\n# just a comment\n```"}],

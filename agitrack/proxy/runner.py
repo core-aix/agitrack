@@ -1664,6 +1664,16 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             daemons.register("session", self.base_repo.repo)
         except Exception as error:
             self._debug(f"session registry entry failed: {error!r}")
+        # ...and in the user-wide repo list the dashboard's switcher offers. Tracking a repo is
+        # what makes it worth listing, so it is recorded here rather than left to whoever opens a
+        # dashboard: reachable only through `ensure_hub_for`, it was missed by every start that
+        # opens no dashboard (scripted, no TTY, or `open_dashboard_on_start` off). Best-effort.
+        try:
+            from agitrack import repos as repo_registry
+
+            repo_registry.remember(self.base_repo.repo)
+        except Exception as error:
+            self._debug(f"remembering repo for the dashboard switcher failed: {error!r}")
         write_proxy_status(
             self.base_repo, commits="manual" if self._manual_commits else "auto", worktree=self._use_worktrees
         )
