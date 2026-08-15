@@ -6,7 +6,13 @@ from agitrack.commits import (
     carries_ai_history,
     render_interaction_trace,
 )
-from agitrack.commits.message import PATH_MASK, SECRET_MASK, apply_summary_to_message, mask_paths
+from agitrack.commits.message import (
+    PATH_MASK,
+    SECRET_MASK,
+    TRACE_EVENT_ROLE,
+    apply_summary_to_message,
+    mask_paths,
+)
 from agitrack.commits.message import _mask_secrets as _mask_secrets_for_test
 
 
@@ -41,6 +47,41 @@ def test_render_interaction_trace_respects_turn_limit():
     # Only the most recent 2 turns are kept (same limiting the commit applies).
     assert "turn 4" in rendered and "turn 3" in rendered
     assert "turn 0" not in rendered
+
+
+def test_a_background_event_is_never_rendered_as_a_user_message():
+    # THE BUG: the harness wakes the agent when a task it backgrounded reports back, and the
+    # parser labels that turn with a synthetic prompt. Recorded under the `user` role it became
+    # a "## User" / "(background task completed)" block — indistinguishable from something the
+    # user typed — in every such commit. It is an event, and the trace is also the summarizer's
+    # sole input, so it must not read as a request.
+    trace = [
+        {"role": "user", "content": "run the sweep in the background"},
+        {"role": "agent", "content": "Started it."},
+        {"role": TRACE_EVENT_ROLE, "content": "(background task completed)"},
+        {"role": "agent", "content": "Sweep finished: 62.5% accuracy."},
+    ]
+    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+
+    assert rendered.count("## User") == 1  # the real prompt, and only it
+    assert "## User\n\n(background task completed)" not in rendered
+    # Still present — it explains a turn nobody asked for — but plainly as an event. The note
+    # is a wrapped blockquote, so assert against its de-wrapped text rather than raw lines.
+    note = " ".join(line.lstrip("> ") for line in rendered.splitlines() if line.startswith(">"))
+    assert "woken here by a background event (background task completed), not by a user" in note
+
+
+def test_a_background_event_starts_a_turn_for_the_trace_limit():
+    # An event-driven turn IS a turn. Counting only `user` entries let a long run of background
+    # wake-ups read as ONE turn, keeping the whole run in the trace well past the limit.
+    trace = []
+    for i in range(5):
+        trace.append({"role": TRACE_EVENT_ROLE, "content": "(background monitor update)"})
+        trace.append({"role": "agent", "content": f"tick {i}"})
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    assert "tick 4" in rendered and "tick 3" in rendered
+    assert "tick 0" not in rendered
 
 
 def test_render_interaction_trace_drops_empty_role_entries():

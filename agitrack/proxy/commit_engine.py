@@ -70,6 +70,7 @@ import time
 from typing import Callable
 
 from agitrack.commits import build_agent_commit_message, render_interaction_trace
+from agitrack.commits.message import TRACE_EVENT_ROLE
 from agitrack.git import GitRepo
 from agitrack.transcripts.opencode import SessionTurn
 from agitrack.transcripts import capabilities
@@ -183,6 +184,20 @@ def _same_prompt(a: str, b: str) -> bool:
 # produced no agent reply and no edits. A real prompt that short does not exist, and a turn that
 # the agent actually answered is never discarded whatever it says.
 _DIALOG_KEYSTROKES = frozenset("0123456789yYnN")
+
+
+def _is_background_event(prompt: str | None) -> bool:
+    """Whether *prompt* is the harness's synthetic label for a turn the agent ran off a
+    BACKGROUND EVENT — a task it had started reporting back — rather than off anything the
+    user said (``BACKGROUND_PROMPT_LABELS`` in transcripts/claude.py).
+
+    Such a turn has no author. Recorded as a ``user`` trace entry it became a ``## User`` /
+    ``(background task completed)`` block that reads exactly like something the user typed,
+    and it reached the commit subject and the dashboard's per-commit prompt the same way.
+    It is instead recorded under ``TRACE_EVENT_ROLE`` and rendered as an event note."""
+    from agitrack.transcripts.claude import BACKGROUND_PROMPT_LABELS
+
+    return (prompt or "").strip() in BACKGROUND_PROMPT_LABELS
 
 
 def _is_dialog_keystroke(turn) -> bool:
@@ -341,7 +356,9 @@ class CommitEngine:
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    self.state.append_trace("user", turn.user_prompt)
+                    # A background wake-up is an EVENT, not something the user said.
+                    role = TRACE_EVENT_ROLE if _is_background_event(turn.user_prompt) else "user"
+                    self.state.append_trace(role, turn.user_prompt)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
@@ -350,7 +367,16 @@ class CommitEngine:
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self._add_turn_usage(turn)
-            prompts = [p for turn in turns for p in ([turn.user_prompt, *turn.queued_followups]) if p]
+            # The subject describes what was ASKED FOR, so a synthetic wake-up label is not a
+            # candidate: a commit whose turns were all background-driven falls back to
+            # "<backend> changes" rather than claiming the user asked for "(background task
+            # completed)".
+            prompts = [
+                p
+                for turn in turns
+                for p in ([turn.user_prompt, *turn.queued_followups])
+                if p and not _is_background_event(p)
+            ]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
@@ -368,8 +394,14 @@ class CommitEngine:
             entries: list[tuple[str, str]] = []
             for turn in turns:
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    subject_prompts.append(turn.user_prompt)
-                    entries.append(("user", turn.user_prompt))
+                    if _is_background_event(turn.user_prompt):
+                        # An EVENT woke the agent; nobody asked for anything. It belongs in the
+                        # trace (it explains a turn with no prompt) but never under the user's
+                        # name, and never as the commit's subject.
+                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt))
+                    else:
+                        subject_prompts.append(turn.user_prompt)
+                        entries.append(("user", turn.user_prompt))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
@@ -428,9 +460,13 @@ class CommitEngine:
             # messages — dropped the leftovers in between (or after) the agent's replies,
             # so a message the user sent mid-turn read as if it came after the agent's
             # final response (issue #8; the agent's answer actually covers all of them).
+            # The anchor is whatever STARTED the last turn — a user prompt, or the background
+            # event that woke the agent with nobody saying anything. Anchoring on "user" alone
+            # dropped a leftover typed during a background-driven turn past all of that turn's
+            # agent replies, reading as if it arrived after the agent's final answer.
             insert_at = len(entries)
             for index in range(len(entries) - 1, -1, -1):
-                if entries[index][0] == "user":
+                if entries[index][0] in ("user", TRACE_EVENT_ROLE):
                     insert_at = index + 1
                     break
             entries[insert_at:insert_at] = [("user", leftover) for leftover in leftovers]

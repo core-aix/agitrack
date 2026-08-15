@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import types
 
+import pytest
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.opencode import SessionTurn
@@ -99,6 +100,55 @@ def test_commit_turns_records_latest_reasoning_effort(tmp_path):
     )
     assert repo.message is not None
     assert "reasoning_effort: high" in repo.message
+
+
+@pytest.mark.parametrize("label", ["(background task completed)", "(background monitor update)"])
+def test_a_background_wake_up_is_not_attributed_to_the_user(tmp_path, label):
+    # THE BUG: the harness's synthetic label for a turn the agent ran off a BACKGROUND EVENT was
+    # recorded as an ordinary user prompt, so the commit carried a "## User" block the user never
+    # wrote — and the same label reached the commit subject and the dashboard's per-commit prompt.
+    engine, repo, state = _engine(tmp_path)
+
+    engine.commit_turns(
+        turns=[_turn(label, "Verified the run and wrote the report.")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    assert "## User" not in repo.message
+    assert f"## User\n\n{label}" not in repo.message
+    # The subject describes what was ASKED FOR; nobody asked for this, so it falls back rather
+    # than claiming the user requested "(background task completed)".
+    assert repo.message.startswith("<aGiTrack> claude changes")
+    # The event itself survives — it is what explains a turn with no prompt.
+    note = " ".join(line.lstrip("> ") for line in repo.message.splitlines() if line.startswith(">"))
+    assert "woken here by a background event" in note
+    assert "## Agent\n\nVerified the run and wrote the report." in repo.message
+
+
+def test_a_real_prompt_alongside_a_background_wake_up_still_owns_the_subject(tmp_path):
+    # A commit routinely spans both kinds of turn (a deferred wake-up folds into the next real
+    # one). The real prompt must still be the user's, and still drive the subject.
+    engine, repo, state = _engine(tmp_path)
+
+    engine.commit_turns(
+        turns=[
+            _turn("(background task completed)", "Build finished."),
+            _turn("now ship it", "Shipped."),
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    assert repo.message.count("## User") == 1
+    assert "## User\n\nnow ship it" in repo.message
+    assert repo.message.startswith("<aGiTrack> now ship it")
 
 
 def test_commit_turns_omits_reasoning_effort_when_no_turn_records_it(tmp_path):
