@@ -470,6 +470,63 @@ def test_dashboard_splits_lines_into_tracked_ai_and_nontracked(tmp_path):
     assert nt_ins == 14
 
 
+def test_a_squash_shows_every_commit_as_its_own_item_and_keeps_its_own_message(tmp_path):
+    # THE BUG: constituents were split on metadata blocks, so every commit between two aGiTrack
+    # commits collapsed into ONE item labelled with the first of them (a real squash folded seven
+    # dependency merges into a single entry), and the first item began at line 0 — swallowing the
+    # PR title, which the merge's own message still carried in full as well.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "squashed.txt", 10)
+    message = (
+        "Batch of fixes (#42)\n\n"
+        "* deps: bump left-pad\n\nBumps left-pad.\n\n"
+        "* deps: bump right-pad\n\nBumps right-pad.\n\n"
+        "* <aGiTrack> did agent work\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 1000\n"
+    )
+    repo.commit(message)
+
+    squashed = next(s for s in build_dashboard(repo).stats if s.subject.startswith("Batch"))
+
+    assert [c.subject for c in squashed.constituents] == [
+        "deps: bump left-pad",
+        "deps: bump right-pad",
+        "<aGiTrack> did agent work",
+    ]
+    # The merge's own message is the PR title and nothing below it.
+    assert squashed.message == "Batch of fixes (#42)"
+    assert "left-pad" not in squashed.message
+    # A squashed commit carrying no metadata was never aGiTrack-tracked; only the agent one is.
+    assert [c.kind for c in squashed.constituents] == ["untracked", "untracked", "agent"]
+    assert squashed.tokens["output"] == 1000  # counted once, from the one commit that has them
+
+
+def test_a_summary_bullet_list_is_not_mistaken_for_a_squashed_commit(tmp_path):
+    # A model writing a `* ` list in a commit summary must not manufacture extra "commits".
+    # git's squash format puts a BLANK line after each bullet and a prose list does not — the
+    # discriminator, measured over 400 commits of real history: 18/18 squash bullets are followed
+    # by a blank, 0/40 prose bullets are.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "one.txt", 10)
+    message = (
+        "Two real commits (#7)\n\n"
+        "* <aGiTrack> first\n\n"
+        "What changed:\n"
+        "* a bullet in the summary\n"
+        "* another bullet\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 5\n\n"
+        "* <aGiTrack> second\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 7\n"
+    )
+    repo.commit(message)
+
+    squashed = next(s for s in build_dashboard(repo).stats if s.subject.startswith("Two real"))
+
+    assert [c.subject for c in squashed.constituents] == ["<aGiTrack> first", "<aGiTrack> second"]
+    assert squashed.tokens["output"] == 12
+
+
 def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
     # A squash / PR-merge message concatenates several original commits' metadata
     # blocks. The dashboard parses each one back out so their tokens and

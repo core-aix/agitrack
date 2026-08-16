@@ -907,7 +907,11 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
     # several commits' blocks (possibly across several rounds of squashing, which
     # git flattens). Parse each original commit so its tokens and model/backend
     # usage are still counted, and so the squash can be expanded in the UI.
-    if body.count(METADATA_HEADER) > 1:
+    # A squash is recognised by git's bullets OR by more than one metadata block (aGiTrack's own
+    # fold, which writes no bullets). Keying on the block count alone missed the ordinary case of
+    # a PR that squashed several commits of which only ONE was aGiTrack-tracked — a batch of
+    # dependency merges plus one agent commit produced no items at all.
+    if _squash_bullets(body.splitlines()) or body.count(METADATA_HEADER) > 1:
         constituents = _parse_constituents(body)
         return _build_squash(sha, author, email, subject, timestamp, body, constituents, co_authors)
     metadata = _parse_metadata(body)
@@ -984,6 +988,41 @@ def _is_metadata_kv(line: str) -> bool:
     return bool(key) and " " not in key
 
 
+def _squash_bullets(lines: list[str]) -> list[int]:
+    """Indices of the ``* <subject>`` lines that git wrote to delimit squashed commits.
+
+    A bullet counts only when it is surrounded by BLANK lines, which is what separates git's
+    format (blank / ``* subject`` / blank / body) from a markdown bullet a model wrote inside a
+    commit summary. Measured across 400 commits of this repository's history: all 18 real bullets
+    in a squash are blank-separated on both sides, and 0 of 55 prose bullets are. BOTH sides are
+    needed — a list's FIRST item has a blank above it and its LAST item has a blank below, so
+    either test alone lets one end of every prose list through. Without this, splitting on ``* ``
+    manufactured an extra "commit" out of any summary that used a bullet list, which 13 of those
+    393 non-squash commits do."""
+    return [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("* ")
+        and (index == 0 or not lines[index - 1].strip())
+        and index + 1 < len(lines)
+        and not lines[index + 1].strip()
+    ]
+
+
+def squash_header_end(lines: list[str]) -> int:
+    """Index of the first line belonging to a squashed constituent — i.e. where the squash's OWN
+    message ends.
+
+    git's squash format is ``<PR title>``, a blank, then one ``* <subject>`` bullet per squashed
+    commit with its body beneath. So the first bullet is the boundary, and it is the ONE bullet
+    that can be trusted: only the title precedes it, whereas later bullets are indistinguishable
+    from a markdown bullet inside a commit body (measured on this repo's history: 13 of 393
+    non-squash commits carry a ``* `` line at column 0 after a blank, all of them prose in the
+    generated summary). 0 when the message has no bullets at all — nothing to separate."""
+    bullets = _squash_bullets(lines)
+    return bullets[0] if bullets else 0
+
+
 def _parse_constituents(body: str) -> list[CommitStat]:
     """Split a squashed message into one :class:`CommitStat` per original commit.
 
@@ -994,6 +1033,19 @@ def _parse_constituents(body: str) -> list[CommitStat]:
     kind/backend/model/tokens/span but no line counts — the squash holds the one
     combined diff."""
     lines = body.splitlines()
+    bullets = _squash_bullets(lines)
+    if bullets:
+        # ONE ITEM PER COMMIT, delimited by the bullets git itself wrote. Splitting on metadata
+        # blocks instead lumped every commit between two aGiTrack commits into a single item —
+        # in a real squash, seven dependency merges were folded into one entry labelled with
+        # only the first of them — and started that item at line 0, so it also swallowed the
+        # merge's own PR title. Commits carrying no metadata (a dependabot merge) are items too:
+        # they are commits that were squashed, which is what this list is for.
+        spans = list(zip(bullets, bullets[1:] + [len(lines)]))
+        return [_constituent(lines[start:end]) for start, end in spans]
+    # No bullets: not git's squash shape. This is aGiTrack's own FOLD — a user commit that
+    # absorbed one or more agent turns, concatenating their metadata blocks with no bullets
+    # anywhere — so the blocks are the only boundaries there are.
     headers = [i for i, line in enumerate(lines) if line.strip() == METADATA_HEADER]
     constituents: list[CommitStat] = []
     prev_end = 0
@@ -1003,8 +1055,7 @@ def _parse_constituents(body: str) -> list[CommitStat]:
             if not _is_metadata_kv(lines[j]):
                 end = j
                 break
-        segment = lines[prev_end:end]
-        constituents.append(_constituent(segment))
+        constituents.append(_constituent(lines[prev_end:end]))
         prev_end = end
     return constituents
 
@@ -1021,7 +1072,12 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         author="",
         email="",
         subject=subject,
-        kind=_kind_from_metadata(metadata),
+        # NO metadata block at all means this squashed commit was never aGiTrack-tracked — a
+        # dependabot merge, or anything else that landed on the branch. `_kind_from_metadata`
+        # answers "agent" for an empty dict, which is right for a block missing only its
+        # commit_type and wrong for a commit that carries no block; before these became items of
+        # their own they were absorbed into a neighbouring agent constituent, so it never showed.
+        kind=_kind_from_metadata(metadata) if METADATA_HEADER in text else "untracked",
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
@@ -1069,9 +1125,24 @@ def _build_squash(
         model=dominant.model if dominant else None,
         tokens=dict(tokens),
         co_authors=co_authors or [],
-        message=body.strip(),
+        # The squash's OWN message: the PR title git wrote on the subject line, and nothing
+        # below it. It used to be the entire body, so expanding a squash showed the whole
+        # concatenation — the first squashed commit's summary, trace and metadata read as if
+        # they were the merge's own message, and then appeared AGAIN as a constituent. Each
+        # squashed commit is an item; the merge is the thing that gathered them.
+        message=_squash_own_message(body, subject),
         constituents=constituents,
     )
+
+
+def _squash_own_message(body: str, subject: str) -> str:
+    """The squash commit's own text — everything above the first constituent bullet."""
+    lines = body.splitlines()
+    end = squash_header_end(lines)
+    if end <= 0:
+        return body.strip()  # no bullets: not git's squash shape, so leave the message alone
+    header = "\n".join(lines[:end]).strip()
+    return header or subject
 
 
 def _sum_tokens(parts: list[CommitStat]) -> dict[str, int]:
