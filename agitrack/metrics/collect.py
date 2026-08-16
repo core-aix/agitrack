@@ -403,7 +403,32 @@ class Dashboard:
         """Per committer, lines split into aGiTrack-tracked AI and non-tracked.
         Agent commits are git-authored by whoever ran aGiTrack but written by the
         model, so they count as that person's AI-driven lines; their user and
-        plain commits are non-tracked (not claimed as human)."""
+        plain commits are non-tracked (not claimed as human).
+
+        A committer who contributed NO LINES is dropped, however many commits they have. That
+        is not the same as having no commits: `git log --numstat` reports nothing for a MERGE
+        commit (deliberately — a turn's lines are counted once, on the commits that introduced
+        them), so somebody whose only commits here are merges appeared as a row of zeros and as
+        a filter option that selects commits showing no lines either. See
+        :meth:`committers_with_lines`, which the filter lists share so the two cannot disagree."""
+        return {label: bucket for label, bucket in self._author_totals().items() if _has_lines(bucket)}
+
+    def committers_with_lines(self) -> set[str]:
+        """Committer labels credited on at least one commit that carries lines — what the filter
+        offers, and the rule the breakdown drops rows by.
+
+        Computed over :meth:`committers_of`, NOT over the ``by_author`` buckets: those are keyed
+        on the PRIMARY author, so a co-author (credited via a ``Co-Authored-By:`` trailer, #54)
+        has no bucket of their own and reading the set off them would have removed every
+        co-author from the filter — a regression well beyond dropping the empty name this exists
+        for."""
+        out: set[str] = set()
+        for stat in self.stats:
+            if stat.insertions or stat.deletions:
+                out.update(label for label in self.committers_of(stat) if label)
+        return out
+
+    def _author_totals(self) -> dict[str, dict[str, int]]:
         labels = self.committer_labels
         groups: dict[str, dict[str, int]] = {}
         for stat in self.stats:
@@ -425,6 +450,13 @@ class Dashboard:
                 bucket["nontracked_insertions"] += stat.insertions
                 bucket["nontracked_deletions"] += stat.deletions
         return {label: dict(bucket) for label, bucket in groups.items()}
+
+
+def _has_lines(bucket: dict[str, int]) -> bool:
+    """Whether a per-committer bucket carries any lines at all, in either bucket."""
+    return any(
+        bucket.get(key, 0) for key in ("ai_insertions", "ai_deletions", "nontracked_insertions", "nontracked_deletions")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +939,11 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
     # several commits' blocks (possibly across several rounds of squashing, which
     # git flattens). Parse each original commit so its tokens and model/backend
     # usage are still counted, and so the squash can be expanded in the UI.
-    if body.count(METADATA_HEADER) > 1:
+    # A squash is recognised by git's bullets OR by more than one metadata block (aGiTrack's own
+    # fold, which writes no bullets). Keying on the block count alone missed the ordinary case of
+    # a PR that squashed several commits of which only ONE was aGiTrack-tracked — a batch of
+    # dependency merges plus one agent commit produced no items at all.
+    if _squash_bullets(body.splitlines()) or len(metadata_header_lines(body.splitlines())) > 1:
         constituents = _parse_constituents(body)
         return _build_squash(sha, author, email, subject, timestamp, body, constituents, co_authors)
     metadata = _parse_metadata(body)
@@ -918,7 +954,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         kind = "agent-merge"
     elif commit_type == "user":
         kind = "user"
-    elif METADATA_HEADER in body:
+    elif metadata_header_lines(body.splitlines()):
         kind = "agent"  # metadata without commit_type: treat as agent work
     elif subject.startswith("Merge ") and _AGITRACK_BRANCH_RE.search(subject):
         # aGiTrack's own integration plumbing: the auto-generated merge commits it
@@ -984,6 +1020,65 @@ def _is_metadata_kv(line: str) -> bool:
     return bool(key) and " " not in key
 
 
+def metadata_header_lines(lines: list[str]) -> list[int]:
+    """Indices of the REAL ``# aGiTrack Metadata`` header lines, skipping fenced code blocks.
+
+    A commit message can *quote* a metadata block — an agent pasting one into its reply to show
+    what it produced, inside a ``` fence, which then rides into the interaction trace verbatim.
+    Nothing distinguished that from aGiTrack's own block, and every consumer got it wrong at once:
+    the commit was misread as a squash (so the dashboard showed the whole message AND a single
+    "squashed" item repeating it), the quoted block became a bogus constituent, and its aligned
+    sample line ``backend: codex          model: gpt-5.6-luna     reasoning_effort: on`` was
+    parsed as a backend NAME — which is why a phantom backend appeared with the model welded into
+    it while the by-model breakdown, reading a real ``model:`` line that block never had, showed
+    nothing. Content inside a fence is quoted text, never structure."""
+    out: list[int] = []
+    in_fence = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and stripped == METADATA_HEADER:
+            out.append(index)
+    return out
+
+
+def _squash_bullets(lines: list[str]) -> list[int]:
+    """Indices of the ``* <subject>`` lines that git wrote to delimit squashed commits.
+
+    A bullet counts only when it is surrounded by BLANK lines, which is what separates git's
+    format (blank / ``* subject`` / blank / body) from a markdown bullet a model wrote inside a
+    commit summary. Measured across 400 commits of this repository's history: all 18 real bullets
+    in a squash are blank-separated on both sides, and 0 of 55 prose bullets are. BOTH sides are
+    needed — a list's FIRST item has a blank above it and its LAST item has a blank below, so
+    either test alone lets one end of every prose list through. Without this, splitting on ``* ``
+    manufactured an extra "commit" out of any summary that used a bullet list, which 13 of those
+    393 non-squash commits do."""
+    return [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("* ")
+        and (index == 0 or not lines[index - 1].strip())
+        and index + 1 < len(lines)
+        and not lines[index + 1].strip()
+    ]
+
+
+def squash_header_end(lines: list[str]) -> int:
+    """Index of the first line belonging to a squashed constituent — i.e. where the squash's OWN
+    message ends.
+
+    git's squash format is ``<PR title>``, a blank, then one ``* <subject>`` bullet per squashed
+    commit with its body beneath. So the first bullet is the boundary, and it is the ONE bullet
+    that can be trusted: only the title precedes it, whereas later bullets are indistinguishable
+    from a markdown bullet inside a commit body (measured on this repo's history: 13 of 393
+    non-squash commits carry a ``* `` line at column 0 after a blank, all of them prose in the
+    generated summary). 0 when the message has no bullets at all — nothing to separate."""
+    bullets = _squash_bullets(lines)
+    return bullets[0] if bullets else 0
+
+
 def _parse_constituents(body: str) -> list[CommitStat]:
     """Split a squashed message into one :class:`CommitStat` per original commit.
 
@@ -994,7 +1089,20 @@ def _parse_constituents(body: str) -> list[CommitStat]:
     kind/backend/model/tokens/span but no line counts — the squash holds the one
     combined diff."""
     lines = body.splitlines()
-    headers = [i for i, line in enumerate(lines) if line.strip() == METADATA_HEADER]
+    bullets = _squash_bullets(lines)
+    if bullets:
+        # ONE ITEM PER COMMIT, delimited by the bullets git itself wrote. Splitting on metadata
+        # blocks instead lumped every commit between two aGiTrack commits into a single item —
+        # in a real squash, seven dependency merges were folded into one entry labelled with
+        # only the first of them — and started that item at line 0, so it also swallowed the
+        # merge's own PR title. Commits carrying no metadata (a dependabot merge) are items too:
+        # they are commits that were squashed, which is what this list is for.
+        spans = list(zip(bullets, bullets[1:] + [len(lines)]))
+        return [_constituent(lines[start:end]) for start, end in spans]
+    # No bullets: not git's squash shape. This is aGiTrack's own FOLD — a user commit that
+    # absorbed one or more agent turns, concatenating their metadata blocks with no bullets
+    # anywhere — so the blocks are the only boundaries there are.
+    headers = metadata_header_lines(lines)
     constituents: list[CommitStat] = []
     prev_end = 0
     for header in headers:
@@ -1003,8 +1111,7 @@ def _parse_constituents(body: str) -> list[CommitStat]:
             if not _is_metadata_kv(lines[j]):
                 end = j
                 break
-        segment = lines[prev_end:end]
-        constituents.append(_constituent(segment))
+        constituents.append(_constituent(lines[prev_end:end]))
         prev_end = end
     return constituents
 
@@ -1021,7 +1128,12 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         author="",
         email="",
         subject=subject,
-        kind=_kind_from_metadata(metadata),
+        # NO metadata block at all means this squashed commit was never aGiTrack-tracked — a
+        # dependabot merge, or anything else that landed on the branch. `_kind_from_metadata`
+        # answers "agent" for an empty dict, which is right for a block missing only its
+        # commit_type and wrong for a commit that carries no block; before these became items of
+        # their own they were absorbed into a neighbouring agent constituent, so it never showed.
+        kind=_kind_from_metadata(metadata) if metadata_header_lines(segment_lines) else "untracked",
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
@@ -1069,9 +1181,24 @@ def _build_squash(
         model=dominant.model if dominant else None,
         tokens=dict(tokens),
         co_authors=co_authors or [],
-        message=body.strip(),
+        # The squash's OWN message: the PR title git wrote on the subject line, and nothing
+        # below it. It used to be the entire body, so expanding a squash showed the whole
+        # concatenation — the first squashed commit's summary, trace and metadata read as if
+        # they were the merge's own message, and then appeared AGAIN as a constituent. Each
+        # squashed commit is an item; the merge is the thing that gathered them.
+        message=_squash_own_message(body, subject),
         constituents=constituents,
     )
+
+
+def _squash_own_message(body: str, subject: str) -> str:
+    """The squash commit's own text — everything above the first constituent bullet."""
+    lines = body.splitlines()
+    end = squash_header_end(lines)
+    if end <= 0:
+        return body.strip()  # no bullets: not git's squash shape, so leave the message alone
+    header = "\n".join(lines[:end]).strip()
+    return header or subject
 
 
 def _sum_tokens(parts: list[CommitStat]) -> dict[str, int]:
@@ -1090,21 +1217,19 @@ def _metadata_block(body: str) -> str:
     block lets :func:`collect_commit_stats` recognise such a merge as a duplicate
     of the cover commit it merges and avoid counting the turn's tokens twice."""
     lines = body.splitlines()
-    try:
-        start = lines.index(METADATA_HEADER)
-    except ValueError:
+    headers = metadata_header_lines(lines)
+    if not headers:
         return ""
-    return "\n".join(lines[start:]).strip()
+    return "\n".join(lines[headers[0] :]).strip()
 
 
 def _parse_metadata(body: str) -> dict[str, str]:
     lines = body.splitlines()
-    try:
-        start = lines.index(METADATA_HEADER)
-    except ValueError:
+    headers = metadata_header_lines(lines)
+    if not headers:
         return {}
     metadata: dict[str, str] = {}
-    for line in lines[start + 1 :]:
+    for line in lines[headers[0] + 1 :]:
         if line.startswith("#"):
             break
         key, sep, value = line.partition(":")

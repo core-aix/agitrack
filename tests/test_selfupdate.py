@@ -114,6 +114,36 @@ def test_a_failed_self_update_is_recorded_for_the_dashboards(tmp_path, monkeypat
     assert json.loads(selfupdate.state_path().read_text())["latest"] == "1.1.0"
 
 
+def test_the_reminder_is_re_checked_against_the_agitrack_running_now():
+    """The state file is a global cache and what it describes moves underneath it, so a record
+    is not trusted as written.
+
+    Both halves are measured, not imagined. A dashboard kept showing "0.6.13 is available and
+    has to be installed by you" on a machine ALREADY running 0.6.13: a failed attempt's record
+    survives, and whoever later succeeds writes a fresh file rather than correcting the old one.
+    The second half is subtler — several aGiTrack processes of different vintages share this one
+    file. A background tracker whose venv wheel had been replaced by an editable install
+    underneath it never saw its own install change again, so it stayed on 0.6.10 for days and
+    kept publishing that version's "install it by hand" verdict, which the current install then
+    displayed as its own problem.
+
+    A source install is exempt from both: its fields are commit shas, and whether a checkout is
+    behind is git's answer, not a version comparison's."""
+    import agitrack
+
+    def _record(**kwargs):
+        return selfupdate.SelfUpdateRecord(state=selfupdate.STATE_FAILED, **kwargs)
+
+    running = agitrack.__version__
+    assert _record(current=running, latest=running, method="pip").needs_user is False
+    assert _record(current="0.6.10", latest="99.0.0", method="pip").needs_user is False
+    # …while this install's own record about a genuinely newer release still asks for action.
+    assert _record(current=running, latest="99.0.0", method="pip").needs_user is True
+    # A sha is not a version: parsed as one it comes back as (0,), which read as "already newer
+    # than that" and silently suppressed every source checkout's notice.
+    assert _record(current="a1b2c3d", latest="e4f5a6b", method="source").needs_user is True
+
+
 def test_a_mode_that_cannot_self_update_is_recorded_without_attempting(tmp_path, monkeypatch):
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
     applied: list[str] = []
@@ -193,6 +223,52 @@ def test_a_session_running_older_code_is_detectable(tmp_path, monkeypatch):
     assert selfupdate.running_session_is_stale(repo_root) is False  # released: nothing running
 
 
+def test_a_repo_dashboard_only_shows_the_install_notice_of_its_own_instance(tmp_path, monkeypatch):
+    """The state file is global; the instances on the machine are not one install.
+
+    A repo tracked from a source checkout updates itself silently, yet its dashboard carried a
+    "this Python is externally managed, upgrade it yourself" banner — written by an unrelated
+    tracker running a wheel in another project's venv, because whoever checks last owns the one
+    global file. On a repo dashboard the subject is that repo's instance, and its fingerprint in
+    the repo lock says which install that is."""
+    import agitrack
+
+    from agitrack.git.lock import RepoLock
+    from agitrack.metrics.web import _update_banner_html
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "config"))
+    repo_root = tmp_path / "repo"
+    (repo_root / ".agitrack").mkdir(parents=True)
+    repo = types.SimpleNamespace(repo=repo_root)
+    selfupdate.write_state(
+        selfupdate.SelfUpdateRecord(
+            state=selfupdate.STATE_FAILED,
+            method="pipx",
+            current=agitrack.__version__,
+            latest="99.0.0",
+            error="pipx could not upgrade it",
+        )
+    )
+
+    # No instance on this repo (a dashboard-only repo): the global installation is the subject.
+    assert "99.0.0" in _update_banner_html(repo)
+
+    lock = RepoLock(repo_root / ".agitrack" / "lock")
+    for fingerprint, expected in (
+        ("commit:abc123", ""),  # tracked from a source checkout — the wheel's verdict is not its own
+        (f"version:{agitrack.__version__}", "99.0.0"),  # the very install the record was written by
+    ):
+        monkeypatch.setattr("agitrack.update.restart.RUNNING_FINGERPRINT", fingerprint)
+        # Same on disk, so the OTHER notice ("restart your session") stays out of the way.
+        monkeypatch.setattr("agitrack.update.restart.disk_fingerprint", lambda f=fingerprint: f)
+        assert lock.acquire() is True
+        try:
+            banner = _update_banner_html(repo)
+        finally:
+            lock.release()
+        assert (expected in banner) if expected else banner == ""
+
+
 def test_the_install_notice_speaks_versions_for_a_package_and_commits_for_a_source_checkout(tmp_path, monkeypatch):
     # A source checkout and a package install are updated in different units. `current`/`latest`
     # for a source install are short COMMIT HASHES (Updater._check_source), so the one-size
@@ -215,8 +291,14 @@ def test_the_install_notice_speaks_versions_for_a_package_and_commits_for_a_sour
     assert "git pull" in source
     assert "installed by you" not in source  # a checkout is pulled, not installed
 
+    import agitrack
+
+    # `current` is the RUNNING version deliberately: a package record naming any other version
+    # was written by a different install and is ignored on purpose (see the re-check test).
     selfupdate.write_state(
-        selfupdate.SelfUpdateRecord(state=selfupdate.STATE_MANUAL, method="pipx", current="0.6.12", latest="0.7.0")
+        selfupdate.SelfUpdateRecord(
+            state=selfupdate.STATE_MANUAL, method="pipx", current=agitrack.__version__, latest="0.7.0"
+        )
     )
     package = _update_banner_html()
     assert "aGiTrack 0.7.0 is available" in package and "commit" not in package

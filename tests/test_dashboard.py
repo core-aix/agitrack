@@ -470,6 +470,95 @@ def test_dashboard_splits_lines_into_tracked_ai_and_nontracked(tmp_path):
     assert nt_ins == 14
 
 
+def test_a_metadata_block_quoted_inside_the_trace_is_not_real_metadata(tmp_path):
+    # THE BUG: an agent that pastes a metadata block into its reply — inside a ``` fence, to show
+    # what it produced — puts a second `# aGiTrack Metadata` line into the commit. Nothing told
+    # the quoted one from the real one, and it broke three things at once: the commit was read as
+    # a SQUASH (the dashboard showed the whole message and then a single "squashed" item repeating
+    # it), the quote became a bogus constituent, and its aligned sample line was parsed as a
+    # backend NAME — a phantom backend "codex          model: ... reasoning_effort: on" that also
+    # explained why that model never reached the by-model breakdown.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "quoted.txt", 20)
+    message = (
+        "<aGiTrack> explain the metadata format\n\n"
+        "Here is what a turn records:\n\n"
+        "```\n"
+        "# aGiTrack Metadata\n"
+        "backend: codex          model: gpt-5.6-luna     reasoning_effort: on\n"
+        "```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-5\n"
+        "tokens_since_last_commit_output: 40\n"
+    )
+    repo.commit(message)
+
+    dash = build_dashboard(repo)
+    stat = next(s for s in dash.stats if s.subject.startswith("<aGiTrack> explain"))
+
+    assert stat.constituents == []  # one commit, not a squash
+    assert stat.backend == "claude"  # the real block wins; the quoted one is prose
+    assert stat.model == "claude-opus-5"
+    assert list(dash.by_backend) == ["claude"]
+    assert stat.tokens["output"] == 40
+
+
+def test_a_squash_shows_every_commit_as_its_own_item_and_keeps_its_own_message(tmp_path):
+    # THE BUG: constituents were split on metadata blocks, so every commit between two aGiTrack
+    # commits collapsed into ONE item labelled with the first of them (a real squash folded seven
+    # dependency merges into a single entry), and the first item began at line 0 — swallowing the
+    # PR title, which the merge's own message still carried in full as well.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "squashed.txt", 10)
+    message = (
+        "Batch of fixes (#42)\n\n"
+        "* deps: bump left-pad\n\nBumps left-pad.\n\n"
+        "* deps: bump right-pad\n\nBumps right-pad.\n\n"
+        "* <aGiTrack> did agent work\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 1000\n"
+    )
+    repo.commit(message)
+
+    squashed = next(s for s in build_dashboard(repo).stats if s.subject.startswith("Batch"))
+
+    assert [c.subject for c in squashed.constituents] == [
+        "deps: bump left-pad",
+        "deps: bump right-pad",
+        "<aGiTrack> did agent work",
+    ]
+    # The merge's own message is the PR title and nothing below it.
+    assert squashed.message == "Batch of fixes (#42)"
+    assert "left-pad" not in squashed.message
+    # A squashed commit carrying no metadata was never aGiTrack-tracked; only the agent one is.
+    assert [c.kind for c in squashed.constituents] == ["untracked", "untracked", "agent"]
+    assert squashed.tokens["output"] == 1000  # counted once, from the one commit that has them
+
+
+def test_a_summary_bullet_list_is_not_mistaken_for_a_squashed_commit(tmp_path):
+    # A model writing a `* ` list in a commit summary must not manufacture extra "commits".
+    # git's squash format puts a BLANK line after each bullet and a prose list does not — the
+    # discriminator, measured over 400 commits of real history: 18/18 squash bullets are followed
+    # by a blank, 0/40 prose bullets are.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "one.txt", 10)
+    message = (
+        "Two real commits (#7)\n\n"
+        "* <aGiTrack> first\n\n"
+        "What changed:\n"
+        "* a bullet in the summary\n"
+        "* another bullet\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 5\n\n"
+        "* <aGiTrack> second\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\ntokens_since_last_commit_output: 7\n"
+    )
+    repo.commit(message)
+
+    squashed = next(s for s in build_dashboard(repo).stats if s.subject.startswith("Two real"))
+
+    assert [c.subject for c in squashed.constituents] == ["<aGiTrack> first", "<aGiTrack> second"]
+    assert squashed.tokens["output"] == 12
+
+
 def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
     # A squash / PR-merge message concatenates several original commits' metadata
     # blocks. The dashboard parses each one back out so their tokens and
@@ -915,6 +1004,10 @@ def _co_authored_dashboard(subject: str):
         kind="agent",
         timestamp=1_700_000_000,
         co_authors=[("Robin Roe", "robin@example.com")],
+        # A real commit carries lines; a committer credited only on line-less commits is now
+        # dropped from the filter, which is incidental to what these co-author tests check.
+        insertions=9,
+        deletions=2,
     )
     return Dashboard(repo="r", branch="main", stats=[stat]), stat
 
@@ -943,7 +1036,18 @@ def test_bot_and_ai_primary_authors_are_not_committers():
         subject="Automated release",
         kind="untracked",
     )
-    human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
+    # Lines given explicitly: a committer contributing none is now dropped from the breakdown
+    # and the filter (see test_a_committer_with_no_lines_is_dropped...), which is incidental to
+    # what this test is about.
+    human = CommitStat(
+        sha="h1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject="Real work",
+        kind="agent",
+        insertions=5,
+        deletions=1,
+    )
     dash = Dashboard(repo="r", branch="main", stats=[bot, human])
     # The bot is the primary author but is not a committer: empty here, absent
     # from the filter options and the per-committer breakdown.
@@ -951,6 +1055,49 @@ def test_bot_and_ai_primary_authors_are_not_committers():
     assert dash.committers_of(human) == ["Alex Doe"]
     assert _options(dash)["committers"] == ["Alex Doe"]
     assert "github-actions[bot]" not in dash.by_author
+
+
+def test_a_committer_with_no_lines_is_dropped_from_the_breakdown_and_the_filter():
+    from agitrack.metrics.collect import Dashboard
+    from agitrack.metrics.web import _options
+
+    # `git log --numstat` reports nothing for a MERGE commit — deliberately, so a turn's lines
+    # are counted once on the commits that introduced them. Somebody whose only commits here are
+    # merges therefore showed up as a row of all zeros, and as a filter option that selects
+    # commits with no lines to show either. Having commits is not the same as having contributed.
+    merger = CommitStat(sha="m1", author="t", email="t@example.com", subject="Merge branch 'dev'", kind="untracked")
+    real = CommitStat(
+        sha="a1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject="Real work",
+        kind="agent",
+        insertions=12,
+        deletions=3,
+    )
+    dash = Dashboard(repo="r", branch="main", stats=[merger, real])
+
+    assert "t" not in dash.by_author
+    assert "Alex Doe" in dash.by_author
+    # The filter offers exactly what the breakdown shows — one set, so they cannot disagree.
+    assert dash.committers_with_lines() == {"Alex Doe"}
+    assert _options(dash)["committers"] == ["Alex Doe"]
+
+
+def test_a_committer_is_kept_when_any_of_their_commits_carries_lines():
+    from agitrack.metrics.collect import Dashboard
+    from agitrack.metrics.web import _options
+
+    # Only a committer with NOTHING is dropped: a merge alongside real work must not hide them.
+    merge = CommitStat(sha="m1", author="t", email="t@example.com", subject="Merge", kind="untracked")
+    work = CommitStat(
+        sha="w1", author="t", email="t@example.com", subject="A fix", kind="user", insertions=4, deletions=1
+    )
+    dash = Dashboard(repo="r", branch="main", stats=[merge, work])
+
+    assert dash.by_author["t"]["commits"] == 2  # both commits still counted for them
+    assert dash.by_author["t"]["nontracked_insertions"] == 4
+    assert _options(dash)["committers"] == ["t"]
 
 
 def test_filter_stats_matches_any_committer():

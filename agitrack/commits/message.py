@@ -1040,16 +1040,35 @@ def _nest_headings_under_role(content: str) -> str:
 
 
 def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
-    # A turn STARTS at whatever prompted it — a user message, or a background event that woke
-    # the agent with nobody saying anything (TRACE_EVENT_ROLE). Both count here: an event-driven
-    # turn is a turn, and counting only `user` entries would let a long run of background wake-ups
-    # read as ONE turn and keep the whole run in the trace, well past the limit.
+    """Keep the most recent ``turn_limit`` turns of ``trace``.
+
+    A turn is an EXCHANGE — something said to the agent, and the agent answering it — so it is
+    the agent's reply that closes one and makes the next thing said a new turn. Consecutive
+    messages with no reply between them are one turn however many there are: the user can keep
+    typing while the agent works, and none of that is a new exchange.
+
+    Counting each `## User` block instead cut the trace INSIDE a turn. Measured on a real
+    session: one turn carried eleven messages sent while the agent worked, so a limit of 5 kept
+    the last three and dropped the opening prompt with eight follow-ups — and because that turn's
+    work was committed there, the words that asked for it survived in no commit at all.
+
+    A turn is opened by a user message or by a background EVENT that woke the agent with nobody
+    saying anything (:data:`TRACE_EVENT_ROLE`) — an event-driven turn is a turn, and counting only
+    `user` entries let a long run of wake-ups read as one. `starts_turn=False`, recorded for a
+    message known to have been queued into a turn already under way, keeps such a message out of
+    the count even where a reply happens to precede it; it is absent on entries written by older
+    installs, so its default preserves their meaning."""
     limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
-    starts = [
-        index
-        for index, item in enumerate(trace)
-        if str(item.get("role", "")).strip().lower() in ("user", TRACE_EVENT_ROLE)
-    ]
+    starts: list[int] = []
+    answered = True  # nothing is in flight yet, so the first thing said opens a turn
+    for index, item in enumerate(trace):
+        role = str(item.get("role", "")).strip().lower()
+        if role not in ("user", TRACE_EVENT_ROLE):
+            answered = True  # the agent replied: whatever is said next begins a new exchange
+            continue
+        if answered and item.get("starts_turn", True) is not False:
+            starts.append(index)
+        answered = False
     if len(starts) <= limit:
         return trace
     return trace[starts[-limit] :]

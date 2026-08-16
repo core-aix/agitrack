@@ -36,6 +36,7 @@ have to do it themselves.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,8 +89,66 @@ class SelfUpdateRecord:
     @property
     def needs_user(self) -> bool:
         """Whether the user has to update by hand — a newer version exists and aGiTrack
-        could not install it."""
-        return self.state in (STATE_MANUAL, STATE_FAILED) and bool(self.latest)
+        could not install it.
+
+        Re-checked against the version RUNNING NOW, not trusted as written. This record is a
+        cache on disk and the thing it describes moves underneath it: aGiTrack self-updates,
+        and whoever succeeds does not rewrite an older failed attempt's file. A record saying
+        "0.6.13 is available, you must install it by hand" therefore kept nagging on a machine
+        that had since installed 0.6.13 — the dashboard reporting a stale problem as a live one.
+        Only versions are comparable: a SOURCE install records commit shas in these fields, so
+        it keeps the recorded verdict (whether the checkout is behind is git's answer, not a
+        version's)."""
+        if self.state not in (STATE_MANUAL, STATE_FAILED) or not self.latest:
+            return False
+        if _describes_another_install(self.current, self.method):
+            return False
+        return not _already_at_least(self.latest)
+
+
+_VERSION_RE = re.compile(r"^\d+(?:\.\d+)+")
+
+
+def _describes_another_install(current: str, method: str) -> bool:
+    """Whether this record was written about an install other than the one reading it.
+
+    The state file is GLOBAL but the machine is not: several aGiTrack processes of different
+    vintages run at once (long-lived background trackers started days apart, a hub daemon, a
+    TUI), they all write this one file, and a daemon still holds the code it imported at
+    startup. So a tracker that has been up since before an upgrade keeps announcing itself as
+    the older version and, taking a package route that this install does not use, writes a
+    "you must install it by hand" record that the *current* install then displays as its own.
+
+    A package record names the version that wrote it, so that is the check: if it is not the
+    version running here, the record is somebody else's and this process must not act on it.
+    Source records carry commit shas, which say nothing comparable — those are left alone."""
+    if method == "source" or not _VERSION_RE.match(current.strip()):
+        return False
+    try:
+        import agitrack
+
+        return current.strip() != agitrack.__version__.strip()
+    except Exception:
+        return False
+
+
+def _already_at_least(latest: str) -> bool:
+    """Whether the aGiTrack running now is at or past *latest*. False when either side is not a
+    comparable version (a source install's commit sha, an unparsable string) — the recorded
+    verdict then stands, since there is nothing to check it against."""
+    try:
+        import agitrack
+        from agitrack.update.updater import _version_tuple
+
+        # BOTH sides must look like a dotted release version. `_version_tuple` is lenient by
+        # design — it strips non-digits, so a commit sha like "e4f5a6b" comes back as `(0,)`,
+        # which then compares as "already newer than that" and silently suppressed every source
+        # checkout's notice. A sha is not a version and must not be treated as one.
+        if not (_VERSION_RE.match(latest.strip()) and _VERSION_RE.match(agitrack.__version__.strip())):
+            return False
+        return _version_tuple(agitrack.__version__) >= _version_tuple(latest)
+    except Exception:
+        return False
 
 
 def read_state() -> SelfUpdateRecord:
@@ -325,6 +384,39 @@ def _instructions(updater) -> str:
 # ---------------------------------------------------------------------------
 
 
+def instance_fingerprint(repo_root: Path) -> str:
+    """Which aGiTrack install the instance tracking *repo_root* is running — the fingerprint it
+    captured at startup (``commit:<sha>`` for a source checkout, ``version:<x.y.z>`` for a wheel),
+    or ``""`` when no instance is live there.
+
+    A repo has at most one aGiTrack instance: they take the repo's single-writer lock, which is
+    where this is read from. The dashboard daemons are the exception — they serve without tracking
+    and take no such lock — so a dashboard-only repo answers ``""``."""
+    record = _lock_record(Path(repo_root) / ".agitrack" / "lock")
+    return str((record or {}).get("fingerprint") or "")
+
+
+def record_matches_instance(repo_root: Path, record: SelfUpdateRecord) -> bool:
+    """Whether the GLOBAL install record describes the aGiTrack instance tracking *repo_root*.
+
+    There is one state file per machine but many aGiTrack instances on it, one per repo plus the
+    dashboards, and they need not share an install: on a developer's machine some track from a
+    source checkout while another still runs a wheel in a project venv. Whoever checked last owns
+    the file, so a wheel-installed tracker's "install it by hand" verdict would surface on the
+    dashboard of a repo whose own instance is a source checkout that updates itself perfectly.
+    That reads as this repo's problem, and it is not one.
+
+    An instance with no lock — a repo with only a dashboard on it — has nothing to compare, and
+    the record shows: the global installation is still the honest subject there."""
+    fingerprint = instance_fingerprint(repo_root)
+    if not fingerprint:
+        return True
+    kind, _, value = fingerprint.partition(":")
+    if kind == "commit":
+        return record.method == "source"  # a source checkout is fingerprinted by its HEAD
+    return record.method != "source" and value.strip() == record.current.strip()
+
+
 def running_session_is_stale(repo_root: Path) -> bool:
     """Whether an aGiTrack session is live on ``repo_root`` running OLDER code than what
     is installed now.
@@ -339,8 +431,7 @@ def running_session_is_stale(repo_root: Path) -> bool:
     try:
         from agitrack.update.restart import disk_fingerprint
 
-        record = _lock_record(repo_root / ".agitrack" / "lock")
-        running = str((record or {}).get("fingerprint") or "")
+        running = instance_fingerprint(repo_root)
         if not running:
             return False  # no live session, or one from before this was recorded
         current = disk_fingerprint()

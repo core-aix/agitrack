@@ -973,7 +973,10 @@ def _stub_source_repo(monkeypatch, *, rev: str, status: str) -> None:
         def status_short(self):
             return status
 
-    monkeypatch.setattr(cli, "GitRepo", _Source)
+    # Patched where the version line RESOLVES it: `agitrack.versioning` imports GitRepo lazily
+    # from `agitrack.git`, so that is the name to stand in for — `cli.GitRepo` is a different
+    # binding and stubbing it left the real git running against a tmp dir that is not a repo.
+    monkeypatch.setattr("agitrack.git.GitRepo", _Source)
 
 
 def test_version_flag_prints_version_and_exits(monkeypatch, capsys):

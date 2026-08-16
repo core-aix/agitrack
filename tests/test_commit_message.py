@@ -42,7 +42,13 @@ def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
 
 
 def test_render_interaction_trace_respects_turn_limit():
-    trace = [{"role": "user", "content": f"turn {i}"} for i in range(5)]
+    # A turn is an EXCHANGE: it takes the agent's reply to close one, so these are five turns
+    # rather than five messages. (Five bare user entries in a row are ONE turn — see
+    # test_messages_sent_back_to_back_are_one_turn_not_several.)
+    trace = []
+    for i in range(5):
+        trace.append({"role": "user", "content": f"turn {i}"})
+        trace.append({"role": "agent", "content": f"answer {i}"})
     rendered = render_interaction_trace(trace, trace_turn_limit=2)
     # Only the most recent 2 turns are kept (same limiting the commit applies).
     assert "turn 4" in rendered and "turn 3" in rendered
@@ -82,6 +88,79 @@ def test_a_background_event_starts_a_turn_for_the_trace_limit():
 
     assert "tick 4" in rendered and "tick 3" in rendered
     assert "tick 0" not in rendered
+
+
+def test_a_message_queued_mid_turn_does_not_count_as_a_turn_of_its_own():
+    """THE BUG: the trace limiter counted every `## User` block as a turn, but a message the user
+    queues while the agent is working is not one — the agent is already answering the turn it
+    belongs to.
+
+    Measured on a real session: one turn carried ELEVEN queued messages, so a limit of 5 cut the
+    trace INSIDE that turn. Its opening prompt and first eight follow-ups were dropped, and
+    because that turn's work was committed here, the words that asked for it ended up in no
+    commit at all — the trace began mid-conversation with the ninth thing the user said."""
+    trace = [{"role": "user", "content": "the opening prompt"}]
+    for i in range(11):
+        trace.append({"role": "user", "content": f"queued {i}", "starts_turn": False})
+    trace.append({"role": "agent", "content": "one answer covering all of it"})
+    trace.append({"role": "user", "content": "a genuinely new turn"})
+    trace.append({"role": "agent", "content": "and its answer"})
+
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    # Two turns fit the limit, and each is kept WHOLE.
+    assert "the opening prompt" in rendered
+    assert all(f"queued {i}" in rendered for i in range(11))
+    assert "a genuinely new turn" in rendered
+
+
+def test_messages_sent_back_to_back_are_one_turn_not_several():
+    """A turn is an exchange, and it is the agent's REPLY that ends one.
+
+    The user can keep typing while the agent works — a correction, an afterthought, a second
+    question — and none of that is a new turn: no answer came between them. Treating each as one
+    let a handful of quick messages evict everything the trace was supposed to keep, and cut a
+    conversation off mid-way through what the user was saying.
+
+    This holds regardless of how the messages were recorded, which is the point of deriving the
+    boundary from the trace: the run collapses even without the `starts_turn` marker, so a
+    recording path that does not set it (or an entry written by an older install) still reads as
+    one turn."""
+    trace = [
+        {"role": "user", "content": "first thought"},
+        {"role": "user", "content": "second thought"},
+        {"role": "user", "content": "third thought"},
+        {"role": "agent", "content": "one answer to all three"},
+        {"role": "user", "content": "a real follow-up turn"},
+        {"role": "agent", "content": "answered"},
+    ]
+
+    # Two turns, so a limit of 2 keeps everything...
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    assert all(t in rendered for t in ("first thought", "second thought", "third thought"))
+    assert "a real follow-up turn" in rendered
+
+    # ...and a limit of 1 drops the first exchange WHOLE, never part of it.
+    rendered = render_interaction_trace(trace, trace_turn_limit=1)
+    assert not any(t in rendered for t in ("first thought", "second thought", "third thought"))
+    assert "a real follow-up turn" in rendered
+
+
+def test_a_turn_that_is_over_the_limit_is_still_dropped_whole():
+    # The limit still bites — it just counts turns. Follow-ups ride with the turn they continue,
+    # so an evicted turn takes its own queued messages with it and never leaves them orphaned
+    # under a later turn's heading.
+    trace = []
+    for turn in range(4):
+        trace.append({"role": "user", "content": f"turn {turn}"})
+        trace.append({"role": "user", "content": f"turn {turn} followup", "starts_turn": False})
+        trace.append({"role": "agent", "content": f"answer {turn}"})
+
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    assert "turn 3" in rendered and "turn 3 followup" in rendered
+    assert "turn 2" in rendered and "turn 2 followup" in rendered
+    assert "turn 1" not in rendered and "turn 1 followup" not in rendered
 
 
 def test_render_interaction_trace_drops_empty_role_entries():
