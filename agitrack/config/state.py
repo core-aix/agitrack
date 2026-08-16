@@ -736,9 +736,19 @@ class AgitrackState:
         self.config.update(merged)
         self._config_baseline = copy.deepcopy(merged)
 
-    def append_trace(self, role: str, content: str) -> None:
+    def append_trace(self, role: str, content: str, *, starts_turn: bool = True) -> None:
+        """Add one entry to the pending trace.
+
+        ``starts_turn=False`` marks an entry that CONTINUES the turn before it rather than
+        opening a new one — a message the user queued while the agent was working. It reads as
+        its own `## User` block (it was sent after the agent had already spoken), but it is not a
+        turn, and the trace limiter must not count it as one. Absent on entries written by older
+        installs, which is why the default preserves the previous meaning."""
         trace = self.pending_trace()
-        trace.append({"role": role, "content": content})
+        item: dict[str, object] = {"role": role, "content": content}
+        if not starts_turn:
+            item["starts_turn"] = False
+        trace.append(item)
         self.data["pending_trace"] = trace
         self.save()
 

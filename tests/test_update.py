@@ -408,6 +408,11 @@ def test_apply_package_detaches_pip_from_terminal(monkeypatch):
 
 def test_apply_package_pip_falls_back_to_pip3_on_path(monkeypatch):
     monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
+    # Outside a virtualenv, where a PATH pip plausibly belongs to this same interpreter. Inside
+    # one it would install into a different environment entirely, so there is no fallback there
+    # (test_updater.py::test_a_venv_with_no_pip_is_never_upgraded_through_another_interpreters_pip)
+    # — and the suite itself runs in a venv, so this has to be stated.
+    monkeypatch.setattr("agitrack.update.updater._in_virtualenv", lambda: False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: False)  # no `python -m pip`
     monkeypatch.setattr(

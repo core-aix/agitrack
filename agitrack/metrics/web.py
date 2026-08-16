@@ -154,6 +154,21 @@ def shell_html(repo: GitRepo) -> str:
     )
 
 
+def _reason_and_detail(record) -> str:
+    """The "(why) what to do" tail of the update notice, with the two never said twice.
+
+    ``error`` and ``instructions`` are recorded separately but overlap by construction: the
+    failure text ends with the same manual-update guidance the instructions carry, so printing
+    both produced the guidance twice in one banner — a paragraph of repeated commands where one
+    line was wanted. When the reason already contains the instructions, the reason alone says
+    everything."""
+    reason = (record.error or "").strip()
+    detail = (record.instructions or "").strip()
+    if detail and detail in reason:
+        detail = ""
+    return (f" ({reason})" if reason else "") + "." + (f" {detail}" if detail else "")
+
+
 def _needs_user_sentence(record) -> str:
     """The lead sentence of the "you have to update this yourself" notice.
 
@@ -171,6 +186,16 @@ def _needs_user_sentence(record) -> str:
     return f"aGiTrack {record.latest} is available and has to be installed by you"
 
 
+def _agitrack_version() -> str:
+    """The version of the aGiTrack serving this request — the same string `agitrack --version`
+    prints, commit included on a source checkout, because one install must not answer "which
+    version is this?" two different ways depending on where it is asked. Imported lazily: this
+    module is imported during aGiTrack's own startup."""
+    from agitrack.versioning import version_line
+
+    return version_line()
+
+
 def _update_banner_html(repo: "GitRepo | None" = None) -> str:
     """The update notices shown at the top of a dashboard. Empty when there is nothing to say.
 
@@ -179,21 +204,21 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
 
     1. **Install it yourself.** Self-update could not: an MSI needing elevation, a Homebrew
        install, a Windows pip upgrade, or an attempt that failed — and a newer version exists.
-       Read from the GLOBAL self-update record, since the installation is global, so every
-       dashboard shows it, backtrace included.
+       The record is GLOBAL (one file per machine) but the machine's aGiTrack instances need not
+       share an install, so on a repo dashboard it is shown only when it describes THIS repo's
+       instance — see :func:`~agitrack.update.selfupdate.record_matches_instance`. Without a repo
+       (the hub's own pages, backtrace) the global installation is the subject and it always shows.
     2. **Restart your session.** The installation is current, but a session on this repo is still
        running the code it loaded before the update (sessions are deliberately never restarted
        from under the user). Repo-specific, so only that repo's live dashboard shows it.
     """
     parts: list[str] = []
     try:
-        from agitrack.update.selfupdate import read_state
+        from agitrack.update.selfupdate import read_state, record_matches_instance
 
         record = read_state()
-        if record.needs_user:
-            detail = f" {record.instructions}" if record.instructions else ""
-            reason = f" ({record.error})" if record.error else ""
-            parts.append(_needs_user_sentence(record) + f"{reason}.{detail}")
+        if record.needs_user and (repo is None or record_matches_instance(repo.repo, record)):
+            parts.append(_needs_user_sentence(record) + _reason_and_detail(record))
     except Exception:
         pass
     if repo is not None:
@@ -278,8 +303,15 @@ def dashboard_data(dash: Dashboard) -> dict:
         "branch": dash.branch,
         # HEAD sha lets the live page skip re-rendering when nothing changed.
         "head": dash.stats[-1].sha if dash.stats else "",
+        # The version SERVING this payload, carried on the same answer the new-commit check
+        # already reads rather than on a request of its own: the page reloads when it changes
+        # (see noteVersion in ui.py), because aGiTrack self-updates and restarts its daemons
+        # under an open tab, leaving the old page's JS rendering a new server's data.
+        "agitrack_version": _agitrack_version(),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "committers": sorted({a for stat in dash.stats for a in dash.committers_of(stat) if a}),
+        # Only committers who contributed lines — the same set the breakdown shows, so the
+        # filter never offers a name whose row is not there (see Dashboard.by_author).
+        "committers": sorted(a for a in dash.committers_with_lines() if a),
         "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
         "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
         "commits": commits,
@@ -503,9 +535,8 @@ def _timeseries(stats: list[CommitStat], *, granularity: str = DEFAULT_GRANULARI
 
 def _options(dash: Dashboard) -> dict:
     covers = _covers(dash)
-    committers, backends, models = set(), set(), set()
+    committers, backends, models = set(dash.committers_with_lines()), set(), set()
     for stat in dash.stats:
-        committers.update(dash.committers_of(stat))
         eff_backend, eff_model = _effective(stat, covers)
         if eff_backend:
             backends.add(eff_backend)
@@ -1257,6 +1288,7 @@ __PREBOOT_HTML__
 __UI_HUBBAR_HTML__
 <div class="topbanners">
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
+__UI_RELOAD_NOTICE_HTML__
 __UPDATE_BANNER__
 </div>
 <div class="wrap">

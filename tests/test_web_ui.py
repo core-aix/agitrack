@@ -468,3 +468,20 @@ def test_a_steered_page_also_asks_to_be_focused():
     # Ignored in most browsers without a user gesture, and that is fine: the real raise comes
     # from aGiTrack's own process. Asking costs nothing and works where it is allowed.
     assert "window.focus();" in html
+
+
+def test_a_page_left_open_reloads_itself_when_the_daemon_updates_under_it(pages):
+    """aGiTrack self-updates and its daemons restart on the new code, but a browser tab keeps
+    rendering the document it downloaded: old HTML, old script, old embedded payload, served by a
+    new backend. A fixed bug then looks unfixed until someone reloads by hand.
+
+    The page learns the served version from the poll it ALREADY makes for new commits — a second
+    endpoint would double the polling to carry one string — and reloads once when it changes,
+    then says why, because a page that reloads itself with no explanation reads as a glitch."""
+    for name, html in pages.items():
+        assert "noteVersion(state.agitrack_version)" in html, f"{name} never checks the served version"
+        assert "location.reload()" in html, f"{name} notices the change but does not act on it"
+        # The reason has to survive the reload that erases the page saying it.
+        assert 'sessionStorage.setItem("agitrack.reloadedFor"' in html, f"{name} reloads without a reason"
+        assert "aGiTrack was updated to" in html, f"{name} does not tell the reader why it reloaded"
+        assert 'id="reloadnotice"' in html, f"{name} has nowhere to show it"

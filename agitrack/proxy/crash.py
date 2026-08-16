@@ -83,9 +83,11 @@ def write_stall_note(root: Path, phase: str, seconds: float) -> None:
 
 def _version() -> str:
     try:
-        from agitrack import __version__
+        from agitrack.versioning import version_line
 
-        return str(__version__)
+        # The commit too, on a source checkout: "which code crashed?" is the first question a
+        # report has to answer, and between two releases the version alone cannot.
+        return version_line()
     except Exception:
         return "unknown"
 
