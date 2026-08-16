@@ -470,6 +470,38 @@ def test_dashboard_splits_lines_into_tracked_ai_and_nontracked(tmp_path):
     assert nt_ins == 14
 
 
+def test_a_metadata_block_quoted_inside_the_trace_is_not_real_metadata(tmp_path):
+    # THE BUG: an agent that pastes a metadata block into its reply — inside a ``` fence, to show
+    # what it produced — puts a second `# aGiTrack Metadata` line into the commit. Nothing told
+    # the quoted one from the real one, and it broke three things at once: the commit was read as
+    # a SQUASH (the dashboard showed the whole message and then a single "squashed" item repeating
+    # it), the quote became a bogus constituent, and its aligned sample line was parsed as a
+    # backend NAME — a phantom backend "codex          model: ... reasoning_effort: on" that also
+    # explained why that model never reached the by-model breakdown.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "quoted.txt", 20)
+    message = (
+        "<aGiTrack> explain the metadata format\n\n"
+        "Here is what a turn records:\n\n"
+        "```\n"
+        "# aGiTrack Metadata\n"
+        "backend: codex          model: gpt-5.6-luna     reasoning_effort: on\n"
+        "```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-5\n"
+        "tokens_since_last_commit_output: 40\n"
+    )
+    repo.commit(message)
+
+    dash = build_dashboard(repo)
+    stat = next(s for s in dash.stats if s.subject.startswith("<aGiTrack> explain"))
+
+    assert stat.constituents == []  # one commit, not a squash
+    assert stat.backend == "claude"  # the real block wins; the quoted one is prose
+    assert stat.model == "claude-opus-5"
+    assert list(dash.by_backend) == ["claude"]
+    assert stat.tokens["output"] == 40
+
+
 def test_a_squash_shows_every_commit_as_its_own_item_and_keeps_its_own_message(tmp_path):
     # THE BUG: constituents were split on metadata blocks, so every commit between two aGiTrack
     # commits collapsed into ONE item labelled with the first of them (a real squash folded seven

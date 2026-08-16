@@ -911,7 +911,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
     # fold, which writes no bullets). Keying on the block count alone missed the ordinary case of
     # a PR that squashed several commits of which only ONE was aGiTrack-tracked — a batch of
     # dependency merges plus one agent commit produced no items at all.
-    if _squash_bullets(body.splitlines()) or body.count(METADATA_HEADER) > 1:
+    if _squash_bullets(body.splitlines()) or len(metadata_header_lines(body.splitlines())) > 1:
         constituents = _parse_constituents(body)
         return _build_squash(sha, author, email, subject, timestamp, body, constituents, co_authors)
     metadata = _parse_metadata(body)
@@ -922,7 +922,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         kind = "agent-merge"
     elif commit_type == "user":
         kind = "user"
-    elif METADATA_HEADER in body:
+    elif metadata_header_lines(body.splitlines()):
         kind = "agent"  # metadata without commit_type: treat as agent work
     elif subject.startswith("Merge ") and _AGITRACK_BRANCH_RE.search(subject):
         # aGiTrack's own integration plumbing: the auto-generated merge commits it
@@ -988,6 +988,30 @@ def _is_metadata_kv(line: str) -> bool:
     return bool(key) and " " not in key
 
 
+def metadata_header_lines(lines: list[str]) -> list[int]:
+    """Indices of the REAL ``# aGiTrack Metadata`` header lines, skipping fenced code blocks.
+
+    A commit message can *quote* a metadata block — an agent pasting one into its reply to show
+    what it produced, inside a ``` fence, which then rides into the interaction trace verbatim.
+    Nothing distinguished that from aGiTrack's own block, and every consumer got it wrong at once:
+    the commit was misread as a squash (so the dashboard showed the whole message AND a single
+    "squashed" item repeating it), the quoted block became a bogus constituent, and its aligned
+    sample line ``backend: codex          model: gpt-5.6-luna     reasoning_effort: on`` was
+    parsed as a backend NAME — which is why a phantom backend appeared with the model welded into
+    it while the by-model breakdown, reading a real ``model:`` line that block never had, showed
+    nothing. Content inside a fence is quoted text, never structure."""
+    out: list[int] = []
+    in_fence = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and stripped == METADATA_HEADER:
+            out.append(index)
+    return out
+
+
 def _squash_bullets(lines: list[str]) -> list[int]:
     """Indices of the ``* <subject>`` lines that git wrote to delimit squashed commits.
 
@@ -1046,7 +1070,7 @@ def _parse_constituents(body: str) -> list[CommitStat]:
     # No bullets: not git's squash shape. This is aGiTrack's own FOLD — a user commit that
     # absorbed one or more agent turns, concatenating their metadata blocks with no bullets
     # anywhere — so the blocks are the only boundaries there are.
-    headers = [i for i, line in enumerate(lines) if line.strip() == METADATA_HEADER]
+    headers = metadata_header_lines(lines)
     constituents: list[CommitStat] = []
     prev_end = 0
     for header in headers:
@@ -1077,7 +1101,7 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         # answers "agent" for an empty dict, which is right for a block missing only its
         # commit_type and wrong for a commit that carries no block; before these became items of
         # their own they were absorbed into a neighbouring agent constituent, so it never showed.
-        kind=_kind_from_metadata(metadata) if METADATA_HEADER in text else "untracked",
+        kind=_kind_from_metadata(metadata) if metadata_header_lines(segment_lines) else "untracked",
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
@@ -1161,21 +1185,19 @@ def _metadata_block(body: str) -> str:
     block lets :func:`collect_commit_stats` recognise such a merge as a duplicate
     of the cover commit it merges and avoid counting the turn's tokens twice."""
     lines = body.splitlines()
-    try:
-        start = lines.index(METADATA_HEADER)
-    except ValueError:
+    headers = metadata_header_lines(lines)
+    if not headers:
         return ""
-    return "\n".join(lines[start:]).strip()
+    return "\n".join(lines[headers[0] :]).strip()
 
 
 def _parse_metadata(body: str) -> dict[str, str]:
     lines = body.splitlines()
-    try:
-        start = lines.index(METADATA_HEADER)
-    except ValueError:
+    headers = metadata_header_lines(lines)
+    if not headers:
         return {}
     metadata: dict[str, str] = {}
-    for line in lines[start + 1 :]:
+    for line in lines[headers[0] + 1 :]:
         if line.startswith("#"):
             break
         key, sep, value = line.partition(":")
