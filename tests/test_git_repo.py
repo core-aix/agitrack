@@ -6,6 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agitrack.git import GitRepo, read_cache
 
 
@@ -220,6 +222,15 @@ def test_read_cache_answers_a_repeated_read_once(tmp_path, monkeypatch):
     assert first == second
     assert len(set(branch_reads)) == 1
     assert sum(1 for cmd in spawned if "status" in cmd) == 1
+    if any("symbolic-ref" in cmd for cmd in spawned):
+        # `git rev-parse --abbrev-ref HEAD` failed, so `current_branch` took its unborn-branch
+        # fallback. `symbolic-ref` is deliberately NOT cacheable (with two arguments it WRITES
+        # HEAD — see _CACHEABLE_SUBCOMMANDS), so running it correctly invalidates the cache and
+        # the next `current_branch` re-spawns rev-parse. The count below is only meaningful when
+        # that fallback did not fire, and on a repo with a commit it only fires when git itself
+        # hiccups — which a Windows runner did, turning this into a confusing `assert 2 == 1`
+        # that had nothing to do with caching (2026-08-15).
+        pytest.skip("git rev-parse failed transiently; the fallback bypasses the cache by design")
     assert sum(1 for cmd in spawned if "rev-parse" in cmd) == 1
 
 

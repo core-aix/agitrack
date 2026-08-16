@@ -44,6 +44,13 @@ from pathlib import Path
 STATE_OK = "ok"  # nothing to do, or an update was installed
 STATE_MANUAL = "manual"  # a newer version exists but this install mode cannot self-update
 STATE_FAILED = "failed"  # self-update was attempted and did not work
+# An update exists but was deliberately NOT applied for a condition that is the user's own and
+# clears itself — a source checkout with uncommitted changes. Deliberately NOT `needs_user`:
+# there is nothing to install and no action to take beyond the work already in progress, and on
+# the aGiTrack checkout itself this is the ordinary state for most of the day, so treating it as
+# an action item put a permanent-looking "install it yourself" banner on the developer's own
+# dashboard that came and went with the working tree.
+STATE_DEFERRED = "deferred"
 
 _STATE_FILE = "self-update.json"
 _LOCK_FILE = "self-update.lock"
@@ -145,14 +152,14 @@ def auto_update_plan(updater) -> tuple[bool, str]:
     """
     import sys
 
-    from agitrack.update.updater import KIND_SOURCE, METHOD_HOMEBREW, METHOD_MSI
+    from agitrack.update.updater import KIND_SOURCE, METHOD_BREW_PYTHON, METHOD_MSI
 
     if updater.kind == KIND_SOURCE:
         return True, ""
     method = updater._install_method()
     if method == METHOD_MSI:
         return False, "the Windows installer needs elevation, so aGiTrack cannot install it for you"
-    if method == METHOD_HOMEBREW:
+    if method == METHOD_BREW_PYTHON:
         return False, "this install belongs to Homebrew — update it with `brew upgrade agitrack`"
     if sys.platform == "win32":
         return False, "Windows locks the running agitrack.exe, so the upgrade has to run after it exits"
@@ -224,9 +231,10 @@ def attempt_self_update(*, debug=None, timeout: int | None = None, on_status=Non
         _log(f"self-update: installing {status.current} → {status.latest}")
         result = updater.apply()
         if not result.ok:
-            _log(f"self-update: apply failed: {result.error}")
+            deferred = bool(getattr(result, "deferred", False))
+            _log(f"self-update: apply {'deferred' if deferred else 'failed'}: {result.error}")
             record = SelfUpdateRecord(
-                state=STATE_FAILED,
+                state=STATE_DEFERRED if deferred else STATE_FAILED,
                 current=status.current,
                 latest=status.latest,
                 method=_method_label(updater),

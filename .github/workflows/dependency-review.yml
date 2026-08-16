@@ -4,10 +4,16 @@ name: Dependency review
 # cheapest point to say no. Dependabot (see .github/dependabot.yml) handles the other
 # direction: advisories published against dependencies we ALREADY have.
 #
-# Pull requests only. The action diffs the PR's dependency manifests against the base branch,
-# so it has nothing to compare on a push.
+# Runs on PRs AND on every push to dev. The action diffs dependency manifests between two refs;
+# on a PR those are the base and head it is given for free, and on a push they are the commits the
+# push moved between (`base-ref`/`head-ref` below). The push trigger is not redundant: this
+# repository commits DIRECTLY to dev — aGiTrack records every agent turn there — so a dependency
+# can change with no pull request in sight, and PR-only coverage would never see it. Checking dev
+# is also what puts the gate BEFORE the release rather than beside it: a merge into main publishes.
 
 on:
+  push:
+    branches: [dev]
   pull_request:
     branches: [dev, main]
 
@@ -27,14 +33,31 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-
-      - uses: actions/dependency-review-action@v4
         with:
+          # The push path names two commits by sha, and the default shallow clone contains only
+          # one — the action would resolve neither `event.before` nor `HEAD^`. Depth 0 is the
+          # simple answer for a repository this size; the PR path ignores it.
+          fetch-depth: ${{ github.event_name == 'push' && 0 || 1 }}
+
+      # Pinned by commit, with the version in the comment so dependabot still tracks it.
+      # NOTE the exact tag: this action publishes `v5.0.0` but has not pushed a moving `v5`
+      # major tag, so `@v5` — which dependabot proposed in PR #243 — does not resolve at all
+      # and would fail the workflow with "Unable to resolve action".
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # On a push there is no PR context to infer the two sides from. `event.before` is the
+          # commit dev pointed at before this push, so the diff is exactly what the push added.
+          # A first push to a new branch reports an all-zero `before`; fall back to the parent so
+          # the action compares against something real instead of failing on a bad ref.
+          base-ref: ${{ github.event_name == 'push' && (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || format('{0}^', github.sha)) || '' }}
+          head-ref: ${{ github.event_name == 'push' && github.sha || '' }}
           # Block the merge on high and critical only. Moderate findings are surfaced in the
           # comment for a human to weigh: this project's dependency tree is small, and a
           # moderate advisory in a dev-only tool is not worth a red required check.
           fail-on-severity: high
-          comment-summary-in-pr: always
+          # Only on a pull request — a push has no PR to comment on, and asking for one there
+          # makes the action warn about a permission it cannot use.
+          comment-summary-in-pr: ${{ github.event_name == 'pull_request' && 'always' || 'never' }}
           # Apache 2.0 project (see LICENCE): a copyleft dependency would be a licensing
           # problem, so name the ones that cannot be pulled in silently.
           deny-licenses: GPL-3.0, AGPL-3.0, LGPL-3.0

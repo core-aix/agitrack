@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+# >=83 for GHSA/CVE coverage, not for a feature: below it, `MANIFEST.in` exclusions can be
+# bypassed when building an sdist through a Unicode normalization collision (NFC vs NFD) on
+# macOS APFS/HFS+ — so a file this project deliberately excludes could still ship. Releases are
+# built on macOS runners, which is exactly the affected filesystem. The lockfile pins the
+# resolved version for everything else; this is the floor the PEP 517 build environment gets.
+requires = ["setuptools>=83"]
 build-backend = "setuptools.build_meta"
 
 # Ship ONLY the import package (and its subpackages). Without this, setuptools'
@@ -109,6 +114,17 @@ fail_under = 78
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+
+[tool.ruff.lint]
+# The rule set is CHOSEN, not inherited. These four groups are ruff's historical defaults
+# (pycodestyle errors E4/E7/E9 and pyflakes F), which is what this codebase has always been held
+# to — the difference is that it now says so. Leaving `select` unset means the gate is whatever
+# the installed ruff's defaults happen to be, and those move: ruff 0.16 widened them, so the
+# routine dependabot bump 0.15.16 -> 0.16.2 turned CI red with 1222 findings across 33 new rules
+# (FURB, RUF, PLW, SIM, UP...) without a line of this project changing. A lint gate that reinterprets
+# itself on someone else's release schedule cannot be a required check. Adopting any of those rules
+# is a deliberate decision to make here, one at a time, with the churn that implies.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests deliberately group some imports with the test sections they belong to.

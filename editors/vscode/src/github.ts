@@ -21,7 +21,13 @@ export type GhStatus = "ok" | "missing" | "unauthenticated";
  * actually lives on GitHub (committer identities, session sharing), so the sign-in prompt
  * is gated on this to avoid nagging on local-only or non-GitHub repos. */
 export function hasGithubRemoteUrl(remoteOutput: string): boolean {
-  return /github\.com/i.test(remoteOutput);
+  // Matched at a HOST boundary, not anywhere in the line. A bare /github\.com/ also fires on
+  // `evil-github.com.example.net` and on `github.com.attacker.io` — a host that merely contains
+  // the string. The consequence here is only a stray sign-in prompt, but a substring test for a
+  // hostname is wrong wherever it appears, and it is no cheaper than the correct one: require
+  // the start of the authority (`://`, an scp-style `user@`, or whitespace) before it, and a
+  // host terminator (`/`, `:`, whitespace, or end) after.
+  return /(?:^|[\s@/])github\.com(?=[\s:/]|$)/im.test(remoteOutput);
 }
 
 /** Decide whether to surface the GitHub sign-in prompt for a just-launched session.

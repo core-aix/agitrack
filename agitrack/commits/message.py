@@ -130,6 +130,14 @@ _PATH_TRAILING_PUNCT = ".,;:!?)]}\"'"
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
 MOUSE_REPORT_FRAGMENT_RE = re.compile(r"(?:\x1b)?\[<\d+(?:;\d+){1,2}[Mm]?")
 # Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).
+#
+# The `[P-_]` and `[@-Z\-_]` ranges look like typos and are not: they are CODE-POINT ranges from
+# ECMA-48, not letter ranges. `P-_` is 0x50-0x5F — exactly the string-introducer half of the C1
+# set (DCS `P`, SOS `X`, PM `^`, APC `_`), which is what a string-terminated escape begins with;
+# `@-Z` plus `\-_` is the rest of the Fe range for the two-byte forms. CodeQL's `py/overly-large-
+# range` flags any class spanning letters into punctuation as suspicious, so this one is reported
+# and dismissed rather than narrowed: writing out the members instead would be the same set,
+# longer, and would stop saying WHY these characters belong together.
 ANSI_SEQUENCE_RE = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
