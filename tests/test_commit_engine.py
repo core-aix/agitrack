@@ -623,6 +623,31 @@ def test_queued_followups_render_as_separate_user_headings_without_duplication(t
     assert "tokens_since_last_commit_output: 80" not in msg
 
 
+def test_a_long_turns_queued_messages_survive_the_trace_limit(tmp_path):
+    """A turn is limited as ONE turn however many messages the user queued into it.
+
+    The engine used to record every follow-up as a plain `user` entry, and the trace limiter
+    counts `user` entries as turns — so a turn carrying more queued messages than the limit was
+    cut inside itself, losing the prompt that opened it. Measured on a real session: eleven
+    queued messages against a limit of 5 left the commit's trace starting at the ninth thing the
+    user had said, with the opening prompt in no commit at all."""
+    engine, repo, state = _engine(tmp_path)
+    turn = _turn("the opening prompt", "one answer covering all of it", total=100, output=40)
+    turn.queued_followups = [f"queued thought {i}" for i in range(11)]
+
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    body = (repo.message or "").split("# Interaction Trace", 1)[1]
+    assert "the opening prompt" in body
+    assert all(f"queued thought {i}" in body for i in range(11))
+
+
 def test_queued_message_the_user_deleted_before_sending_is_not_traced(tmp_path):
     # A message typed into the composer, queued, and then DELETED never reaches the agent, so the
     # backend transcript has no record of it — but the proxy captured it at submit time and it used

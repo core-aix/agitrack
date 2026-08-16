@@ -84,6 +84,47 @@ def test_a_background_event_starts_a_turn_for_the_trace_limit():
     assert "tick 0" not in rendered
 
 
+def test_a_message_queued_mid_turn_does_not_count_as_a_turn_of_its_own():
+    """THE BUG: the trace limiter counted every `## User` block as a turn, but a message the user
+    queues while the agent is working is not one — the agent is already answering the turn it
+    belongs to.
+
+    Measured on a real session: one turn carried ELEVEN queued messages, so a limit of 5 cut the
+    trace INSIDE that turn. Its opening prompt and first eight follow-ups were dropped, and
+    because that turn's work was committed here, the words that asked for it ended up in no
+    commit at all — the trace began mid-conversation with the ninth thing the user said."""
+    trace = [{"role": "user", "content": "the opening prompt"}]
+    for i in range(11):
+        trace.append({"role": "user", "content": f"queued {i}", "starts_turn": False})
+    trace.append({"role": "agent", "content": "one answer covering all of it"})
+    trace.append({"role": "user", "content": "a genuinely new turn"})
+    trace.append({"role": "agent", "content": "and its answer"})
+
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    # Two turns fit the limit, and each is kept WHOLE.
+    assert "the opening prompt" in rendered
+    assert all(f"queued {i}" in rendered for i in range(11))
+    assert "a genuinely new turn" in rendered
+
+
+def test_a_turn_that_is_over_the_limit_is_still_dropped_whole():
+    # The limit still bites — it just counts turns. Follow-ups ride with the turn they continue,
+    # so an evicted turn takes its own queued messages with it and never leaves them orphaned
+    # under a later turn's heading.
+    trace = []
+    for turn in range(4):
+        trace.append({"role": "user", "content": f"turn {turn}"})
+        trace.append({"role": "user", "content": f"turn {turn} followup", "starts_turn": False})
+        trace.append({"role": "agent", "content": f"answer {turn}"})
+
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+
+    assert "turn 3" in rendered and "turn 3 followup" in rendered
+    assert "turn 2" in rendered and "turn 2 followup" in rendered
+    assert "turn 1" not in rendered and "turn 1 followup" not in rendered
+
+
 def test_render_interaction_trace_drops_empty_role_entries():
     # A blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while
     # the agent was busy) must not render as a bare "## User" heading with nothing under it.

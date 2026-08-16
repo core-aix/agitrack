@@ -363,7 +363,8 @@ class CommitEngine:
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
                     if followup.strip():
-                        self.state.append_trace("user", followup)
+                        # Its own heading, but NOT a new turn — see append_trace(starts_turn).
+                        self.state.append_trace("user", followup, starts_turn=False)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self._add_turn_usage(turn)
@@ -391,26 +392,26 @@ class CommitEngine:
             self.state.save()
 
             subject_prompts: list[str] = []
-            entries: list[tuple[str, str]] = []
+            entries: list[tuple[str, str, bool]] = []
             for turn in turns:
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     if _is_background_event(turn.user_prompt):
                         # An EVENT woke the agent; nobody asked for anything. It belongs in the
                         # trace (it explains a turn with no prompt) but never under the user's
                         # name, and never as the commit's subject.
-                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt))
+                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True))
                     else:
                         subject_prompts.append(turn.user_prompt)
-                        entries.append(("user", turn.user_prompt))
+                        entries.append(("user", turn.user_prompt, True))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
                     if not followup.strip():
                         continue
                     subject_prompts.append(followup)
-                    entries.append(("user", followup))
+                    entries.append(("user", followup, False))
                 for message in self._agent_messages_for(turn):
-                    entries.append(("agent", message))
+                    entries.append(("agent", message, True))
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. a follow-up note typed mid-turn) are still added to the
@@ -466,12 +467,13 @@ class CommitEngine:
             # agent replies, reading as if it arrived after the agent's final answer.
             insert_at = len(entries)
             for index in range(len(entries) - 1, -1, -1):
-                if entries[index][0] in ("user", TRACE_EVENT_ROLE):
+                if entries[index][0] in ("user", TRACE_EVENT_ROLE) and entries[index][2]:
                     insert_at = index + 1
                     break
-            entries[insert_at:insert_at] = [("user", leftover) for leftover in leftovers]
-            for role, content in entries:
-                self.state.append_trace(role, content)
+            # Leftovers were typed while that turn was running, so they continue it too.
+            entries[insert_at:insert_at] = [("user", leftover, False) for leftover in leftovers]
+            for role, content, starts_turn in entries:
+                self.state.append_trace(role, content, starts_turn=starts_turn)
 
             cover_backend_head = False
             cover_with_staged = False
