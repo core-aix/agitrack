@@ -1044,11 +1044,19 @@ def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
     # the agent with nobody saying anything (TRACE_EVENT_ROLE). Both count here: an event-driven
     # turn is a turn, and counting only `user` entries would let a long run of background wake-ups
     # read as ONE turn and keep the whole run in the trace, well past the limit.
+    # A message the user QUEUED mid-turn is not a turn start, even though it renders under its own
+    # `## User` heading: the agent was already working on the turn it belongs to. Counting each as
+    # a turn made a long turn look like a dozen, and the trace was then cut INSIDE it — a single
+    # conversation with eleven queued messages had its opening prompt and first eight follow-ups
+    # dropped from the commit, and since that turn's work landed in this commit, the words that
+    # asked for it were in no commit at all. `starts_turn` is absent on entries written by older
+    # installs, so its default keeps their meaning.
     limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
     starts = [
         index
         for index, item in enumerate(trace)
         if str(item.get("role", "")).strip().lower() in ("user", TRACE_EVENT_ROLE)
+        and item.get("starts_turn", True) is not False
     ]
     if len(starts) <= limit:
         return trace
