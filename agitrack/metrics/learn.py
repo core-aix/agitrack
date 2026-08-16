@@ -1791,6 +1791,7 @@ footer code{color:var(--fg)}
 <body>
 __PREBOOT_HTML__
 __UI_HUBBAR_HTML__
+__UI_RELOAD_NOTICE_HTML__
 __BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">

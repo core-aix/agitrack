@@ -403,7 +403,32 @@ class Dashboard:
         """Per committer, lines split into aGiTrack-tracked AI and non-tracked.
         Agent commits are git-authored by whoever ran aGiTrack but written by the
         model, so they count as that person's AI-driven lines; their user and
-        plain commits are non-tracked (not claimed as human)."""
+        plain commits are non-tracked (not claimed as human).
+
+        A committer who contributed NO LINES is dropped, however many commits they have. That
+        is not the same as having no commits: `git log --numstat` reports nothing for a MERGE
+        commit (deliberately — a turn's lines are counted once, on the commits that introduced
+        them), so somebody whose only commits here are merges appeared as a row of zeros and as
+        a filter option that selects commits showing no lines either. See
+        :meth:`committers_with_lines`, which the filter lists share so the two cannot disagree."""
+        return {label: bucket for label, bucket in self._author_totals().items() if _has_lines(bucket)}
+
+    def committers_with_lines(self) -> set[str]:
+        """Committer labels credited on at least one commit that carries lines — what the filter
+        offers, and the rule the breakdown drops rows by.
+
+        Computed over :meth:`committers_of`, NOT over the ``by_author`` buckets: those are keyed
+        on the PRIMARY author, so a co-author (credited via a ``Co-Authored-By:`` trailer, #54)
+        has no bucket of their own and reading the set off them would have removed every
+        co-author from the filter — a regression well beyond dropping the empty name this exists
+        for."""
+        out: set[str] = set()
+        for stat in self.stats:
+            if stat.insertions or stat.deletions:
+                out.update(label for label in self.committers_of(stat) if label)
+        return out
+
+    def _author_totals(self) -> dict[str, dict[str, int]]:
         labels = self.committer_labels
         groups: dict[str, dict[str, int]] = {}
         for stat in self.stats:
@@ -425,6 +450,13 @@ class Dashboard:
                 bucket["nontracked_insertions"] += stat.insertions
                 bucket["nontracked_deletions"] += stat.deletions
         return {label: dict(bucket) for label, bucket in groups.items()}
+
+
+def _has_lines(bucket: dict[str, int]) -> bool:
+    """Whether a per-committer bucket carries any lines at all, in either bucket."""
+    return any(
+        bucket.get(key, 0) for key in ("ai_insertions", "ai_deletions", "nontracked_insertions", "nontracked_deletions")
+    )
 
 
 # ---------------------------------------------------------------------------

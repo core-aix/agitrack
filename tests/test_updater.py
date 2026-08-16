@@ -152,6 +152,9 @@ def test_pip_invocation_falls_back_to_pip3():
     updater = _make_updater_package()
     with (
         patch.object(updater, "_has_module_pip", return_value=False),
+        # NOT in a venv: there a PATH pip plausibly belongs to this same interpreter. (The suite
+        # itself runs in a venv, so this has to be said rather than assumed.)
+        patch("agitrack.update.updater._in_virtualenv", return_value=False),
         patch("agitrack.update.updater.shutil.which", side_effect=lambda n: "/usr/bin/pip3" if n == "pip3" else None),
     ):
         result = updater._pip_invocation()
@@ -162,6 +165,7 @@ def test_pip_invocation_falls_back_to_pip_when_no_pip3():
     updater = _make_updater_package()
     with (
         patch.object(updater, "_has_module_pip", return_value=False),
+        patch("agitrack.update.updater._in_virtualenv", return_value=False),
         patch(
             "agitrack.update.updater.shutil.which",
             side_effect=lambda n: "/usr/bin/pip" if n == "pip" else None,
@@ -169,6 +173,28 @@ def test_pip_invocation_falls_back_to_pip_when_no_pip3():
     ):
         result = updater._pip_invocation()
     assert result == ["/usr/bin/pip"]
+
+
+def test_a_venv_with_no_pip_is_never_upgraded_through_another_interpreters_pip():
+    """A uv-created venv has no `pip` module, and a pip from outside it installs into whatever
+    environment owns THAT pip — not into this one.
+
+    Measured on a developer machine: a background tracker running from such a venv fell back to
+    Homebrew's pip3, which refused under PEP 668, and the daemon then published "this Python is
+    externally managed; run `pip install --upgrade agitrack`" into the global self-update record
+    for every dashboard to show. Both halves were wrong — the diagnosis named an interpreter the
+    tracker does not run from, and the command would not have touched the install it described.
+    Better to say there is no automatic route than to take one that leads elsewhere."""
+    updater = _make_updater_package()
+    with (
+        patch.object(updater, "_has_module_pip", return_value=False),
+        patch("agitrack.update.updater._in_virtualenv", return_value=True),
+        patch("agitrack.update.updater.shutil.which", return_value="/opt/homebrew/bin/pip3"),
+    ):
+        assert updater._pip_invocation() is None
+        # …and the user is pointed at the tool that CAN replace it.
+        guidance = updater._manual_routes()
+    assert "no pip" in guidance and "uv pip install --upgrade" in guidance
 
 
 def test_pip_invocation_returns_none_when_nothing_found():

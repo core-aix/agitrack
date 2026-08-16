@@ -475,11 +475,43 @@ function wireRepoPicker(repos){
 // worse than no status: it is read as fact.
 const HUB_STATE_MS = 5000;
 
+// The aGiTrack version this page was served by, learned from the first /state answer. aGiTrack
+// self-updates and restarts its daemons underneath an open dashboard, so a tab left open renders
+// the OLD page's JS against a NEW server: stale enough that a fixed bug looks unfixed until
+// someone reloads by hand. A full reload is the only honest response: the HTML, the JS and the
+// embedded payload all came from the old version.
+let servedVersion = null;
+
+function noteVersion(version){
+  if(!version) return;                       // an older server that does not report one
+  if(servedVersion === null){ servedVersion = version; return; }
+  if(version === servedVersion) return;
+  // Survive the reload we are about to do, so the new page can say why it happened.
+  try{ sessionStorage.setItem("agitrack.reloadedFor", version); }catch(e){}
+  location.reload();
+}
+
+// Shown once, on the page that comes back up. The box is `RELOAD_NOTICE_HTML`, which every
+// page carries: `announceReload` gives up silently when it is missing, so a page without it
+// still reloads; it just never says why, which is the glitch this exists to avoid.
+(function announceReload(){
+  let version = null;
+  try{ version = sessionStorage.getItem("agitrack.reloadedFor"); sessionStorage.removeItem("agitrack.reloadedFor"); }catch(e){}
+  if(!version) return;
+  const box = document.getElementById("reloadnotice");
+  if(!box) return;
+  box.textContent = "\u21bb Reloaded: aGiTrack was updated to " + version + " while this page was open.";
+  box.hidden = false;
+})();
+
 async function refreshHubState(){
-  if(!HUB) return;
-  const box = $("hub-state"); if(!box) return;
+  const box = $("hub-state");
   let state = null;
   try{ state = await (await fetch("state", {cache:"no-store"})).json(); }catch(e){}
+  // Checked before anything else and regardless of HUB: a version change matters on every page
+  // that polls, and it is the reason the rest of what follows can be out of date.
+  if(state) noteVersion(state.agitrack_version);
+  if(!HUB || !box) return;
   if(!state || !state.label){ box.hidden = true; return; }
   box.classList.toggle("live", !!state.running);
   box.title = state.detail || "";
@@ -670,6 +702,11 @@ function renderDiff(text){
 }"""
 
 
+# Where a page says it reloaded itself after aGiTrack was updated underneath it. Styled as an
+# update banner because that is what it is reporting; hidden until `announceReload` fills it.
+RELOAD_NOTICE_HTML = '<div id="reloadnotice" class="updatebanner" hidden></div>'
+
+
 def render(template: str, **extra: str) -> str:
     """Substitute the shared blocks (and any page-specific ``extra``) into ``template``.
 
@@ -682,6 +719,7 @@ def render(template: str, **extra: str) -> str:
         .replace("__UI_HUBBAR_CSS__", HUBBAR_CSS)
         .replace("__UI_HUBBAR_HTML__", HUBBAR_HTML)
         .replace("__UI_HUBBAR_JS__", HUBBAR_JS)
+        .replace("__UI_RELOAD_NOTICE_HTML__", RELOAD_NOTICE_HTML)
         .replace("__UI_FLASH_CSS__", FLASH_CSS)
         .replace("__UI_ENGINE_CSS__", ENGINE_CSS)
         .replace("__UI_RANGE_CSS__", RANGE_CSS)

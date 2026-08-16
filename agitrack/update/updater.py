@@ -822,16 +822,25 @@ class Updater:
         return True
 
     def _pip_invocation(self) -> list[str] | None:
-        """The command prefix for a pip call, or ``None`` when no pip is reachable.
+        """The command prefix for a pip call, or ``None`` when no pip can upgrade THIS install.
 
-        Prefers the *running* interpreter's own pip (``<python> -m pip``) so the
-        SAME environment aGiTrack is imported from is the one upgraded. Only when
-        that interpreter has no ``pip`` module does it fall back to a ``pip3``/``pip``
-        executable on ``PATH`` — a looser match that may target another interpreter,
-        but better than offering no update at all.
-        """
+        Prefers the *running* interpreter's own pip (``<python> -m pip``) so the SAME environment
+        aGiTrack is imported from is the one upgraded.
+
+        The fallback to a ``pip3``/``pip`` on ``PATH`` is deliberately NOT taken inside a virtual
+        environment. It was, on the reasoning that a loose match beats offering no update at all,
+        and the result was worse than no update: a uv-created venv has no ``pip`` module, so a
+        tracker running from one reached for Homebrew's ``pip3``, which refused under PEP 668 —
+        and had it succeeded it would have upgraded HOMEBREW's site-packages while the venv
+        aGiTrack actually runs from stayed where it was. The daemon then published "this Python
+        is externally managed; run `pip install --upgrade agitrack`" for every dashboard on the
+        machine to display: a diagnosis about the wrong interpreter and a command that would not
+        have updated the install it was complaining about. Outside a venv a PATH pip plausibly IS
+        this interpreter's, so the fallback still stands there."""
         if self._has_module_pip(sys.executable):
             return [sys.executable, "-m", "pip"]
+        if _in_virtualenv():
+            return None
         for name in ("pip3", "pip"):
             found = shutil.which(name)
             if found:
@@ -996,6 +1005,15 @@ class Updater:
                 f"reinstall with `pipx install {DIST_NAME}`, or force it with "
                 f"`pip install --upgrade --break-system-packages {DIST_NAME}`"
             )
+        if _in_virtualenv() and not self._has_module_pip(sys.executable):
+            # No pip in here, and a pip from outside would install somewhere else entirely. Only
+            # the tool that built the venv can replace what is in it; uv is what builds a venv
+            # without pip in the first place, so it is the one worth naming.
+            return (
+                f"this virtual environment ({sys.prefix}) has no pip, and a pip from outside it "
+                f"would install somewhere else — upgrade it with the tool that created it, e.g. "
+                f"`uv pip install --upgrade {DIST_NAME}` with that environment active"
+            )
         return f"update it with `pip install --upgrade {DIST_NAME}`"
 
     def _manual_upgrade_guidance(self, *, pep668: bool) -> str:
@@ -1005,6 +1023,13 @@ class Updater:
             else "could not upgrade aGiTrack automatically"
         )
         return f"{lead}; {self._manual_routes()}"
+
+
+def _in_virtualenv() -> bool:
+    """Whether the running interpreter is a virtual environment (venv/virtualenv/uv). Its
+    packages are private to it: a pip belonging to another interpreter installs into that other
+    interpreter, never in here."""
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 
 def _ps_single_quote(value: str) -> str:

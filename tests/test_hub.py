@@ -633,6 +633,26 @@ def test_the_dashboard_reports_the_repos_running_mode(tmp_path, monkeypatch):
     assert "4242" in state["detail"]
 
 
+def test_the_running_check_also_carries_the_version_serving_it(tmp_path):
+    """The page reloads itself when the backend it talks to has been updated underneath it, and
+    it learns that from THIS poll rather than one of its own: the dashboard already asks every
+    few seconds whether aGiTrack is running here, so the version rides along on an answer the
+    page is waiting for anyway."""
+    from agitrack import __version__
+    from agitrack.metrics.server import RepoScope
+    from agitrack.versioning import version_line
+
+    repo = _repo(tmp_path, "versioned")
+
+    state = json.loads(RepoScope(repo).get("/state", {}).body)
+
+    # The same string `agitrack --version` prints — one install must not answer "which version
+    # is this?" differently depending on where it is asked, and on a source checkout the commit
+    # is the part that actually distinguishes two runs between releases.
+    assert state["agitrack_version"] == version_line()
+    assert state["agitrack_version"].startswith(__version__)
+
+
 def test_a_repo_nothing_is_tracking_says_so_and_how_to_start(tmp_path, monkeypatch):
     from agitrack.metrics.server import RepoScope
 
