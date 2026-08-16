@@ -42,7 +42,13 @@ def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
 
 
 def test_render_interaction_trace_respects_turn_limit():
-    trace = [{"role": "user", "content": f"turn {i}"} for i in range(5)]
+    # A turn is an EXCHANGE: it takes the agent's reply to close one, so these are five turns
+    # rather than five messages. (Five bare user entries in a row are ONE turn — see
+    # test_messages_sent_back_to_back_are_one_turn_not_several.)
+    trace = []
+    for i in range(5):
+        trace.append({"role": "user", "content": f"turn {i}"})
+        trace.append({"role": "agent", "content": f"answer {i}"})
     rendered = render_interaction_trace(trace, trace_turn_limit=2)
     # Only the most recent 2 turns are kept (same limiting the commit applies).
     assert "turn 4" in rendered and "turn 3" in rendered
@@ -106,6 +112,38 @@ def test_a_message_queued_mid_turn_does_not_count_as_a_turn_of_its_own():
     assert "the opening prompt" in rendered
     assert all(f"queued {i}" in rendered for i in range(11))
     assert "a genuinely new turn" in rendered
+
+
+def test_messages_sent_back_to_back_are_one_turn_not_several():
+    """A turn is an exchange, and it is the agent's REPLY that ends one.
+
+    The user can keep typing while the agent works — a correction, an afterthought, a second
+    question — and none of that is a new turn: no answer came between them. Treating each as one
+    let a handful of quick messages evict everything the trace was supposed to keep, and cut a
+    conversation off mid-way through what the user was saying.
+
+    This holds regardless of how the messages were recorded, which is the point of deriving the
+    boundary from the trace: the run collapses even without the `starts_turn` marker, so a
+    recording path that does not set it (or an entry written by an older install) still reads as
+    one turn."""
+    trace = [
+        {"role": "user", "content": "first thought"},
+        {"role": "user", "content": "second thought"},
+        {"role": "user", "content": "third thought"},
+        {"role": "agent", "content": "one answer to all three"},
+        {"role": "user", "content": "a real follow-up turn"},
+        {"role": "agent", "content": "answered"},
+    ]
+
+    # Two turns, so a limit of 2 keeps everything...
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    assert all(t in rendered for t in ("first thought", "second thought", "third thought"))
+    assert "a real follow-up turn" in rendered
+
+    # ...and a limit of 1 drops the first exchange WHOLE, never part of it.
+    rendered = render_interaction_trace(trace, trace_turn_limit=1)
+    assert not any(t in rendered for t in ("first thought", "second thought", "third thought"))
+    assert "a real follow-up turn" in rendered
 
 
 def test_a_turn_that_is_over_the_limit_is_still_dropped_whole():
