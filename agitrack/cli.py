@@ -2514,40 +2514,11 @@ def _refuse_during_merge_conflict(repo: GitRepo) -> bool:
 
 
 def _version_line() -> str:
-    """What ``agitrack --version`` prints.
+    """What ``agitrack --version`` prints — see :func:`agitrack.versioning.version_line`, which is
+    the single definition every version indicator shares (the dashboard shows the same string)."""
+    from agitrack.versioning import version_line
 
-    A package install prints the release version alone, exactly as before. A SOURCE checkout
-    prints the commit too — ``0.6.12 (source 06b6eb9a)``, with ``-dirty`` when the tree has
-    uncommitted changes — because on a checkout the release version is ambiguous: every commit
-    between two releases reports the same one, so "0.6.12" cannot answer "which code is this?",
-    which is the question anyone asks --version to settle. The release version stays FIRST and
-    unadorned so a prefix read (`--version | cut -d" " -f1`) still yields exactly what it did.
-
-    Runs git through :class:`GitRepo`, never a bare ``subprocess.run``: that is what carries the
-    repo-wide invariants an audited test enforces — UTF-8 decoding rather than the platform code
-    page, and console isolation so a Windows spawn opens no window. Hand-rolling the two calls
-    here broke both (caught by ``test_utf8_text_is_used_everywhere_git_output_is_decoded`` and
-    ``test_every_spawn_keeps_its_console_window_off_the_desktop``).
-
-    Side-effect-free by contract, like the caller: it looks only at aGiTrack's OWN install
-    directory and never discovers or touches the user's repository. Any failure degrades to the
-    bare version — reporting a version must not be something that can fail."""
-    from agitrack import __version__
-
-    try:
-        from agitrack.update.updater import detect_source_repo
-
-        root = detect_source_repo()
-        if root is None:
-            return __version__
-        source = GitRepo(root)
-        rev = source.short_sha("HEAD")
-        if not rev:
-            return __version__
-        dirty = "-dirty" if source.status_short().strip() else ""
-        return f"{__version__} (source {rev}{dirty})"
-    except Exception:
-        return __version__
+    return version_line()
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:

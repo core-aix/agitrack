@@ -39,3 +39,36 @@ def test_resolve_version_falls_back_to_placeholder(monkeypatch):
     monkeypatch.setattr(agitrack, "_source_version", lambda: None)
     monkeypatch.setattr(agitrack, "_installed_version", lambda: None)
     assert agitrack._resolve_version() == "0.0.0"
+
+
+def test_every_version_indicator_says_the_same_thing(monkeypatch, tmp_path):
+    """One install must not answer "which version is this?" differently depending on where it is
+    asked. It did: `agitrack --version` named the commit on a source checkout while the dashboard
+    served the bare release version, and the dashboard's copy is not cosmetic — the page compares
+    it across polls to notice that the daemon serving it has been replaced, so between two
+    releases (every commit reporting the same version) it could not notice at all."""
+    from agitrack import versioning
+    from agitrack.cli import _version_line
+    from agitrack.metrics.web import _agitrack_version
+    from agitrack.proxy.crash import _version
+
+    class _Source:
+        def __init__(self, root):
+            self.repo = root
+
+        def short_sha(self, ref="HEAD"):
+            return "feedface"
+
+        def status_short(self):
+            return ""
+
+    monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
+    monkeypatch.setattr("agitrack.git.GitRepo", _Source)
+    versioning.source_suffix.cache_clear()
+
+    expected = versioning.version_line()
+
+    assert "(source feedface)" in expected
+    assert _version_line() == expected  # agitrack --version
+    assert _agitrack_version() == expected  # the dashboard page and its /state poll
+    assert _version() == expected  # a crash report

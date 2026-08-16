@@ -216,7 +216,7 @@ class RepoScope:
             # the committer list and trace count are branch-dependent.
             payload = learn_page.learn_state(self.repo.repo, self.repo)
             dash = self._dashboard(ref)
-            payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
+            payload["committers"] = sorted(dash.committers_with_lines())
             payload["branches"] = dash.branches or self.repo.list_branches()
             payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
             payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
@@ -228,8 +228,20 @@ class RepoScope:
             # every request (a handshake file and a pid check, no git), because the whole point
             # of the answer is that it changes while the page is open.
             from agitrack.proxy.background import running_mode
+            from agitrack.versioning import version_line
 
-            return json_response(running_mode(self.repo))
+            state = dict(running_mode(self.repo))
+            # The version SERVING this request. The page compares it with the one it loaded
+            # under and reloads on a change: aGiTrack self-updates and restarts its daemons
+            # underneath an open dashboard, so a tab could sit for hours rendering with the old
+            # page's JS against a new server — which is exactly how a fixed parsing bug appeared
+            # to persist until the tab was reloaded by hand.
+            # The same string `agitrack --version` prints (`versioning.version_line`), so a
+            # source checkout's commit is part of the identity being compared: between two
+            # releases every commit reports the same version, and it is precisely those
+            # restarts a developer needs the open page to notice.
+            state["agitrack_version"] = version_line()
+            return json_response(state)
         return None
 
     def post(self, path: str, body: dict) -> "Response | None":

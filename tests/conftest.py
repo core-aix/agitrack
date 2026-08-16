@@ -65,6 +65,22 @@ def _keep_console_windows_off_the_desktop():
 
 
 @pytest.fixture(autouse=True)
+def _forget_the_resolved_source_commit():
+    """Drop the memoized "(source <sha>)" suffix between tests.
+
+    `versioning.source_suffix` resolves once per PROCESS on purpose — it names the code the
+    process loaded, which cannot change underneath it, and the dashboard would otherwise shell
+    out to git several times a second to re-derive a constant. A test process is the one place
+    that assumption is false: every test stubs a different checkout, and without this the first
+    one to ask would answer for all the rest."""
+    from agitrack.versioning import source_suffix
+
+    source_suffix.cache_clear()
+    yield
+    source_suffix.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_global_config(tmp_path_factory, monkeypatch):
     """Point aGiTrack's global config at an isolated empty dir for every test.
 

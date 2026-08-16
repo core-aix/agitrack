@@ -1004,6 +1004,10 @@ def _co_authored_dashboard(subject: str):
         kind="agent",
         timestamp=1_700_000_000,
         co_authors=[("Robin Roe", "robin@example.com")],
+        # A real commit carries lines; a committer credited only on line-less commits is now
+        # dropped from the filter, which is incidental to what these co-author tests check.
+        insertions=9,
+        deletions=2,
     )
     return Dashboard(repo="r", branch="main", stats=[stat]), stat
 
@@ -1032,7 +1036,18 @@ def test_bot_and_ai_primary_authors_are_not_committers():
         subject="Automated release",
         kind="untracked",
     )
-    human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
+    # Lines given explicitly: a committer contributing none is now dropped from the breakdown
+    # and the filter (see test_a_committer_with_no_lines_is_dropped...), which is incidental to
+    # what this test is about.
+    human = CommitStat(
+        sha="h1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject="Real work",
+        kind="agent",
+        insertions=5,
+        deletions=1,
+    )
     dash = Dashboard(repo="r", branch="main", stats=[bot, human])
     # The bot is the primary author but is not a committer: empty here, absent
     # from the filter options and the per-committer breakdown.
@@ -1040,6 +1055,49 @@ def test_bot_and_ai_primary_authors_are_not_committers():
     assert dash.committers_of(human) == ["Alex Doe"]
     assert _options(dash)["committers"] == ["Alex Doe"]
     assert "github-actions[bot]" not in dash.by_author
+
+
+def test_a_committer_with_no_lines_is_dropped_from_the_breakdown_and_the_filter():
+    from agitrack.metrics.collect import Dashboard
+    from agitrack.metrics.web import _options
+
+    # `git log --numstat` reports nothing for a MERGE commit — deliberately, so a turn's lines
+    # are counted once on the commits that introduced them. Somebody whose only commits here are
+    # merges therefore showed up as a row of all zeros, and as a filter option that selects
+    # commits with no lines to show either. Having commits is not the same as having contributed.
+    merger = CommitStat(sha="m1", author="t", email="t@example.com", subject="Merge branch 'dev'", kind="untracked")
+    real = CommitStat(
+        sha="a1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject="Real work",
+        kind="agent",
+        insertions=12,
+        deletions=3,
+    )
+    dash = Dashboard(repo="r", branch="main", stats=[merger, real])
+
+    assert "t" not in dash.by_author
+    assert "Alex Doe" in dash.by_author
+    # The filter offers exactly what the breakdown shows — one set, so they cannot disagree.
+    assert dash.committers_with_lines() == {"Alex Doe"}
+    assert _options(dash)["committers"] == ["Alex Doe"]
+
+
+def test_a_committer_is_kept_when_any_of_their_commits_carries_lines():
+    from agitrack.metrics.collect import Dashboard
+    from agitrack.metrics.web import _options
+
+    # Only a committer with NOTHING is dropped: a merge alongside real work must not hide them.
+    merge = CommitStat(sha="m1", author="t", email="t@example.com", subject="Merge", kind="untracked")
+    work = CommitStat(
+        sha="w1", author="t", email="t@example.com", subject="A fix", kind="user", insertions=4, deletions=1
+    )
+    dash = Dashboard(repo="r", branch="main", stats=[merge, work])
+
+    assert dash.by_author["t"]["commits"] == 2  # both commits still counted for them
+    assert dash.by_author["t"]["nontracked_insertions"] == 4
+    assert _options(dash)["committers"] == ["t"]
 
 
 def test_filter_stats_matches_any_committer():
