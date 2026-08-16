@@ -12,7 +12,7 @@ import sys
 import types
 
 from agitrack.update import selfupdate
-from agitrack.update.updater import KIND_PACKAGE, KIND_SOURCE, METHOD_HOMEBREW, METHOD_MSI, METHOD_PIP
+from agitrack.update.updater import KIND_PACKAGE, KIND_SOURCE, METHOD_BREW_PYTHON, METHOD_MSI, METHOD_PIP
 
 # The suite-wide guard in conftest stubs attempt_self_update so no test can ever install a
 # real update (it fetches and merges the checkout aGiTrack runs from). These tests ARE the
@@ -40,7 +40,7 @@ def test_only_install_modes_that_can_finish_unattended_are_attempted():
 
     can, why = selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_MSI))
     assert can is False and "elevation" in why  # MSI replaces the running exe
-    can, why = selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_HOMEBREW))
+    can, why = selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_BREW_PYTHON))
     assert can is False and "brew upgrade" in why  # brew owns that install
 
 
@@ -122,7 +122,7 @@ def test_a_mode_that_cannot_self_update_is_recorded_without_attempting(tmp_path,
         kind = KIND_PACKAGE
 
         def _install_method(self):
-            return METHOD_HOMEBREW
+            return METHOD_BREW_PYTHON
 
         def check(self, **kwargs):
             return types.SimpleNamespace(ok=True, available=True, current="1.0.0", latest="1.1.0", error="")
@@ -138,7 +138,7 @@ def test_a_mode_that_cannot_self_update_is_recorded_without_attempting(tmp_path,
 
     record = _attempt_self_update()
     assert applied == []  # brew's install is not ours to touch
-    assert record.state == selfupdate.STATE_MANUAL and record.method == METHOD_HOMEBREW
+    assert record.state == selfupdate.STATE_MANUAL and record.method == METHOD_BREW_PYTHON
     assert "brew upgrade" in record.instructions
 
 
@@ -193,6 +193,35 @@ def test_a_session_running_older_code_is_detectable(tmp_path, monkeypatch):
     assert selfupdate.running_session_is_stale(repo_root) is False  # released: nothing running
 
 
+def test_the_install_notice_speaks_versions_for_a_package_and_commits_for_a_source_checkout(tmp_path, monkeypatch):
+    # A source checkout and a package install are updated in different units. `current`/`latest`
+    # for a source install are short COMMIT HASHES (Updater._check_source), so the one-size
+    # sentence rendered "aGiTrack a1b2c3d is available" — which reads like a version and says
+    # nothing about how far behind the checkout is.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    from agitrack.metrics.web import _update_banner_html
+
+    selfupdate.write_state(
+        selfupdate.SelfUpdateRecord(
+            state=selfupdate.STATE_MANUAL,
+            method="source",
+            current="a1b2c3d",
+            latest="e4f5a6b",
+            instructions="update manually by running `git pull` in the aGiTrack source checkout",
+        )
+    )
+    source = _update_banner_html()
+    assert "commit is available" in source and "a1b2c3d" in source and "e4f5a6b" in source
+    assert "git pull" in source
+    assert "installed by you" not in source  # a checkout is pulled, not installed
+
+    selfupdate.write_state(
+        selfupdate.SelfUpdateRecord(state=selfupdate.STATE_MANUAL, method="pipx", current="0.6.12", latest="0.7.0")
+    )
+    package = _update_banner_html()
+    assert "aGiTrack 0.7.0 is available" in package and "commit" not in package
+
+
 def test_dashboards_show_the_two_notices_separately(tmp_path, monkeypatch):
     """The live dashboard distinguishes "install it yourself" (global, the installation)
     from "restart your session" (this repo) — they call for different actions. Backtrace
@@ -210,12 +239,12 @@ def test_dashboards_show_the_two_notices_separately(tmp_path, monkeypatch):
         selfupdate.SelfUpdateRecord(
             state=selfupdate.STATE_MANUAL,
             latest="1.2.0",
-            error="belongs to Homebrew",
-            instructions="Run: brew upgrade agitrack",
+            error="pip could not upgrade it",
+            instructions="update it with `pipx upgrade agitrack`",
         )
     )
     installed = _update_banner_html(repo)
-    assert "has to be installed by you" in installed and "brew upgrade agitrack" in installed
+    assert "has to be installed by you" in installed and "pipx upgrade agitrack" in installed
     assert "restart aGiTrack" not in installed
 
     selfupdate.write_state(selfupdate.SelfUpdateRecord(state=selfupdate.STATE_OK))

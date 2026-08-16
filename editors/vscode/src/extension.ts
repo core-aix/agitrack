@@ -19,7 +19,7 @@
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
 import { readdirSync, readFileSync, writeFileSync } from "fs";
-import { writeFile } from "fs/promises";
+import { mkdtemp, writeFile } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
 
@@ -31,6 +31,7 @@ import {
   MsiAsset,
   msiInstallCandidates,
   pickMsiAsset,
+  verifyMsiDigest,
   releasesApiUrl,
 } from "./msi";
 import { sessionLooksLive } from "./liveness";
@@ -1170,7 +1171,22 @@ async function fetchLatestMsiAsset(repo: string): Promise<MsiAsset | undefined> 
   return pickMsiAsset(release.assets);
 }
 
-/** Download the MSI asset to the OS temp dir and return the local file path. */
+/** Download the MSI asset into a PRIVATE temp directory and return the local file path.
+ *
+ * Two deliberate precautions, because whatever lands here is then run by `msiexec /i`, which
+ * self-elevates through UAC — so anything that can influence this path gets to choose what
+ * executes with administrator rights:
+ *
+ *  - `mkdtemp` rather than the shared temp dir. The old path was `tmpdir()/<asset name>`, which
+ *    is predictable, so anything able to write there could pre-create or symlink that name and
+ *    have the installer run its file instead. A fresh `mkdtemp` directory is unguessable and
+ *    created with owner-only permissions.
+ *  - A FIXED filename. The asset's own name comes from the GitHub releases API — data from off
+ *    the machine — and `join` walks out of the directory given `..` segments. It also buys
+ *    nothing: this path is passed to msiexec and never shown, so nothing downstream needs the
+ *    remote name. Not deriving the path from remote data at all is stronger than sanitising it,
+ *    and leaves no tainted value to reason about. (msi.ts independently refuses an asset name
+ *    containing a separator, which is where that contract belongs.) */
 async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
   const resp = await fetch(asset.url, {
     headers: { Accept: "application/octet-stream", "User-Agent": "agitrack-vscode" },
@@ -1179,10 +1195,13 @@ async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
     throw new Error(`downloading the installer returned ${resp.status} ${resp.statusText}`);
   }
   const bytes = Buffer.from(await resp.arrayBuffer());
-  const dest = join(tmpdir(), asset.name);
+  verifyMsiDigest(bytes, asset.digest);
+  const dir = await mkdtemp(join(tmpdir(), "agitrack-msi-"));
+  const dest = join(dir, "agitrack.msi");
   await writeFile(dest, bytes);
   return dest;
 }
+
 
 /** Run the downloaded MSI. `msiexec /i` self-elevates (UAC) for the perMachine install; we
  * wait for it and tolerate exit 3010 (success, reboot advised) as success. The long timeout

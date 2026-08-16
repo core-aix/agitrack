@@ -11,6 +11,16 @@ test("hasGithubRemoteUrl detects ssh and https GitHub remotes", () => {
   assert.equal(hasGithubRemoteUrl("origin\thttps://GitHub.com/Owner/Repo (fetch)"), true);
 });
 
+test("hasGithubRemoteUrl is false for a host that merely CONTAINS github.com", () => {
+  // A bare /github\.com/ substring test also matched these. The consequence is only a stray
+  // sign-in prompt, but a substring test for a hostname is wrong wherever it appears, so the
+  // match is anchored to the host position instead.
+  assert.equal(hasGithubRemoteUrl("origin\thttps://evil-github.com/owner/repo.git (fetch)"), false);
+  assert.equal(hasGithubRemoteUrl("origin\thttps://github.com.attacker.io/owner/repo.git (fetch)"), false);
+  // ...and the shapes git really prints still match, including a port and an scp-style remote.
+  assert.equal(hasGithubRemoteUrl("origin\tssh://git@github.com:22/owner/repo.git (fetch)"), true);
+});
+
 test("hasGithubRemoteUrl is false for non-GitHub or absent remotes", () => {
   assert.equal(hasGithubRemoteUrl("origin\tgit@gitlab.com:owner/repo.git (fetch)"), false);
   assert.equal(hasGithubRemoteUrl(""), false);

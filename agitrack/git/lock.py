@@ -52,8 +52,14 @@ else:
 
 
 def _open_lock_file(path: str) -> int:
-    """Open/create the lock file; cross-platform (os.open works on Windows too)."""
-    return os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    """Open/create the lock file; cross-platform (os.open works on Windows too).
+
+    Mode 0o600, not 0o644. The lock is only ever taken by this user's own aGiTrack processes —
+    nothing reads it across accounts — and it carries the holder's pid and repo path, which is
+    no one else's business on a shared machine. World-readable was simply the default nobody
+    chose. (Only applied when the file is CREATED; an existing lock keeps its mode, which is
+    correct — changing it under a running holder is not this function's business.)"""
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
 
 
 def _lock_holder_description(repo_root: Path | str | None, pid: int | None) -> tuple[str, str]:

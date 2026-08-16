@@ -1,4 +1,5 @@
 import subprocess
+import types
 import sys
 
 import pytest
@@ -215,7 +216,6 @@ def _fake_msvcrt(monkeypatch, presses):
     # A stand-in msvcrt for the native-Windows menu-key probe so it's testable on POSIX
     # (the real path has no termios; #118). getch pops the queued keypresses in order.
     import sys
-    import types
 
     queue = list(presses)
     monkeypatch.setitem(
@@ -960,6 +960,22 @@ def test_delay_merge_off_by_default(monkeypatch):
     assert captured["delay_merge"] is False
 
 
+def _stub_source_repo(monkeypatch, *, rev: str, status: str) -> None:
+    """Stand in for aGiTrack's own source checkout in the --version tests."""
+
+    class _Source:
+        def __init__(self, root):
+            self.repo = root
+
+        def short_sha(self, ref="HEAD"):
+            return rev
+
+        def status_short(self):
+            return status
+
+    monkeypatch.setattr(cli, "GitRepo", _Source)
+
+
 def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
     # `agitrack --version` is cheap and side-effect-free: no repo discovery, no
     # privacy prompt. The VSCode extension reads it to detect a self-updated CLI.
@@ -967,9 +983,48 @@ def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
 
     called = {"discover": False}
     monkeypatch.setattr(cli, "_discover_or_init", lambda p: called.__setitem__("discover", True))
+    monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: None)  # a package install
     assert cli.main(["--version"]) == 0
     assert capsys.readouterr().out.strip() == agitrack.__version__
     assert called["discover"] is False  # exits before touching the repo
+
+
+def test_version_flag_names_the_commit_on_a_source_checkout(monkeypatch, capsys, tmp_path):
+    # On a checkout the release version is ambiguous — every commit between two releases reports
+    # the same one — so it cannot answer "which code am I running?", which is what --version is
+    # asked. The release version stays FIRST and unadorned so `--version | cut -d" " -f1` is
+    # unchanged for anything parsing it.
+    import agitrack
+
+    monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
+    _stub_source_repo(monkeypatch, rev="c3eba7d7", status="")  # a CLEAN checkout
+
+    assert cli.main(["--version"]) == 0
+    out = capsys.readouterr().out.strip()
+
+    assert out == f"{agitrack.__version__} (source c3eba7d7)"
+    assert out.split()[0] == agitrack.__version__
+
+
+def test_version_flag_marks_a_dirty_source_checkout(monkeypatch, capsys, tmp_path):
+    # "which code is this?" is only half-answered by a sha when the tree carries uncommitted
+    # work — which, on the aGiTrack checkout itself, is most of the time.
+    monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
+    _stub_source_repo(monkeypatch, rev="c3eba7d7", status=" M agitrack/cli.py\n")
+
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip().endswith("(source c3eba7d7-dirty)")
+
+
+def test_version_flag_falls_back_to_the_bare_version_when_git_fails(monkeypatch, capsys, tmp_path):
+    # Reporting a version must not be something that can fail.
+    import agitrack
+
+    monkeypatch.setattr("agitrack.update.updater.detect_source_repo", lambda: tmp_path)
+    monkeypatch.setattr(cli, "GitRepo", lambda root: (_ for _ in ()).throw(OSError("no git")))
+
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == agitrack.__version__
 
 
 def test_startup_message_printed_for_interactive_proxy(monkeypatch, capsys):

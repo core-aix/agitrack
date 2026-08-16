@@ -1245,6 +1245,17 @@ class GitRepo:
         timeout: float | None = None,
         allow_lazy_fetch: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        # THE PROGRAM IS ALWAYS `git`, and this is the one place that can promise it. Every
+        # caller builds its argv beginning with the literal, and nothing here ever uses a shell
+        # (no `shell=True` anywhere in aGiTrack), so a value flowing into `command` is an
+        # ARGUMENT to git — never the thing that gets executed, and never shell syntax. Asserting
+        # it makes that a checked invariant instead of a convention that happens to hold: a
+        # future caller passing a configured or user-supplied program name fails loudly here
+        # rather than quietly turning this into a program-execution sink. (What is left to guard
+        # after this is git's OWN option parsing — a ref or path that begins with `-` being read
+        # as a flag — which callers handle by separating revisions from pathspecs with `--`.)
+        if not command or command[0] != "git":
+            raise ValueError(f"GitRepo._run only runs git; got {command[:1] or ['(empty)']}")
         # History reads silently truncate on a busy repo, two ways -- both because aGiTrack
         # commits every turn, which constantly fires background ``git gc --auto``:
         #
