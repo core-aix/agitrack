@@ -7,6 +7,7 @@ itself with the new version instead of silently running stale modules.
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -162,7 +163,10 @@ def test_only_background_trackers_are_waited_for(monkeypatch, tmp_path):
         "/repo/interactive": "version:1.0.0",
     }
     monkeypatch.setattr(daemons, "list_running", lambda **kwargs: infos)
-    monkeypatch.setattr(selfupdate, "instance_fingerprint", lambda root: fingerprints.get(str(root), ""))
+    # Keyed through `as_posix`, not `str`: the gate looks each repo up as a Path, and on Windows
+    # `str(Path("/repo/stale"))` is `\\repo\\stale` — so a `str`-keyed double answered "" for
+    # every repo, the gate found nothing stale, and the test failed on Windows alone.
+    monkeypatch.setattr(selfupdate, "instance_fingerprint", lambda root: fingerprints.get(Path(root).as_posix(), ""))
     monkeypatch.setattr(update_restart, "disk_fingerprint", lambda: "version:2.0.0")
 
     assert update_restart.stale_background_trackers() == ["/repo/stale"]
