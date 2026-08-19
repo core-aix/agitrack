@@ -648,6 +648,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--autostart-on-agent",
+        action="store_true",
+        # Internal: entry point of the SESSION-START hooks background mode installs for every
+        # backend (Claude Code and Codex hooks, an OpenCode plugin). Starts the tracker as soon
+        # as an agent opens a session in the repo — the earliest signal that work is about to
+        # happen here — and carries the commit-guidance note for the session that started it.
+        # Called by the backend, not by hand.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--claude-session-note",
         action="store_true",
         # Internal: the body of the Claude Code SessionStart hook that background mode
@@ -764,6 +774,13 @@ def _dispatch(argv: list[str] | None = None) -> int:
         from agitrack.backends.claude_settings import print_session_note
 
         return print_session_note()
+
+    # The session-start auto-start hook, answered just as early and for the same reasons: it
+    # runs on EVERY session start in a tracked repo, so it must be cheap and must never prompt.
+    if args.autostart_on_agent:
+        from agitrack.proxy.background import autostart_on_agent_hook
+
+        return autostart_on_agent_hook()
 
     # Print the version and exit. Kept simple and side-effect-free (no repo
     # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
@@ -1182,12 +1199,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # hook it installed" would be false: the Claude Code entries (the session note and the
         # turn-end auto-start) would keep running after the user opted out.
         try:
-            from agitrack.backends import claude_settings
+            from agitrack.backends import agent_hooks, claude_settings
 
             if claude_settings.remove_autostart_hook(rh_repo.repo):
                 removed.append("claude Stop")
-            if claude_settings.remove_commit_guidance_hook(rh_repo.repo):
-                removed.append("claude SessionStart")
+            if agent_hooks.remove_commit_guidance(rh_repo.repo):
+                removed.append("session-note SessionStart")
+            if agent_hooks.remove_agent_autostart(rh_repo.repo):
+                removed.append("session-start auto-start")
         except Exception:
             pass
         # Persist the opt-out so a later aGiTrack run doesn't silently reinstall the auto-track hook.
@@ -2233,30 +2252,53 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool, backe
         "    AI work is recorded INTO the commit, and tracking restarts (in the same auto/manual\n"
         "    mode as your last run) for the turns that follow.\n"
     )
+    # Where each backend's start-on-session-open hook is written. All three have one; only the
+    # file differs, and naming the actual file is what lets the user go look at it.
+    session_hook_file = {
+        "claude": "this repo's .claude/settings.local.json",
+        "codex": "this repo's .codex/hooks.json",
+        "opencode": "this repo's .opencode/plugin/",
+    }.get(backend or "", "this repo's agent config")
+    session_hook = (
+        f"  * a session-start hook for your agent, in {session_hook_file}: opening a session in\n"
+        "    this repo starts tracking right then — including the first one after a reboot.\n"
+    )
     if backend == "claude":
         detail = (
-            "\naGiTrack can keep tracking this repo when it isn't running, by installing two hooks —\n"
+            "\naGiTrack can keep tracking this repo when it isn't running, by installing three hooks —\n"
             "so tracking survives you closing the terminal, or a reboot:\n"
             "\n"
             + commit_hook
+            + session_hook
             + "  * a turn-end hook for Claude Code, in this repo's .claude/settings.local.json: when a\n"
             "    turn leaves changes behind and nothing is tracking, tracking starts right then,\n"
             "    without waiting for a commit.\n"
         )
         switches = (
-            "`agitrack -b stop` turns both off until you start again;\n"
+            "`agitrack -b stop` turns them off until you start again;\n"
             "`agitrack --remove-hooks` disables them for good."
         )
     else:
+        # Codex earns one extra sentence, and only Codex: it is the single backend that will not
+        # run a hook until a person has reviewed it, so an install that looks complete here does
+        # nothing until they do. Saying it at the prompt is cheaper than the user discovering it
+        # as "auto-start just doesn't work".
+        trust = (
+            "\nCodex runs a new hook only after you review it: run `/hooks` in Codex once and trust\n"
+            "aGiTrack's session hooks.\n"
+            if backend == "codex"
+            else ""
+        )
         detail = (
-            "\naGiTrack can keep tracking this repo when it isn't running, by installing a hook —\n"
+            "\naGiTrack can keep tracking this repo when it isn't running, by installing two hooks —\n"
             "so tracking survives you closing the terminal, or a reboot:\n"
-            "\n" + commit_hook + "\n"
-            "Tracking then resumes at your next COMMIT. Only Claude Code exposes a turn-end hook,\n"
-            "so on this backend an agent that edits without committing is picked up when you commit.\n"
+            "\n" + commit_hook + session_hook + trust + "\n"
+            "Only Claude Code exposes a turn-end hook, so on this backend a session that is already\n"
+            "open when tracking stops is picked up at your next commit.\n"
         )
         switches = (
-            "`agitrack -b stop` turns it off until you start again;\n`agitrack --remove-hooks` disables it for good."
+            "`agitrack -b stop` turns them off until you start again;\n"
+            "`agitrack --remove-hooks` disables them for good."
         )
     print(
         detail + "\n"

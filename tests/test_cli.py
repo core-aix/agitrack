@@ -751,11 +751,12 @@ def _autostart_config(tmp_path):
 def test_the_autostart_prompt_describes_what_this_backend_will_actually_install(tmp_path, monkeypatch, capsys):
     """The prompt is the consent moment, so it has to match what gets written.
 
-    Answering yes installs a git pre-commit hook on every backend, and ADDITIONALLY a turn-end
-    hook in the repo's `.claude/settings.local.json` — but only on Claude Code, which is the
-    only backend exposing one. Describing that file to a Codex or OpenCode user would promise
-    an install that never happens and hide the limit that does apply to them: nothing is picked
-    up until they commit.
+    Answering yes installs a git pre-commit hook and a session-start hook on every backend —
+    each in that backend's OWN file, so the prompt names the file the user can go and look at.
+    Claude Code additionally has a turn-end hook, which no other backend exposes. Codex adds the
+    one step aGiTrack cannot take for them: it will not run a hook nobody has reviewed, and says
+    nothing when it skips one, so an install that looks complete does nothing until they trust
+    it.
     """
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
@@ -767,11 +768,13 @@ def test_the_autostart_prompt_describes_what_this_backend_will_actually_install(
     codex_text = capsys.readouterr().out
 
     assert ".claude/settings.local.json" in claude_text
-    assert "without waiting for a commit" in claude_text
+    assert "without waiting for a commit" in claude_text  # Claude's extra, turn-end hook
     assert ".claude" not in codex_text
-    assert "at your next COMMIT" in codex_text  # the limitation, said plainly
+    assert ".codex/hooks.json" in codex_text
+    assert "`/hooks` in Codex" in codex_text  # the step only Codex needs, said plainly
     for text in (claude_text, codex_text):
-        assert "pre-commit hook" in text  # the part every backend gets
+        assert "pre-commit hook" in text  # the parts every backend gets
+        assert "session-start hook" in text
         assert "--remove-hooks" in text
 
 
