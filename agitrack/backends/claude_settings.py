@@ -31,6 +31,7 @@ not JSON keeps working exactly as before, minus the note.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,34 @@ def session_note_payload(note: str) -> str:
         {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": note}},
         ensure_ascii=False,
     )
+
+
+def issued_at_clause(now: datetime | None = None) -> str:
+    """The sentence that makes each injection of the note a text Claude Code has not seen
+    before in this conversation. Appended only on the hook path.
+
+    CLAUDE CODE DROPS A SessionStart INJECTION IT HAS ALREADY ADDED TO THIS CONVERSATION.
+    The hook still runs and still prints — measured on 2.1.235 with a wrapper logging every
+    invocation — and the session simply records nothing. An A/B on one repo isolates the
+    cause to the TEXT: resuming a conversation that did not yet carry the note recorded it in
+    full, while resuming one that already carried it recorded no injection at all, from the
+    same hook printing the same bytes.
+
+    That silence is exactly the "it stopped working when I switched sessions" report. A
+    resumed conversation keeps only the copy it got when it first started, which in a long
+    session — or one forked by a compaction, where the injection sits thousands of turns back
+    — is far behind the live context or has fallen out of it entirely. The agent then has no
+    commit guidance left and goes back to committing its own work, which is the duplicate
+    commit (and lost token accounting) this whole module exists to prevent.
+
+    The stamp is content, not a nonce: the note asserts that a tracker is committing for the
+    agent RIGHT NOW, and that claim is only ever as current as the check behind it — which is
+    the check ``print_session_note`` has just made. Seconds resolution is enough to make two
+    injections differ; two SessionStart events for one conversation within the same second
+    are the same event's duplicate entries (aGiTrack's own hook plus a wrapper, say), and
+    collapsing those is the de-duplication working as intended."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return f" (aGiTrack tracker confirmed running at {stamp.strftime('%Y-%m-%dT%H:%M:%SZ')}.)"
 
 
 def _load(path: Path) -> dict[str, Any] | None:
@@ -411,5 +440,8 @@ def print_session_note(cwd: Path | None = None) -> int:
         return 0
     # Always the no-worktree note: background mode runs on the current branch, and the
     # worktree variant would send the agent looking for a directory that does not exist.
-    print(session_note_payload(agent_system_note(use_worktrees=False)))
+    # The issued-at stamp keeps this injection distinct from the one an earlier SessionStart
+    # in the same conversation already made, which Claude Code would otherwise drop —
+    # see `issued_at_clause`.
+    print(session_note_payload(agent_system_note(use_worktrees=False) + issued_at_clause()))
     return 0
