@@ -73,6 +73,101 @@ def test_watch_for_update_requires_two_consecutive_sightings():
     assert fired == ["2.2.2"]
 
 
+def test_a_view_daemon_holds_its_restart_until_the_trackers_have_taken_the_update():
+    """The dashboard, hub and backtrace daemons restart LAST.
+
+    All the daemons watch the same fingerprint, so one update wakes them all at once — and the
+    view daemons, with the least to do on the way up, kept winning the race. The reader then got a
+    page that reloaded to announce the new version and, right beside it, a warning that this
+    repo's session was still on the old one and should be restarted "when convenient": a warning
+    about a tracker that was already restarting itself, gone by the next poll.
+    """
+    waiting = iter([["/repo/a"], ["/repo/a"], []])
+    notes: list[str] = []
+    fired: list[str] = []
+    stop = threading.Event()
+
+    thread = update_restart.watch_for_update(
+        stop,
+        fired.append,
+        interval=0.01,
+        read_version=lambda: "2.2.2",
+        defer_while=lambda: next(waiting, []),
+        log=notes.append,
+    )
+    thread.join(timeout=5)
+
+    assert fired == ["2.2.2"]  # once the trackers are current, and not before
+    assert any("holding this restart" in note for note in notes)
+    # The confirmed fingerprint is HELD across the wait, not thrown away: re-running the
+    # two-sightings confirmation each round would push the restart back indefinitely on a busy
+    # machine, which is the opposite of what the ordering is for.
+    assert len(fired) == 1
+
+
+def test_the_wait_for_the_trackers_is_bounded():
+    # A tracker that never comes back — wedged, or stopped between the two readings — must not
+    # leave the dashboard serving old code forever. It says so, and goes.
+    notes: list[str] = []
+    fired: list[str] = []
+    stop = threading.Event()
+
+    thread = update_restart.watch_for_update(
+        stop,
+        fired.append,
+        interval=0.01,
+        read_version=lambda: "2.2.2",
+        defer_while=lambda: ["/repo/stuck"],
+        defer_limit=0.0,
+        log=notes.append,
+    )
+    thread.join(timeout=5)
+
+    assert fired == ["2.2.2"]
+    assert any("did not pick the update up in time" in note for note in notes)
+
+
+def test_a_gate_that_raises_never_blocks_the_restart():
+    # The ordering is a courtesy to the reader; it is never a reason a daemon cannot get onto
+    # the new code.
+    def _explode() -> list[str]:
+        raise RuntimeError("registry unreadable")
+
+    fired: list[str] = []
+    stop = threading.Event()
+
+    thread = update_restart.watch_for_update(
+        stop, fired.append, interval=0.01, read_version=lambda: "2.2.2", defer_while=_explode
+    )
+    thread.join(timeout=5)
+
+    assert fired == ["2.2.2"]
+
+
+def test_only_background_trackers_are_waited_for(monkeypatch, tmp_path):
+    """An interactive session holds the same repo lock and is deliberately never restarted, so
+    waiting on one would keep the dashboard on old code for as long as the conversation lasts."""
+    from agitrack import daemons
+    from agitrack.update import selfupdate
+
+    infos = [
+        daemons.DaemonInfo(pid=1, kind="background", repo="/repo/stale"),
+        daemons.DaemonInfo(pid=2, kind="background", repo="/repo/current"),
+        daemons.DaemonInfo(pid=3, kind="session", repo="/repo/interactive"),
+        daemons.DaemonInfo(pid=4, kind="dashboard", repo="/repo/stale"),
+    ]
+    fingerprints = {
+        "/repo/stale": "version:1.0.0",
+        "/repo/current": "version:2.0.0",
+        "/repo/interactive": "version:1.0.0",
+    }
+    monkeypatch.setattr(daemons, "list_running", lambda **kwargs: infos)
+    monkeypatch.setattr(selfupdate, "instance_fingerprint", lambda root: fingerprints.get(str(root), ""))
+    monkeypatch.setattr(update_restart, "disk_fingerprint", lambda: "version:2.0.0")
+
+    assert update_restart.stale_background_trackers() == ["/repo/stale"]
+
+
 def test_watch_for_update_stops_with_the_daemon():
     stop = threading.Event()
     thread = update_restart.watch_for_update(stop, lambda v: None, interval=30, read_version=lambda: None)

@@ -8,6 +8,7 @@ left for the user to do reaches them on the dashboards.
 """
 
 import json
+import os
 import sys
 import types
 
@@ -338,6 +339,41 @@ def test_dashboards_show_the_two_notices_separately(tmp_path, monkeypatch):
     selfupdate.write_state(selfupdate.SelfUpdateRecord(state=selfupdate.STATE_FAILED, latest="1.2.0"))
     both = _update_banner_html(repo)
     assert both.count('class="updatebanner"') == 2
+
+
+def test_the_stale_notice_says_something_different_about_a_daemon(monkeypatch, tmp_path):
+    """A background tracker and an interactive session need OPPOSITE things said about them.
+
+    The tracker restarts itself a minute or two after the update lands, so "restart aGiTrack when
+    convenient" asks for work already under way — and that is what the page said, next to its own
+    "reloaded because aGiTrack was updated" notice, which read as a contradiction. An interactive
+    session is genuinely left alone (restarting it would interrupt the conversation), so there the
+    user really is the only one who can act.
+    """
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    import json as _json
+
+    from agitrack import daemons
+    from agitrack.metrics.web import _update_banner_html
+
+    repo = types.SimpleNamespace(repo=tmp_path / "repo")
+    (repo.repo / ".agitrack").mkdir(parents=True)
+    (repo.repo / ".agitrack" / "lock").write_text(_json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    selfupdate.write_state(selfupdate.SelfUpdateRecord(state=selfupdate.STATE_OK))
+    monkeypatch.setattr("agitrack.update.selfupdate.running_session_is_stale", lambda root: True)
+
+    monkeypatch.setattr(
+        daemons,
+        "list_running",
+        lambda **kwargs: [daemons.DaemonInfo(pid=os.getpid(), kind="background", repo=str(repo.repo))],
+    )
+    daemon_banner = _update_banner_html(repo)
+    assert "will load the new one by itself" in daemon_banner
+    assert "restart aGiTrack when convenient" not in daemon_banner
+
+    monkeypatch.setattr(daemons, "list_running", lambda **kwargs: [])
+    session_banner = _update_banner_html(repo)
+    assert "restart aGiTrack when convenient" in session_banner
 
 
 def test_daemon_watcher_also_installs_updates(monkeypatch):
