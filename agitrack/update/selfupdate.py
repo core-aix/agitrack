@@ -440,6 +440,35 @@ def running_session_is_stale(repo_root: Path) -> bool:
         return False
 
 
+def stale_session_kind(repo_root: Path) -> str | None:
+    """Who is holding ``repo_root`` on pre-update code: ``"background"`` for a tracker daemon,
+    ``"session"`` for an interactive one, or None when nothing there is stale.
+
+    The two need OPPOSITE things said about them, which one sentence cannot do. A daemon restarts
+    itself a minute or two after the update lands, so telling the user to restart it asks for work
+    that is already happening; an interactive session is deliberately left alone — restarting it
+    would interrupt the conversation — so there the user really is the only one who can act.
+
+    The lock record carries the holder's pid, and the daemon registry says what that pid is, so
+    this costs one file read on top of the staleness check itself. Unknown pids answer
+    ``"session"``: an aGiTrack that is not a registered daemon is the interactive kind, and
+    suggesting a restart for a daemon is a smaller error than staying silent about a session
+    nobody will restart."""
+    if not running_session_is_stale(repo_root):
+        return None
+    record = _lock_record(Path(repo_root) / ".agitrack" / "lock") or {}
+    pid = record.get("pid")
+    try:
+        from agitrack import daemons
+
+        for info in daemons.list_running(repo=repo_root):
+            if info.pid == pid:
+                return "background" if info.kind == "background" else "session"
+    except Exception:
+        pass
+    return "session"
+
+
 def _lock_record(path: Path) -> dict | None:
     """The JSON the lock holder wrote, or None when the lock is free (the file is
     truncated on release) or unreadable."""

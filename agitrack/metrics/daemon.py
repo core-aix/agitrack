@@ -354,7 +354,17 @@ def run_dashboard_daemon(
             _stop.set()
             threading.Thread(target=_server.shutdown, daemon=True).start()
 
-        update_restart.watch_for_update(stop, _restart_for_update, self_update=True)
+        # Restart LAST, after the repos' background trackers have taken the update: a view that
+        # reloads itself onto the new version while a tracker is still on the old one announces
+        # the update and warns about a stale session in the same breath, for a tracker that is
+        # already restarting itself. See restart.stale_background_trackers.
+        update_restart.watch_for_update(
+            stop,
+            _restart_for_update,
+            self_update=True,
+            defer_while=update_restart.stale_background_trackers,
+            log=lambda message: print(f"aGiTrack: {message}", flush=True),
+        )
 
         try:
             server.serve_forever()

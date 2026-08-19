@@ -223,9 +223,19 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
         pass
     if repo is not None:
         try:
-            from agitrack.update.selfupdate import running_session_is_stale
+            from agitrack.update.selfupdate import stale_session_kind
 
-            if running_session_is_stale(repo.repo):
+            # WHO is stale decides what to say. A background tracker restarts itself, so asking
+            # the user to restart it is asking for work already under way — and that is exactly
+            # what the page used to do, in the same breath as announcing the update, for the
+            # couple of minutes it took the tracker to come back.
+            stale = stale_session_kind(repo.repo)
+            if stale == "background":
+                parts.append(
+                    "aGiTrack updated itself; the background tracker on this repo is still on the old "
+                    "version and will load the new one by itself shortly. Nothing to do."
+                )
+            elif stale == "session":
                 parts.append(
                     "aGiTrack updated itself, but the session running on this repo is still on the old "
                     "version — restart aGiTrack when convenient to load the new one."

@@ -194,9 +194,13 @@ def _disarm_tracking(repo: GitRepo) -> bool:
     and is now disarmed."""
     disarmed = False
     try:
-        from agitrack.backends import claude_settings
+        from agitrack.backends import agent_hooks, claude_settings
 
-        claude_settings.remove_commit_guidance_hook(repo.repo)
+        agent_hooks.remove_commit_guidance(repo.repo)
+        # BOTH auto-start triggers, on every backend: a stop that left the session-start hook
+        # behind would be undone by the user simply opening their agent again, which is not a
+        # stop. See agent_hooks for why removal is never scoped to the current backend.
+        disarmed |= agent_hooks.remove_agent_autostart(repo.repo)
         disarmed |= claude_settings.remove_autostart_hook(repo.repo)
     except Exception:
         pass
@@ -677,6 +681,114 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
         f"\naGiTrack background tracker daemon live (PID {record.get('pid')}, {record.get('mode', '?')}, no worktree).\n"
         "Drive the agent from any UI; it keeps tracking in the background. Stop it with `agitrack -b stop`."
     )
+    # The one hook step aGiTrack cannot take for the user: Codex refuses to run a hook nobody has
+    # reviewed, and says nothing when it skips one. Silence there would look exactly like a
+    # working install, so the daemon's own start is where it gets said. See
+    # codex_settings.trust_reminder.
+    try:
+        from agitrack.backends import agent_hooks
+
+        notice = agent_hooks.startup_notice(repo.repo, _recorded_backend(AgitrackState(repo.repo)))
+        if notice:
+            print(f"\naGiTrack: {notice}")
+    except Exception:
+        pass
+    return 0
+
+
+# How long the session-start hook waits for the tracker it just spawned to hand back its
+# handshake. The agent's session start is BLOCKED for this long, so it is deliberately short:
+# the daemon writes the handshake as one of its first acts, and if it is slower than this the
+# hook gives up on the note rather than making the user wait for their prompt.
+_AGENT_AUTOSTART_HANDSHAKE_SECONDS = 5.0
+
+
+def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
+    """Every reason NOT to auto-start a tracker for ``repo``, and the arguments to start one
+    with when none of them applies. ``None`` means "leave it alone".
+
+    Shared by both auto-start triggers — the turn-end hook (``autostart_on_change``) and the
+    session-start hook (``autostart_on_agent_session``) — because the answer must not depend on
+    which one fired: the opt-out, an already-running tracker and any other aGiTrack holding the
+    single-writer lock are properties of the repository, not of the trigger. Only the extra
+    condition each trigger adds (a turn that changed something / an agent session opening) is
+    left to the caller.
+
+    The lock is PROBED, not held: an interactive TUI, a `--recover` or a `--backtrace commit` is
+    the single writer while it runs, and starting a daemon beside it is exactly the double-writer
+    this must never create."""
+    config = GlobalConfig()
+    config.load_repo_overlay(repo.repo)
+    if config.autotrack_hook == "off":
+        return None
+    if _live_background_pid(repo) is not None:
+        return None  # already tracking
+    from agitrack.git import RepoLock
+
+    lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    if not lock.acquire():
+        return None
+    lock.release()  # only probing: the daemon we spawn takes it for real
+    state = AgitrackState(repo.repo)
+    backend_name = _recorded_backend(state)
+    if not backend_name:
+        return None
+    manual = read_background_mode(repo)
+    if manual is None:
+        manual = config.manual_commits
+    return ["--manual-commits" if manual else "--auto-commit", "--backend", backend_name]
+
+
+def autostart_on_agent_hook(cwd: Path | None = None) -> int:
+    """The hook entry point: find the repository around ``cwd`` and hand off.
+
+    Split from :func:`autostart_on_agent_session` so the discovery — which fails, loudly and
+    normally, in every directory that is not a git repository — is the caller's whole error
+    surface, and so the CLI does not have to import ``GitRepo`` into a function that already
+    has one by that name."""
+    try:
+        repo = GitRepo.discover(Path(cwd) if cwd else Path.cwd())
+    except Exception:
+        return 0  # a directory aGiTrack has never heard of is not an error
+    return autostart_on_agent_session(repo)
+
+
+def autostart_on_agent_session(repo: GitRepo) -> int:
+    """Entry point of the backends' SESSION-START hooks (``agitrack --autostart-on-agent``).
+
+    WHY, ON TOP OF THE TURN-END HOOK. Auto-start could previously only react to work that had
+    already happened: a commit (the git ``pre-commit`` hook) or a finished turn that left the
+    tree changed (``autostart_on_change``). After a reboot — the case auto-start exists for —
+    that means the FIRST turn of the session is written with nothing tracking it, and it is
+    recovered afterwards rather than recorded as it happens. An agent opening a session in the
+    repo is the earliest honest signal that work is about to start here, and every backend
+    aGiTrack supports now exposes it.
+
+    It also carries the commit-guidance note for the session it just started, and that is not a
+    bonus — it is required. The note hook checks whether a tracker is running and stays silent
+    when none is, so the session that STARTS the tracker would otherwise be the one session that
+    never learns aGiTrack is committing for it, and would commit its own work all the way to the
+    next restart. Printing it here (only when this hook actually started the tracker — otherwise
+    the note hook has it covered, and two injections of the same guidance is noise) closes that
+    hole.
+
+    Best-effort and always 0, like every other hook body: a hook that fails or blocks breaks the
+    user's agent, which is far worse than not starting a tracker."""
+    started = False
+    try:
+        args = _autostart_daemon_args(repo)
+        if args is not None:
+            proc = spawn_background_daemon(repo, extra_args=args)
+            started = wait_for_handshake(repo, pid=proc.pid, timeout=_AGENT_AUTOSTART_HANDSHAKE_SECONDS) is not None
+    except Exception:
+        return 0
+    if started:
+        try:
+            from agitrack.backends.claude_settings import print_session_note
+
+            print_session_note(cwd=repo.repo, tracker_known_running=True)
+        except Exception:
+            pass
     return 0
 
 
@@ -696,31 +808,11 @@ def autostart_on_change(repo: GitRepo) -> int:
     always 0 — a hook that fails or blocks would break the user's agent, which is a far worse
     outcome than not starting a tracker."""
     try:
-        config = GlobalConfig()
-        config.load_repo_overlay(repo.repo)
-        if config.autotrack_hook == "off":
+        extra_args = _autostart_daemon_args(repo)
+        if extra_args is None:
             return 0
-        if _live_background_pid(repo) is not None:
-            return 0  # already tracking
-        # Any other aGiTrack on this repo (an interactive TUI, a `--recover`, a `--backtrace
-        # commit`) is the single writer while it runs. Starting a daemon beside it is exactly
-        # the double-writer this must never create, and the TUI is already tracking anyway.
-        from agitrack.git import RepoLock
-
-        lock = RepoLock(repo.repo / ".agitrack" / "lock")
-        if not lock.acquire():
-            return 0
-        lock.release()  # only probing: the daemon we spawn takes it for real
         if not repo.has_changes():
             return 0  # a question-and-answer turn leaves nothing to track
-        state = AgitrackState(repo.repo)
-        backend_name = _recorded_backend(state)
-        if not backend_name:
-            return 0
-        manual = read_background_mode(repo)
-        if manual is None:
-            manual = config.manual_commits
-        extra_args = ["--manual-commits" if manual else "--auto-commit", "--backend", backend_name]
         spawn_background_daemon(repo, extra_args=extra_args)
     except Exception:
         return 0
@@ -1317,10 +1409,14 @@ class BackgroundRunner:
 
         Installed under the same ``autotrack_hook`` opt-in as the git hook, and persistent for
         the same reason — its job is to run when aGiTrack is not."""
+        from agitrack.backends import agent_hooks, claude_settings
+
+        # The SESSION-START hook is per backend and every backend has one, so it is installed
+        # first and unconditionally. The turn-end (Stop) hook below is Claude's alone.
+        if agent_hooks.install_agent_autostart(self.repo.repo, self.state.backend, debug=self._debug):
+            self._debug(f"{self.state.backend} session-start autostart hook installed")
         if self.state.backend != "claude":
             return
-        from agitrack.backends import claude_settings
-
         if claude_settings.install_autostart_hook(self.repo.repo, debug=self._debug):
             self._debug("claude change-autostart hook installed")
 
@@ -1339,22 +1435,22 @@ class BackgroundRunner:
         tracking working while aGiTrack is NOT running; this one would be a lie in the same
         situation — with no tracker watching, nothing is committing for the agent and it
         should behave normally again."""
-        if not self._commit_guidance or self.state.backend != "claude":
+        if not self._commit_guidance:
             return
         try:
-            from agitrack.backends import claude_settings
+            from agitrack.backends import agent_hooks
 
-            if claude_settings.install_commit_guidance_hook(self.repo.repo, debug=self._debug):
-                self._debug("claude commit-guidance hook installed")
+            if agent_hooks.install_commit_guidance(self.repo.repo, self.state.backend, debug=self._debug):
+                self._debug(f"{self.state.backend} commit-guidance hook installed")
         except Exception as error:
             self._debug(f"commit-guidance hook install failed: {error!r}")
 
     def _remove_commit_guidance(self) -> None:
         try:
-            from agitrack.backends import claude_settings
+            from agitrack.backends import agent_hooks
 
-            if claude_settings.remove_commit_guidance_hook(self.repo.repo, debug=self._debug):
-                self._debug("claude commit-guidance hook removed")
+            if agent_hooks.remove_commit_guidance(self.repo.repo, debug=self._debug):
+                self._debug("commit-guidance hook removed")
         except Exception as error:
             self._debug(f"commit-guidance hook removal failed: {error!r}")
 

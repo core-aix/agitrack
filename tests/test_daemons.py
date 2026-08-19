@@ -212,6 +212,39 @@ def test_every_long_lived_daemon_checks_for_updates_itself():
     assert not missing, f"these daemons never check for an update themselves: {missing}"
 
 
+def test_every_view_daemon_restarts_only_after_the_background_trackers():
+    """Scanned from the source for the same reason as the check above: a NEW view daemon added
+    later would otherwise silently race the trackers again.
+
+    The ordering is one-directional. The background tracker goes FIRST and must not wait for
+    anything (waiting on itself would deadlock the whole update), so it is the one caller that
+    must NOT pass the gate; every daemon that only shows the user what the trackers recorded
+    passes it.
+    """
+    import re
+    from pathlib import Path
+
+    views: list[str] = []
+    trackers: list[str] = []
+    for path in Path("agitrack").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"watch_for_update\(([^)]*)\)", source, re.S):
+            if source[: match.start()].rstrip().endswith("def"):
+                continue  # the definition itself, not a call
+            posix = path.as_posix()
+            (views if posix.startswith("agitrack/metrics/") else trackers).append(
+                posix if "defer_while" in match.group(1) else f"MISSING:{posix}"
+            )
+
+    assert views, "no view daemon watches for updates at all"
+    assert not [v for v in views if v.startswith("MISSING:")], (
+        f"these view daemons would restart before the trackers: {views}"
+    )
+    assert not [t for t in trackers if not t.startswith("MISSING:")], (
+        f"the background tracker must not wait for itself: {trackers}"
+    )
+
+
 def test_the_dashboard_hub_is_recognised_as_a_daemon_to_restart():
     """`restart_all` demands proof a pid really is an aGiTrack daemon before signalling it (a
     registry pid can be a reused pid after a reboot). A daemon whose serve flag is not listed

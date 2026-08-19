@@ -783,6 +783,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # pre-commit hook aside (they share one hook slot). Drives its restore on teardown, so a
         # worktree run after a background/no-worktree one never silently uninstalls it.
         self._displaced_autotrack_hook = False
+        # Which backends' session-start auto-start hooks this run took out (see
+        # _displace_background_autostart). Empty when there were none to take.
+        self._displaced_agent_autostart: list[str] = []
         # Facts about the turn the agent is currently running, refreshed from every session
         # export (see _note_in_flight). Lets the fold trailer attribute a commit the AGENT makes
         # ITSELF before that turn ends — a turn only becomes a pending latent turn once complete.
@@ -1877,6 +1880,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # keeps serving after aGiTrack quits (stops with the terminal or `-d stop`).
             self._remove_base_commit_guard()  # uninstall the pre-commit guard + restore any chained hook
             self._teardown_manual_commit_mode()  # uninstall the manual-commit hooks + restore any chained
+            self._restore_background_autostart()  # put back the session-start hooks this run displaced
             self._cleanup_child()
             self._restore_terminal()
             if self._host is not None:
@@ -2159,6 +2163,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         self._teardown_manual_commit_mode()
         self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
         self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
+        self._displace_background_autostart()  # this session is the single writer; see below
 
     def _install_base_commit_guard(self) -> None:
         # Install the pre-commit guard in the base repo when active. Skipped (with a note) when a
@@ -2198,6 +2203,51 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                     self._install_autotrack_precommit_hook()
         except Exception as error:
             self._debug(f"base-commit guard removal failed: {error!r}")
+
+    def _displace_background_autostart(self) -> None:
+        """Take BACKGROUND mode's start-on-session-open hooks out for the length of this run.
+
+        Those hooks exist to start a background daemon when an agent opens a session in this
+        repo — and this run IS an agent session in this repo, spawned by aGiTrack itself. Left
+        installed, the backend would fire them at our own child and try to start a daemon beside
+        the TUI, which is the double-writer aGiTrack never allows. The fire-time lock probe would
+        refuse it anyway, but relying on a race to prevent something we can simply not arm is the
+        wrong way round: interactive mode owns the repository while it runs, so it holds the
+        hooks too.
+
+        Records exactly which backends were armed, so :meth:`_restore_background_autostart` can
+        put back what was there and nothing else — a repo where auto-start was never enabled must
+        not come out of an interactive session with it enabled."""
+        try:
+            from agitrack.backends import agent_hooks
+
+            if self.base_repo is None:
+                return
+            armed = agent_hooks.installed_autostart_backends(self.base_repo.repo)
+            if not armed:
+                return
+            agent_hooks.remove_agent_autostart(self.base_repo.repo, debug=self._debug)
+            self._displaced_agent_autostart = armed
+            self._debug(f"session-start autostart hooks displaced for this run: {armed}")
+        except Exception as error:  # never let hook setup block startup
+            self._debug(f"session-start autostart displace failed: {error!r}")
+
+    def _restore_background_autostart(self) -> None:
+        """Put back what :meth:`_displace_background_autostart` took, and only that.
+
+        Symmetrical with the auto-track pre-commit hook's displace/restore: these hooks must
+        OUTLIVE aGiTrack, so an interactive session must not be what silently uninstalls them."""
+        armed, self._displaced_agent_autostart = self._displaced_agent_autostart, []
+        if not armed or self.base_repo is None:
+            return
+        try:
+            from agitrack.backends import agent_hooks
+
+            for backend in armed:
+                agent_hooks.install_agent_autostart(self.base_repo.repo, backend, debug=self._debug)
+            self._debug(f"session-start autostart hooks restored: {armed}")
+        except Exception as error:
+            self._debug(f"session-start autostart restore failed: {error!r}")
 
     def _autotrack_hook_will_survive_exit(self) -> bool:
         """Whether a `git commit` made AFTER aGiTrack exits will still fold in the tracking.
