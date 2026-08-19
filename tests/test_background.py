@@ -1984,14 +1984,32 @@ def test_no_commit_guidance_installs_nothing(tmp_path):
     assert claude_settings.hook_is_installed(repo.repo) is False
 
 
-def test_a_non_claude_backend_is_left_alone(tmp_path):
-    # Codex's only lever REPLACES its base instructions and OpenCode's CLI has none at all,
-    # so neither gets a half-measure — and neither gets a stray .claude/ directory either.
+def test_a_backend_with_nowhere_to_put_the_note_is_left_alone(tmp_path):
+    # OpenCode's only place to add text to a turn is the user's own message parts, so it gets no
+    # half-measure — and no stray .claude/ or .opencode/ config for a note it cannot carry.
+    # (Codex is no longer in this category: since 0.147 its SessionStart hook carries the note,
+    # see test_codex_gets_the_note_through_its_own_hooks_file.)
     runner, repo = _guidance_runner(tmp_path, backend="opencode")
     runner.state.backend = "opencode"
 
     runner._install_commit_guidance()
 
+    assert not (tmp_path / ".claude").exists()
+    assert not (tmp_path / ".opencode").exists()
+
+
+def test_codex_gets_the_note_through_its_own_hooks_file(tmp_path):
+    """The capability that arrived with Codex 0.147 and that background mode never had: its
+    SessionStart hook takes the same payload Claude Code's does, so a Codex agent can finally be
+    told that aGiTrack is committing for it instead of committing its own work."""
+    from agitrack.backends import codex_settings
+
+    runner, repo = _guidance_runner(tmp_path, backend="codex")
+    runner.state.backend = "codex"
+
+    runner._install_commit_guidance()
+
+    assert codex_settings.hook_is_installed(tmp_path, codex_settings.SESSION_NOTE_HOOK)
     assert not (tmp_path / ".claude").exists()
 
 
