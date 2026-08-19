@@ -9,6 +9,7 @@ settings that already have content worth keeping.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from agitrack.backends import claude_settings
 
@@ -168,12 +169,45 @@ def test_the_hook_prints_the_note_in_the_documented_envelope(tmp_path, monkeypat
     payload = json.loads(capsys.readouterr().out)
     specific = payload["hookSpecificOutput"]
     assert specific["hookEventName"] == "SessionStart"
-    assert specific["additionalContext"] == agent_system_note(use_worktrees=False)
+    assert specific["additionalContext"].startswith(agent_system_note(use_worktrees=False))
     # The note background mode needs is the NO-WORKTREE one: -b always runs on the current
     # branch, and the worktree variant would send the agent looking for a directory that
     # does not exist.
     assert "no separate worktree" in specific["additionalContext"]
     assert "Do NOT create git commits yourself" in specific["additionalContext"]
+
+
+def test_every_injection_of_the_note_is_a_text_claude_has_not_seen_before(tmp_path, monkeypatch, capsys):
+    """Claude Code DROPS a SessionStart injection whose text is already in the conversation.
+
+    Measured on 2.1.235: the hook fires on `/resume` and prints, and the resumed session
+    records no injection at all when it already carries an identical note — while the same
+    hook printing into a session without it records the note in full. So a switched-to
+    conversation kept only the copy from its own first start, which in a long or
+    compaction-forked session is far behind the live context, and the agent went back to
+    committing its own work. Two injections must therefore never be byte-identical.
+    """
+    monkeypatch.setattr("agitrack.proxy.background.background_tracker_is_running", lambda repo: True)
+    repo = _repo(tmp_path)
+    stamps = iter(
+        [
+            datetime(2026, 8, 19, 9, 30, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 19, 13, 4, 10, tzinfo=timezone.utc),
+        ]
+    )
+    stamped = claude_settings.issued_at_clause
+    monkeypatch.setattr(claude_settings, "issued_at_clause", lambda: stamped(next(stamps)))
+
+    claude_settings.print_session_note(cwd=repo)
+    claude_settings.print_session_note(cwd=repo)
+
+    lines = capsys.readouterr().out.splitlines()
+    first, second = [json.loads(line)["hookSpecificOutput"]["additionalContext"] for line in lines]
+    assert first != second
+    # ...and the stamp is the ONLY difference: the guidance itself must not drift between
+    # injections, or the agent is told something new every time it resumes.
+    assert first.split(" (aGiTrack tracker confirmed")[0] == second.split(" (aGiTrack tracker confirmed")[0]
+    assert "2026-08-19T13:04:10Z" in second
 
 
 def test_a_settings_file_the_repo_TRACKS_is_never_deleted(tmp_path):

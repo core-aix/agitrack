@@ -14,15 +14,19 @@ file — and its ``SessionStart`` hook injects the hook command's output into th
 context. ``.claude/`` is in ``git/repo.py``'s ``_NEVER_STAGE_PREFIXES``, so nothing aGiTrack
 writes there can end up in a commit.
 
-The other two backends have no equivalent, which is why this module is Claude-specific:
+This module stays Claude-specific because the FILE is; the protocol is no longer. Codex 0.147
+added lifecycle hooks whose ``SessionStart`` input and output are wire-compatible with Claude
+Code's, so it now carries the same note through its own file — see ``codex_settings``, which
+reuses the entry shape and the payload built here. Before that it had only
+``experimental_instructions_file`` (which REPLACES Codex's base instructions rather than
+appending) and ``AGENTS.md`` (a TRACKED file in the user's repo), which is why background mode
+could not reach it at all.
 
-* **Codex** exposes only ``experimental_instructions_file``, which REPLACES the base
-  instructions rather than appending, so using it would delete Codex's own coding prompt.
-  Its other channel is ``AGENTS.md`` — a TRACKED file in the user's repo.
-* **OpenCode**'s CLI has no system-prompt flag at all (verified against ``opencode --help``
-  and ``opencode run --help``); ``--agent`` selects a whole replacement agent, and its
-  config lives in a repo-root ``opencode.json`` or the user's global config — again either
-  a tracked file or a setting that would leak into sessions aGiTrack is not running.
+**OpenCode** still has no channel for the note: its CLI has no system-prompt flag (``--agent``
+selects a whole replacement agent), its config lives in a repo-root ``opencode.json`` or the
+user's global config, and the one place a plugin may add text to a turn is the user's own
+message parts — which would put aGiTrack's note inside the prompt aGiTrack then commits as the
+user's. It does take the start-on-session-open hook, through a plugin (``opencode_settings``).
 
 Everything here is best-effort: a repo whose settings file is unreadable, unwritable or
 not JSON keeps working exactly as before, minus the note.
@@ -31,6 +35,7 @@ not JSON keeps working exactly as before, minus the note.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +47,7 @@ from agitrack.fileio import atomic_write_text
 # whole settings file down with it.
 HOOK_FLAG = "--claude-session-note"
 AUTOSTART_FLAG = "--autostart-on-change"
+AGENT_AUTOSTART_FLAG = "--autostart-on-agent"
 
 # The two hooks, each as (event, flag). They have DIFFERENT lifetimes, which is the whole
 # reason they are separate entries rather than one:
@@ -52,6 +58,14 @@ AUTOSTART_FLAG = "--autostart-on-change"
 #       `-b stop` / `--remove-hooks` take it away.
 SESSION_NOTE_HOOK = ("SessionStart", HOOK_FLAG)
 AUTOSTART_HOOK = ("Stop", AUTOSTART_FLAG)
+# The THIRD hook, and the second persistent one: an agent OPENING a session here starts the
+# tracker, instead of the repo waiting for a turn to end with changes (Stop) or for a commit
+# (git pre-commit). It shares the persistent lifetime of the Stop hook — its whole job is to
+# run when aGiTrack is not — with one addition the others do not need: `agitrack -i` takes it
+# out for the length of an interactive session and puts it back on exit (see
+# ProxyRunner._displace_background_autostart), because the TUI is the single writer while it
+# runs and must not have a daemon starting underneath it.
+AGENT_AUTOSTART_HOOK = ("SessionStart", AGENT_AUTOSTART_FLAG)
 
 SETTINGS_RELPATH = Path(".claude") / "settings.local.json"
 
@@ -136,6 +150,34 @@ def session_note_payload(note: str) -> str:
         {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": note}},
         ensure_ascii=False,
     )
+
+
+def issued_at_clause(now: datetime | None = None) -> str:
+    """The sentence that makes each injection of the note a text Claude Code has not seen
+    before in this conversation. Appended only on the hook path.
+
+    CLAUDE CODE DROPS A SessionStart INJECTION IT HAS ALREADY ADDED TO THIS CONVERSATION.
+    The hook still runs and still prints — measured on 2.1.235 with a wrapper logging every
+    invocation — and the session simply records nothing. An A/B on one repo isolates the
+    cause to the TEXT: resuming a conversation that did not yet carry the note recorded it in
+    full, while resuming one that already carried it recorded no injection at all, from the
+    same hook printing the same bytes.
+
+    That silence is exactly the "it stopped working when I switched sessions" report. A
+    resumed conversation keeps only the copy it got when it first started, which in a long
+    session — or one forked by a compaction, where the injection sits thousands of turns back
+    — is far behind the live context or has fallen out of it entirely. The agent then has no
+    commit guidance left and goes back to committing its own work, which is the duplicate
+    commit (and lost token accounting) this whole module exists to prevent.
+
+    The stamp is content, not a nonce: the note asserts that a tracker is committing for the
+    agent RIGHT NOW, and that claim is only ever as current as the check behind it — which is
+    the check ``print_session_note`` has just made. Seconds resolution is enough to make two
+    injections differ; two SessionStart events for one conversation within the same second
+    are the same event's duplicate entries (aGiTrack's own hook plus a wrapper, say), and
+    collapsing those is the de-duplication working as intended."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return f" (aGiTrack tracker confirmed running at {stamp.strftime('%Y-%m-%dT%H:%M:%SZ')}.)"
 
 
 def _load(path: Path) -> dict[str, Any] | None:
@@ -386,7 +428,16 @@ def remove_autostart_hook(repo: Path, *, debug=None) -> bool:
     return remove_hook(repo, AUTOSTART_HOOK, debug=debug)
 
 
-def print_session_note(cwd: Path | None = None) -> int:
+def install_agent_autostart_hook(repo: Path, *, debug=None) -> bool:
+    """The SessionStart hook that starts the tracker when an agent opens a session here."""
+    return install_hook(repo, AGENT_AUTOSTART_HOOK, debug=debug)
+
+
+def remove_agent_autostart_hook(repo: Path, *, debug=None) -> bool:
+    return remove_hook(repo, AGENT_AUTOSTART_HOOK, debug=debug)
+
+
+def print_session_note(cwd: Path | None = None, *, tracker_known_running: bool = False) -> int:
     """Entry point of the hook itself (``agitrack --claude-session-note``).
 
     SILENT WHEN NO TRACKER IS RUNNING, and that is the important part. The note asserts that
@@ -397,19 +448,28 @@ def print_session_note(cwd: Path | None = None) -> int:
     agent stops committing and nothing else starts. Printing nothing is a no-op for Claude
     Code, so a stale hook simply does nothing until a tracker returns.
 
+    ``tracker_known_running`` skips that check for the ONE caller that already knows the
+    answer: the session-start auto-start hook, which has just started a tracker and waited for
+    its handshake. Re-deriving "is one running" from the outside there would race the daemon's
+    own startup and answer "no" for the session that most needs the note.
+
     Always exits 0. A hook that fails is noise in the user's session about a feature they did
     not ask for."""
     from agitrack.backends.proxy_agents import agent_system_note
 
-    try:
-        from agitrack.git import GitRepo
-        from agitrack.proxy.background import background_tracker_is_running
+    if not tracker_known_running:
+        try:
+            from agitrack.git import GitRepo
+            from agitrack.proxy.background import background_tracker_is_running
 
-        if not background_tracker_is_running(GitRepo.discover(Path(cwd) if cwd else Path.cwd())):
+            if not background_tracker_is_running(GitRepo.discover(Path(cwd) if cwd else Path.cwd())):
+                return 0
+        except Exception:
             return 0
-    except Exception:
-        return 0
     # Always the no-worktree note: background mode runs on the current branch, and the
     # worktree variant would send the agent looking for a directory that does not exist.
-    print(session_note_payload(agent_system_note(use_worktrees=False)))
+    # The issued-at stamp keeps this injection distinct from the one an earlier SessionStart
+    # in the same conversation already made, which Claude Code would otherwise drop —
+    # see `issued_at_clause`.
+    print(session_note_payload(agent_system_note(use_worktrees=False) + issued_at_clause()))
     return 0

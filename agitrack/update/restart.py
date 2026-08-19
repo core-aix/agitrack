@@ -142,6 +142,54 @@ def updated_fingerprint() -> str | None:
 SELF_UPDATE_SECONDS = 1800.0
 
 
+# How long a view daemon (dashboard, hub, backtrace) will hold its own restart back waiting
+# for the background trackers to pick the update up first. A tracker needs two consecutive
+# one-minute checks plus its handoff, so the ordinary wait is two or three minutes; this cap
+# exists for the tracker that never comes back — wedged, or stopped between the two readings —
+# where serving the old dashboard forever would be the worse failure.
+DEFER_LIMIT_SECONDS = 600.0
+
+
+def stale_background_trackers() -> list[str]:
+    """Repositories whose BACKGROUND TRACKER is still running pre-update code.
+
+    WHY THE VIEW DAEMONS WAIT FOR THIS. Every daemon watches the same fingerprint, so they all
+    notice one update at once and race to restart — and the dashboard, which has the least to do
+    on the way up, kept winning. The user then got a page that reloaded itself to announce the new
+    version and, in the same breath, warned that the session on this repo was still on the old one
+    and should be restarted "when convenient" — a warning about a tracker that was already
+    restarting itself, and that was gone by the next poll. Two true statements that read as a
+    contradiction, and the only actionable one asked for work nobody had to do.
+
+    So the order is fixed rather than raced: trackers first, views last. By the time the page
+    reloads, everything it can report on has already moved, and the stale-session banner is left
+    to mean what it is for — an interactive session, which aGiTrack deliberately never restarts
+    from under the user.
+
+    A tracker's fingerprint is the one it recorded in the repo lock when it took it, and a
+    restart re-takes that lock, so this is a file read per tracked repo. Only ``background``
+    daemons count: an interactive TUI holds the same lock and is never restarted, so waiting on
+    one would keep a dashboard on old code for as long as the conversation lasts.
+    """
+    try:
+        from agitrack import daemons
+        from agitrack.update.selfupdate import instance_fingerprint
+
+        current = disk_fingerprint()
+        if not current:
+            return []
+        stale = []
+        for info in daemons.list_running():
+            if info.kind != "background" or not info.repo:
+                continue
+            running = instance_fingerprint(Path(info.repo))
+            if running and running != current:
+                stale.append(info.repo)
+        return stale
+    except Exception:
+        return []  # never let this gate be the reason a daemon cannot restart
+
+
 def watch_for_update(
     stop: threading.Event,
     on_update: Callable[[str], None],
@@ -150,6 +198,9 @@ def watch_for_update(
     read_version: Callable[[], str | None] = updated_fingerprint,
     self_update: bool = False,
     self_update_interval: float = SELF_UPDATE_SECONDS,
+    defer_while: Callable[[], list[str]] | None = None,
+    defer_limit: float = DEFER_LIMIT_SECONDS,
+    log: Callable[[str], None] = lambda _message: None,
 ) -> threading.Thread:
     """Start the watcher thread: calls ``on_update(new_fingerprint)`` ONCE, after the
     same new on-disk fingerprint has been seen on two consecutive checks (see module
@@ -168,10 +219,19 @@ def watch_for_update(
     tooling — cannot start installing updates by omission: it once did, and a test's
     watcher fast-forwarded CI's own checkout mid-run, changing pyproject.toml underneath
     the already-imported version and failing the build.
+
+    ``defer_while`` ORDERS restarts that would otherwise race. It is polled once the update is
+    confirmed and returns whatever is not ready yet (empty when clear); while it returns
+    something, the confirmed fingerprint is HELD — not discarded — and re-checked each interval,
+    so the restart happens as soon as the wait clears rather than starting the two-reading
+    confirmation over. ``defer_limit`` bounds that wait: a daemon must still get onto the new
+    code even when whatever it is waiting for never does. See :func:`stale_background_trackers`,
+    the one gate that uses it.
     """
 
     def _loop() -> None:
         candidate: str | None = None
+        deferring_since: float | None = None
         last_self_update = 0.0
         while not stop.wait(interval):
             if self_update:
@@ -189,18 +249,45 @@ def watch_for_update(
             fresh = read_version()
             if fresh is None:
                 candidate = None
+                deferring_since = None
                 continue
             if fresh == candidate:
+                if defer_while is not None:
+                    waiting_for = _deferral(defer_while)
+                    if waiting_for:
+                        if deferring_since is None:
+                            deferring_since = time.monotonic()
+                            log(
+                                "aGiTrack updated on disk; holding this restart until the background "
+                                f"tracker(s) restart first: {', '.join(waiting_for)}"
+                            )
+                            continue  # keep the confirmed fingerprint and look again next round
+                        if time.monotonic() - deferring_since < defer_limit:
+                            continue
+                        log(
+                            "background tracker(s) did not pick the update up in time "
+                            f"({', '.join(waiting_for)}); restarting anyway."
+                        )
                 try:
                     on_update(fresh)
                 except Exception:
                     pass
                 return
             candidate = fresh
+            deferring_since = None
 
     thread = threading.Thread(target=_loop, daemon=True, name="agitrack-update-watch")
     thread.start()
     return thread
+
+
+def _deferral(defer_while: Callable[[], list[str]]) -> list[str]:
+    """What the gate is still waiting for. A gate that RAISES answers "nothing": the ordering is
+    a courtesy to the reader, never a reason a daemon cannot get onto the new code."""
+    try:
+        return list(defer_while() or [])
+    except Exception:
+        return []
 
 
 def restart_command(extra_args: Iterable[str] = ()) -> list[str]:
