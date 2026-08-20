@@ -893,6 +893,13 @@ def viewable_branches(repo: GitRepo) -> list[str]:
     open them here. A remote branch that HAS a local counterpart is dropped rather than listed
     twice: the local one is the same history and is what the rest of aGiTrack works with.
 
+    A remote-tracking branch the remote no longer HAS is dropped. Git never removes those refs on
+    a plain ``git fetch`` (only ``--prune`` does), so a clone accumulates one for every branch
+    ever pushed, and the selector filled up with branches that had been merged and deleted long
+    ago. Only the remote can answer that question, so it is asked in the BACKGROUND and cached —
+    see :mod:`agitrack.metrics.remote_branches`. A remote that could not be asked is left alone:
+    its branches are all shown, because a network failure must never hide a branch.
+
     ONE function so the selector and the ref validator (``LiveDashboard._ref``) cannot disagree:
     offering a branch the validator then refuses would silently fall back to HEAD, which reads
     as the selector not working.
@@ -903,7 +910,19 @@ def viewable_branches(repo: GitRepo) -> list[str]:
     except Exception:
         remote = []  # a repo with no remotes, or an unreadable ref store: local branches still work
     known = set(local)
-    return [*local, *(name for name in remote if name.split("/", 1)[-1] not in known)]
+    remote_only = [name for name in remote if name.split("/", 1)[-1] not in known]
+    if remote_only:
+        # Only now is the remote worth asking about. A repo whose every remote branch is also
+        # checked out locally shows nothing from `refs/remotes/` and needs no network at all.
+        try:
+            from agitrack.metrics import remote_branches
+
+            remote_only = remote_branches.prune_stale(
+                remote_only, remote_branches.live_branches(repo, repo.remote_names())
+            )
+        except Exception:
+            pass  # unknown means show everything, exactly as an unreachable remote does
+    return [*local, *remote_only]
 
 
 def build_dashboard(
