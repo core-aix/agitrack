@@ -929,6 +929,21 @@ repository aGiTrack knows about under a path, so switching projects or views is 
 another daemon on another port. It opens by itself when aGiTrack starts on a repository, in any
 mode (`open_dashboard_on_start`).
 
+**Branches appear as soon as they land.** The branch selector offers every branch you could look
+at, including one you have only fetched: a branch someone else pushed exists as
+`origin/<name>` until you check it out, and it shows under that name until you do. A branch
+arriving does not move the branch you are currently viewing, so the page notices it by watching
+the set of branch names, not just the tip of the one on screen: pull, and it is in the dropdown on
+the next poll, with no reload and no restart.
+
+**People are identified per branch.** GitHub's commit listing covers the default branch only, so a
+contributor whose work is on the branch you just pulled used to show under their raw git name
+instead of their GitHub ID, and filtering by that ID found none of their commits. The branch you
+are viewing is now looked up as well, so the same person is one person on every branch. It resolves
+in the background: the first paint labels people from their email and their IDs settle a moment
+later. Someone whose commit email is linked to no GitHub account keeps their git name, which is
+all there is to know about them.
+
 ```mermaid
 flowchart TD
   any(["agitrack -i / -b / -d / --backtrace,<br/>or Ctrl-G → dashboard"]) --> remember[["Remember this repo in ~/.agitrack/repos.json<br/>(path, display name, derived slug)"]]

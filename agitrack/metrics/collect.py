@@ -883,6 +883,29 @@ def _display_repo(path: str) -> str:
     return name or path
 
 
+def viewable_branches(repo: GitRepo) -> list[str]:
+    """Every branch the dashboard will show, local first, then remote-tracking branches that
+    have no local counterpart (``origin/feature-x``).
+
+    A branch someone has just FETCHED exists only as a remote-tracking ref until it is checked
+    out, so listing local branches alone meant a newly pulled branch never appeared in the
+    selector at all — the user could see the commits arrive in `git log` and had no way to
+    open them here. A remote branch that HAS a local counterpart is dropped rather than listed
+    twice: the local one is the same history and is what the rest of aGiTrack works with.
+
+    ONE function so the selector and the ref validator (``LiveDashboard._ref``) cannot disagree:
+    offering a branch the validator then refuses would silently fall back to HEAD, which reads
+    as the selector not working.
+    """
+    local = repo.list_branches()
+    try:
+        remote = repo.list_remote_branches()
+    except Exception:
+        remote = []  # a repo with no remotes, or an unreadable ref store: local branches still work
+    known = set(local)
+    return [*local, *(name for name in remote if name.split("/", 1)[-1] not in known)]
+
+
 def build_dashboard(
     repo: GitRepo,
     ref: str = "HEAD",
@@ -900,9 +923,9 @@ def build_dashboard(
     # The branch the dashboard *shows*: the explicit ref when one is requested,
     # otherwise whatever HEAD currently points at.
     branch = repo.current_branch() if ref == "HEAD" else ref
-    # Every local branch feeds the per-branch view selector. Keep the shown branch
-    # in the list (and first) even if it's detached/HEAD so it's always selectable.
-    branches = repo.list_branches()
+    # Every branch the user could want to look at feeds the per-branch view selector. Keep the
+    # shown branch in the list (and first) even if it's detached/HEAD so it's always selectable.
+    branches = viewable_branches(repo)
     if branch and branch != "HEAD":
         branches = [branch, *(b for b in branches if b != branch)]
     return Dashboard(
