@@ -480,3 +480,77 @@ def test_a_replacement_that_hangs_is_abandoned_not_left_racing(monkeypatch):
 
     assert child.terminated
     assert any("did not come up within" in line for line in lines)
+
+
+# --- POSIX gets the same handoff, for the same reason ------------------------------------------
+
+
+def test_posix_does_not_exec_into_an_update_it_has_not_verified(monkeypatch):
+    """POSIX used to ``os.execv`` here, and that is the one thing that cannot keep the promise
+    this module makes. exec replaces the process image: a successor that dies on import leaves
+    NOTHING to fall back to, so "a failed restart never strands a dead daemon" was true of the
+    dashboard and false of the background tracker.
+
+    Measured on a real pip install with a broken upgrade staged: the tracker logged "restarting
+    on the new version", exec'd, the successor died on a SyntaxError, and the repository was left
+    with no tracker at all — while the hub in the same experiment survived, because it verified.
+    """
+    monkeypatch.setattr(update_restart.os, "name", "posix")
+    monkeypatch.setattr(
+        update_restart.os, "execv", lambda *a: pytest.fail("os.execv cannot be undone by a failed successor")
+    )
+    child = _FakeChild(exits_with=1)  # the broken update: started, then died on the way up
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: child)
+    monkeypatch.setattr(update_restart.os, "_exit", lambda code: pytest.fail("must not exit on a failed restart"))
+    lines: list[str] = []
+
+    update_restart.exec_replacement(["agitrack"], log=lines.append, verify=lambda pid: False, verify_seconds=2.0)
+
+    # Returning IS the contract: the caller resumes on the code it already has.
+    assert any("exited during startup" in line for line in lines)
+    assert any("keeping the current version running" in line for line in lines)
+
+
+def test_posix_hands_over_once_the_successor_proves_it_is_up(monkeypatch):
+    monkeypatch.setattr(update_restart.os, "name", "posix")
+    monkeypatch.setattr(update_restart.os, "execv", lambda *a: pytest.fail("no exec on this path"))
+    child = _FakeChild(pid=909)
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: child)
+    exited: list = []
+
+    def _exit(code):
+        exited.append(code)
+        raise _Execed()  # the real os._exit never returns
+
+    monkeypatch.setattr(update_restart.os, "_exit", _exit)
+
+    with pytest.raises(_Execed):
+        update_restart.exec_replacement(
+            ["agitrack"], log=lambda _: None, verify=lambda pid: pid == 909, verify_seconds=5.0
+        )
+
+    assert exited == [0]
+    assert not child.terminated
+
+
+def test_the_posix_successor_is_detached_so_it_outlives_us(monkeypatch):
+    """We exit the moment the successor proves it is up. A child left in this process's session
+    would go down with the terminal that started us, which is the same "repo left untracked"
+    outcome by another route."""
+    from agitrack.proc import detach_kwargs
+
+    monkeypatch.setattr(update_restart.os, "name", "posix")
+    seen: dict = {}
+
+    def fake_popen(command, **kwargs):
+        seen.update(kwargs)
+        return _FakeChild(pid=5150)
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(update_restart.os, "_exit", lambda code: (_ for _ in ()).throw(_Execed()))
+
+    with pytest.raises(_Execed):
+        update_restart.exec_replacement(["agitrack"], log=lambda _: None, verify=lambda pid: True)
+
+    for key, value in detach_kwargs().items():
+        assert seen.get(key) == value, f"the successor must be spawned detached ({key})"
