@@ -72,3 +72,20 @@ def test_every_version_indicator_says_the_same_thing(monkeypatch, tmp_path):
     assert _version_line() == expected  # agitrack --version
     assert _agitrack_version() == expected  # the dashboard page and its /state poll
     assert _version() == expected  # a crash report
+
+
+def test_the_suite_can_never_self_update_the_checkout_it_runs_from():
+    """The guard behind ``test_source_version_matches_pyproject``.
+
+    A test that starts a real background tracker starts a real update watcher with it, and on a
+    source checkout a self-update MERGES the checkout aGiTrack is running from — in CI, the job's
+    own working tree. That merge pulled the release commit in mid-run, so ``pyproject.toml``
+    advanced while the already-imported ``agitrack.__version__`` stayed put, and the test above
+    failed with the two exactly one release apart (0.6.12/0.6.13, 0.6.13/0.6.14, 0.6.14/0.6.15 on
+    three consecutive Windows runs). Monkeypatching ``attempt_self_update`` cannot stop it: the
+    tracker doing the merging is a SUBPROCESS. What reaches a subprocess is the config dir, which
+    is inherited through ``AGITRACK_CONFIG_DIR`` — so it is the config that must say no.
+    """
+    from agitrack.config.settings import GlobalConfig
+
+    assert GlobalConfig().check_for_updates is False

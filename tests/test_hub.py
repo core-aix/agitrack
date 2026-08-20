@@ -1138,3 +1138,130 @@ def test_the_page_that_does_say_is_believed_over_the_header(tmp_path):
 
     threading.Timer(0.05, lambda: router.post("/clients", {"id": "t", "path": "/r/x/", "page": ""})).start()
     assert router.clients.navigate("/r/y/") == "firefox"
+
+
+# --- a failed update restart must not be how the dashboard dies -------------------------------
+
+
+class _FakeHubServer:
+    """Stands in for the bound HTTP server so the daemon's restart loop can be driven without
+    opening a port. ``on_serve`` is what ends each ``serve_forever``."""
+
+    def __init__(self, on_serve):
+        self.server_address = ("127.0.0.1", 8765)
+        self._on_serve = on_serve
+
+    def serve_forever(self):
+        self._on_serve(self)
+
+    def shutdown(self):
+        pass
+
+    def server_close(self):
+        pass
+
+
+class _StopTheLoop(Exception):
+    """Breaks out of the daemon's endless serve/restart loop at a known iteration."""
+
+
+def _drive_hub(monkeypatch, *, spawn, acquire_results=None, iterations=2):
+    """Run the REAL ``run_hub_daemon`` loop with the port, the update watch and the replacement
+    spawn faked out. Returns (bind count, captured stdout lines, lock call log)."""
+    from agitrack.git import lock as lock_module
+
+    binds: list[int] = []
+    calls: list[str] = []
+    fired = {"n": 0}
+    captured: dict = {}
+
+    def fake_watch(stop, on_update, **kwargs):
+        captured["on_update"] = on_update
+        return None
+
+    def on_serve(_server):
+        binds.append(1)
+        if len(binds) >= iterations:
+            raise _StopTheLoop
+        fired["n"] += 1
+        captured["on_update"]("new-fingerprint")  # an update landed: ask for a restart
+
+    class _Lock:
+        def __init__(self, path):
+            self.path = path
+
+        def acquire(self, *, retry_seconds: float = 0.0) -> bool:
+            calls.append("acquire")
+            if acquire_results:
+                return acquire_results.pop(0)
+            return True
+
+        def release(self) -> None:
+            calls.append("release")
+
+    monkeypatch.setattr(lock_module, "RepoLock", _Lock)
+    monkeypatch.setattr("agitrack.git.RepoLock", _Lock)
+    monkeypatch.setattr("agitrack.update.restart.watch_for_update", fake_watch)
+    monkeypatch.setattr("agitrack.metrics.server.bind_scanning", lambda factory, *a, **k: _FakeHubServer(on_serve))
+    monkeypatch.setattr(hub, "_spawn_hub", spawn)
+    monkeypatch.setattr(hub, "_write_handshake", lambda record: None)
+    monkeypatch.setattr(hub, "clear_handshake", lambda: None)
+    monkeypatch.setattr(hub, "running_hub", lambda: None)
+    return binds, calls, captured
+
+
+def test_a_failed_update_restart_keeps_the_dashboard_serving(tmp_path, monkeypatch, capsys):
+    """The invariant: a restart that fails leaves the PREVIOUS version running. The hub used to
+    honour that only by accident — it looped back and served on, but having permanently given up
+    the lock that makes it single."""
+    binds, calls, _ = _drive_hub(monkeypatch, spawn=lambda: None)  # the replacement never starts
+
+    with pytest.raises(_StopTheLoop):
+        hub.run_hub_daemon()
+
+    assert len(binds) == 2, "the hub must bind again and keep serving, not exit"
+    out = capsys.readouterr().out
+    assert "update restart failed" in out, "a hub that quietly failed its update reads as one that died"
+
+
+def test_a_failed_update_restart_takes_the_lock_back(tmp_path, monkeypatch, capsys):
+    """The lock is handed over before spawning the replacement so the two do not deadlock. When
+    the replacement never arrives it has to be taken BACK: serving on without it let the next
+    `agitrack -d` walk in through a free lock and start a second hub on a second port."""
+    binds, calls, _ = _drive_hub(monkeypatch, spawn=lambda: None)
+
+    with pytest.raises(_StopTheLoop):
+        hub.run_hub_daemon()
+
+    # Startup acquire, hand-over release, then the take-back before serving again.
+    assert calls == ["acquire", "release", "acquire"]
+
+
+def test_a_spawn_that_raises_is_not_how_the_dashboard_dies(tmp_path, monkeypatch, capsys):
+    # `_spawn_hub` answers None for the OSError it expects; anything else it raises used to come
+    # straight out of the daemon's loop and end the process.
+    def explode():
+        raise RuntimeError("no fork for you")
+
+    binds, _calls, _ = _drive_hub(monkeypatch, spawn=explode)
+
+    with pytest.raises(_StopTheLoop):
+        hub.run_hub_daemon()
+
+    assert len(binds) == 2
+
+
+def test_a_late_successor_makes_the_old_hub_stand_down(tmp_path, monkeypatch, capsys):
+    """The other half of taking the lock back: if a replacement DID come up, just later than the
+    verification window, it holds the lock and is the hub now. Serving on beside it would be the
+    two-hub state all over again, so this one exits instead."""
+    binds, calls, _ = _drive_hub(
+        monkeypatch,
+        spawn=lambda: None,
+        acquire_results=[True, False],  # startup succeeds; the take-back finds the successor
+    )
+
+    assert hub.run_hub_daemon() == 0  # a clean exit, not an exception and not a second bind
+
+    assert len(binds) == 1
+    assert "exiting rather than serving beside it" in capsys.readouterr().out

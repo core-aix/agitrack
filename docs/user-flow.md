@@ -88,7 +88,7 @@ flowchart TD
   mode -->|"No, and a terminal is attached"| menu[/"Mode menu: arrow keys, Enter.<br/>background+auto is the default;<br/>each row shows the command it stands for"/]
   menu -->|"q / Ctrl-C"| quit
   menu -->|"Chooses a mode"| priv
-  mode -->|"stop"| stopcmd[["agitrack stop: stop the background tracker,<br/>any interactive session, and this repo's dashboard"]]
+  mode -->|"stop"| stopcmd[["agitrack stop: stop the background tracker,<br/>any interactive session, and this repo's dashboard,<br/>and record that tracking is off from now"]]
   stopcmd --> quit
   mode -->|"-i / -b / -d / --backtrace / -s / a prompt,<br/>or no terminal to ask on"| priv
 
@@ -117,8 +117,13 @@ flowchart TD
 
   updchk[["Startup update check, TTY-gated, short network timeout"]] --> updq{"aGiTrack update available and checks enabled?"}
   updq -->|Yes| updoffer[/"Offer to update now, see Self-update"/]
-  updq -->|No, non-TTY, or disabled| sess
-  updoffer --> sess
+  updq -->|No, non-TTY, or disabled| gap
+  updoffer --> gap
+
+  gap{"Was tracking stopped with agitrack stop and not restarted since?"}
+  gap -->|Yes| gapclose[["Stamp the moment tracking resumed. Turns prompted before it<br/>are never written into a commit message (see Stopping and restarting)"]]
+  gapclose --> sess
+  gap -->|No| sess
 
   sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> dash
 
@@ -573,6 +578,7 @@ flowchart TD
   pkg --> ok
   ok -->|Yes| reexec[["Re-exec python -m agitrack so the new code loads"]]
   ok -->|No| failnotice[["Never crashes: record the target version, show a single manual-update reminder next startup; keep running current version"]]
+  failnotice --> daemonfail[["A DAEMON that failed to hand over to its replacement keeps serving on the old version,<br/>takes its lock back, and says so. It stands down only if the replacement<br/>turned up late and now holds the lock"]]
   reexec --> done2(["Updated"])
   failnotice --> done2
 ```
@@ -624,6 +630,63 @@ flowchart TD
 ```
 
 **Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
+
+---
+
+## 10a. Stopping and restarting (`agitrack stop`)
+
+`agitrack stop` is scoped to one repository and takes down everything aGiTrack is running for
+it: the background tracker, any interactive session, and this repo's dashboard view. It also
+disarms the auto-start hooks, so the next commit does not quietly bring the tracker back.
+
+**What happens to the conversation in between.** Stopping the processes is only half of what
+"stop tracking me" means. The conversation usually carries straight on in the backend's own UI,
+writing into the very transcript file the next tracker will read, and aGiTrack's per-conversation
+watermark is persistent by design (that is what lets a crashed or self-updated tracker pick up
+exactly where it left off). So the stop is **recorded**, and the next start stamps a floor: the
+moment tracking resumed. A turn that was **prompted before that floor** is never written into a
+commit message by any mode, whatever a watermark says about it.
+
+```mermaid
+flowchart TD
+  stop(["agitrack stop"]) --> rec[["Record that tracking is off from now (.agitrack/tracking-gap.json).<br/>A repeated stop keeps the moment the stretch actually began"]]
+  rec --> kill[["Stop the tracker, any interactive session, this repo's dashboard view.<br/>Remove the auto-start hooks: the git commit hook and<br/>every backend's session hook, whatever was running"]]
+  kill --> off(["aGiTrack is off. The user keeps talking to the agent in its own UI"])
+
+  off --> hook{"An auto-start fires anyway?<br/>(a hook a backend had already loaded, one restored from dotfiles)"}
+  hook -->|Yes| refuse[["Refused. The recorded stop outranks the hook files,<br/>so nothing starts tracking on its own"]]
+  refuse --> off
+
+  off --> back(["agitrack -b or agitrack -i: the USER starts tracking again"])
+  back --> floor[["Stamp the floor: the moment tracking resumed"]]
+  floor --> pick{"For each turn the transcript offers: when was it prompted?"}
+  pick -->|"Before the floor"| skip[["Skipped. Its prompt, reply, tokens, model and capabilities<br/>reach no commit message; the watermark moves past it<br/>so it is not reconsidered on every poll"]]
+  pick -->|"At or after the floor"| keep[["Tracked exactly as before"]]
+```
+
+**What the floor deliberately does not do.** It does not hide the *file changes*: work done
+while aGiTrack was off is still sitting in the working tree and still needs committing, so the
+next commit's diff carries it as it always did. What is withheld is the conversation. It does not
+reach backwards either: turns committed before the stop stay in history, and
+[Backtrace](#13-backtrace---backtrace--reconstruct-a-history-you-didnt-track) still reconstructs
+whatever it is pointed at, because asking for that is an explicit request rather than automatic
+tracking. And it is a moment, not a mode: everything from the restart onwards is tracked
+normally.
+
+**What does not count as a restart.** Only a start you type ends the stretch. An auto-start hook
+firing is not you starting aGiTrack, so it is refused while the stop stands: removing the hooks is
+not enough on its own, because the removal cannot reach a backend that has already loaded its
+plugin. A dashboard opened on the repo mid-stretch reads history and records nothing, so it leaves
+the stretch open too. And a tracker that restarts itself (a crash, a self-update swap) is
+continuing the same tracking run rather than starting a new one, so it keeps the floor your own
+restart put there.
+
+**If a stop cannot reach something.** `agitrack stop` names any process that would not go and exits
+non-zero. Your decision still governs: while the stretch is open nothing is recorded at all, so a
+tracker that outlives the command cannot go on writing the conversation into commit messages.
+
+**Jump to:** [Background mode](#3b-background-mode---background---b) ·
+[Exit and terminal close](#10-exit-and-terminal-close)
 
 ---
 
@@ -866,6 +929,21 @@ There is **one** dashboard process for the whole machine. It binds a single port
 repository aGiTrack knows about under a path, so switching projects or views is a link rather than
 another daemon on another port. It opens by itself when aGiTrack starts on a repository, in any
 mode (`open_dashboard_on_start`).
+
+**Branches appear as soon as they land.** The branch selector offers every branch you could look
+at, including one you have only fetched: a branch someone else pushed exists as
+`origin/<name>` until you check it out, and it shows under that name until you do. A branch
+arriving does not move the branch you are currently viewing, so the page notices it by watching
+the set of branch names, not just the tip of the one on screen: pull, and it is in the dropdown on
+the next poll, with no reload and no restart.
+
+**People are identified per branch.** GitHub's commit listing covers the default branch only, so a
+contributor whose work is on the branch you just pulled used to show under their raw git name
+instead of their GitHub ID, and filtering by that ID found none of their commits. The branch you
+are viewing is now looked up as well, so the same person is one person on every branch. It resolves
+in the background: the first paint labels people from their email and their IDs settle a moment
+later. Someone whose commit email is linked to no GitHub account keeps their git name, which is
+all there is to know about them.
 
 ```mermaid
 flowchart TD

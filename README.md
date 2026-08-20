@@ -1,5 +1,9 @@
 # aGiTrack
 
+[![License](https://img.shields.io/github/license/core-aix/agitrack?color=blue)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/agitrack?color=blue)](https://pypi.org/project/agitrack/)
+[![Downloads](https://img.shields.io/pepy/dt/agitrack?color=blue)](https://pepy.tech/project/agitrack)
+
 aGiTrack stands for *agent + git tracking*. It's a command-line tool that runs an AI coding agent for you and turns each change the agent makes into a git commit automatically — with a record of what you asked, what the agent did, and how many tokens it used. You get a clean, reviewable git history of the AI's work without committing anything by hand.
 
 You can use **Claude (Claude Code)**, **Codex (OpenAI's Codex CLI)** or **OpenCode** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with any of them. Support for more agents is planned.
