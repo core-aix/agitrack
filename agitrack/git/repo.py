@@ -978,6 +978,44 @@ class GitRepo:
     def remote_exists(self, name: str = "origin") -> bool:
         return name in self._run(["git", "remote"], check=False).stdout.split()
 
+    def remote_names(self) -> list[str]:
+        """Every configured remote, in git's own order (``origin`` first in a normal clone)."""
+        return self._run(["git", "remote"], check=False).stdout.split()
+
+    def remote_head_branches(self, remote: str = "origin", *, timeout: float = 20.0) -> set[str] | None:
+        """The branch names ``remote`` currently HAS, or None when it could not be asked.
+
+        This is the only way to learn that a branch was DELETED upstream. Git never removes a
+        remote-tracking ref on a plain ``git fetch`` — only ``--prune`` does — so a repository
+        accumulates ``refs/remotes/origin/*`` for branches that were merged and deleted months
+        ago, and anything listing those refs is listing branches that no longer exist.
+
+        None (not an empty set) is the answer for "could not ask": no such remote, offline, a
+        credential we do not have, a stalled connection. The caller must treat that as "I know
+        nothing about this remote" and leave its branches alone — hiding a branch because the
+        network was down would be a worse failure than showing a stale one.
+
+        ``GIT_TERMINAL_PROMPT=0`` so a remote needing credentials fails fast instead of blocking
+        on a prompt no one is there to answer, and the timeout bounds a connection that hangs:
+        this runs on a background refresh for a page that must stay responsive."""
+        try:
+            result = self._run(
+                ["git", "ls-remote", "--heads", "--quiet", remote],
+                check=False,
+                env={"GIT_TERMINAL_PROMPT": "0"},
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        names: set[str] = set()
+        for line in result.stdout.splitlines():
+            _sha, _, ref = line.partition("\t")
+            if ref.startswith("refs/heads/"):
+                names.add(ref[len("refs/heads/") :].strip())
+        return names
+
     def fetch_ref(
         self,
         refspec: str,

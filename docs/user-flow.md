@@ -937,6 +937,13 @@ arriving does not move the branch you are currently viewing, so the page notices
 the set of branch names, not just the tip of the one on screen: pull, and it is in the dropdown on
 the next poll, with no reload and no restart.
 
+**And they disappear when they are deleted.** Git leaves `origin/<name>` behind forever unless you
+fetch with `--prune`, so the list would otherwise fill with branches that were merged and removed
+long ago. aGiTrack asks the remote which branches it still has, in the background and at most
+every few minutes, and drops the rest from the dropdown. It never deletes anything: your refs stay
+exactly as git left them, only the list is filtered. If the remote cannot be reached, nothing is
+hidden, because a branch missing because your network was down is worse than a branch that lingers.
+
 **People are identified per branch.** GitHub's commit listing covers the default branch only, so a
 contributor whose work is on the branch you just pulled used to show under their raw git name
 instead of their GitHub ID, and filtering by that ID found none of their commits. The branch you
