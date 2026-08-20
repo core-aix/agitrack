@@ -375,3 +375,58 @@ def test_switching_with_no_model_pin_says_nothing():
 
     assert runner._backend_args == ["--verbose"]
     assert messages == []
+
+
+def _has_autotrack_hook(repo: GitRepo) -> bool:
+    return git_hooks.is_autotrack_hook(_hooks_dir(repo) / "pre-commit")
+
+
+def test_a_noworktree_run_does_not_leave_autostart_on_in_a_repo_that_had_it_off(tmp_path):
+    # The persistent pre-commit hook has two jobs: fold this run's AI work into a later commit,
+    # and AUTO-START a background tracker on the next one. Leaving it behind in a repo that had
+    # none means an interactive session quietly turned auto-start on: a standing preference,
+    # decided for the user, by a command that says nothing about it. Same rule the backends'
+    # session-start hooks already follow (test_agent_session_hooks.py).
+    runner, repo, _ = _mode_runner(tmp_path, use_worktrees=False, manual=False)
+    assert not _has_autotrack_hook(repo)
+
+    _slate_clean_and_install(runner)
+    assert _has_autotrack_hook(repo)  # armed for THIS run's own commits
+    # ...so the exit prompt must not promise a later fold through a hook about to be removed.
+    assert runner._autotrack_hook_will_survive_exit() is False
+
+    runner._teardown_manual_commit_mode()
+    assert not _has_autotrack_hook(repo)
+
+
+def test_a_noworktree_run_never_uninstalls_an_autostart_the_user_already_had(tmp_path):
+    # The mirror image, and the half that matters more: these hooks OUTLIVE aGiTrack by design,
+    # so a session must not be what takes one away either.
+    from agitrack.proc import agitrack_invocation
+
+    runner, repo, _ = _mode_runner(tmp_path, use_worktrees=False, manual=False)
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(repo.repo), version="0.0.0"
+    )
+
+    _slate_clean_and_install(runner)
+    assert runner._autotrack_hook_will_survive_exit() is True
+
+    runner._teardown_manual_commit_mode()
+    assert _has_autotrack_hook(repo)
+
+
+def test_the_startup_stale_hook_sweep_never_removes_a_preexisting_autostart(tmp_path):
+    # `_reset_hook_slate` tears down BEFORE it sets up, to clear hooks a crashed run left behind.
+    # That first teardown must not touch the pre-commit slot: no setup has recorded what was
+    # there, so it cannot tell giving the slot back from stealing it.
+    from agitrack.proc import agitrack_invocation
+
+    runner, repo, _ = _mode_runner(tmp_path, use_worktrees=False, manual=False)
+    git_hooks.install_autotrack_precommit_hook(
+        repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(repo.repo), version="0.0.0"
+    )
+
+    runner._teardown_manual_commit_mode()  # the startup sweep, before any setup
+
+    assert _has_autotrack_hook(repo)

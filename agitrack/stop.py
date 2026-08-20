@@ -38,31 +38,62 @@ def stop_everything(repo: GitRepo, *, assume_yes: bool = False) -> int:
     holds is not an error. Exit 1 means something was asked to stop and would not.
     """
     from agitrack.metrics.collect import _abbreviate_home
+    from agitrack.proxy.background import UNTRACKED_FROM_NOW_NOTE
 
     where = _abbreviate_home(str(repo.repo))
     acted: list[str] = []
     survivors: list[str] = []
 
+    # Record the untracked stretch FIRST, and from here rather than only from the tracker's own
+    # stop path: `stop` is the whole intention, and it means the same thing whether or not a
+    # tracker happened to be up to receive it. The conversation almost always carries on in the
+    # backend's own UI afterwards, writing into the very transcript the next tracker will read;
+    # this is what keeps those turns out of the commit messages it writes (see
+    # agitrack.tracking_gap). Marking is idempotent within one gap, so the tracker teardown
+    # below marking again does not move the moment the gap began.
+    _mark_untracked_from_now(repo)
+
     acted += _stop_background_tracker(repo, survivors)
     acted += _stop_sessions(repo, survivors, assume_yes=assume_yes)
     acted += _stop_views(repo, survivors)
 
+    # ALWAYS, whatever was or was not running. The auto-start hooks are the thing that undoes a
+    # stop, so removing them is not a tidy-up that only a tracker teardown owes: a tracker that
+    # died without tearing down leaves them armed, and so does one that was never up while a
+    # dashboard or an interactive session was. That last case used to skip the disarm entirely
+    # (it hung off the "nothing was running" branch, which a running dashboard makes false), so
+    # `agitrack stop` reported success on a repo whose OpenCode plugin and git hooks were still
+    # armed to start a tracker on the next agent session or commit. Reported and reproduced.
+    # `_disarm_tracking` is idempotent and answers "was anything armed", so calling it after the
+    # tracker's own stop path already ran is silent.
+    disarmed = _disarm(repo)
+
     if not acted and not survivors:
         print(f"aGiTrack is not running on {where}.")
-        # The tracker may have died without tearing down (a crashed daemon, a killed terminal),
-        # leaving the auto-start hooks armed to bring it back on the next commit. "Not running"
-        # and "will start itself again in a moment" are not the same state, so disarm either way.
-        _disarm(repo)
-        return 0
-
-    print(f"Stopped aGiTrack on {where}:")
-    for line in acted:
-        print(f"  • {line}")
-    for line in survivors:
-        # Named rather than force-killed: a wedged daemon is a smaller problem than one killed
-        # mid-write of its handshake or state.
-        print(f"  ! {line}")
+    else:
+        print(f"Stopped aGiTrack on {where}:")
+        for line in acted:
+            print(f"  • {line}")
+        if disarmed:
+            print("  • auto-start hooks (the git commit hook and the backends' session hooks)")
+        for line in survivors:
+            # Named rather than force-killed: a wedged daemon is a smaller problem than one killed
+            # mid-write of its handshake or state.
+            print(f"  ! {line}")
+    if disarmed:
+        print("Auto-start is off for this repo until you run `agitrack -b` (or `agitrack -i`) again.")
+    print(UNTRACKED_FROM_NOW_NOTE)
     return 1 if survivors else 0
+
+
+def _mark_untracked_from_now(repo: GitRepo) -> None:
+    """Best-effort: a gap record that cannot be written must not stop the stop."""
+    from agitrack import tracking_gap
+
+    try:
+        tracking_gap.mark_stopped(repo.repo)
+    except Exception:
+        pass
 
 
 def _stop_background_tracker(repo: GitRepo, survivors: list[str]) -> list[str]:
@@ -152,15 +183,17 @@ def _stop_views(repo: GitRepo, survivors: list[str]) -> list[str]:
     return stopped
 
 
-def _disarm(repo: GitRepo) -> None:
-    """Best-effort removal of the hooks that would restart tracking on the next commit."""
+def _disarm(repo: GitRepo) -> bool:
+    """Remove every hook that would start tracking again: the git ``pre-commit`` auto-track hook
+    and each backend's session-start hook (Claude and Codex settings entries, the OpenCode
+    plugin). Returns whether anything was armed. Best-effort: a hook that will not come off must
+    not fail the stop, and the recorded stop refuses an auto-start regardless."""
     try:
         from agitrack.proxy.background import _disarm_tracking
 
-        if _disarm_tracking(repo):
-            print("Auto-start is off for this repo until you run `agitrack -b` (or `agitrack -i`) again.")
+        return bool(_disarm_tracking(repo))
     except Exception:
-        pass
+        return False
 
 
 def _wait_for_exit(pid: int) -> bool:

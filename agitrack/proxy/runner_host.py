@@ -113,6 +113,7 @@ class RunnerHost:
         _cwd_drift_checked: bool
         _manual_last_head: str | None
         _manual_hooks_installed: bool
+        _autotrack_hook_preexisting: bool | None
         _update_check_at: float
         _update_offered: bool
         _update_pending: bool

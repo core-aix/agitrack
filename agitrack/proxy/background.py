@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from agitrack import __version__
+from agitrack import __version__, tracking_gap
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
@@ -121,6 +121,11 @@ def stop_background(repo: GitRepo) -> int:
     # Read the daemon's record BEFORE terminating it: on POSIX its own teardown deletes the
     # handshake, and the `--log-file` it was started with lives nowhere else.
     running = _read_handshake(repo) or {}
+    # Open the untracked stretch from HERE, before the tracker is asked to go: the user has
+    # already decided, and marking first means a stop that then fails to reach a wedged daemon
+    # still leaves the record that the next start reads. Marking is idempotent within one gap,
+    # so `agitrack stop` calling through to here does not move the moment it began.
+    tracking_gap.mark_stopped(repo.repo)
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
         _disarm_tracking(repo)  # a tracker that died without tearing down may have left it armed
@@ -153,7 +158,14 @@ def stop_background(repo: GitRepo) -> int:
     print("Stopped the aGiTrack background tracker.")
     if disarmed:
         print("Auto-start is off for this repo until you run `agitrack -b` again.")
+    print(UNTRACKED_FROM_NOW_NOTE)
     return 0
+
+
+# Said by every command that switches tracking off, so the guarantee is stated wherever the
+# decision is made. The stretch until the next start is the user's own: its conversation is
+# never quoted into a commit message (see agitrack.tracking_gap).
+UNTRACKED_FROM_NOW_NOTE = "Conversations from now until you start aGiTrack again stay out of commit messages."
 
 
 def _emit_stop_event(repo: GitRepo, *, log_file: str | None = None) -> None:
@@ -651,6 +663,12 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     needless teardown is what made the tracker appear to "quit" whenever aGiTrack was invoked again
     for an unrelated reason. A run asking for the OTHER commit mode still replaces it, so
     ``agitrack -b -m`` over an auto-commit daemon really does switch modes."""
+    # THE user start. This is the one background entry point a person types, so it is the one
+    # that ends a stretch `agitrack stop` opened (an auto-start hook is not the user starting
+    # aGiTrack, and refuses while the stop stands). Before the spawn, so the daemon never runs a
+    # poll cycle without the floor in place, and before the already-running early return, so
+    # `agitrack -b` over a tracker that somehow survived the stop still means "track from now".
+    _resume_tracking_for(repo)
     # The launcher always forwards one of these two, so the requested commit mode is unambiguous.
     manual: bool | None = None
     if "--manual-commits" in extra_args:
@@ -703,6 +721,32 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
 _AGENT_AUTOSTART_HANDSHAKE_SECONDS = 5.0
 
 
+def _resume_tracking_for(repo: GitRepo) -> None:
+    """End a stretch `agitrack stop` opened, best-effort. Called only from a start a PERSON asked
+    for; a gap record that cannot be written must never keep a tracker from starting."""
+    try:
+        if tracking_gap.resume_tracking(repo.repo) is not None:
+            print("\nTracking again. Turns from while aGiTrack was stopped stay out of commit messages.")
+    except Exception:
+        pass
+
+
+def _stop_still_stands(repo: GitRepo) -> bool:
+    """Whether `agitrack stop` is still in force here, so nothing may start tracking on its own.
+
+    `stop` already promises auto-start is off "until you run `agitrack -b` (or `agitrack -i`)
+    again", and removing the hooks is not enough on its own to keep it: the removal cannot reach a
+    backend that has ALREADY loaded its plugin (an OpenCode server outliving the agent command
+    that started it puts a tracker back within seconds of the stop, measured), and a hook file
+    the user restores from their dotfiles arms it again. The recorded stop is the authority the
+    hook files are not. Errs toward starting: a record that cannot be read must not leave a repo
+    untracked forever."""
+    try:
+        return tracking_gap.gap_is_open(repo.repo)
+    except Exception:
+        return False
+
+
 def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
     """Every reason NOT to auto-start a tracker for ``repo``, and the arguments to start one
     with when none of them applies. ``None`` means "leave it alone".
@@ -721,6 +765,8 @@ def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
     config.load_repo_overlay(repo.repo)
     if config.autotrack_hook == "off":
         return None
+    if _stop_still_stands(repo):
+        return None  # the user stopped aGiTrack here and has not started it again
     if _live_background_pid(repo) is not None:
         return None  # already tracking
     from agitrack.git import RepoLock
@@ -890,7 +936,7 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     # self-sustaining dead state — the tracker stops once and no number of later commits brings
     # it back, which is exactly what was observed. Whether THIS commit carries AI work and
     # whether a tracker should be running from now on are different questions.
-    if config.autotrack_hook != "off" and _live_background_pid(repo) is None:
+    if config.autotrack_hook != "off" and not _stop_still_stands(repo) and _live_background_pid(repo) is None:
         # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
         # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
         # same commit mode as the last run; the *starting* commit is manual regardless.
@@ -1052,6 +1098,7 @@ class BackgroundRunner:
         # silently strips its '# Interaction Trace' / '# aGiTrack Metadata' headings.
         self.repo.ensure_comment_char_preserves_headings()
         write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
+        self._report_open_stop()
         self._load_tracked_head()  # persistent coverage watermark (survives restarts)
         self._clear_stale_worktree_guard()
         self._manual.setup()
@@ -1153,6 +1200,27 @@ class BackgroundRunner:
             self._manual.setup()
             self._install_autotrack_hook()
             self._write_handshake()
+
+    def _report_open_stop(self) -> None:
+        """Say so when this tracker is running with the user's stop still standing.
+
+        Ending the stretch is NOT done here: this same entry point serves a daemon the user
+        launched and a daemon a hook launched, and only the first is "the user starting aGiTrack
+        again". `start_background_daemon` (the `agitrack -b` path) closes it before spawning us,
+        so reaching here with it still open means something started tracking on its own. Auto-start
+        refuses while a stop stands, so this should be unreachable; if it happens anyway, the
+        user's decision still governs (no turn is recorded) and the log says why rather than
+        leaving a tracker that silently commits nothing."""
+        try:
+            if not tracking_gap.gap_is_open(self.repo.repo):
+                return
+        except Exception as error:  # a gap record must never keep a tracker from starting
+            self._debug(f"stop-record lookup failed: {error!r}")
+            return
+        self._print(
+            "aGiTrack was stopped on this repo and has not been started again, so no conversation "
+            "is being recorded. Run `agitrack -b` to start tracking."
+        )
 
     def _clear_stale_worktree_guard(self) -> None:
         """Drop a worktree base-commit guard left in the base repo by a crashed WORKTREE run.
