@@ -578,6 +578,7 @@ flowchart TD
   pkg --> ok
   ok -->|Yes| reexec[["Re-exec python -m agitrack so the new code loads"]]
   ok -->|No| failnotice[["Never crashes: record the target version, show a single manual-update reminder next startup; keep running current version"]]
+  failnotice --> daemonfail[["A DAEMON that failed to hand over to its replacement keeps serving on the old version,<br/>takes its lock back, and says so. It stands down only if the replacement<br/>turned up late and now holds the lock"]]
   reexec --> done2(["Updated"])
   failnotice --> done2
 ```
