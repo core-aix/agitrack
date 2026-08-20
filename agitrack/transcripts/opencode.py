@@ -18,6 +18,7 @@ from agitrack.fileio import safe_is_dir
 # ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
 # names must already exist here or that cycle fails when opencode is the first module imported.
 from agitrack.transcripts import capabilities
+from agitrack.transcripts.shell_edits import edits_from_shell
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 from agitrack.transcripts.edits import (
     content_from_read_output,
@@ -662,6 +663,9 @@ def parse_exported_session(
     # Per-session running content of each edited file, so each edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
+    # The directory the session ran in. OpenCode's edit/write tools record absolute paths but its
+    # `bash` tool's commands are relative to this, and both must key `file_state` the same way.
+    session_directory = str(info.get("directory") or "")
 
     def flush() -> None:
         nonlocal compactions
@@ -675,6 +679,7 @@ def parse_exported_session(
             file_state=file_state,
             mcp_servers=mcp_servers,
             active_skills=turn_skills,
+            directory=session_directory,
         )
         # Skills this turn LOADED (the tail past the opening snapshot) carry forward even if the
         # turn also compacted; ones it merely inherited are already in the roster, or were cleared.
@@ -748,6 +753,7 @@ def _build_turn(
     file_state: dict[str, str] | None = None,
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
     active_skills: list[str] | None = None,
+    directory: str = "",
 ) -> SessionTurn | None:
     # `active_skills` is the session's live skill roster (see `parse_exported_session`): the turn
     # starts with everything already loaded, and anything it loads itself is added back for the
@@ -779,7 +785,9 @@ def _build_turn(
         model = _model_name(assistant_info) or model
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
-            edits.extend(_edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}))
+            edits.extend(
+                _edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}, cwd=directory)
+            )
         _collect_capabilities(assistant.get("parts"), tool_names, subagents, skills)
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
@@ -872,11 +880,17 @@ def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[
             subagents.append(agent.strip())
 
 
-def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdit]:
+def _edits_from_parts(parts: object, file_state: dict[str, str], *, cwd: str = "") -> list[FileEdit]:
     """The file edits in an assistant message's ``tool`` parts (OpenCode's edit / write /
-    patch tools), reconstructed from each call's input — used by the backtrace exporter.
-    Non-editing tools (read, bash, webfetch, …) are ignored. ``file_state`` (per session,
-    mutated) tracks each file's current content so each edit's diff is the incremental change."""
+    patch / bash tools), reconstructed from each call's input — used by the backtrace exporter.
+    ``file_state`` (per session, mutated) tracks each file's current content so each edit's diff
+    is the incremental change.
+
+    ``bash`` is read through :func:`agitrack.transcripts.shell_edits.edits_from_shell`: a heredoc
+    or `sed -i` run there changes the repository exactly as the `write` tool does, and counting
+    only the editing tools reported a fraction of the session's real lines. ``cwd`` is the
+    session's directory, which resolves those commands' relative paths onto the same keys the
+    editing tools' absolute ones use."""
     if not isinstance(parts, list):
         return []
     out: list[FileEdit] = []
@@ -889,6 +903,9 @@ def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdi
         inp = raw_input if isinstance(raw_input, dict) else {}
         path = inp.get("filePath") or inp.get("file_path") or inp.get("path") or ""
         if not isinstance(path, str):
+            continue
+        if tool == "bash":
+            out.extend(edits_from_shell(file_state, str(inp.get("command") or inp.get("cmd") or ""), cwd=cwd))
             continue
         if tool == "read":
             # The read's output is the file's pre-existing content: seed it so a later whole-file

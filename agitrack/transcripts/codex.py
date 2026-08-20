@@ -33,6 +33,7 @@ from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 from agitrack.transcripts import capabilities as caps
 from agitrack.transcripts.edits import merge_edits_by_path, tracked_edit
+from agitrack.transcripts.shell_edits import edits_from_shell
 from agitrack.transcripts.types import (
     SUBAGENT_LIVE_HORIZON_SECONDS,
     ExportedSession,
@@ -417,6 +418,78 @@ def _tool_name(payload: dict) -> str:
     return name.strip() if isinstance(name, str) else ""
 
 
+# Codex spells "run a shell command" three ways, and only the first is a plain tool call:
+# `exec_command` (a function_call whose JSON arguments carry `cmd`/`workdir`), the older
+# `shell`/`local_shell` (whose `command` is an argv LIST, e.g. ["bash","-lc","sed -i ..."]),
+# and `exec` — a custom_tool_call whose input is JAVASCRIPT that calls
+# `tools.exec_command({cmd:"...", workdir:"..."})`. The last is the shape the current sandbox
+# uses, so reading only the first two recovered nothing from a modern rollout.
+_JS_EXEC_CALL = re.compile(r"tools\.exec_command\s*\(\s*\{(?P<body>.*?)\}\s*\)", re.S)
+_JS_FIELD = re.compile(
+    r"""["']?(?P<key>cmd|command|workdir)["']?\s*:\s*(?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"""
+)
+_SHELL_TOOLS = frozenset({"exec_command", "shell", "local_shell", "container.exec"})
+
+
+def _shell_commands(name: str, payload: dict) -> list[tuple[str, str]]:
+    """Every ``(command, workdir)`` a tool call would run in a shell.
+
+    A list rather than one pair because a single ``exec`` script may drive several commands.
+    Empty for any tool that is not a shell, and for a call whose arguments cannot be read —
+    an unreadable command is recovered as nothing, never guessed at.
+    """
+    if name in _SHELL_TOOLS:
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, str):
+            return []
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(parsed, dict):
+            return []
+        command = parsed.get("cmd") or parsed.get("command") or ""
+        if isinstance(command, list):
+            # An argv list: the script is the last word of a `bash -lc <script>` style call,
+            # and a bare argv (["ls","-la"]) rejoins to the same text a shell would have run.
+            command = (
+                str(command[-1])
+                if len(command) > 2 and command[0] in ("bash", "sh", "zsh")
+                else " ".join(str(word) for word in command)
+            )
+        workdir = parsed.get("workdir") or parsed.get("cwd") or ""
+        return [(str(command), str(workdir) if isinstance(workdir, str) else "")]
+    if name != "exec":
+        return []
+    source = payload.get("input")
+    if not isinstance(source, str):
+        return []
+    out: list[tuple[str, str]] = []
+    for call in _JS_EXEC_CALL.finditer(source):
+        fields = {match.group("key"): match.group("value") for match in _JS_FIELD.finditer(call.group("body"))}
+        raw = fields.get("cmd") or fields.get("command")
+        if not raw:
+            continue
+        command = _js_string(raw)
+        if command is None:
+            continue
+        workdir = _js_string(fields.get("workdir") or '""') or ""
+        out.append((command, workdir))
+    return out
+
+
+def _js_string(literal: str) -> str | None:
+    """A JavaScript string literal as its value. JSON decodes double-quoted ones exactly; a
+    single-quoted one is re-quoted first, since JS allows what JSON does not."""
+    try:
+        if literal.startswith("'"):
+            literal = '"' + literal[1:-1].replace('"', '\\"') + '"'
+        value = json.loads(literal)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
 def _patch_edits(payload: dict, file_state: dict[str, str]) -> list[FileEdit]:
     """File edits from a ``patch_apply_end`` event.
 
@@ -538,6 +611,10 @@ def parse_rows(
     """
     turns: list[SessionTurn] = []
     file_state: dict[str, str] = {}
+    # The directory the rollout ran in, from its `session_meta` header. Codex's `apply_patch`
+    # names absolute paths, but a shell command's are relative to this, and the two must land on
+    # the SAME key in `file_state` or one file is tracked (and counted) twice.
+    rollout_cwd = str(_session_meta(rows).get("cwd") or "")
     current: dict | None = None
     # Ids of message records already counted, so a rollout that repeats a record (Codex writes
     # both an `event_msg` and a mirrored `response_item` for each assistant message) never
@@ -600,6 +677,12 @@ def parse_rows(
             if name:
                 current["tool_names"].append(name)
                 _classify_tool(name, payload, current)
+            if collect_edits:
+                # Codex edits through the shell as readily as through `apply_patch`, and a
+                # `sed -i` or `cat` heredoc leaves no FileChange record — so without this the
+                # backtrace showed only the patches (see transcripts.shell_edits).
+                for command, workdir in _shell_commands(name, payload):
+                    current["edits"].extend(edits_from_shell(file_state, command, cwd=workdir or rollout_cwd))
             continue
 
         if payload_kind == "patch_apply_end":

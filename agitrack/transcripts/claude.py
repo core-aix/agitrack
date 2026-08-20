@@ -14,6 +14,7 @@ from agitrack.fileio import safe_is_dir
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts import capabilities
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
+from agitrack.transcripts.shell_edits import edits_from_shell
 from agitrack.transcripts.types import (
     SUBAGENT_LIVE_HORIZON_SECONDS,
     ExportedSession,
@@ -1540,7 +1541,10 @@ def parse_rows(
                 # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
                 # so they land on the same SessionTurn the conversation trace does.
-                current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
+                recorded_cwd = row.get("cwd")
+                current.setdefault("edits", []).extend(
+                    _edits_from_message(message, file_state, cwd=recorded_cwd if isinstance(recorded_cwd, str) else "")
+                )
                 pending_reads.update(_whole_file_reads(message))
             text = _assistant_text(message)
             if text:
@@ -1733,13 +1737,20 @@ def _seed_reads_from_result(message: dict, pending_reads: dict[str, str], file_s
             seed_file_state(file_state, path, content_from_read_output(body))
 
 
-def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileEdit]:
+def _edits_from_message(message: dict, file_state: dict[str, str], *, cwd: str = "") -> list[FileEdit]:
     """The file edits in an assistant message's ``tool_use`` blocks (Edit / Write /
-    MultiEdit), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
-    how the conversation changed files. Non-editing tools (Read, Bash, …) are ignored;
-    a tool call that produced no net change contributes nothing. ``file_state`` (per
-    session, mutated) tracks each file's current content so every edit's diff is the
-    INCREMENTAL change, not the whole file each time it is rewritten."""
+    MultiEdit / Bash), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
+    how the conversation changed files. A tool call that produced no net change contributes
+    nothing. ``file_state`` (per session, mutated) tracks each file's current content so every
+    edit's diff is the INCREMENTAL change, not the whole file each time it is rewritten.
+
+    ``Bash`` is read too, through :func:`agitrack.transcripts.shell_edits.edits_from_shell`.
+    Skipping it used to lose most of a session: Claude Code's auto mode tells the agent to edit
+    with ``sed``/heredocs rather than the editing tools, and one measured session here ran 405
+    Bash calls against 42 Edit/Write calls — the reconstruction showed 31.5% of the lines its
+    tracked commits recorded. ``cwd`` (the directory the transcript row records the command ran
+    in) resolves those shell paths to the same ABSOLUTE form the editing tools carry, so one
+    file cannot occupy two ``file_state`` slots and have its lines counted twice."""
     content = message.get("content")
     if not isinstance(content, list):
         return []
@@ -1752,6 +1763,9 @@ def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileE
         inp = raw_input if isinstance(raw_input, dict) else {}
         path = inp.get("file_path") or inp.get("filePath") or ""
         if not isinstance(path, str):
+            continue
+        if name == "Bash":
+            edits.extend(edits_from_shell(file_state, str(inp.get("command") or ""), cwd=cwd))
             continue
         if name == "Write":
             edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))
