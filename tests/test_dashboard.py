@@ -1222,7 +1222,8 @@ def test_cached_logins_serves_warm_cache_without_spawning(monkeypatch, tmp_path)
 
     repo = GitRepo.init(tmp_path)
     github._reset_cache_for_tests()
-    github._CACHE[str(repo.repo)] = (time.monotonic(), {"sha1": "octocat"})  # fresh entry
+    # Keyed by (repo, ref tip); the empty tip is the default branch's crawl.
+    github._CACHE[(str(repo.repo), "")] = (time.monotonic(), {"sha1": "octocat"})  # fresh entry
     calls = {"n": 0}
     monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
     monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))

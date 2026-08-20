@@ -786,6 +786,11 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # Which backends' session-start auto-start hooks this run took out (see
         # _displace_background_autostart). Empty when there were none to take.
         self._displaced_agent_autostart: list[str] = []
+        # Whether the PERSISTENT auto-track pre-commit hook was already armed when this run set up
+        # (see _setup_manual_commit_mode). False means WE armed it, so teardown gives the slot
+        # back rather than leaving an interactive session having turned auto-start on. None means
+        # no setup has run yet, so nothing may act on it.
+        self._autotrack_hook_preexisting: bool | None = None
         # Facts about the turn the agent is currently running, refreshed from every session
         # export (see _note_in_flight). Lets the fold trailer attribute a commit the AGENT makes
         # ITSELF before that turn ends — a turn only becomes a pending latent turn once complete.
@@ -1684,6 +1689,17 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # LAST chose — not the last one a *background* run happened to use. Without this, switching
         # to interactive auto and then committing would silently auto-start a manual-commit daemon.
         write_background_mode(self.base_repo, manual=self._manual_commits)
+        # Close any stretch a `agitrack stop` had switched tracking off for. The startup baseline
+        # below already excludes the RESUMED conversation's earlier turns, but only that one: this
+        # is what covers a conversation the user started (or switched to) while aGiTrack was off.
+        # Recorded against the base repo, so a worktree session reads the same floor.
+        try:
+            from agitrack import tracking_gap
+
+            if tracking_gap.resume_tracking(self.base_repo.repo) is not None:
+                self._debug("resumed tracking after a stop; turns from the gap stay out of commits")
+        except Exception as error:  # never let a gap record keep a session from starting
+            self._debug(f"resuming after stop failed: {error!r}")
         # Keep git's comment char off '#' for this repo, or editing one of our commit messages
         # in an EDITOR (amend, rebase -i reword) silently deletes every '# ...' heading — the
         # whole trace/metadata structure. Repo-local, idempotent, never overrides a set value.
@@ -2260,6 +2276,12 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             if self.base_repo is None or self.base_repo.core_hooks_path():
                 return False
             if getattr(self.global_config, "autotrack_hook", "auto") == "off":
+                return False
+            # ...and it is absent in a third: this session INSTALLED it into a repo that did not
+            # have it, so teardown gives the slot back (see `_teardown_manual_commit_mode`).
+            # Asking while the hook is sitting right there would answer "yes, your pending turns
+            # will fold into your next commit" about a hook that is about to be removed.
+            if self._autotrack_hook_preexisting is False:
                 return False
             return git_hooks.is_autotrack_hook(self.base_repo.hooks_dir() / "pre-commit")
         except Exception as error:

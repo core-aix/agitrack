@@ -1009,23 +1009,46 @@ def run_hub_daemon(*, host: str | None = None, port: int | None = None) -> int:
         lock.release()
         # Restart by spawn-and-verify rather than exec: a replacement running a broken update
         # could crash on startup, and an exec'd-over process has nothing left to retry with.
-        child = _spawn_hub()
-        if child is None:
-            continue  # could not spawn: keep serving on the old version rather than vanish
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            record = running_hub()
-            if record is not None and record.get("pid") != os.getpid():
-                return 0
-            if child.poll() is not None:
-                break
-            time.sleep(0.1)
-        # The replacement never came up. Reap it and serve on; the next update check retries.
         try:
-            if child.poll() is None:
-                terminate_pid(child.pid)
-        except Exception:
-            pass
+            child = _spawn_hub()
+        except Exception:  # a failed restart must never be how the dashboard dies
+            child = None
+        if child is not None:
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                record = running_hub()
+                if record is not None and record.get("pid") != os.getpid():
+                    return 0
+                if child.poll() is not None:
+                    break
+                time.sleep(0.1)
+            # The replacement never came up. Reap the corpse; the next check retries.
+            try:
+                if child.poll() is None:
+                    terminate_pid(child.pid)
+            except Exception:
+                pass
+        # TAKE THE LOCK BACK before serving again. It is what makes the hub single (see this
+        # function's docstring), and the two retry paths above used to loop straight back into
+        # `bind_scanning` without it — so after one failed update restart the hub served on
+        # holding nothing, and the next `agitrack -d` walked in through the free lock and started
+        # a SECOND hub. Two hubs then bound two ports, each serving a different subset of its own
+        # caches, with the handshake naming whichever wrote last: exactly the state the lock
+        # exists to prevent. The standalone dashboard and backtrace daemons have no such lock and
+        # so were never affected; only the hub had something to give back.
+        if not lock.acquire(retry_seconds=5.0):
+            # A successor DID come up, just later than the window above. It holds the lock and is
+            # the hub now, so stop rather than serve beside it — the same call the background
+            # tracker makes when it cannot take its repo lock back.
+            print(
+                "aGiTrack: the replacement dashboard came up after all and now holds the lock; "
+                "this one is exiting rather than serving beside it.",
+                flush=True,
+            )
+            return 0
+        # Say so. The other two daemons print this on the same path, and its absence here is why
+        # a hub that had quietly failed its update looked like a hub that stopped for no reason.
+        print("aGiTrack: update restart failed; still serving on the current version and retrying.", flush=True)
 
 
 __all__ = [

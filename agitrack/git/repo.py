@@ -670,6 +670,28 @@ class GitRepo:
         names = [line for line in output.splitlines() if line]
         return [name for name in names if name.startswith(prefix)] if prefix else names
 
+    def list_remote_branches(self) -> list[str]:
+        """Remote-tracking branches, ``remote/branch`` (e.g. ``origin/feature-x``).
+
+        Deliberately NOT part of :meth:`list_branches`: everything that CHECKS OUT, merges or
+        deletes a branch means a local one, and handing those callers a read-only remote ref
+        would be a new class of bug. Only readers want these — the dashboard, whose branch
+        selector must offer a branch the user has fetched but not checked out, because that is
+        exactly what "a new branch just landed in this repo" looks like on disk.
+
+        ``origin/HEAD`` is dropped: it is a symbolic alias for the default branch, so listing it
+        offers the same branch twice under two names."""
+        output = self._run(
+            ["git", "for-each-ref", "--format=%(refname:short)%09%(symref)", "refs/remotes/"],
+            check=False,
+        ).stdout
+        names = []
+        for line in output.splitlines():
+            name, _, symref = line.partition("\t")
+            if name and not symref:  # a symref is origin/HEAD -> origin/main; not a branch of its own
+                names.append(name)
+        return names
+
     def switch(self, branch: str, *, create: bool = False, base: str | None = None) -> None:
         command = ["git", "switch"]
         if create:

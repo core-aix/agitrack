@@ -78,12 +78,21 @@ class ManualCommitsMixin(RunnerHost):
                 )
         except Exception as error:
             self._debug(f"manual-commit hook install failed: {error!r}")
-        # Also install the PERSISTENT auto-track pre-commit hook so a commit made LATER — after
-        # this aGiTrack exits (e.g. a reboot) — still records its AI work and folds it into that
-        # commit. It defers to a live tracker (this session), so it's a no-op while we run; it earns
-        # its keep once aGiTrack is gone. The worktree base-commit guard wants the same hook slot,
-        # so a worktree run steps this one aside and restores it on teardown (see
-        # `_install_base_commit_guard`); this path is no-worktree/_latent_tracking.
+        # Also install the PERSISTENT auto-track pre-commit hook so this run's own commits fold
+        # their AI work. Whether it STAYS after exit is decided by whether it was there before:
+        # the hook auto-starts a background tracker on the next commit, so leaving one behind in a
+        # repo that had none would mean an interactive session quietly turned auto-start ON — a
+        # standing preference, decided on the user's behalf, from a command that says nothing about
+        # it. Same rule the backends' session-start hooks already follow
+        # (`_displace_background_autostart`): restore what was there, and only that. Recorded here
+        # rather than in teardown because by then the hook is always installed, so "was it there?"
+        # can no longer be asked. Tri-state: None means no setup has run, so the teardown that
+        # CLEARS stale hooks at startup (called before this) never acts on it.
+        try:
+            self._autotrack_hook_preexisting = git_hooks.is_autotrack_hook(self.base_repo.hooks_dir() / "pre-commit")
+        except Exception as error:
+            self._debug(f"autotrack hook state read failed: {error!r}")
+            self._autotrack_hook_preexisting = True  # unknown: err toward leaving it alone
         self._install_autotrack_precommit_hook()
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
@@ -124,9 +133,19 @@ class ManualCommitsMixin(RunnerHost):
         # a stale manual fold-hook left by a prior crashed no-worktree run is cleared. It only
         # removes aGiTrack's OWN marked hooks (restoring any chained user hook) and is a no-op when
         # none are installed, so calling it in any mode is safe.
+        # getattr: several tests build a ProxyRunner via __new__, so the attribute may not exist.
+        preexisting = getattr(self, "_autotrack_hook_preexisting", None)
+        self._autotrack_hook_preexisting = None
         try:
             if self.base_repo is not None and not self.base_repo.core_hooks_path():
                 git_hooks.remove_manual_commit_hooks(self.base_repo.hooks_dir(), debug=self._debug)
+                # Give the pre-commit slot back exactly as this run found it. `preexisting is
+                # False` and nothing weaker: None means no setup ran (the startup call that clears
+                # stale hooks), and True means the user already had auto-start armed, which an
+                # interactive session must never be what uninstalls.
+                if preexisting is False:
+                    git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
+                    self._debug("auto-track pre-commit hook removed: this repo did not have it before the session")
         except Exception as error:
             self._debug(f"manual-commit hook removal failed: {error!r}")
 

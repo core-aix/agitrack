@@ -31,10 +31,11 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
+from agitrack.git.repo import read_cache
 from agitrack.proc import UTF8_TEXT
 from agitrack.metrics import learn as learn_page
 from agitrack.metrics import story as story_page
-from agitrack.metrics.collect import Dashboard, build_dashboard
+from agitrack.metrics.collect import Dashboard, build_dashboard, viewable_branches
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
 from agitrack.metrics.github import cached_logins
@@ -137,6 +138,17 @@ class RepoScope:
 
     def get(self, path: str, query: dict[str, list[str]]) -> "Response | None":
         """Answer a GET, or None when this scope has no such route (a 404 at the edge)."""
+        with read_cache():
+            return self._get(path, query)
+
+    def _get(self, path: str, query: dict[str, list[str]]) -> "Response | None":
+        """The routes themselves, under one read-cache scope (see :meth:`get`).
+
+        A single request asks git the same cheap questions several times over — the branch list
+        backs the selector, the ref validator AND the cache fingerprint, and the shown ref's tip
+        is read by more than one of them. The scope is per REQUEST (and thread-local, which is
+        what makes it safe under the threading server) and the dashboard only ever reads, so
+        de-duplicating within it cannot serve a value the request itself invalidated."""
         author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
         frm, to = _int(query, "from", 0), _int(query, "to", 0)
         ref = self._ref(_str(query, "branch"))
@@ -146,7 +158,7 @@ class RepoScope:
             # history doesn't block the first paint on the git-log crunch. Warming the login
             # cache here (a background refresh) means the resolved GitHub IDs are likely ready by
             # the time the first /data poll lands, so committers show as their IDs almost at once.
-            cached_logins(self.repo)
+            cached_logins(self.repo, ref)
             return html_response(shell_html(self.repo))
         if path == "/data":
             payload = aggregates_payload(
@@ -202,7 +214,7 @@ class RepoScope:
                     stats,
                     sha_paths,
                     branch=ref if ref != "HEAD" else self.repo.current_branch(),
-                    branches=self._dashboard(ref).branches or self.repo.list_branches(),
+                    branches=self._dashboard(ref).branches or viewable_branches(self.repo),
                     repo_name=self.repo_name,
                 )
             )
@@ -217,7 +229,7 @@ class RepoScope:
             payload = learn_page.learn_state(self.repo.repo, self.repo)
             dash = self._dashboard(ref)
             payload["committers"] = sorted(dash.committers_with_lines())
-            payload["branches"] = dash.branches or self.repo.list_branches()
+            payload["branches"] = dash.branches or viewable_branches(self.repo)
             payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
             payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
             return json_response(payload)
@@ -309,17 +321,20 @@ class RepoScope:
         return stats, insights, self._browser(ref).files_payload()
 
     def _ref(self, branch: str) -> str:
-        # Only an actual local branch may be viewed: an unchecked value would be interpolated
-        # straight into ``git log <ref>``, so anything not in the branch list (an option string,
-        # a bogus name, "") falls back to HEAD.
-        return branch if branch and branch in self.repo.list_branches() else "HEAD"
+        # Only a branch this repo actually has may be viewed: an unchecked value would be
+        # interpolated straight into ``git log <ref>``, so anything not in the branch list (an
+        # option string, a bogus name, "") falls back to HEAD. `viewable_branches` is the SAME
+        # list the selector is built from — including remote-tracking branches, which is how a
+        # branch the user has fetched but not checked out becomes viewable — so the selector can
+        # never offer something this refuses.
+        return branch if branch and branch in viewable_branches(self.repo) else "HEAD"
 
     def _dashboard(self, ref: str = "HEAD") -> Dashboard:
         # cached_logins never blocks: it returns the cached GitHub identities (or {} when cold)
         # and refreshes them in the background, so polls stay fast. Resolved logins appear on a
         # later poll. {} when gh is absent. The initial / paint warms this cache so the IDs are
         # usually ready by the first /data poll.
-        logins = cached_logins(self.repo)
+        logins = cached_logins(self.repo, ref)
         # Reading the whole history is THE expensive thing this server does, and every request
         # used to do it again: a poll, a log page, the story page, and every return from /learn
         # or /story. It only changes when a ref moves, so key it on the tips we actually read
@@ -335,8 +350,16 @@ class RepoScope:
         return dash
 
     def _ref_state(self, ref: str) -> str:
-        """A cheap fingerprint of everything the dashboard reads: the branch tip and the latent
-        (manual-mode) refs. Two git plumbing calls instead of a full history walk."""
+        """A cheap fingerprint of everything the dashboard reads: the shown branch's tip, the
+        latent (manual-mode) refs, and the NAMES of every branch. Two git plumbing calls instead
+        of a full history walk.
+
+        The branch names are part of it because the dashboard carries the branch SELECTOR, and a
+        branch arriving does not move the branch being shown: fingerprinting the shown tip alone
+        served the stale selector for as long as the current branch sat still, so a freshly
+        pulled branch stayed invisible until the user happened to commit. Names, not tips — a
+        branch merely MOVING changes nothing the selector shows, and rebuilding the whole
+        history for it would be pure churn."""
         try:
             head = self.repo.rev_parse(ref)
         except Exception:
@@ -347,7 +370,11 @@ class RepoScope:
             ).stdout
         except Exception:
             latent = ""
-        return head + "|" + latent.strip()
+        try:
+            names = "\n".join(viewable_branches(self.repo))
+        except Exception:
+            names = ""
+        return head + "|" + latent.strip() + "|" + names
 
     def _browser(self, ref: str = "HEAD") -> FileBrowser:
         # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll that

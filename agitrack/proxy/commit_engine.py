@@ -67,8 +67,10 @@ from __future__ import annotations
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
+from agitrack import tracking_gap
 from agitrack.commits import build_agent_commit_message, render_interaction_trace
 from agitrack.commits.message import TRACE_EVENT_ROLE
 from agitrack.git import GitRepo
@@ -268,6 +270,44 @@ class CommitEngine:
         self._full_agent_messages = full_agent_messages
 
     # ------------------------------------------------------------------
+    # The untracked stretch (`agitrack stop` → next start)
+    # ------------------------------------------------------------------
+
+    def _tracking_floor(self) -> float | None:
+        """When tracking last resumed after a stop, or None if it never was stopped.
+
+        Read from the repo rather than carried on the engine because the engine is constructed
+        fresh per commit call and the record is written by a DIFFERENT process (the `agitrack
+        stop` the user typed). Defensive to the last: an engine built over a repo stand-in with
+        no path, or a record that will not parse, simply has no floor and changes nothing."""
+        root = getattr(self.repo, "repo", None)
+        if root is None:
+            return None
+        try:
+            return tracking_gap.tracking_floor(Path(root))
+        except Exception as error:
+            self._debug(f"tracking floor lookup failed: {error!r}")
+            return None
+
+    def _skip_untracked_turns(self, turns: list[SessionTurn]) -> None:
+        """Advance this conversation's watermark past turns from the untracked stretch, so they
+        are not re-exported and re-dropped on every poll for the rest of the conversation's life.
+
+        Anchoring is deliberately blunt compared with the commit path's: these turns will never
+        be recorded, so there is no force-capture to continue and nothing to count. Whichever id
+        the turn carries is enough to move past it, and ``marked_at`` keeps the time fallback
+        honest if a later compaction reshapes the boundary the id names."""
+        last = turns[-1]
+        mark = last.assistant_message_id or last.user_message_id
+        if not mark:
+            return
+        self.state.set_backend_message_id(
+            self.state.backend_session_id,
+            mark,
+            marked_at=(last.ended_at or last.started_at or time.time()),
+        )
+
+    # ------------------------------------------------------------------
     # Core commit pipeline
     # ------------------------------------------------------------------
 
@@ -328,6 +368,13 @@ class CommitEngine:
 
         Returns ``True`` if a commit was made, ``False`` otherwise.
         """
+        # The last gate before turns become commit-message text, so the "nothing from a stopped
+        # stretch, ever" rule is enforced where it is actually spent rather than only where the
+        # live parse selects turns. Costs one small file read per commit and normally drops
+        # nothing: the floor is unset until a `agitrack stop` has actually happened.
+        _untracked, turns = tracking_gap.split_untracked_turns(turns, self._tracking_floor())
+        if _untracked:
+            self._debug(f"dropping {len(_untracked)} turn(s) prompted while aGiTrack was stopped")
         if not turns:
             return False
         backend_commits = list(backend_commits or [])
@@ -797,6 +844,21 @@ class CommitEngine:
             last_message_id,
             marked_at=self.state.backend_message_marked_at_for(self.state.backend_session_id),
         )
+
+        # Turns the user had switched tracking OFF for (`agitrack stop`, resumed later) are not
+        # ours to record. The watermark alone cannot express that: it is persistent by design, so
+        # everything after it looks committable however long aGiTrack was down, and a conversation
+        # STARTED during the gap has no watermark at all and would export whole. Dropped here,
+        # before anything reads `all_turns` — the in-flight trailer, the trace, the token
+        # accounting and the cover path all take their input from this list. See
+        # agitrack.tracking_gap for what the floor does and does not cover.
+        untracked_turns, all_turns = tracking_gap.split_untracked_turns(all_turns, self._tracking_floor())
+        if untracked_turns:
+            debug_fn(
+                f"skipping {len(untracked_turns)} turn(s) prompted while aGiTrack was stopped "
+                f"session_id={new_session_id}"
+            )
+            self._skip_untracked_turns(untracked_turns)
 
         # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
         # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —

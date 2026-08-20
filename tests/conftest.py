@@ -89,8 +89,23 @@ def _isolate_global_config(tmp_path_factory, monkeypatch):
     passed locally but broke in CI (empty config, no default backend). Isolating it
     makes the suite behave the same on every machine and in CI. Tests that need a
     specific config still set ``AGITRACK_CONFIG_DIR`` themselves (that wins, as it
-    runs after this fixture)."""
-    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path_factory.mktemp("agitrack-config")))
+    runs after this fixture).
+
+    The config is written rather than left empty for one reason: ``check_for_updates`` must be
+    OFF. A test that starts a real background tracker starts a real update watcher with it
+    (``watch_for_update(..., self_update=True)``), and on a source checkout a self-update MERGES
+    the checkout aGiTrack is running from. In CI that is this job's own working tree: the merge
+    pulled the release commit in mid-run, so ``pyproject.toml`` advanced to the new version while
+    the already-imported ``agitrack.__version__`` stayed on the old one, and
+    ``test_source_version_matches_pyproject`` failed with the two exactly one release apart.
+    Windows only, because that job runs ~12 minutes and the POSIX ones finish inside the update
+    check's own throttle interval. ``_never_really_self_update`` was the first attempt at this and
+    cannot reach it: monkeypatch is in-process, and the tracker doing the merging is a SUBPROCESS.
+    The config dir is inherited through the environment, so switching it off here reaches every
+    process a test can start. Tests of the updater itself build their own GlobalConfig."""
+    config_dir = tmp_path_factory.mktemp("agitrack-config")
+    (config_dir / "config.json").write_text('{"check_for_updates": false}\n', encoding="utf-8")
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(config_dir))
 
 
 @pytest.fixture(autouse=True)
