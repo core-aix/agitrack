@@ -2533,9 +2533,15 @@ function wireAdvanced(){
     if(e.target.closest("#advpanel") || e.target.closest("#advbtn")) return;
     closeAdvanced();
   }, true);
-  document.addEventListener("keydown", e => {
-    if(e.key === "Escape" && !panel.hidden){ closeAdvanced(); btn.focus(); }
-  });
+  // Escape is bound to the CONTROL, never to the document: a page-wide keydown scheme is the
+  // kind nobody can discover and everybody trips over (tests/test_web_ui.py enforces this, and
+  // the story page forbids one outright). Both the panel and the button, because keydown
+  // bubbles from whatever inside the panel has focus — and the button keeps focus until the
+  // reader moves into it. A click outside already dismisses the panel, which covers the one
+  // case this cannot: focus having left the control entirely.
+  const escapes = e => { if(e.key === "Escape" && !panel.hidden){ closeAdvanced(); btn.focus(); } };
+  panel.addEventListener("keydown", escapes);
+  btn.addEventListener("keydown", escapes);
   panel.addEventListener("change", e => {
     const el = e.target.closest("[data-part]"); if(!el) return;
     const i = +el.dataset.i, part = el.dataset.part;
