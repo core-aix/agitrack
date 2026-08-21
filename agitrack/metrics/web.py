@@ -246,16 +246,13 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
         # Nothing from the self-updater: fall back to the shared per-repo marker, which an
         # install predating self-update (or a check that ran before any attempt) may carry.
         try:
-            from agitrack.update.marker import read_update_marker
+            from agitrack.update.marker import update_reminder_line
 
-            info = read_update_marker(repo.repo)
+            fallback = update_reminder_line(repo.repo)
         except Exception:
-            info = None
-        if info:
-            parts.append(
-                f"aGiTrack update available: {info.get('current', '?')} \u2192 {info.get('latest', '?')} — "
-                "run `agitrack` and choose 'update', or update via pip/pipx."
-            )
+            fallback = None
+        if fallback:
+            parts.append(fallback)
     return "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in parts)
 
 
