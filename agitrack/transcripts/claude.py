@@ -14,6 +14,7 @@ from agitrack.fileio import safe_is_dir
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts import capabilities
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
+from agitrack.transcripts.shell_edits import edits_from_shell
 from agitrack.transcripts.types import (
     SUBAGENT_LIVE_HORIZON_SECONDS,
     ExportedSession,
@@ -983,6 +984,7 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
         path.stem,
         rows,
         subagent_tokens=_subagent_token_map(path),
+        subagent_edits=_subagent_edit_map(path) if collect_edits else None,
         unmatched_subagent_time=_subagent_unmatched_mtime(path),
         subagent_activity=_subagent_activity(path),
         collect_edits=collect_edits,
@@ -1014,6 +1016,70 @@ def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:
     for agent_path in agent_files:
         out.setdefault(_subagent_tool_use_id(agent_path), TokenUsage()).add(_subagent_file_tokens(agent_path))
     return out
+
+
+def _subagent_edit_map(session_path: Path) -> dict[str | None, list[FileEdit]]:
+    """The files each sub-agent changed, keyed by the parent Task tool_use id — the edit
+    counterpart of :func:`_subagent_token_map` (Codex has had this as ``_subagent_work``).
+
+    A sub-agent's transcript is a separate file that nothing else reads: it is not a
+    conversation the user can resume, so it never appears in the session listings. Its tokens
+    were already recovered; its EDITS were not, so every file a delegated agent wrote was
+    missing from ``--backtrace`` entirely — and a turn that fanned all of its work out to
+    sub-agents looked like a turn that changed nothing at all.
+
+    Each sub-agent gets its OWN ``file_state``. Its work runs concurrently with the parent
+    turn, so there is no true ordering to share a baseline with, and an isolated one can only
+    ever miss an overlap — never corrupt the main agent's reconstruction with edits interleaved
+    at the wrong point. Delegated work is normally on files the parent is not editing, which is
+    the point of delegating it.
+    """
+    subdir = session_path.with_suffix("") / "subagents"
+    if not safe_is_dir(subdir):
+        return {}
+    try:
+        agent_files = sorted(subdir.glob("agent-*.jsonl"))
+    except OSError:
+        return {}
+    out: dict[str | None, list[FileEdit]] = {}
+    for agent_path in agent_files:
+        out.setdefault(_subagent_tool_use_id(agent_path), []).extend(_subagent_file_edits(agent_path))
+    return out
+
+
+def _subagent_file_edits(agent_path: Path) -> list[FileEdit]:
+    # One sub-agent transcript's edits, read exactly as the main transcript's are — the same
+    # editing tools AND the same shell recovery, since a sub-agent reaches for `Bash` as
+    # readily as the agent that launched it.
+    file_state: dict[str, str] = {}
+    pending_reads: dict[str, str] = {}
+    edits: list[FileEdit] = []
+    try:
+        with agent_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                message = _as_dict(row.get("message"))
+                if row.get("type") == "user":
+                    _seed_reads_from_result(message, pending_reads, file_state)
+                    continue
+                if row.get("type") != "assistant":
+                    continue
+                recorded_cwd = row.get("cwd")
+                edits.extend(
+                    _edits_from_message(message, file_state, cwd=recorded_cwd if isinstance(recorded_cwd, str) else "")
+                )
+                pending_reads.update(_whole_file_reads(message))
+    except OSError:
+        return []
+    return edits
 
 
 def _subagent_unmatched_mtime(session_path: Path) -> int | None:
@@ -1209,6 +1275,7 @@ def parse_rows(
     rows: list[dict],
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+    subagent_edits: "dict[str | None, list[FileEdit]] | None" = None,
     unmatched_subagent_time: int | None = None,
     subagent_activity: dict[str, int] | None = None,
     collect_edits: bool = False,
@@ -1540,7 +1607,10 @@ def parse_rows(
                 # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
                 # so they land on the same SessionTurn the conversation trace does.
-                current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
+                recorded_cwd = row.get("cwd")
+                current.setdefault("edits", []).extend(
+                    _edits_from_message(message, file_state, cwd=recorded_cwd if isinstance(recorded_cwd, str) else "")
+                )
                 pending_reads.update(_whole_file_reads(message))
             text = _assistant_text(message)
             if text:
@@ -1552,6 +1622,7 @@ def parse_rows(
                 current["messages"].append(text)
     flush(dangling=True)
     _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens, unmatched_subagent_time)
+    _attribute_subagent_edits(turns, tool_ids_per_turn, subagent_edits, unmatched_subagent_time)
     horizon = time.time() - _BACKGROUND_LIVE_HORIZON_SECONDS
     live_ids = sorted(
         task_id
@@ -1733,13 +1804,20 @@ def _seed_reads_from_result(message: dict, pending_reads: dict[str, str], file_s
             seed_file_state(file_state, path, content_from_read_output(body))
 
 
-def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileEdit]:
+def _edits_from_message(message: dict, file_state: dict[str, str], *, cwd: str = "") -> list[FileEdit]:
     """The file edits in an assistant message's ``tool_use`` blocks (Edit / Write /
-    MultiEdit), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
-    how the conversation changed files. Non-editing tools (Read, Bash, …) are ignored;
-    a tool call that produced no net change contributes nothing. ``file_state`` (per
-    session, mutated) tracks each file's current content so every edit's diff is the
-    INCREMENTAL change, not the whole file each time it is rewritten."""
+    MultiEdit / Bash), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
+    how the conversation changed files. A tool call that produced no net change contributes
+    nothing. ``file_state`` (per session, mutated) tracks each file's current content so every
+    edit's diff is the INCREMENTAL change, not the whole file each time it is rewritten.
+
+    ``Bash`` is read too, through :func:`agitrack.transcripts.shell_edits.edits_from_shell`.
+    Skipping it used to lose most of a session: Claude Code's auto mode tells the agent to edit
+    with ``sed``/heredocs rather than the editing tools, and one measured session here ran 405
+    Bash calls against 42 Edit/Write calls — the reconstruction showed 31.5% of the lines its
+    tracked commits recorded. ``cwd`` (the directory the transcript row records the command ran
+    in) resolves those shell paths to the same ABSOLUTE form the editing tools carry, so one
+    file cannot occupy two ``file_state`` slots and have its lines counted twice."""
     content = message.get("content")
     if not isinstance(content, list):
         return []
@@ -1752,6 +1830,9 @@ def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileE
         inp = raw_input if isinstance(raw_input, dict) else {}
         path = inp.get("file_path") or inp.get("filePath") or ""
         if not isinstance(path, str):
+            continue
+        if name == "Bash":
+            edits.extend(edits_from_shell(file_state, str(inp.get("command") or ""), cwd=cwd))
             continue
         if name == "Write":
             edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))
@@ -1801,6 +1882,34 @@ def _attribute_subagent_tokens(
         if index is None:
             index = len(turns) - 1
         turns[index].tokens.add(usage)
+
+
+def _attribute_subagent_edits(
+    turns: list[SessionTurn],
+    tool_ids_per_turn: list[set[str]],
+    subagent_edits: "dict[str | None, list[FileEdit]] | None",
+    unmatched_subagent_time: int | None = None,
+) -> None:
+    """Add each sub-agent's file edits to the turn that launched it, by the same rule its
+    tokens follow (:func:`_attribute_subagent_tokens`): matched on the Task tool_use id, else
+    the turn that was running when the sub-agent's transcript was last written.
+
+    The work belongs to the delegating turn — that is the prompt the user gave and the change
+    it produced — so the two must agree, or a turn would report a sub-agent's tokens beside
+    none of its files."""
+    if not subagent_edits or not turns:
+        return
+    for tool_id, edits in subagent_edits.items():
+        if not edits:
+            continue
+        index: int | None = None
+        if tool_id is not None:
+            index = next((i for i, ids in enumerate(tool_ids_per_turn) if tool_id in ids), None)
+        if index is None and unmatched_subagent_time is not None:
+            index = _turn_index_at_time(turns, unmatched_subagent_time)
+        if index is None:
+            index = len(turns) - 1
+        turns[index].edits.extend(edits)
 
 
 def _turn_index_at_time(turns: list[SessionTurn], when: int) -> int | None:
