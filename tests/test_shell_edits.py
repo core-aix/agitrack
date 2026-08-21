@@ -327,6 +327,37 @@ def test_a_subshell_cd_does_not_move_the_lines_after_it():
     assert sorted(state) == ["/repo/pkg/a.txt", "/repo/pkg/b.txt"]
 
 
+def test_python_invoked_by_path_is_still_python():
+    # `./.venv/bin/python - <<PY` is the same script as `python3 - <<PY`. Requiring a bare word
+    # missed every one — one measured session ran 60+ that way and reconstructed almost none.
+    _, state = _run("cat > m.py <<'EOF'\naaa\nEOF\n")
+    edits, state = _run(
+        "./.venv/bin/python - <<'PY'\nfrom pathlib import Path\np = Path(\"m.py\")\n"
+        't = p.read_text()\nt = t.replace("aaa", "bbb")\np.write_text(t)\nPY\n',
+        state,
+    )
+    assert state["/repo/m.py"] == "bbb\n" and _lines(edits) == (1, 1)
+
+
+def test_a_variable_the_command_assigns_is_expanded():
+    # `SP=/tmp/work` then `cd $SP` — naming a directory once and reusing it. The value is in the
+    # command, so treating every `$` as unknowable declined whole sessions that worked this way.
+    _, state = _run("SP=/tmp/work\ncd $SP && cat > notes.md <<'EOF'\nalpha\nEOF\n")
+    assert list(state) == ["/tmp/work/notes.md"]
+    _, state = _run("D=pkg/sub\necho hi > ${D}/f.txt")
+    assert list(state) == ["/repo/pkg/sub/f.txt"]
+
+
+def test_a_variable_the_command_never_assigns_stays_unresolvable():
+    edits, state = _run("cd $SOMETHING_ELSE && cat > x.py <<'EOF'\none\nEOF\n")
+    assert edits == [] and state == {}
+
+
+def test_a_variable_assigned_from_a_substitution_is_not_guessed():
+    edits, state = _run("SP=$(mktemp -d)\ncat > $SP/x.py <<'EOF'\none\nEOF\n")
+    assert edits == [] and state == {}
+
+
 def test_commands_apply_in_order_within_one_call():
     edits, state = _run("cat > a.txt <<'EOF'\nalpha\nEOF\nsed -i '' 's/alpha/beta/' a.txt\necho gamma >> a.txt\n")
     assert state["/repo/a.txt"] == "beta\ngamma\n"
