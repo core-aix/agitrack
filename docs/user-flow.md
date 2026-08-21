@@ -90,7 +90,11 @@ flowchart TD
   menu -->|"Chooses a mode"| priv
   mode -->|"stop"| stopcmd[["agitrack stop: stop the background tracker,<br/>any interactive session, and this repo's dashboard,<br/>and record that tracking is off from now"]]
   stopcmd --> quit
-  mode -->|"-i / -b / -d / --backtrace / -s / a prompt,<br/>or no terminal to ask on"| priv
+  mode -->|"status"| statuscmd[["agitrack status: report what is running here<br/>and in which mode (same as -s)"]]
+  statuscmd --> quit
+  mode -->|"any other bare word"| unknown[["Unknown command: name it, list the commands<br/>that exist, exit 2. Nothing is started"]]
+  unknown --> quit
+  mode -->|"-i / -b / -d / --backtrace / a prompt after --,<br/>or no terminal to ask on"| priv
 
   priv{"Privacy notice acknowledged before?"}
   priv -->|No| privask[/"Show privacy notice, ask to acknowledge"/]
@@ -224,7 +228,7 @@ commit style (auto — default — or `--manual-commits`).
 **It runs as a DETACHED daemon, like `agitrack -d`.** `agitrack -b` starts the tracker in the
 background and **returns to your shell immediately**; unlike the dashboard daemon it has **no
 owner-terminal watchdog**, so it keeps tracking after the terminal closes — stop it with
-`agitrack -b stop`. `agitrack -b status` reports whether one is running; **`agitrack --status` / `-s`**
+`agitrack -b stop`. `agitrack -b status` reports whether one is running; **`agitrack status`** (also `--status` / `-s`)
 reports the mode of whatever is tracking the repo (interactive vs background, auto/manual,
 worktree/no-worktree, or not running) and whether **auto-start on commit** is enabled. The daemon
 logs activity to `<repo>/.agitrack/background.log`, appends notable events to a user `--log-file`,
