@@ -482,7 +482,10 @@ class AgitrackShell:
             # The summary is built from ONLY the interaction trace appended to the
             # commit (the same text the commit carries), and nothing else — so
             # render it now, before clear_trace below.
-            trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+            # Redacted before the summarizer sees it — see the same call in commit_engine.py.
+            trace_text = render_interaction_trace(
+                self.state.pending_trace(), self.state.trace_turn_limit, repo_root=self.repo.repo
+            )
             commit_summary = None
             summary_metadata = None
             summarizer_model = self.state.summarization_model or self.global_config.summarization_model
@@ -520,6 +523,7 @@ class AgitrackShell:
                     summary=commit_summary,
                     summary_metadata=summary_metadata,
                     origin_event=origin_event,
+                    repo_root=self.repo.repo,
                 )
             )
             if origin_event is not None:

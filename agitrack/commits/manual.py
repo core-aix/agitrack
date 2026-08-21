@@ -219,7 +219,7 @@ class ManualCommitTracker:
             except Exception:
                 summary = None
             if summary and summary.strip():
-                body = apply_summary_to_message(body, summary)
+                body = apply_summary_to_message(body, summary, repo_root=self.repo.repo)
             bodies.append(body)
         return bodies
 
@@ -269,6 +269,7 @@ class ManualCommitTracker:
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self.pending_bodies(),
                 in_flight=self.in_flight_attribution(),
+                repo_root=self.repo.repo,
             )
             write_lf(agit_dir / "manual-pending-trailer", trailer)
         except Exception as error:
@@ -415,7 +416,7 @@ class ManualCommitTracker:
             self.render_trailer()
             return
         message = "<aGiTrack> track agent turns\n\n" + build_manual_squash_trailer(
-            agitrack_session_id=self.state.session_id, latent_bodies=bodies
+            agitrack_session_id=self.state.session_id, latent_bodies=bodies, repo_root=self.repo.repo
         )
         try:
             head_tree = self.repo.rev_parse("HEAD^{tree}")

@@ -424,6 +424,23 @@ class GlobalConfig:
         self.save()
 
     @property
+    def redact_other_repos(self) -> bool:
+        # Whether the names of the user's OTHER projects are taken out of the commit messages
+        # aGiTrack writes here (agitrack/commits/foreign.py). ON by default: a commit message is
+        # published the moment it is pushed, and a conversation that wandered into another
+        # project has no business naming it in this repository's history. Turn it OFF for a repo
+        # whose sessions legitimately talk about its siblings — a monorepo split across
+        # directories, or a tool developed alongside the project it is used on — where the
+        # redaction removes context the reader actually needs.
+        value = self._raw("redact_other_repos")
+        return True if value is None else bool(value)
+
+    @redact_other_repos.setter
+    def redact_other_repos(self, value: bool) -> None:
+        self.data["redact_other_repos"] = bool(value)
+        self.save()
+
+    @property
     def autotrack_hook(self) -> str:
         # The persistent auto-track pre-commit hook (repo-scoped). "auto" (default): install it — on
         # a `git commit` made when aGiTrack isn't running it folds the AI trace into that commit AND

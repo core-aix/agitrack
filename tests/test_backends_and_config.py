@@ -126,6 +126,15 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert "pull request" in AGENT_SYSTEM_NOTE  # pushing is allowed for PRs/CI
     assert "separate remote branch" in AGENT_SYSTEM_NOTE  # push target may differ from the worktree branch
     assert "correct that note" in AGENT_SYSTEM_NOTE  # override + fix any conflicting saved memory
+    # ...and that the agent's FINAL message is published in the commit, so it must not name
+    # projects or paths outside this repository. aGiTrack redacts the other-repo names it KNOWS
+    # (commits/foreign.py), but only the agent knows what it just looked at, and only the agent
+    # can keep a project it merely described out of the summary.
+    assert "final message" in AGENT_SYSTEM_NOTE
+    assert "outside your current working directory" in AGENT_SYSTEM_NOTE
+    # It constrains what the agent WRITES, never what it may look at: read as "do not leave this
+    # directory" it would refuse work the user asked for.
+    assert "read, run and reason about whatever the task needs" in AGENT_SYSTEM_NOTE
     # Under --no-worktree the worktree-merge clause is replaced by a clause that POSITIVELY
     # states the agent edits the checked-out branch in its current directory (so a session that
     # switched here from worktree mode isn't left ambiguous), but names no worktree PATH.
@@ -139,6 +148,7 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert "commit and the merge" not in no_wt  # the worktree merge explanation is gone
     assert "git commit" in no_wt
     assert "pull request" in no_wt  # the push allowance lives in the shared intro, so it stays
+    assert "final message" in no_wt  # the keep-it-to-this-repo clause is shared by both models
     cmd = agent.spawn_command(Path("/repo"), session_id="u1", resume=False, use_worktrees=False)
     assert cmd == ["claude", "--session-id", "u1", "--append-system-prompt", no_wt]
     # commit_guidance=False (--no-commit-guidance) omits the note entirely.

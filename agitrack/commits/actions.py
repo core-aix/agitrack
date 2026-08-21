@@ -205,7 +205,11 @@ class AgitrackActions:
                         if allow_skip
                         else f"User commit message is required — {skip_hint}."
                     )
-        self.repo.commit(build_user_commit_message(message=message, agitrack_session_id=self.state.session_id))
+        self.repo.commit(
+            build_user_commit_message(
+                message=message, agitrack_session_id=self.state.session_id, repo_root=self.repo.repo
+            )
+        )
         self.state.clear_trace()
         self._say("Created user commit.")
         return True

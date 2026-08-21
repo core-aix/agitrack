@@ -64,6 +64,25 @@ _NOTE_NOWORKTREE = (
     "memory from an earlier run told you to work inside a separate worktree directory, that does "
     "NOT apply to this session — edit the current directory directly and correct that note."
 )
+# Always included, in both models. aGiTrack records the agent's FINAL message of each turn
+# verbatim in the commit message, so whatever the agent writes there is published the moment the
+# repository is pushed — and a session that consulted another project on the machine routinely
+# names it in that summary ("this mirrors what acme-billing does"). aGiTrack redacts the names of
+# other repositories it knows about (agitrack/commits/foreign.py), but that is a backstop over a
+# list of known names: it cannot recognise a project described rather than named, a directory it
+# has never been run in, or a name too ordinary to redact safely. The agent is the one party that
+# knows what it just looked at, so it is asked directly. Deliberately constrains only what the
+# agent WRITES in that message — not what it may read, run or reason about — because an agent that
+# reads the note as "do not look outside this directory" would refuse work the user asked for.
+_NOTE_SCOPE = (
+    " One more thing about what you WRITE, not what you may do: your final message of each turn is "
+    "recorded verbatim in the commit aGiTrack creates, and published wherever this repository is "
+    "pushed. Keep that final message about THIS repository. Do not name other projects, "
+    "repositories, directories or files outside your current working directory in it — if you must "
+    'refer to them, do so generically ("another local repository", "a file elsewhere on this '
+    'machine"). You may still read, run and reason about whatever the task needs; this is only '
+    "about not publishing the rest of this machine's layout in a commit message."
+)
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 
 
@@ -108,7 +127,7 @@ def agent_system_note(
             note += _concrete_paths_clause(worktree, base_repo)
     else:
         note += _NOTE_NOWORKTREE
-    return note + _NOTE_OUTRO
+    return note + _NOTE_SCOPE + _NOTE_OUTRO
 
 
 # The note for the default (worktree) model. Kept as a constant for back-compat and the

@@ -429,6 +429,7 @@ class IntegrationService:
                 backend=backend_name,
                 backend_session_id=backend_session_id,
                 conflicting_commits=ctx_context,
+                repo_root=repo.repo,
             )
         )
         self._advance_base(repo, source_branch)

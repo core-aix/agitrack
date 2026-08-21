@@ -2273,7 +2273,7 @@ class BackgroundRunner:
         if not force and not self._fold_summary_ready(tip):
             return  # retry next cycle
         bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
-        message = build_auto_fold_message(bodies)
+        message = build_auto_fold_message(bodies, repo_root=self.repo.repo)
         if not message:
             return
         try:
