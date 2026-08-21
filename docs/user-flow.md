@@ -993,12 +993,23 @@ flowchart TD
   act -.->|"header repo selector,<br/>keeps view and page"| other["another repo's same page"]
 ```
 
-**Routes.** `/` redirects to the repository you used last, in the view that fits it.
+**Routes.** `/` redirects to the repository you used last that the switcher still offers, in the
+view that fits it.
 `/r/<slug>/…` is a repository's tracked dashboard and `/b/<slug>/…` its backtrace; each serves the
 same sub-paths a standalone daemon would (`data`, `log`, `diff`, `files`, `learn`, `story`, …),
 because every page fetches with **relative** URLs. `/repos` is what the header's switcher is built
 from. A mount reached without its trailing slash redirects, so the address bar and the page's own
 relative links never disagree.
+
+**Which repositories the selector offers.** The ones aGiTrack is doing something for, or would:
+tracking now, ARMED to start itself on the next commit or agent session, or open in this dashboard
+(which always includes the repository you are looking at, so the switcher never contradicts the
+header above it). Anything else is finished with — nothing runs there, nothing will, nobody is
+looking at it — and listing it forever is how the dropdown fills up with last month's scratch
+directories. The registry entry survives, so working in the repository again, or opening it with
+`agitrack -d`, puts it back with its remembered view. "Armed" is its own state on the row,
+`auto-start`, never `off`: with the hook in place the next commit records the agent's turns, and a
+row that said "off" would send the reader off to start something that is already going to happen.
 
 **The header.** Three controls, shared by all three pages: a repository selector (a listbox, so it
 scrolls at a bounded height, shows each repository's own tracking state on its row, and can pin a

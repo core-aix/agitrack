@@ -25,14 +25,29 @@ def _isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "config"))
 
 
-def _repo(tmp_path: Path, name: str) -> GitRepo:
+def _repo(tmp_path: Path, name: str, *, armed: bool = True) -> GitRepo:
     root = tmp_path / name
     root.mkdir(parents=True, exist_ok=True)
     repo = GitRepo.init(root)
     (root / "f.txt").write_text("x", encoding="utf-8")
     repo.stage_paths(["f.txt"])
     repo.commit("seed")
+    if armed:
+        _arm(repo)
     return repo
+
+
+def _arm(repo: GitRepo) -> None:
+    """Install the auto-start pre-commit hook, i.e. make this the ordinary state of a repository
+    aGiTrack has been used in: nothing running this second, and a hook that starts a tracker on
+    the next commit. The switcher lists a repository on exactly that basis, so a test about
+    anything else (slugs, URLs, the daemon union) must not accidentally be a test about a
+    repository nothing will ever track again."""
+    from agitrack.git import hooks as git_hooks
+
+    hooks_dir = repo.hooks_dir()
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke="agitrack", repo_root=str(repo.repo))
 
 
 # --- the repository registry --------------------------------------------------------------------
@@ -656,7 +671,7 @@ def test_the_running_check_also_carries_the_version_serving_it(tmp_path):
 def test_a_repo_nothing_is_tracking_says_so_and_how_to_start(tmp_path, monkeypatch):
     from agitrack.metrics.server import RepoScope
 
-    repo = _repo(tmp_path, "idle")
+    repo = _repo(tmp_path, "idle", armed=False)
     monkeypatch.setattr("agitrack.proxy.background._live_background_pid", lambda r: None, raising=False)
     monkeypatch.setattr("agitrack.proxy.background._read_proxy_status", lambda r: None, raising=False)
 
@@ -665,6 +680,24 @@ def test_a_repo_nothing_is_tracking_says_so_and_how_to_start(tmp_path, monkeypat
     assert state["running"] is False and state["label"] == "not tracking"
     # A dashboard that only says "off" leaves the reader with nowhere to go.
     assert "agitrack" in state["detail"]
+
+
+def test_a_repo_that_will_track_itself_on_the_next_commit_does_not_say_off(tmp_path, monkeypatch):
+    """An idle repository and a finished one are different states, and calling both "not
+    tracking" was wrong in the direction that costs work: with the auto-start hook installed, the
+    next commit records the agent's turns, and a reader told "not tracking" would go and start
+    something."""
+    from agitrack.metrics.server import RepoScope
+
+    repo = _repo(tmp_path, "armed")  # armed by default: the ordinary post-`agitrack -b` state
+    monkeypatch.setattr("agitrack.proxy.background._live_background_pid", lambda r: None, raising=False)
+    monkeypatch.setattr("agitrack.proxy.background._read_proxy_status", lambda r: None, raising=False)
+
+    state = json.loads(RepoScope(repo).get("/state", {}).body)
+
+    assert state["running"] is False and state["armed"] is True
+    assert state["kind"] == "armed" and state["label"] == "auto-start armed"
+    assert "next" in state["detail"] and "commit" in state["detail"]
 
 
 def test_an_unreadable_repo_reports_not_tracking_rather_than_breaking_the_page(tmp_path):
@@ -713,9 +746,9 @@ def test_the_repo_list_carries_each_repos_tracking_state(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "agitrack.proxy.background.running_mode",
         lambda repo: (
-            {"running": True, "kind": "background", "label": "tracking · background · auto commits", "detail": "d"}
+            {"running": True, "armed": False, "kind": "background", "label": "tracking · background", "detail": "d"}
             if repo.repo.name == "live"
-            else {"running": False, "kind": "none", "label": "not tracking", "detail": "start it"}
+            else {"running": False, "armed": True, "kind": "armed", "label": "auto-start armed", "detail": "next"}
         ),
     )
     router = hub.HubRouter()
@@ -723,9 +756,127 @@ def test_the_repo_list_carries_each_repos_tracking_state(tmp_path, monkeypatch):
     rows = {r["name"]: r for r in json.loads(router.get("/repos", {}).body)["repos"]}
 
     assert rows["live"]["running"] is True and rows["live"]["state"] == "background"
-    assert rows["idle"]["running"] is False and rows["idle"]["state"] == "off"
+    # Armed, not running: listed, and NOT spelled the same as a repo nothing will track again.
+    assert rows["idle"]["running"] is False and rows["idle"]["state"] == "auto-start"
     # The full sentence rides along for the row's tooltip.
-    assert rows["idle"]["state_detail"] == "start it"
+    assert rows["idle"]["state_detail"] == "next"
+
+
+def test_a_repo_nothing_runs_in_and_nothing_will_is_not_offered(tmp_path):
+    """The switcher fills up with dead scratch directories otherwise.
+
+    A repository is listed while aGiTrack is doing something for it or would: tracking it now, or
+    armed to start on the next commit. One that is neither — and that nobody has opened here — is
+    finished with, and after a few months of temporary repositories the dropdown was mostly them.
+    The ENTRY is kept, not deleted: working in the repo again brings it straight back."""
+    _repo(tmp_path, "armed")
+    _repo(tmp_path, "done", armed=False)
+    repo_registry.remember(tmp_path / "armed")
+    repo_registry.remember(tmp_path / "done")
+    router = hub.HubRouter()
+
+    rows = json.loads(router.get("/repos", {}).body)["repos"]
+
+    assert [row["name"] for row in rows] == ["armed"]
+    # Dropped from the LISTING only. The registry still has it, so it comes back on its own.
+    assert repo_registry.entry_for(tmp_path / "done") is not None
+
+
+def test_an_unlisted_repo_comes_back_the_moment_it_is_opened(tmp_path):
+    # Otherwise `agitrack -d` in an untracked project would open a dashboard whose own switcher
+    # denies the project exists — and there would be no way back to it.
+    _repo(tmp_path, "done", armed=False)
+    entry = repo_registry.remember(tmp_path / "done")
+    router = hub.HubRouter()
+    assert json.loads(router.get("/repos", {}).body)["repos"] == []
+
+    router.get(f"/r/{entry.slug}/", {})  # someone opens it
+
+    rows = json.loads(router.get("/repos", {}).body)["repos"]
+    assert [row["name"] for row in rows] == ["done"]
+    assert rows[0]["state"] == "off"  # listed because it is open, and honest about being off
+
+
+def test_the_root_lands_on_a_repo_the_switcher_actually_offers(tmp_path):
+    # A page whose header lists everything except the repository it is showing is arguing with
+    # itself; `/` picks the most recent LISTED repo rather than the most recent remembered one.
+    _repo(tmp_path, "armed")
+    _repo(tmp_path, "done", armed=False)
+    repo_registry.remember(tmp_path / "armed")
+    repo_registry.remember(tmp_path / "done")  # most recent, but not offered
+    router = hub.HubRouter()
+
+    response = router.get("/", {})
+
+    assert repo_registry.slug_for(tmp_path / "armed") in response.headers["Location"]
+
+
+def test_a_live_daemon_keeps_a_repo_listed_even_with_no_handshake_to_describe_it(tmp_path, monkeypatch):
+    # The two sources can disagree: a tracker that died without clearing its files leaves a stale
+    # handshake, and one that never wrote one leaves none. A repository aGiTrack is demonstrably
+    # running on may never be missing from the switcher, so the disagreement resolves toward
+    # listing it.
+    _repo(tmp_path, "headless", armed=False)
+    repo_registry.remember(tmp_path / "headless")
+    monkeypatch.setattr("agitrack.daemons.running_repos", lambda **_: [str(tmp_path / "headless")])
+    router = hub.HubRouter()
+
+    rows = json.loads(router.get("/repos", {}).body)["repos"]
+
+    assert [row["name"] for row in rows] == ["headless"]
+    # What is certain is that something runs there; the mode is not invented.
+    assert rows[0]["running"] is True and rows[0]["state"] == "tracking"
+
+
+def test_a_stopped_repo_is_not_armed_even_if_its_hooks_survived(tmp_path):
+    """`agitrack stop` removes the hooks, but it cannot reach a backend that has already loaded
+    its plugin, and a user can restore a hook file from their dotfiles. The RECORDED stop is the
+    authority — so a stopped repo does not come back to the switcher wearing "auto-start"."""
+    from agitrack import tracking_gap
+    from agitrack.proxy.background import autostart_armed
+
+    repo = _repo(tmp_path, "stopped")  # hooks installed and left in place
+    assert autostart_armed(repo.repo) is True
+
+    tracking_gap.mark_stopped(repo.repo)
+
+    assert autostart_armed(repo.repo) is False
+
+
+def test_auto_start_turned_off_by_preference_is_not_armed(tmp_path, monkeypatch):
+    # The hook can only start a tracker that `_autostart_daemon_args` agrees to start, and that
+    # refuses outright when the preference is off. "Armed" has to mean the same thing here.
+    from agitrack.proxy.background import autostart_armed
+
+    repo = _repo(tmp_path, "prefoff")
+    assert autostart_armed(repo.repo) is True
+
+    monkeypatch.setattr("agitrack.config.GlobalConfig.autotrack_hook", "off", raising=False)
+
+    assert autostart_armed(repo.repo) is False
+
+
+def test_armedness_is_read_from_a_worktree_without_asking_git(tmp_path):
+    # The hooks are the REPOSITORY's, shared with every linked worktree, and the switcher resolves
+    # them from the filesystem alone — a `git` subprocess per row is not something to put on the
+    # path of drawing a dropdown.
+    from agitrack.git import hooks as git_hooks
+
+    repo = _repo(tmp_path, "main")
+    worktree = tmp_path / "wt"
+    repo._run(["git", "worktree", "add", "-q", str(worktree), "-b", "side"], check=False)
+
+    resolved = git_hooks.hooks_dir_for_path(worktree)
+    assert resolved is not None and resolved.resolve() == repo.hooks_dir().resolve()
+
+
+def test_a_directory_that_is_not_a_repository_has_no_hooks_dir(tmp_path):
+    # A caller that cannot find the hooks must conclude "not armed", never "armed".
+    from agitrack.git import hooks as git_hooks
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert git_hooks.hooks_dir_for_path(plain) is None
 
 
 def test_a_repos_state_is_read_from_its_path_without_opening_a_repository(tmp_path):
