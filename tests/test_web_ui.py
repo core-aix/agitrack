@@ -177,6 +177,27 @@ def test_every_page_has_the_same_helpers(pages):
         assert helper in ui.DOM_JS
 
 
+def test_the_update_banner_is_re_rendered_from_the_poll_not_only_from_the_html(pages):
+    """The banner is the one part of the page whose whole job is to be current, and it was the one
+    part that could not change: the server rendered it into the HTML and nothing touched it again,
+    so a tab open since the morning kept announcing an update that had since been installed."""
+    html = pages["dashboard"]
+
+    assert 'id="updatebanners"' in html  # somewhere to render into, even with nothing to say
+    assert "function renderUpdateNotices(" in html
+    assert "renderUpdateNotices(state.update_notices)" in html
+
+
+def test_a_tab_says_it_is_back_the_moment_it_is_looked_at(pages):
+    """A hidden tab's timers are throttled to about one tick a minute, so the ping interval is not
+    what re-registers it: coming back into view is. That moment is also when a launcher that just
+    raised this window is waiting to hand it a navigation."""
+    presence = pages["dashboard"]
+    assert "hubPing" in presence
+    assert 'document.addEventListener("visibilitychange", () => { if(!document.hidden) hubPing(); });' in presence
+    assert 'window.addEventListener("focus", hubPing);' in presence
+
+
 def test_no_page_redefines_a_shared_helper(pages):
     """A second definition would shadow the shared one and drift from it."""
     for name, html in pages.items():

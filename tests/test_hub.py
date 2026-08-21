@@ -1019,13 +1019,87 @@ def test_nothing_steered_means_nothing_raised():
     assert clients.navigate("/r/two/", timeout=0.2) is None
 
 
-def test_the_launcher_raises_the_browser_that_took_the_navigation(monkeypatch):
-    raised: list[str] = []
-    monkeypatch.setattr("agitrack.metrics.server.raise_browser_window", lambda family="": raised.append(family) or True)
+def test_a_tab_throttled_to_one_ping_a_minute_still_counts_as_open():
+    """The tab worth reusing is hidden by definition: the user opened the dashboard and went back
+    to the terminal. Every current browser throttles a hidden tab's timers to about one tick a
+    minute, so at the 15-second TTL this used to have, the tab was outside the window most of the
+    time and the launcher opened yet another one."""
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "", "chrome")
+    clients._seen["tab-1"]["seen"] -= 60.0  # one throttled tick ago
 
-    class FakeResponse:
+    assert clients.candidate_browser() == "chrome"
+
+
+def test_a_tab_that_really_has_stopped_answering_is_still_given_up_on():
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "", "chrome")
+    clients._seen["tab-1"]["seen"] -= hub._CLIENT_TTL_SECONDS + 1.0
+
+    assert clients.candidate_browser() is None
+
+
+def test_a_hub_that_just_started_waits_for_its_tabs_to_say_they_are_there():
+    """Nothing is persisted, so a hub the launcher itself just started has an empty registry while
+    every tab still open is a ping away from saying so. Answering "nothing is open" inside that
+    window is how the first session after a hub restart put a second tab next to the one already
+    showing the dashboard."""
+    import threading
+
+    clients = hub._Clients()
+    assert clients.candidate_browser() is None  # cold, and asked without a grace period
+
+    threading.Timer(0.1, lambda: clients.ping("tab-1", "/r/one/", "", "safari")).start()
+
+    assert clients.candidate_browser(wait=2.0) == "safari"
+
+
+def test_the_grace_period_is_not_paid_when_a_tab_is_already_known(monkeypatch):
+    # Asserted by CAUSE rather than by the clock (see AGENTS.md): the grace period is a sleep, and
+    # a launcher with an answer in hand must not sleep at all before using it.
+    clients = hub._Clients()
+    clients.ping("tab-1", "/r/one/", "", "chrome")
+    monkeypatch.setattr(hub.time, "sleep", lambda seconds: pytest.fail("waited with a tab already known"))
+
+    assert clients.candidate_browser(wait=5.0) == "chrome"
+
+
+def test_the_candidate_endpoint_reports_the_tab_without_queueing_anything():
+    router = hub.HubRouter()
+    router.clients.ping("tab-1", "/r/one/", "", "chrome")
+
+    answer = json.loads(router.get("/steer-candidate", {}).body.decode("utf-8"))
+    assert answer == {"found": True, "browser": "chrome"}
+    # Asking must not consume anything: the launcher still has to send the navigation.
+    assert router.clients.ping("tab-1", "/r/one/", "", "chrome") == ""
+
+
+def test_the_candidate_endpoint_bounds_the_wait_it_is_asked_for():
+    # The value becomes a sleep inside a request handler, so a caller that asks for an hour must
+    # not be able to hold a hub thread for an hour.
+    assert hub._float_param({"wait": ["3600"]}, "wait") == 10.0
+    assert hub._float_param({"wait": ["-5"]}, "wait") == 0.0
+    assert hub._float_param({"wait": ["soon"]}, "wait") == 0.0
+    assert hub._float_param({}, "wait") == 0.0
+
+
+class _FakeHub:
+    """The two endpoints the launcher talks to, and a log of what it did in which order.
+
+    The order is the point of the test: the browser has to be raised BEFORE the navigation is
+    waited for, or the hidden tab it is meant to wake never answers in time."""
+
+    def __init__(self, *, found=True, browser="firefox", navigated=True, has_candidate_endpoint=True):
+        self.found, self.browser, self.navigated = found, browser, navigated
+        self.has_candidate_endpoint = has_candidate_endpoint
+        self.log: list[tuple[str, str]] = []
+
+    class _Response:
+        def __init__(self, payload):
+            self.payload = payload
+
         def read(self):
-            return json.dumps({"navigated": True, "browser": "firefox"}).encode()
+            return json.dumps(self.payload).encode()
 
         def __enter__(self):
             return self
@@ -1033,31 +1107,81 @@ def test_the_launcher_raises_the_browser_that_took_the_navigation(monkeypatch):
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResponse())
+    def urlopen(self, request, *args, **kwargs):
+        import urllib.error
+
+        url = request.full_url
+        if "/steer-candidate" in url:
+            self.log.append(("candidate", url))
+            if not self.has_candidate_endpoint:
+                raise urllib.error.HTTPError(url, 404, "not found", {}, None)  # type: ignore[arg-type]
+            return self._Response({"found": self.found, "browser": self.browser})
+        self.log.append(("navigate", url))
+        return self._Response({"navigated": self.navigated, "browser": self.browser})
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr("urllib.request.urlopen", self.urlopen)
+        monkeypatch.setattr(
+            "agitrack.metrics.server.raise_browser_window",
+            lambda family="": self.log.append(("raise", family)) or True,
+        )
+        return self
+
+
+def test_the_browser_is_raised_before_the_navigation_is_waited_for(monkeypatch):
+    """Every current browser throttles timers in a hidden tab to about one tick a minute, and a
+    hidden tab is the only kind there is to steer. Queueing a navigation and waiting a few seconds
+    for a tab in that state to notice is waiting for something that will not happen; raising its
+    window first is what lets it answer at all."""
+    fake = _FakeHub().install(monkeypatch)
 
     assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is True
-    assert raised == ["firefox"]
+    assert [what for what, _ in fake.log] == ["candidate", "raise", "navigate"]
+    assert ("raise", "firefox") in fake.log
+
+
+def test_nothing_open_means_no_navigation_is_even_asked_for(monkeypatch):
+    fake = _FakeHub(found=False, browser="").install(monkeypatch)
+    monkeypatch.setattr(
+        "agitrack.metrics.server.raise_browser_window",
+        lambda family="": pytest.fail("nothing is open, so there is no window to raise"),
+    )
+
+    assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is False
+    assert [what for what, _ in fake.log] == ["candidate"]
+
+
+def test_an_older_hub_still_steers_the_way_it_used_to(monkeypatch):
+    """A hub already running from a previous version has no `/steer-candidate`. Falling back to
+    "ask, then raise" keeps the tab reuse working across the update that introduced the other
+    order, instead of opening a second tab until the hub is restarted."""
+    fake = _FakeHub(has_candidate_endpoint=False).install(monkeypatch)
+
+    assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is True
+    assert [what for what, _ in fake.log] == ["candidate", "navigate", "raise"]
+
+
+def test_the_cold_hub_grace_is_asked_of_the_hub_not_slept_off_locally(monkeypatch):
+    # The hub is the one that can see the tabs check in, so the wait belongs there: the launcher
+    # says how long it is prepared to wait and the hub answers as soon as something appears.
+    fake = _FakeHub().install(monkeypatch)
+
+    hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/", wait_for_client=3.0)
+
+    assert "wait=3" in fake.log[0][1]
 
 
 def test_no_window_is_raised_when_no_tab_was_steered(monkeypatch):
+    fake = _FakeHub(navigated=False).install(monkeypatch)
     monkeypatch.setattr(
         "agitrack.metrics.server.raise_browser_window",
-        lambda family="": pytest.fail("nothing was steered, so there is no window to raise"),
+        lambda family="": fake.log.append(("raise", family)) or True,
     )
 
-    class FakeResponse:
-        def read(self):
-            return json.dumps({"navigated": False, "browser": ""}).encode()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResponse())
-
     assert hub._steer_open_tab({"url": "http://127.0.0.1:8765/"}, "/r/two/") is False
+    # The pre-raise happened (a tab was there to wake); nothing is raised for a navigation that
+    # nobody took, because there is no window holding the page.
+    assert [what for what, _ in fake.log] == ["candidate", "raise", "navigate"]
 
 
 def test_a_browser_that_is_not_running_is_never_launched(monkeypatch):

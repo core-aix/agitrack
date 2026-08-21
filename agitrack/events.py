@@ -1,6 +1,7 @@
 """A user-facing **event log**: an append-only record of the notable things aGiTrack does on
-your behalf — a daemon starting or stopping, an AI change detected, a commit made, an update
-becoming available — written to a plain-text file you choose (``--log-file`` / the ``log_file``
+your behalf — a daemon starting or stopping, a tracker following you to another coding agent,
+an AI change detected, a commit made, an update becoming available — written to a plain-text
+file you choose (``--log-file`` / the ``log_file``
 config key). It works in **every** mode: the interactive proxy TUI, the headless background
 tracker, and the one-shot ``--prompt``/``--json`` shell, so you can ``tail -f`` one file and
 watch exactly what aGiTrack is doing.
@@ -14,6 +15,7 @@ kill, and every call is best-effort and **never raises** — writing the log mus
 tracking. Lines are simple and greppable::
 
     2026-07-04T18:30:00 daemon-start backend=claude mode="auto commits" repo=/path
+    2026-07-04T18:30:09 backend-switch backend=opencode previous=claude repo=/path
     2026-07-04T18:30:12 ai-change-detected backend=claude session=abc123
     2026-07-04T18:30:14 commit sha=deadbeef type=agent subject="Add input validation"
     2026-07-04T18:31:02 update-available current=0.1.16 latest=0.2.0

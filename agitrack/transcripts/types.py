@@ -45,6 +45,16 @@ class SessionTurn:
     # the backend transcript carries no timestamps.
     started_at: int | None = None
     ended_at: int | None = None
+    # The version of the AGENT HARNESS (the backend CLI) that recorded this turn — Claude Code's
+    # `version`, Codex's `cli_version`, OpenCode's `info.version`. Per TURN, not per session,
+    # because these CLIs update themselves mid-conversation (aGiTrack's own daemons do exactly
+    # that), so one session can span several versions and only the turn knows which one made it.
+    # The harness shapes a change as much as the model does: measured on this repository, the
+    # ratio of shell calls to editing-tool calls rose from 3:1 to ~10:1 across six weeks of CLI
+    # releases with the model and permission mode unchanged — a drift that was invisible in the
+    # commits and had to be reconstructed from raw transcripts to be seen at all. None when the
+    # backend records no version.
+    backend_version: str | None = None
     # The reasoning effort / thinking level the model used for this turn, when the
     # backend transcript reveals it. Neither backend records a numeric budget, so
     # this is a coarse, best-effort signal: a named effort/variant when the export

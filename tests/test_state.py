@@ -552,6 +552,24 @@ def test_the_claude_settings_file_agitrack_writes_is_excluded(tmp_path):
     assert ".agitrack/" in exclude
 
 
+def test_every_backends_session_hook_file_is_excluded(tmp_path):
+    """The same complaint, for the other two backends — and it got louder when the tracker began
+    arming EVERY installed backend: a repo whose owner only ever opens Claude still gets Codex's
+    and OpenCode's session-start hooks written into it. OpenCode's plugin is the sharp one, since
+    it lands in the source tree proper: it was committed, by hand, as part of a real first commit
+    because `git add .` swept up the `?? .opencode/` aGiTrack had just created."""
+    from agitrack.config.state import AgitrackState
+
+    repo = _repo_with_history(tmp_path)
+    AgitrackState(repo.repo).ensure_local_ignore()
+    (repo.repo / ".codex").mkdir()
+    (repo.repo / ".codex" / "hooks.json").write_text("{}", encoding="utf-8")
+    (repo.repo / ".opencode" / "plugin").mkdir(parents=True)
+    (repo.repo / ".opencode" / "plugin" / "agitrack-autostart.js").write_text("// x\n", encoding="utf-8")
+
+    assert _porcelain(repo) == ""
+
+
 def test_ensure_local_ignore_is_idempotent(tmp_path):
     from agitrack.config.state import AgitrackState
 

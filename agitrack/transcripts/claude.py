@@ -31,6 +31,7 @@ __all__ = [
     "turns_after",
     "latest_session_id",
     "list_sessions",
+    "repo_activity",
     "list_worktree_sessions",
     "sessions_under",
     "session_belongs_to_repo",
@@ -211,6 +212,35 @@ def latest_session_id(repo: Path) -> str | None:
     # session's own).
     project = _project_dir(repo)
     return max(pool, key=lambda ref: _content_updated(project / f"{ref.id}.jsonl", ref.updated)).id
+
+
+# How many conversations a repo-activity probe looks at, newest file first. The probe is asked
+# of EVERY installed backend on every tracker cycle — including backends nobody is driving — so
+# it has to stay cheap in a project directory holding hundreds of past conversations. A session
+# a person is driving right now is being appended to, so it is always among the newest few by
+# mtime; the cap costs an active conversation nothing.
+_ACTIVITY_SCAN_LIMIT = 8
+
+
+def repo_activity(repo: Path) -> float | None:
+    """Epoch seconds of the newest HUMAN-driven activity recorded for ``repo`` on this backend,
+    or None when this backend holds no conversation for it at all.
+
+    This is how the background tracker tells WHICH backend the person is actually using
+    (``BackgroundRunner._tracked_session_id``): it is asked of every installed backend, and the
+    newest answer wins. It exists as a separate, deliberately cheap question because the real
+    listing is not cheap on every backend — OpenCode's costs a ~0.4 s subprocess — and paying
+    that for backends the user is not running, several times a minute, is not acceptable.
+
+    Content timestamps, not file mtimes: aGiTrack's own staging rewrites transcripts without
+    adding a message (see :func:`_content_updated`), and an mtime bumped by aGiTrack itself
+    would let a dead conversation here outrank a live one on another backend — a switch to the
+    wrong backend, which is the exact failure this whole probe exists to prevent."""
+    refs = sorted(list_sessions(repo), key=lambda ref: ref.updated, reverse=True)[:_ACTIVITY_SCAN_LIMIT]
+    if not refs:
+        return None
+    project = _project_dir(repo)
+    return max(_content_updated(project / f"{ref.id}.jsonl", ref.updated) for ref in refs)
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
@@ -1591,6 +1621,12 @@ def parse_rows(
                 # _finalize_turn) until the restarted process produces a real reply.
                 continue
             current["stop_reason"] = message.get("stop_reason")
+            # The harness version that produced this message. Last one wins: Claude Code can
+            # update itself mid-conversation, and the version that made the change is the one
+            # worth recording.
+            row_version = row.get("version")
+            if isinstance(row_version, str) and row_version.strip():
+                current["backend_version"] = row_version.strip()
             # Claude Code emits a `thinking` content block whenever extended
             # thinking is enabled, so its presence is the only signal the transcript
             # gives that reasoning was active (the budget itself is never recorded).
@@ -1976,6 +2012,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         ended_at=turn.get("ended_at"),
         compaction_count=int(turn.get("compactions") or 0),
         reasoning_effort=turn.get("reasoning_effort"),
+        backend_version=turn.get("backend_version"),
         agent_messages=list(turn.get("messages") or []),
         queued_followups=list(turn.get("queued_followups") or []),
         mcp_servers=used.mcp_servers,

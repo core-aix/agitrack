@@ -197,7 +197,21 @@ def _agitrack_version() -> str:
 
 
 def _update_banner_html(repo: "GitRepo | None" = None) -> str:
-    """The update notices shown at the top of a dashboard. Empty when there is nothing to say.
+    """:func:`update_notices` as the markup the page is served with.
+
+    Always a container, even with nothing to say: the page re-renders these from its own polling
+    (see ``renderUpdateNotices`` in `agitrack/metrics/ui.py`), and a notice that only ever arrives
+    with the HTML is a notice that stays on screen until the tab is closed. That is how a message
+    withdrawn hours ago was still being read."""
+    return (
+        '<div id="updatebanners">'
+        + "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in update_notices(repo))
+        + "</div>"
+    )
+
+
+def update_notices(repo: "GitRepo | None" = None) -> list[str]:
+    """The update notices for the top of a dashboard. Empty when there is nothing to say.
 
     aGiTrack updates ITSELF now, so these are only the two cases the user still has to act on,
     and they call for different actions — one line covering both told people to do the wrong thing:
@@ -246,17 +260,14 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
         # Nothing from the self-updater: fall back to the shared per-repo marker, which an
         # install predating self-update (or a check that ran before any attempt) may carry.
         try:
-            from agitrack.update.marker import read_update_marker
+            from agitrack.update.marker import update_reminder_line
 
-            info = read_update_marker(repo.repo)
+            fallback = update_reminder_line(repo.repo)
         except Exception:
-            info = None
-        if info:
-            parts.append(
-                f"aGiTrack update available: {info.get('current', '?')} \u2192 {info.get('latest', '?')} — "
-                "run `agitrack` and choose 'update', or update via pip/pipx."
-            )
-    return "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in parts)
+            fallback = None
+        if fallback:
+            parts.append(fallback)
+    return parts
 
 
 def dashboard_data(dash: Dashboard) -> dict:
@@ -324,6 +335,7 @@ def dashboard_data(dash: Dashboard) -> dict:
         "committers": sorted(a for a in dash.committers_with_lines() if a),
         "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
         "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
+        "meta_fields": metadata_filter_fields(dash),
         "commits": commits,
     }
 
@@ -392,11 +404,166 @@ def _covers(dash: Dashboard) -> dict[str, CommitStat]:
     return covers
 
 
-def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm: int, to: int) -> list[CommitStat]:
+# --------------------------------------------------------------------------- advanced filter
+#
+# The named filters (committer/backend/model/date) cover the questions asked most, and cover
+# nothing else. Every commit already carries a full metadata block — harness version, OS,
+# session name, compactions, token counts — and none of it was selectable, so "show me only what
+# Claude Code 2.1.238 produced" or "only the commits from the Ubuntu box" meant reading `git log`
+# by hand. The advanced filter selects on ANY recorded field, without a new named filter (and a
+# new query parameter, and a new dropdown) per field.
+
+# Above this many distinct values a field is offered as free text rather than a dropdown: a
+# select holding 537 conversation anchors is not a control, it is a wall.
+_FACET_VALUE_LIMIT = 100
+
+# `eq` exact, `has` substring (case-insensitive), `ge`/`le` bounds, `between` an inclusive
+# range written `LOW..HIGH`. Anything else is dropped rather than guessed at — a filter that
+# silently means something other than what the URL says would misreport the slice every panel
+# on the page is computed from.
+_META_OPS = frozenset({"eq", "has", "ge", "le", "between"})
+
+# What separates a range's two ends. `..` reads as a range and appears in no value any of these
+# fields carries; a value that does contain it can still be bounded with `ge` and `le` separately.
+RANGE_SEPARATOR = ".."
+
+# Splits a value into digit and non-digit runs, so ordering is NATURAL rather than lexical.
+# It has to be: bounds are wanted on token counts (numbers), timestamps (ISO-8601) and harness
+# versions, and the three cannot share one rule otherwise — plain string order puts 2.1.9 after
+# 2.1.10, and plain numeric order cannot read a timestamp at all. Before this, `ge`/`le` parsed
+# both sides as floats and returned False for anything else, so a date or version bound matched
+# NOTHING and looked like a filter with no results rather than a filter that could not run.
+_ORDER_CHUNKS = re.compile(r"(\d+)")
+
+
+def _order_key(value: str) -> tuple:
+    return tuple((1, int(part)) if part.isdigit() else (0, part) for part in _ORDER_CHUNKS.split(value) if part != "")
+
+
+def _at_least(actual: str, bound: str) -> bool:
+    return _order_key(actual) >= _order_key(bound)
+
+
+def _at_most(actual: str, bound: str) -> bool:
+    return _order_key(actual) <= _order_key(bound)
+
+
+def parse_meta_filters(raw: list[str]) -> list[tuple[str, str, str]]:
+    """``["system:eq:macOS 15.7.3"]`` -> ``[("system", "eq", "macOS 15.7.3")]``.
+
+    Split at most twice, because a value legitimately contains colons (an ISO timestamp, an
+    `mcp__server__tool` name). Malformed or unknown-operator entries are DROPPED: the filter
+    is applied server-side to every panel, so a condition that cannot be honoured exactly must
+    not be silently relaxed into one that can.
+    """
+    out: list[tuple[str, str, str]] = []
+    for entry in raw:
+        key, _, rest = (entry or "").partition(":")
+        op, _, value = rest.partition(":")
+        if not (key.strip() and op in _META_OPS and value != ""):
+            continue
+        # A range with NEITHER end filled in is a condition the reader has not written yet, so
+        # it must not filter. It used to select every commit that merely HAD the field, which
+        # silently shrank the view the moment `between` was picked — while the button's badge,
+        # which already ignored an empty range, still said nothing was filtered.
+        if op == "between" and not any(end.strip() for end in value.split(RANGE_SEPARATOR)):
+            continue
+        out.append((key.strip(), op, value))
+    return out
+
+
+def _meta_matches(stat: CommitStat, key: str, op: str, value: str) -> bool:
+    actual = (stat.metadata or {}).get(key)
+    if actual is None:
+        return False
+    if op == "eq":
+        return actual == value
+    if op == "has":
+        return value.casefold() in actual.casefold()
+    if op == "between":
+        low, separator, high = value.partition(RANGE_SEPARATOR)
+        if not separator:
+            return False  # not a range at all; better no rows than a bound the user did not write
+        low, high = low.strip(), high.strip()
+        # An open end is allowed: `..500` is "up to 500" and `100..` is "from 100".
+        return (not low or _at_least(actual, low)) and (not high or _at_most(actual, high))
+    return _at_least(actual, value) if op == "ge" else _at_most(actual, value)
+
+
+def _passes_meta(stat: CommitStat, meta: list[tuple[str, str, str]]) -> bool:
+    """Conditions on DIFFERENT keys are ANDed; conditions on the SAME key are ORed.
+
+    That is what makes the control usable as a facet: adding a second value for `system` widens
+    "macOS" to "macOS or Ubuntu", while adding a `backend_version` condition narrows within it.
+    ANDing everything would make two values of one field select nothing at all, which reads as
+    the filter being broken.
+    """
+    by_key: dict[str, list[tuple[str, str, str]]] = {}
+    for condition in meta:
+        by_key.setdefault(condition[0], []).append(condition)
+    return all(any(_meta_matches(stat, key, op, value) for key, op, value in group) for group in by_key.values())
+
+
+def metadata_filter_fields(dash: Dashboard) -> list[dict]:
+    """The fields the advanced filter offers, each with the values actually present.
+
+    Built from the commits in view rather than a hard-coded list, so a field aGiTrack adds later
+    (as `backend_version` was) is filterable the day it lands, with no dashboard change at all.
+    """
+    values: dict[str, set[str]] = {}
+    for stat in dash.stats:
+        for key, value in (stat.metadata or {}).items():
+            values.setdefault(key, set()).add(value)
+    fields = []
+    for key in sorted(values):
+        seen = values[key]
+        numeric = all(_is_number(v) for v in seen)
+        fields.append(
+            {
+                "key": key,
+                "numeric": numeric,
+                # Omitted above the cap: the page offers a text box instead, so a high-cardinality
+                # field stays filterable without shipping every distinct value to the browser.
+                "values": sorted(seen, key=_numeric_sort_key if numeric else str)
+                if len(seen) <= _FACET_VALUE_LIMIT
+                else [],
+                "count": len(seen),
+            }
+        )
+    return fields
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _numeric_sort_key(value: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _filter_stats(
+    dash: Dashboard,
+    *,
+    author: str,
+    backend: str,
+    model: str,
+    frm: int,
+    to: int,
+    meta: list[tuple[str, str, str]] | None = None,
+) -> list[CommitStat]:
     covers = _covers(dash)
     out: list[CommitStat] = []
     for stat in dash.stats:
         if author and author not in dash.committers_of(stat):
+            continue
+        if meta and not _passes_meta(stat, meta):
             continue
         eff_backend, eff_model = _effective(stat, covers)
         if backend and eff_backend != backend:
@@ -556,6 +723,9 @@ def _options(dash: Dashboard) -> dict:
         "committers": sorted(c for c in committers if c),
         "backends": sorted(backends),
         "models": sorted(models),
+        # Every metadata field present in these commits, so the advanced filter can offer them
+        # without the page knowing any field name in advance.
+        "meta_fields": metadata_filter_fields(dash),
         "branches": dash.branches,
     }
 
@@ -566,6 +736,7 @@ def aggregates_payload(
     author: str = "",
     backend: str = "",
     model: str = "",
+    meta: list[tuple[str, str, str]] | None = None,
     frm: int = 0,
     to: int = 0,
     granularity: str = DEFAULT_GRANULARITY,
@@ -573,7 +744,7 @@ def aggregates_payload(
     """All the metric panels for the given filters — no per-commit list, so the
     response stays small no matter how large the repository is. Filter options
     come from the full history so the dropdowns never lose entries."""
-    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
     # Full-history commit-date span (unfiltered) so the from/to date inputs can show
     # — and be bounded to — the real range the dashboard covers.
     dated = [s.timestamp for s in dash.stats if s.timestamp]
@@ -637,6 +808,7 @@ def log_page(
     author: str = "",
     backend: str = "",
     model: str = "",
+    meta: list[tuple[str, str, str]] | None = None,
     frm: int = 0,
     to: int = 0,
     offset: int = 0,
@@ -651,7 +823,7 @@ def log_page(
     fetched on demand — and *only* those commits' blobs are fetched, so a blobless
     partial clone never pulls its whole history just to render one page (the
     full-history scan in :func:`collect_commit_stats` counts from local blobs alone)."""
-    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
@@ -969,6 +1141,43 @@ header{padding:26px 0 18px}
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
 __UI_RANGE_CSS__
+/* The advanced filter. It hangs BELOW the sticky bar rather than expanding it: growing the bar
+   pushes the whole page down every time it opens, and on a phone a bar tall enough to hold three
+   condition rows covers most of the screen. */
+.advwrap{align-self:flex-end;display:inline-flex}
+.advbtn{cursor:pointer;border:1px solid var(--line);color:var(--fg);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:7px 12px;white-space:nowrap}
+.advbtn:hover{border-color:var(--phosphor);color:var(--phosphor)}
+.advbtn[aria-expanded="true"]{border-color:var(--phosphor);color:var(--phosphor)}
+.advbtn .advcount{color:var(--ink);background:var(--phosphor);padding:0 5px;margin-left:6px}
+.advpanel{position:absolute;top:calc(100% + 6px);left:12px;right:12px;z-index:29;background:var(--panel);
+  border:1px solid var(--phosphor-dim);padding:12px 14px;box-shadow:0 10px 26px rgba(0,0,0,.55)}
+.advrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.advrow select,.advrow input{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:6px 9px;min-width:0}
+.advrow select:focus,.advrow input:focus{outline:none;border-color:var(--phosphor)}
+.advrow .advkey{flex:1 1 210px}
+.advrow .advop{flex:0 0 118px}
+.advrow .advval{flex:2 1 240px}
+.advrow .advend{flex:1 1 130px}
+.advrow .advdash{color:var(--dim);padding:0 2px}
+.advrow .advdel{cursor:pointer;border:1px solid var(--line);color:var(--amber);background:transparent;
+  font-family:var(--mono);font-size:13px;padding:5px 10px}
+.advrow .advdel:hover{border-color:var(--amber)}
+.advfoot{display:flex;gap:10px;align-items:center;margin-top:4px}
+.advadd{cursor:pointer;border:1px solid var(--phosphor-dim);color:var(--phosphor);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:6px 11px}
+.advadd:hover{background:var(--phosphor);color:var(--ink)}
+.advapply{cursor:pointer;border:1px solid var(--phosphor);color:var(--ink);background:var(--phosphor);
+  font-family:var(--mono);font-size:12.5px;padding:6px 14px;font-weight:600}
+.advapply:hover{filter:brightness(1.15)}
+/* Nothing to apply: still clickable (it closes the panel) but visibly not the next step. */
+.advapply.clean{background:transparent;color:var(--dim);border-color:var(--line);font-weight:400}
+.advhint{color:var(--dim);font-size:12px}
+@media (max-width:760px){
+  .advpanel{position:static;margin-top:10px}
+  .advrow .advkey,.advrow .advop,.advrow .advval{flex:1 1 100%}
+}
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
@@ -1327,8 +1536,17 @@ __UPDATE_BANNER__
         <button class="dr-done" id="dr-done">done</button>
       </div>
     </div>
+    <span class="advwrap"><button class="advbtn" id="advbtn" aria-expanded="false" aria-controls="advpanel" title="Filter on any field the commits record: harness version, OS, session name, compactions, token counts">advanced</button></span>
     <button class="reset" id="reset">reset</button>
     <span class="loading" id="loading" hidden aria-live="polite"><span class="spin"></span>loading…</span>
+    <div class="advpanel" id="advpanel" hidden>
+      <div id="advrows"></div>
+      <div class="advfoot">
+        <button class="advadd" id="advadd">+ add condition</button>
+        <button class="advapply" id="advapply">apply</button>
+        <span class="advhint">Conditions on different fields must all match; several values of the same field match any of them.</span>
+      </div>
+    </div>
   </div>
 
   <!-- Work the BACKTRACE can see and this dashboard cannot: sessions or turns no aGiTrack
@@ -1489,7 +1707,7 @@ const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
 const DEFAULT_BRANCH = INIT.branch || "";
-const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -1536,6 +1754,9 @@ function qs(extra){
   if(state.author) p.set("author", state.author);
   if(state.backend) p.set("backend", state.backend);
   if(state.model) p.set("model", state.model);
+  // Repeated (append, not set): the filter is a LIST of conditions, and several may name the
+  // same field — which is exactly how one field is widened to "any of these values".
+  for(const [k,op,v] of state.meta){ if(k && op && v !== "") p.append("meta", k+":"+op+":"+v); }
   if(state.fromTs) p.set("from", state.fromTs);
   if(state.toTs) p.set("to", state.toTs);
   if(state.granularity) p.set("granularity", state.granularity);
@@ -2223,7 +2444,213 @@ function syncFilters(){
   if(!OPTIONS.committers.includes(state.author)) state.author = "";
   if(!OPTIONS.backends.includes(state.backend)) state.backend = "";
   if(!OPTIONS.models.includes(state.model)) state.model = "";
+  // A branch switch changes which metadata fields exist. Drop conditions on fields this view
+  // does not have, or the page would keep filtering by something the user can no longer see or
+  // clear — an empty dashboard with no visible cause.
+  const known = new Set(metaFields().map(f => f.key));
+  const kept = known.size ? state.meta.filter(([k]) => known.has(k)) : state.meta;
+  const pruned = kept.length !== state.meta.length;
+  state.meta = kept;
+  // Re-render ONLY when the offered fields actually changed (a branch switch) or a condition
+  // was pruned. Every filter change refetches and lands back here, and re-rendering then tore
+  // out the very controls the reader was still filling in: typing a range's second bound was
+  // wiped the moment the first bound's results arrived, because the element being edited was
+  // replaced. Never re-render while the focus is inside the panel, for the same reason.
+  const signature = [...known].sort().join("\u0000");
+  const editing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#advpanel");
+  if(pruned && advDraft) advDraft = advDraft.filter(([k]) => known.has(k));
+  if((pruned || signature !== ADV_SIG) && !editing){ renderAdvanced(); syncApply(); }
+  ADV_SIG = signature;
+  syncAdvBtn();
 }
+
+// --- advanced filter ------------------------------------------------------
+// Every field the commits actually record, offered without the page knowing any field name in
+// advance — so a field aGiTrack adds later is filterable the day it lands. A field with few
+// distinct values gets a dropdown of them; a high-cardinality one (session ids, timestamps,
+// token counts) gets a text box, because a select holding 500 conversation anchors is a wall,
+// not a control. Numeric fields also offer >= and <=.
+const META_OPS = {eq:"is", has:"contains", between:"between", ge:"\u2265", le:"\u2264"};
+const RANGE_SEP = "..";
+// Bounds are offered on EVERY field, not just numeric ones: the ranges worth asking for are
+// token counts, timestamps and harness versions, and only the first is a number. The server
+// orders all three naturally (see _order_key), so 2.1.9 sorts before 2.1.10.
+function opsFor(f){ return f.numeric ? ["eq","between","ge","le"] : ["eq","has","between","ge","le"]; }
+function metaFields(){ return (OPTIONS && OPTIONS.meta_fields) || []; }
+// The conditions being EDITED, which are not the conditions being applied. Filtering live on
+// every keystroke and every dropdown meant the page refetched midway through a half-written
+// condition — picking a field applied that field's first value, and typing a range's low bound
+// filtered on it before the high bound existed. The panel now edits a draft and `apply` commits
+// it. `state.meta` stays the applied set, so it alone decides what the URL and the page show.
+let advDraft = null;
+function draft(){ if(!advDraft) advDraft = state.meta.map(c => c.slice()); return advDraft; }
+function activeConditions(list){
+  return list.filter(([k,o,v]) => k && o && v !== "" &&
+    !(o === "between" && v.split(RANGE_SEP).every(x => !x.trim())));
+}
+function advDirty(){ return JSON.stringify(activeConditions(draft())) !== JSON.stringify(state.meta); }
+function syncApply(){
+  const btn = $("advapply"); if(!btn) return;
+  const dirty = advDirty();
+  btn.classList.toggle("clean", !dirty);
+  btn.textContent = dirty ? "apply" : "close";
+  btn.title = dirty ? "Apply these conditions to the whole page" : "No unapplied changes";
+}
+function metaField(key){ return metaFields().find(f => f.key === key) || null; }
+function renderAdvanced(){
+  const host = $("advrows");
+  if(!host) return;
+  const fields = metaFields();
+  if(!fields.length){
+    host.innerHTML = '<div class="advhint">No metadata fields in this view yet — they appear once commits carry an aGiTrack metadata block.</div>';
+    return;
+  }
+  host.innerHTML = draft().map(([key,op,val], i) => {
+    const f = metaField(key) || fields[0];
+    const ops = opsFor(f);
+    const keyOpts = fields.map(x => `<option value="${esc(x.key)}"${x.key===key?" selected":""}>${esc(x.key)}</option>`).join("");
+    const opOpts = ops.map(o => `<option value="${o}"${o===op?" selected":""}>${META_OPS[o]}</option>`).join("");
+    // A range needs two ends, so it gets two controls; `is` on a field whose values we shipped
+    // gets a dropdown; everything else is free text.
+    let valCtl;
+    if(op === "between"){
+      const cut = val.indexOf(RANGE_SEP);
+      const lo = cut < 0 ? val : val.slice(0, cut), hi = cut < 0 ? "" : val.slice(cut + RANGE_SEP.length);
+      const end = (part, v, ph) => (f.values && f.values.length)
+        ? `<select class="advval advend" data-i="${i}" data-part="${part}">` +
+          `<option value=""${v===""?" selected":""}>${ph}</option>` +
+          f.values.map(x => `<option value="${esc(x)}"${x===v?" selected":""}>${esc(x)}</option>`).join("") + `</select>`
+        : `<input class="advval advend" data-i="${i}" data-part="${part}" type="text" value="${esc(v)}" placeholder="${ph}" autocomplete="off">`;
+      // Either end may be left blank — "up to X" and "from X" are both real questions.
+      valCtl = end("lo", lo, "from (any)") + `<span class="advdash">\u2192</span>` + end("hi", hi, "to (any)");
+    } else if(op === "eq" && f.values && f.values.length){
+      valCtl = `<select class="advval" data-i="${i}" data-part="val">` +
+        f.values.map(v => `<option value="${esc(v)}"${v===val?" selected":""}>${esc(v)}</option>`).join("") + `</select>`;
+    } else {
+      valCtl = `<input class="advval" data-i="${i}" data-part="val" type="text" value="${esc(val)}" placeholder="value" autocomplete="off">`;
+    }
+    return `<div class="advrow">` +
+      `<select class="advkey" data-i="${i}" data-part="key">${keyOpts}</select>` +
+      `<select class="advop" data-i="${i}" data-part="op">${opOpts}</select>` +
+      valCtl +
+      `<button class="advdel" data-i="${i}" title="Remove this condition">&times;</button></div>`;
+  }).join("");
+}
+function closeAdvanced(){
+  const panel = $("advpanel"), btn = $("advbtn");
+  if(!panel || panel.hidden) return;
+  panel.hidden = true;
+  if(btn) btn.setAttribute("aria-expanded", "false");
+}
+function syncAdvBtn(){
+  const btn = $("advbtn"); if(!btn) return;
+  // A range with both ends blank is not a condition anyone set, so it must not show in the
+  // badge as though the view were filtered.
+  const n = state.meta.length;   // what is APPLIED, never what is merely typed
+  btn.innerHTML = "advanced" + (n ? ` <span class="advcount">${n}</span>` : "");
+}
+// A new condition defaults to the first field and its first value, so it selects something
+// real immediately instead of sitting incomplete until three controls have been touched.
+function newCondition(){
+  const f = metaFields()[0];
+  if(!f) return null;
+  return [f.key, "eq", (f.values && f.values[0]) || ""];
+}
+function wireAdvanced(){
+  const btn = $("advbtn"), panel = $("advpanel");
+  if(!btn || !panel) return;
+  btn.onclick = () => {
+    const open = panel.hidden;
+    panel.hidden = !open;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    advDraft = state.meta.map(c => c.slice());
+    if(open && !advDraft.length){ const c = newCondition(); if(c){ advDraft.push(c); } }
+    if(open){ renderAdvanced(); syncApply(); }
+  };
+  $("advadd").onclick = () => { const c = newCondition(); if(c){ draft().push(c); renderAdvanced(); syncApply(); } };
+  // Close on a click anywhere else, and on Escape — a panel that floats over the page and only
+  // closes via the button it came from is a panel the reader has to remember how to dismiss.
+  // Bound once, on the document, in the CAPTURE phase so a click on some other control both
+  // closes this and still reaches that control.
+  document.addEventListener("mousedown", e => {
+    if(panel.hidden) return;
+    if(e.target.closest("#advpanel") || e.target.closest("#advbtn")) return;
+    closeAdvanced();
+  }, true);
+  // Escape is bound to the CONTROL, never to the document: a page-wide keydown scheme is the
+  // kind nobody can discover and everybody trips over (tests/test_web_ui.py enforces this, and
+  // the story page forbids one outright). Both the panel and the button, because keydown
+  // bubbles from whatever inside the panel has focus — and the button keeps focus until the
+  // reader moves into it. A click outside already dismisses the panel, which covers the one
+  // case this cannot: focus having left the control entirely.
+  const applyDraft = () => {
+    state.meta = activeConditions(draft());
+    advDraft = state.meta.map(c => c.slice());
+    closeAdvanced();          // the panel floats over the results it just changed
+    syncAdvBtn(); applyFilters();
+  };
+  // "close" when there is nothing to apply, so the button is never a dead end.
+  $("advapply").onclick = () => { if(advDirty()) applyDraft(); else { closeAdvanced(); btn.focus(); } };
+  // Enter in a value box is the same intent as pressing apply.
+  panel.addEventListener("keydown", e => {
+    if(e.key === "Enter" && e.target.closest("input")){ e.preventDefault(); applyDraft(); }
+  });
+  const escapes = e => { if(e.key === "Escape" && !panel.hidden){ closeAdvanced(); btn.focus(); } };
+  panel.addEventListener("keydown", escapes);
+  btn.addEventListener("keydown", escapes);
+  panel.addEventListener("change", e => {
+    const el = e.target.closest("[data-part]"); if(!el) return;
+    const i = +el.dataset.i, part = el.dataset.part;
+    if(!draft()[i]) return;
+    if(part === "key"){
+      // Switching field invalidates the operator and value: the new field may not be numeric,
+      // and its values are its own. Re-seed from the new field rather than carrying a value
+      // that belongs to a different field and silently matches nothing.
+      const f = metaField(el.value);
+      draft()[i] = [el.value, "eq", (f && f.values && f.values[0]) || ""];
+      renderAdvanced();
+    } else if(part === "op"){
+      const wasRange = draft()[i][1] === "between", isRange = el.value === "between";
+      draft()[i][1] = el.value;
+      // Leaving a range collapses `lo..hi` to its low end rather than carrying the separator
+      // into a single-value operator, where it would match nothing.
+      if(wasRange && !isRange) draft()[i][2] = String(draft()[i][2]).split(RANGE_SEP)[0];
+      if(!wasRange && isRange) draft()[i][2] = String(draft()[i][2]) + RANGE_SEP;
+      renderAdvanced();   // the operator decides whether the value is one control or two
+    } else if(part === "lo" || part === "hi"){
+      draft()[i][2] = rangeValue(i, part, el.value);
+    } else {
+      draft()[i][2] = el.value;
+    }
+    syncApply();
+  });
+  // Typing in a text value refilters as you go, like every other control on this bar.
+  panel.addEventListener("input", e => {
+    const el = e.target.closest('input[data-part="val"],input[data-part="lo"],input[data-part="hi"]');
+    if(!el) return;
+    const i = +el.dataset.i;
+    if(!draft()[i]) return;
+    const part = el.dataset.part;
+    draft()[i][2] = (part === "val") ? el.value : rangeValue(i, part, el.value);
+    syncApply();
+  });
+  panel.addEventListener("click", e => {
+    const del = e.target.closest(".advdel"); if(!del) return;
+    draft().splice(+del.dataset.i, 1);
+    renderAdvanced(); syncApply();
+  });
+}
+// One end changed: rebuild the `lo..hi` the server reads, keeping the other end as it was.
+function rangeValue(i, part, value){
+  const current = String((draft()[i] || [])[2] || "");
+  const cut = current.indexOf(RANGE_SEP);
+  let lo = cut < 0 ? current : current.slice(0, cut);
+  let hi = cut < 0 ? "" : current.slice(cut + RANGE_SEP.length);
+  if(part === "lo") lo = value; else hi = value;
+  return lo + RANGE_SEP + hi;
+}
+// The field set the panel was last drawn for; see fillSelects for why it is remembered.
+let ADV_SIG = null;
 
 // A filter change refetches the aggregates and resets the log to its first page.
 // PER stays in state; the data range comes from the period filter. A data change
@@ -2497,8 +2924,10 @@ async function init(){
   // picked again, which fires no change event and so used to do nothing at all.
   const showDateRange = on => { $("daterange").hidden = !on; };
   bindRangeControl(() => { applyPeriod(); applyFilters(); });
+  wireAdvanced();
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
+    state.meta=[]; advDraft=null; renderAdvanced(); syncAdvBtn(); syncApply();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span

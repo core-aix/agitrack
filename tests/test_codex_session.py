@@ -81,6 +81,46 @@ def _write(home, rows, session_id=SESSION):
     return path
 
 
+# --- cross-backend activity probe -------------------------------------------
+
+
+def test_repo_activity_answers_when_this_repo_last_had_a_conversation(codex_home, tmp_path):
+    """The cross-backend probe: the background tracker asks every installed backend this, every
+    cycle, to find out which agent the person is actually driving (see
+    ``BackgroundRunner._follow_the_driven_backend``). Codex answers from the rollout files as
+    well as the state db because the db is opened immutable — rows for the session being written
+    RIGHT NOW, the one this exists to notice, can still be in the WAL and invisible."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = _write(codex_home, [_meta(cwd=str(repo)), *_turn("t1", "add subtract", "Added subtract.")])
+
+    assert codex.repo_activity(repo) == pytest.approx(path.stat().st_mtime)
+    # A repo Codex has never been opened in says so, rather than reporting a time of 0 that would
+    # read as "used, long ago" and take part in the comparison.
+    assert codex.repo_activity(tmp_path / "never-used") is None
+
+
+def test_repo_activity_ignores_threads_no_human_drove(codex_home, tmp_path):
+    # A headless `codex exec` — which is exactly what aGiTrack's own summarizer looks like — and a
+    # sub-agent's thread are work, not conversations. Counting either as activity would hand the
+    # tracker to Codex on the strength of a script's run, or of a sub-agent spawned by an agent
+    # running on some other backend.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    exec_meta = _row(
+        "session_meta",
+        {"session_id": SESSION, "id": SESSION, "cwd": str(repo), "source": "exec", "thread_source": "user"},
+    )
+    _write(codex_home, [exec_meta, *_turn("t1", "summarize", "Summarized.")])
+    _write(
+        codex_home,
+        [_meta(cwd=str(repo), session_id="019fe8dc-ca6c-7951-9225-000000000000", thread_source="subagent")],
+        session_id="019fe8dc-ca6c-7951-9225-000000000000",
+    )
+
+    assert codex.repo_activity(repo) is None
+
+
 # --- turn assembly -----------------------------------------------------------
 
 

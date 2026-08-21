@@ -271,12 +271,28 @@ class _Mounts:
 # is open, and a launcher that wants to show a repository asks an already-open dashboard tab to
 # go there instead of opening another.
 
-# How long a page may go without pinging before it is presumed closed. Comfortably more than the
-# ping interval, so one slow frame never evicts a live tab.
-_CLIENT_TTL_SECONDS = 15.0
+# How long a page may go without pinging before it is presumed closed.
+#
+# Sized for a HIDDEN tab, because that is the only kind there is to steer: the user opened the
+# dashboard, went back to the terminal, and started aGiTrack on the next repository. Every current
+# browser throttles timers in a hidden tab to roughly one tick a minute (Chrome, Firefox and
+# Safari all do), so the page's 2-second ping interval becomes a 60-second one the moment it stops
+# being looked at. At the 15 seconds this used to be, the tab we exist to reuse was outside the
+# window about three quarters of the time and the launcher opened yet another tab. A minute and a
+# half keeps one throttled tick comfortably inside it. Believing a closed tab for longer costs
+# nothing: `navigate` waits for the page to actually take the navigation and falls back to a new
+# tab when nothing does.
+_CLIENT_TTL_SECONDS = 90.0
 # How long a launcher waits for an open tab to pick up a navigation before giving up and opening
-# a browser itself. Long enough for one ping to land, short enough not to be felt.
-_NAVIGATE_WAIT_SECONDS = 4.0
+# a browser itself. Long enough for a tab that was just raised to notice, come back up to speed
+# and ping, short enough not to be felt as a hang.
+_NAVIGATE_WAIT_SECONDS = 6.0
+# How often `_await_dashboard` looks again while waiting for a tab to check in.
+_CLIENT_POLL_SECONDS = 0.25
+# How long to wait for the open tabs to re-register when the launcher STARTED the hub it is asking.
+# The registry is in-memory, so a hub that has just come up has an empty one while every tab still
+# open is a ping away from saying so. Slightly more than the page's 2-second ping interval.
+_COLD_HUB_CLIENT_WAIT_SECONDS = 3.0
 
 
 class _Clients:
@@ -318,6 +334,34 @@ class _Clients:
         waiting out the TTL, so a navigation is never handed to a tab that has gone."""
         with self._lock:
             self._seen.pop(client_id, None)
+
+    def candidate_browser(self, *, wait: float = 0.0) -> str | None:
+        """The browser family of the tab a navigation would go to, or None when there is no tab.
+
+        Asked BEFORE the navigation is queued, because raising that browser is what makes the tab
+        able to take it: see :func:`_steer_open_tab`. ``""`` is a real answer (a tab that did not
+        say which browser it is in), and it is not None: something is open either way."""
+        target = self._await_dashboard(wait)
+        if target is None:
+            return None
+        with self._lock:
+            return str((self._seen.get(target) or {}).get("browser") or "")
+
+    def _await_dashboard(self, grace: float) -> str | None:
+        """The dashboard tab to steer, waiting up to ``grace`` seconds for one to check in.
+
+        Nothing is persisted, so a hub that the asking command has just STARTED has an empty
+        registry: the tabs still open on the old hub's port are about to re-register, but not for
+        another ping. Answering "nothing is open" inside that window is how the first session
+        after a hub restart put a second tab next to the one already showing the dashboard."""
+        deadline = time.monotonic() + max(0.0, grace)
+        while True:
+            with self._lock:
+                self._expire()
+                target = self._pick_dashboard()
+            if target is not None or time.monotonic() >= deadline:
+                return target
+            time.sleep(_CLIENT_POLL_SECONDS)
 
     def navigate(self, url: str, *, timeout: float = _NAVIGATE_WAIT_SECONDS) -> str | None:
         """Ask an open DASHBOARD tab to go to ``url``. True once one has taken it.
@@ -372,6 +416,18 @@ class _Clients:
 # --------------------------------------------------------------------------- routing
 
 
+def _float_param(query: dict[str, list[str]], name: str, *, maximum: float = 10.0) -> float:
+    """A non-negative, bounded float from a query string. Anything unparseable reads as 0.
+
+    Bounded because the value becomes a SLEEP inside a request handler: a caller that asks for an
+    hour would hold a hub thread for an hour."""
+    try:
+        value = float((query.get(name) or ["0"])[0])
+    except (TypeError, ValueError):
+        return 0.0
+    return min(max(value, 0.0), maximum)
+
+
 class HubRouter:
     """Turns a request path into the right scope's answer.
 
@@ -390,6 +446,13 @@ class HubRouter:
             return json_response({"repos": self.repo_list()})
         if path == "/clients":
             return json_response({"clients": self.clients.snapshot()})
+        if path == "/steer-candidate":
+            # Which browser holds the tab a navigation would go to, WITHOUT queueing one. The
+            # launcher raises that browser first and only then asks for the navigation: a hidden
+            # tab is too throttled to answer while it stays hidden (see `_steer_open_tab`).
+            wait = _float_param(query, "wait")
+            browser = self.clients.candidate_browser(wait=wait)
+            return json_response({"found": browser is not None, "browser": browser or ""})
         chosen = split_choose(path)
         if chosen is not None:
             # Switching repository must not carry the CURRENT view across: the view that suits one
@@ -810,7 +873,11 @@ def open_dashboard(
         )
     # Before opening anything: is a dashboard tab already open? Steering it beats stacking up a
     # tab per repository, all of them the same dashboard on the same port.
-    if open_browser and _steer_open_tab(record, url):
+    # A hub this command started has an empty client registry for a ping or two: give the tabs
+    # that survived the old one a moment to say they are still there, or the first session after a
+    # hub restart opens a tab next to the one already showing the dashboard.
+    grace = 0.0 if was_running else _COLD_HUB_CLIENT_WAIT_SECONDS
+    if open_browser and _steer_open_tab(record, url, wait_for_client=grace):
         if not quiet:
             print("  (switched the dashboard tab you already had open)")
         return 0
@@ -821,38 +888,95 @@ def open_dashboard(
     return 0
 
 
-def _steer_open_tab(record: dict, url: str) -> bool:
-    """Ask the hub to send an already-open dashboard tab to ``url``. True once one has gone there.
+def _steer_open_tab(record: dict, url: str, *, wait_for_client: float = 0.0) -> bool:
+    """Ask an already-open dashboard tab to show ``url``. True once one has gone there.
 
-    Best-effort by construction: any failure (no hub, an old hub without the endpoint, a browser
-    with nothing open) just answers False and the caller opens a tab, which is what it did before
-    this existed. The hub does the waiting, so this returns only once a real page has taken it."""
+    Two round trips, and the FIRST one is the point. Every current browser throttles timers in a
+    hidden tab to about one tick a minute, and the tab worth reusing is hidden by definition: the
+    user opened the dashboard, went back to the terminal, and started aGiTrack on the next
+    repository. Queueing a navigation and waiting a few seconds for a tab in that state to notice
+    is waiting for something that will not happen. So the browser holding it is raised BEFORE the
+    navigation is asked for: the tab becomes visible, its timers run at full speed again, and it
+    picks the navigation up on its next ping. Raising costs nothing when it turns out not to help,
+    because the fallback (opening a tab) raises that browser anyway.
+
+    Best-effort by construction: any failure (no hub, an older one without these endpoints, a
+    browser with nothing open) answers False and the caller opens a tab, which is what it did
+    before this existed."""
     base = str(record.get("url") or "").rstrip("/")
     if not base:
         return False
+    from agitrack.metrics.server import raise_browser_window
+
+    candidate = _steer_candidate(base, wait_for_client)
+    if candidate is _CANDIDATE_UNSUPPORTED:
+        # An older hub, without the endpoint. Ask for the navigation and raise afterwards, which
+        # is exactly what this did before the raise moved in front of the wait.
+        browser = _ask_to_navigate(base, url)
+        if browser is None:
+            return False
+        raise_browser_window(browser)
+        return True
+    if candidate is None:
+        return False  # nothing open: skip the navigation round trip entirely
+    # The tab now knows it is being looked at, so it will ping in about two seconds rather than in
+    # about a minute. A page cannot raise itself: `window.focus()` is ignored without a user
+    # gesture in every current browser, by design, so the ask has to come from out here.
+    raised = raise_browser_window(candidate)
+    browser = _ask_to_navigate(base, url)
+    if browser is None:
+        return False
+    if not raised or (browser and browser != candidate):
+        # Either the raise did not happen, or a different tab took it (another one pinged first).
+        # A page that changed where nobody can see it is indistinguishable from nothing happening.
+        raise_browser_window(browser)
+    return True
+
+
+# Told apart from "no tab is open", which is also not a browser family: one means open a tab, the
+# other means fall back to how this worked before `/steer-candidate` existed.
+_CANDIDATE_UNSUPPORTED = "\x00unsupported"
+
+
+def _steer_candidate(base: str, wait: float) -> str | None:
+    """The browser family of the tab a navigation would go to.
+
+    None when nothing is open, :data:`_CANDIDATE_UNSUPPORTED` when the hub is too old to answer
+    (or did not), and otherwise the family, which may be ``""`` when the tab did not say."""
+    query = f"?wait={wait:g}" if wait > 0 else ""
+    answer = _hub_json(f"{base}/steer-candidate{query}")
+    if answer is None:
+        return _CANDIDATE_UNSUPPORTED
+    return str(answer.get("browser") or "") if answer.get("found") else None
+
+
+def _ask_to_navigate(base: str, url: str) -> str | None:
+    """Queue the navigation and wait for a tab to take it. The browser family that did, or None."""
+    answer = _hub_json(f"{base}/navigate", body={"url": url})
+    if answer is None or not answer.get("navigated"):
+        return None
+    return str(answer.get("browser") or "")
+
+
+def _hub_json(url: str, *, body: dict | None = None) -> dict | None:
+    """One request to the local hub, or None for anything that did not come back as JSON.
+
+    The timeout allows for the hub's own waiting: it holds the request while a page picks a
+    navigation up, and giving up before it answers would open a second tab on top of the one that
+    is already on its way to the right page."""
     import json as _json
-    import urllib.error
     import urllib.request
 
+    data = None if body is None else _json.dumps(body).encode("utf-8")
+    headers = {} if data is None else {"Content-Type": "application/json"}
+    timeout = _NAVIGATE_WAIT_SECONDS + _COLD_HUB_CLIENT_WAIT_SECONDS + 5.0
     try:
-        request = urllib.request.Request(
-            f"{base}/navigate",
-            data=_json.dumps({"url": url}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=_NAVIGATE_WAIT_SECONDS + 3.0) as response:
+        request = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             answer = _json.loads(response.read().decode("utf-8"))
-        if not answer.get("navigated"):
-            return False
-        # The tab now holds the right page, but it may be behind three other windows, and a page
-        # that changed where nobody can see it is indistinguishable from nothing happening.
-        from agitrack.metrics.server import raise_browser_window
-
-        raise_browser_window(str(answer.get("browser") or ""))
-        return True
+        return answer if isinstance(answer, dict) else None
     except Exception:
-        return False
+        return None
 
 
 def unmount_repo(directory: Path | str) -> bool:

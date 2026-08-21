@@ -3,6 +3,7 @@ import pytest
 import subprocess
 
 from agitrack.transcripts.opencode import (
+    repo_activity,
     latest_session_id,
     parse_exported_session,
     session_belongs_to_repo,
@@ -728,3 +729,86 @@ def test_opencode_session_list_is_bounded_and_safe_on_timeout(monkeypatch):
 
     monkeypatch.setattr(O.subprocess, "run", timeout_run)
     assert O._opencode_session_list(Path("/tmp"), 50) == []
+
+
+# --- cross-backend activity probe -------------------------------------------
+
+
+def _fake_store(tmp_path, monkeypatch, rows):
+    """An OpenCode data directory holding just enough database to answer the probe."""
+    import sqlite3
+
+    monkeypatch.setenv("AGITRACK_XDG_DATA_HOME", str(tmp_path / "share"))
+    database = tmp_path / "share" / "opencode" / "opencode.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER)")
+        connection.executemany("INSERT INTO session VALUES (?, ?, ?)", rows)
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+def test_repo_activity_answers_from_the_database_without_spawning_the_cli(tmp_path, monkeypatch):
+    """The cross-backend probe: the background tracker asks every installed backend this, every
+    cycle, to find out which agent the person is actually driving (see
+    ``BackgroundRunner._follow_the_driven_backend``). It reads the database directly because the
+    obvious alternative — ``opencode session list`` — costs a ~0.4 s subprocess, and most of the
+    time it is being asked about a backend nobody is running."""
+    from agitrack.transcripts import opencode as opencode_session
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_store(
+        tmp_path,
+        monkeypatch,
+        [
+            ("ses_old", str(repo), 1_700_000_000_000),
+            ("ses_new", str(repo), 1_700_000_900_000),
+            ("ses_elsewhere", str(tmp_path / "other"), 1_800_000_000_000),
+        ],
+    )
+    monkeypatch.setattr(
+        opencode_session,
+        "_opencode_session_list",
+        lambda *a, **k: pytest.fail("the probe must not shell out to the OpenCode CLI"),
+    )
+
+    assert repo_activity(repo) == 1_700_000_900.0  # newest conversation IN THIS REPO, in seconds
+    # A repo OpenCode has never been opened in says so, rather than reporting a time of 0 that
+    # would read as "used, long ago" and take part in the comparison.
+    assert repo_activity(tmp_path / "never-used") is None
+
+
+def test_repo_activity_ignores_sessions_no_human_drove(tmp_path, monkeypatch):
+    # aGiTrack's own summarizer runs are `opencode run` calls it records as programmatic. Counting
+    # one as activity would let aGiTrack's own machinery decide which backend it should follow.
+    from agitrack.transcripts import opencode as opencode_session
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_store(tmp_path, monkeypatch, [("ses_script", str(repo), 1_700_000_900_000)])
+    opencode_session.mark_programmatic("ses_script")
+
+    assert repo_activity(repo) is None
+
+
+def test_repo_activity_is_silent_rather_than_wrong_when_the_store_is_unreadable(tmp_path, monkeypatch):
+    # A missing or differently-shaped database means "no signal", never an exception and never a
+    # timestamp: the tracker keeps following the backend it is on instead of chasing a store it
+    # cannot read.
+    import sqlite3
+
+    monkeypatch.setenv("AGITRACK_XDG_DATA_HOME", str(tmp_path / "share"))
+    assert repo_activity(tmp_path / "repo") is None  # no database at all
+
+    database = tmp_path / "share" / "opencode" / "opencode.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE something_else (id TEXT)")  # a schema this version doesn't know
+    connection.commit()
+    connection.close()
+
+    assert repo_activity(tmp_path / "repo") is None

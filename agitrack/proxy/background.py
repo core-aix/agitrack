@@ -44,6 +44,13 @@ from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.session import Session
 
 
+# How long the list of installed backends is trusted before it is established again. The
+# tracker asks for it on every poll cycle, and answering costs a PATH search plus (for a backend
+# that isn't there) an `npm` call — so it is cached; long-running trackers still notice an agent
+# installed after they started, within this window.
+_INSTALLED_BACKENDS_TTL_SECONDS = 300.0
+
+
 def background_handshake_path(repo: GitRepo) -> Path:
     """Where a running background tracker records its pid, so `agitrack -b stop`/`status` can
     find it. Separate from the repo lock (which every mode shares) so stop/status target ONLY a
@@ -706,7 +713,7 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     try:
         from agitrack.backends import agent_hooks
 
-        notice = agent_hooks.startup_notice(repo.repo, _recorded_backend(AgitrackState(repo.repo)))
+        notice = agent_hooks.startup_notice(repo.repo)
         if notice:
             print(f"\naGiTrack: {notice}")
     except Exception:
@@ -747,6 +754,27 @@ def _stop_still_stands(repo: GitRepo) -> bool:
         return False
 
 
+def _installed_backend(preferred: str | None = None) -> str | None:
+    """``preferred`` when it names a backend installed on this machine; otherwise any installed
+    backend; otherwise None — i.e. "an agent this machine can actually run".
+
+    Used to answer "is there anything here to track at all?", never to OVERRIDE a backend the
+    repo has recorded: which one a tracker starts on matters far less than it used to (it
+    follows whichever backend the person opens — see
+    ``BackgroundRunner._follow_the_driven_backend``), and a daemon handed a recorded backend
+    that is not installed moves itself onto one that is, without rewriting the user's global
+    default the way an explicit ``--backend`` would."""
+    from agitrack.backends.proxy_agents import available_backends
+    from agitrack.backends.setup import backend_installed
+
+    names = available_backends()
+    ordered = ([preferred] if preferred in names else []) + [name for name in names if name != preferred]
+    for name in ordered:
+        if backend_installed(name):
+            return name
+    return None
+
+
 def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
     """Every reason NOT to auto-start a tracker for ``repo``, and the arguments to start one
     with when none of them applies. ``None`` means "leave it alone".
@@ -776,7 +804,13 @@ def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
         return None
     lock.release()  # only probing: the daemon we spawn takes it for real
     state = AgitrackState(repo.repo)
-    backend_name = _recorded_backend(state)
+    # The recorded backend is taken AS RECORDED — not filtered through "is it installed?". This
+    # hook fires when an agent session opens, so an agent is demonstrably running; a probe that
+    # cannot see its binary (a CI box, a wrapper on a path the search does not know) must not be
+    # what decides the repo goes untracked. Only when nothing at all is recorded does the
+    # question become "what could this machine run?", which is still better than the previous
+    # answer — nothing, leaving every repo whose FIRST agent session fired this hook untracked.
+    backend_name = _recorded_backend(state) or config.default_backend or _installed_backend()
     if not backend_name:
         return None
     manual = read_background_mode(repo)
@@ -875,7 +909,6 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     ``background_autostart`` is set, starts the background daemon for future commits (else it prints
     a one-line reminder). A purely human commit (no pending AI turns) is left completely untouched:
     no trailer, no reminder, no daemon."""
-    from agitrack.backends.setup import backend_installed
     from agitrack.git import RepoLock
 
     # Remind about an available update on EVERY commit (the marker is written by the background
@@ -915,8 +948,10 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # blanket `except` below turned the raise into a silent no-op — no fold hooks installed, no
         # trace folded, rc 0, the commit's AI work lost, while `agitrack -s` still reported
         # "Auto-start on commit: on". Ask a question that can be answered with "don't know".
-        backend_name = _recorded_backend(runner.state)
-        if not backend_name or not backend_installed(backend_name):
+        # ...and a repo with none recorded still gets tracked: the runner below follows whichever
+        # backend the session actually ran on, so any agent this machine has is a fine start.
+        backend_name = _recorded_backend(runner.state) or config.default_backend or _installed_backend()
+        if not backend_name:
             return 0
         runner.state.ensure_local_ignore()  # git-ignore .agitrack/ before writing the trailer/ref
         # This hook path folds a trace + metadata into a commit the user is writing THEMSELVES, so
@@ -936,7 +971,16 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     # self-sustaining dead state — the tracker stops once and no number of later commits brings
     # it back, which is exactly what was observed. Whether THIS commit carries AI work and
     # whether a tracker should be running from now on are different questions.
-    if config.autotrack_hook != "off" and not _stop_still_stands(repo) and _live_background_pid(repo) is None:
+    if (
+        config.autotrack_hook != "off"
+        and not _stop_still_stands(repo)
+        and _live_background_pid(repo) is None
+        # Spawning a daemon on a machine with no coding agent installed gets a process that
+        # exits seconds later having printed "backend ... is not installed" into background.log,
+        # and a line in the commit output claiming tracking had started. The turns this hook
+        # just recorded are already folded into the commit either way.
+        and _installed_backend(backend_name) is not None
+    ):
         # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
         # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
         # same commit mode as the last run; the *starting* commit is manual regardless.
@@ -1031,6 +1075,18 @@ class BackgroundRunner:
         # amend HEAD to add it later), reused to also write the commit-summary git note.
         self._pending_cover_summary: str | None = None
 
+        # Every backend installed on this machine, and when that was last established. The
+        # tracker watches all of them (see `_installed_backends`); the answer is cached because
+        # `backend_installed` can shell out to npm looking for a backend that ISN'T there, and
+        # refreshed on a slow throttle so installing an agent mid-run is eventually noticed.
+        self._installed: list[str] = []
+        self._installed_at = 0.0
+        # Whether this runner is the live daemon (``run()``), as opposed to the throwaway one the
+        # pre-commit hook builds to record pending turns. Both track and both may switch backend;
+        # only the daemon may act on that by arming hooks and publishing a handshake — a hook
+        # process doing so would leave a handshake for a pid that is already gone, and would
+        # promise "aGiTrack commits for you" in a repo where nothing is about to run.
+        self._is_live_daemon = False
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
             self.global_config.load_repo_overlay(repo.repo)
@@ -1083,11 +1139,17 @@ class BackgroundRunner:
     # ------------------------------------------------------------------
 
     def run(self) -> int:
-        from agitrack.backends.setup import backend_installed
-
-        if not backend_installed(self.state.backend):
+        installed = self._installed_backends()
+        if not installed:
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
+        if self.state.backend not in installed:
+            # The recorded backend is gone (uninstalled, or a global default that was never
+            # installed here) but another agent IS available. Refusing to start would leave the
+            # repo untracked for a backend the person can actually run — and the tracker follows
+            # whichever one they open anyway, so start on what exists.
+            self._print(f"backend '{self.state.backend}' is not installed; tracking {installed[0]} instead.")
+            self._switch_backend(installed[0], announce=False)
         # FIRST, before any of the startup work below: from this point on the process is
         # findable and stoppable by `--daemons`, by a self-update, and by the test suite's
         # sweep. Everything after it can take seconds, and a daemon nobody can see for seconds
@@ -1119,6 +1181,7 @@ class BackgroundRunner:
         # nothing armed at all. Publishing it only once the repo really is in the advertised
         # state costs the launcher that fraction of a second and makes every reading true.
         self._write_handshake()
+        self._is_live_daemon = True
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
         self.events.emit(
@@ -1127,9 +1190,11 @@ class BackgroundRunner:
             mode="manual" if self._manual_commits else "auto",
             repo=self.repo.repo,
         )
+        watching = ", ".join(self._installed_backends()) or self.state.backend
         self._print(
             f"background tracker running for {self.state.backend} in {self.repo.repo} "
-            f"({mode}, no worktree). Drive the agent from any UI; stop it with `agitrack -b stop`."
+            f"({mode}, no worktree), following whichever agent you open here ({watching}). "
+            "Drive the agent from any UI; stop it with `agitrack -b stop`."
         )
         # aGiTrack updated on disk: leave the loop, tear down WITHOUT force-capturing an
         # in-flight turn (the replacement resumes tracking it via the persisted watermark),
@@ -1297,11 +1362,18 @@ class BackgroundRunner:
             path = background_handshake_path(self.repo)
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = "manual commits" if self._manual_commits else "auto commits"
+            # Rewritten mid-run whenever the tracked backend changes, so the start time has to
+            # survive: `-b status` and the dashboard report it as "running since", and stamping
+            # `now` there would reset this tracker's apparent uptime on every switch.
+            started_at = time.time()
+            existing = _read_handshake(self.repo) or {}
+            if existing.get("pid") == os.getpid() and isinstance(existing.get("started_at"), (int, float)):
+                started_at = float(existing["started_at"])
             path.write_text(
                 json.dumps(
                     {
                         "pid": os.getpid(),
-                        "started_at": time.time(),
+                        "started_at": started_at,
                         "backend": self.state.backend,
                         "mode": mode,
                         # Stamp the running aGiTrack version so a later `agitrack -b` can tell an
@@ -1476,14 +1548,20 @@ class BackgroundRunner:
         offers one; the others keep the commit-time behaviour they have always had.
 
         Installed under the same ``autotrack_hook`` opt-in as the git hook, and persistent for
-        the same reason — its job is to run when aGiTrack is not."""
+        the same reason — its job is to run when aGiTrack is not.
+
+        ARMED FOR EVERY INSTALLED BACKEND, not just the one being tracked. Auto-start has to fire
+        for whichever agent the person opens next, and that is not necessarily the one they
+        opened last: arming only the current backend meant opening a different agent in the repo
+        started nothing, and the session ran untracked until the next commit noticed."""
         from agitrack.backends import agent_hooks, claude_settings
 
         # The SESSION-START hook is per backend and every backend has one, so it is installed
         # first and unconditionally. The turn-end (Stop) hook below is Claude's alone.
-        if agent_hooks.install_agent_autostart(self.repo.repo, self.state.backend, debug=self._debug):
-            self._debug(f"{self.state.backend} session-start autostart hook installed")
-        if self.state.backend != "claude":
+        for name in self._installed_backends() or [self.state.backend]:
+            if agent_hooks.install_agent_autostart(self.repo.repo, name, debug=self._debug):
+                self._debug(f"{name} session-start autostart hook installed")
+        if "claude" not in (self._installed_backends() or [self.state.backend]):
             return
         if claude_settings.install_autostart_hook(self.repo.repo, debug=self._debug):
             self._debug("claude change-autostart hook installed")
@@ -1502,14 +1580,20 @@ class BackgroundRunner:
         UNLIKE THE AUTOTRACK HOOK, this one IS removed on teardown. That hook exists to keep
         tracking working while aGiTrack is NOT running; this one would be a lie in the same
         situation — with no tracker watching, nothing is committing for the agent and it
-        should behave normally again."""
+        should behave normally again.
+
+        Installed for every INSTALLED backend, because this tracker commits for whichever one is
+        opened here (see :meth:`_follow_the_driven_backend`) — telling only the backend that
+        happens to be tracked right now leaves the agent the person actually opens committing
+        its own work, which is the duplicate-commit mess the note exists to prevent."""
         if not self._commit_guidance:
             return
         try:
             from agitrack.backends import agent_hooks
 
-            if agent_hooks.install_commit_guidance(self.repo.repo, self.state.backend, debug=self._debug):
-                self._debug(f"{self.state.backend} commit-guidance hook installed")
+            for name in self._installed_backends() or [self.state.backend]:
+                if agent_hooks.install_commit_guidance(self.repo.repo, name, debug=self._debug):
+                    self._debug(f"{name} commit-guidance hook installed")
         except Exception as error:
             self._debug(f"commit-guidance hook install failed: {error!r}")
 
@@ -1630,7 +1714,8 @@ class BackgroundRunner:
         return session
 
     def _tracked_session_id(self) -> str | None:
-        """The conversation to export this cycle: the newest one a HUMAN is driving here.
+        """The conversation to export this cycle: the newest one a HUMAN is driving here, on
+        WHICHEVER backend they are driving it on.
 
         The interactive proxy gets this for free — it spawns the backend itself and pins that
         session (``ProxyRunner._discover_spawned_session``), so it tracks exactly one
@@ -1648,11 +1733,121 @@ class BackgroundRunner:
         adopted before this filter existed, and a still-running one would keep feeding the
         daemon "turns" the user never asked for.
         """
+        self._follow_the_driven_backend()
         try:
             return self.backend.latest_session_id(self.repo.repo)
         except Exception as error:
             self._debug(f"tracked session lookup failed: {error!r}")
             return None
+
+    # ------------------------------------------------------------------
+    # Following the backend the person actually opened
+    # ------------------------------------------------------------------
+
+    def _installed_backends(self) -> list[str]:
+        """Every backend installed on this machine, in registry order.
+
+        WHY THE TRACKER WATCHES ALL OF THEM. A background tracker observes work it did not
+        start: the person opens whatever agent they feel like in the repo, and the backend
+        recorded for the repo is only ever a GUESS about which that will be — seeded from the
+        global default the first time anything tracked here. When the guess is wrong the tracker
+        polls a store that will never mention the session, and everything about it is lost: no
+        per-turn commits, and the user's own commit carries no trace, no tokens, no model.
+        Measured, in a repo whose recorded backend was OpenCode while the whole session ran on
+        Claude Code: 90 minutes and ~148k output tokens tracked nowhere, ending in a hand-made
+        commit. A person is free to choose their agent per session; the tracker follows.
+
+        Cached, and refreshed only every few minutes: ``backend_installed`` searches PATH and
+        then the installer directories, running ``npm`` to find them — cheap when the backend is
+        there, not cheap when it isn't, and this is asked on every poll cycle."""
+        from agitrack.backends.proxy_agents import available_backends
+        from agitrack.backends.setup import backend_installed
+
+        now = time.monotonic()
+        if self._installed and now - self._installed_at < _INSTALLED_BACKENDS_TTL_SECONDS:
+            return list(self._installed)
+        found = [name for name in available_backends() if backend_installed(name)]
+        if found:
+            self._installed = found
+            self._installed_at = now
+        return list(found)
+
+    def _agent_for(self, name: str) -> Any:
+        """The proxy agent for ``name`` — the live one when it is the backend being tracked, so a
+        caller that swapped ``self.backend`` (the tests, a future in-process reuse) keeps being
+        asked, rather than a fresh replacement that would ignore it."""
+        if name == self.state.backend:
+            return self.backend
+        return make_proxy_agent(name)
+
+    def _backend_activity(self) -> dict[str, float]:
+        """When each installed backend last had human activity in this repo, by backend name.
+
+        Backends never used here are ABSENT rather than zero: "nothing recorded" and "recorded
+        long ago" are different answers and only the second can win a comparison. A backend whose
+        probe fails is treated the same way — an unreadable store must never be able to pull the
+        tracker off the backend that is actually working."""
+        activity: dict[str, float] = {}
+        for name in self._installed_backends():
+            try:
+                probe = getattr(self._agent_for(name), "repo_activity", None)
+                when = probe(self.repo.repo) if callable(probe) else None
+            except Exception as error:
+                self._debug(f"{name} activity probe failed: {error!r}")
+                continue
+            if when is not None:
+                activity[name] = float(when)
+        return activity
+
+    def _follow_the_driven_backend(self) -> None:
+        """Point this tracker at the backend the person is actually using, when that is not the
+        one it is currently on.
+
+        The comparison is between CONVERSATION timestamps, not "does this backend have a session
+        here at all" — otherwise a repo where Claude was used once last month would pull the
+        tracker off the OpenCode session running right now. Ties go to the backend already being
+        tracked, so a quiet repo never flaps between stores.
+
+        Never switches mid-turn: a turn in flight is one this tracker still owes a commit, and
+        going to look at another store would drop its trace and tokens on the floor."""
+        if self._in_flight is not None:
+            return
+        activity = self._backend_activity()
+        if not activity:
+            return  # nothing recorded anywhere — stay put and let the normal poll run
+        driven, driven_at = max(activity.items(), key=lambda item: item[1])
+        if driven == self.state.backend:
+            return
+        current_at = activity.get(self.state.backend)
+        if current_at is not None and current_at >= driven_at:
+            return
+        self._switch_backend(driven)
+
+    def _switch_backend(self, name: str, *, announce: bool = True) -> None:
+        """Track ``name`` from now on, keeping everything the outgoing backend had.
+
+        Its conversation is REMEMBERED rather than dropped, so switching back (the person
+        returning to their other agent) resumes that conversation instead of adopting whatever
+        happens to be newest there. The per-conversation watermark
+        (``AgitrackState.backend_message_id_for``) is what keeps every conversation's turns
+        counted exactly once across all this, which is why the global mark is deliberately left
+        alone: clearing it means "recompute from scratch", and the incoming conversation would
+        re-commit turns it had already recorded."""
+        previous = self.state.backend
+        self.state.remember_backend_session()
+        self.state.backend = name
+        self.state.backend_session_id = self.state.stored_backend_session(name)
+        self.backend = make_proxy_agent(name)
+        self.events.emit("backend-switch", backend=name, previous=previous, repo=self.repo.repo)
+        if announce:
+            self._print(f"the session in this repository is running on {name}; tracking that now (was {previous}).")
+        if not self._is_live_daemon:
+            return
+        # The hooks are per backend: the incoming one needs its commit-guidance note, and its
+        # session-start hook is what starts a tracker here again after this one stops.
+        self._install_commit_guidance()
+        self._install_change_autostart_hook()
+        self._write_handshake()  # `-b status` and the dashboard read the tracked backend from here
 
     def _process_once(self, *, require_complete: bool = True) -> bool:
         """Export the user's active backend session and record any newly completed turns as

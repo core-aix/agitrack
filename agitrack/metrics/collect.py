@@ -127,6 +127,19 @@ class CommitStat:
     started_at: str = ""  # AI conversation start, ISO-8601 UTC (agent commits)
     ended_at: str = ""  # AI conversation end, ISO-8601 UTC (agent commits)
     backend: str | None = None
+    # The whole parsed metadata block, so the dashboard's advanced filter can select on ANY
+    # recorded field — CLI version, OS, session name, compactions, token counts — without a new
+    # CommitStat attribute per field. Only well-formed `key: value` lines with a lower_snake_case
+    # key are kept (see `filterable_metadata`): a commit body can quote a metadata block or carry
+    # git trailers (`Signed-off-by`, dependabot's `update-type`), and those must not become
+    # filter fields. Empty for a commit with no block.
+    metadata: dict[str, str] = field(default_factory=dict)
+    # The agent harness version that made this commit (`backend_version:` in the metadata).
+    # Carried here rather than left in the raw block so a reader can group and compare by it —
+    # the harness owns the tool set and editing style, and updates far more often than the
+    # model, so "which harness made this?" is a question the history has to be able to answer.
+    # None for a commit written before the field existed, or by a backend that reports none.
+    backend_version: str | None = None
     model: str | None = None
     tokens: dict[str, int] = field(default_factory=dict)
     insertions: int = 0
@@ -1017,6 +1030,8 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
+        backend_version=_real_metadata_label(metadata.get("backend_version")),
+        metadata=filterable_metadata(metadata),
         model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         covered_commits=(metadata.get("covered_commits") or "").split(),
@@ -1179,6 +1194,8 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
+        backend_version=_real_metadata_label(metadata.get("backend_version")),
+        metadata=filterable_metadata(metadata),
         model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         # The metadata block identifies the original commit this constituent was
@@ -1278,6 +1295,19 @@ def _parse_metadata(body: str) -> dict[str, str]:
         if sep and key.strip() and " " not in key.strip():
             metadata[key.strip()] = value.strip()
     return metadata
+
+
+# A metadata key the advanced filter may offer: lower_snake_case, as every field aGiTrack
+# writes is. The commit body is NOT a trustworthy source of key/value pairs — a message can
+# quote a metadata block verbatim (a GitHub merge copies the whole PR body), and git trailers
+# ride in the same shape — so without this the field list filled up with `Signed-off-by`,
+# dependabot's `update-type`, and fragments of prose like `deps(vscode)` or `(Claude)`.
+_FILTERABLE_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def filterable_metadata(metadata: dict[str, str]) -> dict[str, str]:
+    """The metadata entries the dashboard's advanced filter may select on."""
+    return {key: value for key, value in metadata.items() if value and _FILTERABLE_KEY.match(key)}
 
 
 def _extract_prompt(body: str, subject: str, kind: str) -> str:

@@ -43,6 +43,7 @@ __all__ = [
     "turns_after",
     "latest_session_id",
     "list_sessions",
+    "repo_activity",
     "list_worktree_sessions",
     "sessions_under",
     "session_belongs_to_repo",
@@ -693,6 +694,8 @@ def parse_exported_session(
     # The directory the session ran in. OpenCode's edit/write tools record absolute paths but its
     # `bash` tool's commands are relative to this, and both must key `file_state` the same way.
     session_directory = str(info.get("directory") or "")
+    # The harness version, from the export header — OpenCode records one per session.
+    session_version = str(info.get("version") or "")
 
     def flush() -> None:
         nonlocal compactions
@@ -707,6 +710,7 @@ def parse_exported_session(
             mcp_servers=mcp_servers,
             active_skills=turn_skills,
             directory=session_directory,
+            backend_version=session_version,
         )
         # Skills this turn LOADED (the tail past the opening snapshot) carry forward even if the
         # turn also compacted; ones it merely inherited are already in the roster, or were cleared.
@@ -799,6 +803,7 @@ def _build_turn(
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
     active_skills: list[str] | None = None,
     directory: str = "",
+    backend_version: str = "",
 ) -> SessionTurn | None:
     # `active_skills` is the session's live skill roster (see `parse_exported_session`): the turn
     # starts with everything already loaded, and anything it loads itself is added back for the
@@ -872,6 +877,7 @@ def _build_turn(
         # the turn spent reasoning tokens — the only reasoning signal OpenCode
         # reliably exposes (the configured level is not in the export).
         reasoning_effort=effort or ("on" if tokens.reasoning > 0 else None),
+        backend_version=backend_version or None,
         started_at=_message_time(user_info),
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
         agent_messages=agent_messages,
@@ -1215,8 +1221,16 @@ _OPENCODE_DB_NAME = "opencode.db"
 
 
 def _opencode_data_root() -> Path:
-    """OpenCode's data directory. Honours XDG_DATA_HOME; otherwise the documented default."""
-    xdg = getenv_compat("XDG_DATA_HOME")
+    """OpenCode's data directory. Honours XDG_DATA_HOME; otherwise the documented default.
+
+    Both spellings are read, aGiTrack's own override first: ``getenv_compat`` looks ONLY at
+    ``AGITRACK_XDG_DATA_HOME`` (that is what it is for — pointing a test or an isolated run at a
+    fake store), so consulting it alone meant the standard variable — set by default on a good
+    many Linux desktops — was ignored and the store was looked for in ``~/.local/share`` where it
+    is not. Everything that reads this then silently reported "OpenCode has nothing here":
+    turn-end liveness fell back to the PTY, and the cross-backend activity probe could never see
+    an OpenCode session. ``agitrack.proxy.sandbox`` reads the real variable for the same paths."""
+    xdg = getenv_compat("XDG_DATA_HOME") or os.environ.get("XDG_DATA_HOME")
     root = Path(xdg) if xdg else Path.home() / ".local" / "share"
     return root / "opencode"
 
@@ -1252,6 +1266,51 @@ def session_last_activity(session_id: str) -> float | None:
     if not row or row[0] is None:
         return None
     return _to_seconds(row[0])
+
+
+# How many session rows the repo-activity probe considers, newest first. See the equivalent cap
+# in the Claude parser: the probe runs for every installed backend on every tracker cycle, and
+# anything a person is driving right now is at the top of this ordering.
+_ACTIVITY_ROW_LIMIT = 200
+
+
+def repo_activity(repo: Path) -> float | None:
+    """Epoch seconds of the newest HUMAN-driven activity recorded for ``repo`` on this backend,
+    or None when OpenCode holds no conversation for it (or its store cannot be read).
+
+    See :func:`agitrack.transcripts.claude.repo_activity` for what the background tracker does
+    with this. THIS ONE READS THE DATABASE DIRECTLY rather than going through
+    ``opencode session list``, and that is the whole reason the probe is a separate question
+    from the listing: the CLI call takes ~0.4 s (measured), and the tracker asks this of every
+    installed backend every few seconds — including, for most people, a backend they are not
+    running at all. The same read-only, never-blocking rules as
+    :func:`session_last_activity` apply, and an OpenCode whose store this cannot read simply
+    never wins the cross-backend comparison; it is still tracked normally once it is the
+    backend being followed."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return None
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            rows = connection.execute(
+                f"SELECT id, directory, time_updated FROM session ORDER BY time_updated DESC LIMIT {_ACTIVITY_ROW_LIMIT}"
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception:
+        return None  # wrong schema, locked, corrupt, no sqlite3 — all mean "no signal"
+    machine_driven = programmatic_session_ids()
+    resolved = repo.resolve()
+    for session_id, directory, updated in rows:
+        if str(session_id) in machine_driven:
+            continue  # a scripted `opencode run` (aGiTrack's own summarizer included), not a conversation
+        if not _same_repo(directory, resolved):
+            continue
+        return _to_seconds(updated)  # rows are newest-first, so the first match for this repo is the answer
+    return None
 
 
 def session_activity_mtime(session_id: str) -> float | None:

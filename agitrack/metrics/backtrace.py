@@ -896,6 +896,10 @@ def _metadata_lines(source: _Source, session_id: str, turn: SessionTurn) -> list
         f"backend: {source.backend}",
         f"model: {turn.model or 'unknown'}",
     ]
+    # The harness version, when the transcript recorded one — the same field a live commit
+    # carries, so a reconstructed history is comparable with a tracked one.
+    if turn.backend_version:
+        lines.append(f"backend_version: {turn.backend_version}")
     if turn.reasoning_effort:
         lines.append(f"reasoning_effort: {turn.reasoning_effort}")
     if session_id:
@@ -1133,11 +1137,26 @@ class BacktraceScope:
                         "here. `git init` and then `agitrack` starts recording it."
                     ),
                     "pid": None,
+                    **self._live_page_state(),
                 }
             )
         from agitrack.proxy.background import running_mode
 
-        return json_response(running_mode(self.learn_repo))
+        return json_response({**running_mode(self.learn_repo), **self._live_page_state()})
+
+    def _live_page_state(self) -> dict:
+        """What every polling page needs regardless of what it is showing: which aGiTrack is
+        answering (the page reloads itself when that changes) and the update notices (the page
+        re-renders its banner from them). This view used to answer neither, so a reconstruction
+        left open across an update went on running the old page's JS and showing the old page's
+        notices until someone reloaded it by hand."""
+        from agitrack.metrics.web import update_notices
+        from agitrack.versioning import version_line
+
+        # No repo, deliberately: the reconstruction's own banner is built the same way (see
+        # `_banner_html`), because a reconstruction is about a directory, not about a
+        # session running there. The two must not disagree.
+        return {"agitrack_version": version_line(), "update_notices": update_notices()}
 
     def story_view(self, branch: str) -> tuple[list, dict]:
         """What the storyline is told from HERE: the reconstructed turns and the files each one
@@ -1155,7 +1174,7 @@ class BacktraceScope:
         from agitrack.metrics import learn as learn_page
         from agitrack.metrics import story as story_page
         from agitrack.metrics.routing import Response, html_response, json_response
-        from agitrack.metrics.web import aggregates_payload, log_page
+        from agitrack.metrics.web import aggregates_payload, log_page, parse_meta_filters
 
         if path == "/state":
             # Answered BEFORE the reconstruction is touched: "is aGiTrack running here?" is a
@@ -1165,6 +1184,9 @@ class BacktraceScope:
         active = self.serving()
         view, browser = active.view, active.browser
         author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
+        # The advanced filter: repeated `meta=<key>:<op>:<value>` conditions over any recorded
+        # metadata field (see web.parse_meta_filters).
+        meta = parse_meta_filters(query.get("meta") or [])
         frm, to = _int(query, "from", 0), _int(query, "to", 0)
         if path in ("", "/", "/index.html"):
             return Response(content_type="text/html; charset=utf-8", body=active.page, cache_control="no-cache")
@@ -1174,6 +1196,7 @@ class BacktraceScope:
                 author=author,
                 backend=backend,
                 model=model,
+                meta=meta,
                 frm=frm,
                 to=to,
                 granularity=_str(query, "granularity"),
@@ -1188,6 +1211,7 @@ class BacktraceScope:
                     author=author,
                     backend=backend,
                     model=model,
+                    meta=meta,
                     frm=frm,
                     to=to,
                     offset=_int(query, "offset", 0),

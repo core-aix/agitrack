@@ -504,6 +504,26 @@ function noteVersion(version){
   box.hidden = false;
 })();
 
+// The update banner is the one thing on the page whose whole job is to be current, and it was
+// the one thing that could not change: the server rendered it into the HTML and nothing ever
+// touched it again. A tab open since the morning kept announcing an update that had since been
+// installed, or a marker that had since been withdrawn. Re-rendered from the same poll that
+// watches the version, so it costs no extra request.
+function renderUpdateNotices(notices){
+  const box = $("updatebanners");
+  if(!box || !Array.isArray(notices)) return;   // an older server, which simply does not say
+  const wanted = notices.join("\u0000");
+  if(box.dataset.notices === wanted) return;    // unchanged: leave the DOM (and any selection) be
+  box.dataset.notices = wanted;
+  box.textContent = "";
+  for(const text of notices){
+    const div = document.createElement("div");
+    div.className = "updatebanner";
+    div.textContent = "\u2b06 " + text;
+    box.appendChild(div);
+  }
+}
+
 async function refreshHubState(){
   const box = $("hub-state");
   let state = null;
@@ -511,6 +531,7 @@ async function refreshHubState(){
   // Checked before anything else and regardless of HUB: a version change matters on every page
   // that polls, and it is the reason the rest of what follows can be out of date.
   if(state) noteVersion(state.agitrack_version);
+  if(state) renderUpdateNotices(state.update_notices);
   if(!HUB || !box) return;
   if(!state || !state.label){ box.hidden = true; return; }
   box.classList.toggle("live", !!state.running);
@@ -564,6 +585,12 @@ function wireHubPresence(){
   if(!HUB) return;
   hubPing();
   setInterval(hubPing, HUB_PING_MS);
+  // The interval above is not what re-registers a tab that has been in the background: every
+  // current browser throttles timers in a hidden tab to about one tick a minute, so the moment
+  // this page is looked at again is the moment it has to say so itself. That moment is also when
+  // a launcher that just raised this window is waiting to hand it a navigation.
+  document.addEventListener("visibilitychange", () => { if(!document.hidden) hubPing(); });
+  window.addEventListener("focus", hubPing);
   // Say goodbye on the way out, so a navigation is never handed to a tab that has gone. A beacon
   // rather than a fetch: the page is being torn down and a normal request would be cancelled.
   window.addEventListener("pagehide", () => {

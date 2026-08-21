@@ -235,7 +235,7 @@ def test_a_repo_dashboard_only_shows_the_install_notice_of_its_own_instance(tmp_
     import agitrack
 
     from agitrack.git.lock import RepoLock
-    from agitrack.metrics.web import _update_banner_html
+    from agitrack.metrics.web import update_notices
 
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "config"))
     repo_root = tmp_path / "repo"
@@ -252,7 +252,7 @@ def test_a_repo_dashboard_only_shows_the_install_notice_of_its_own_instance(tmp_
     )
 
     # No instance on this repo (a dashboard-only repo): the global installation is the subject.
-    assert "99.0.0" in _update_banner_html(repo)
+    assert any("99.0.0" in notice for notice in update_notices(repo))
 
     lock = RepoLock(repo_root / ".agitrack" / "lock")
     for fingerprint, expected in (
@@ -264,10 +264,10 @@ def test_a_repo_dashboard_only_shows_the_install_notice_of_its_own_instance(tmp_
         monkeypatch.setattr("agitrack.update.restart.disk_fingerprint", lambda f=fingerprint: f)
         assert lock.acquire() is True
         try:
-            banner = _update_banner_html(repo)
+            notices = update_notices(repo)
         finally:
             lock.release()
-        assert (expected in banner) if expected else banner == ""
+        assert any(expected in notice for notice in notices) if expected else notices == []
 
 
 def test_the_install_notice_speaks_versions_for_a_package_and_commits_for_a_source_checkout(tmp_path, monkeypatch):
@@ -310,13 +310,15 @@ def test_dashboards_show_the_two_notices_separately(tmp_path, monkeypatch):
     from "restart your session" (this repo) — they call for different actions. Backtrace
     has no session of its own, so it only ever shows the first."""
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
-    from agitrack.metrics.web import _update_banner_html
+    from agitrack.metrics.web import _update_banner_html, update_notices
 
     repo = types.SimpleNamespace(repo=tmp_path / "repo")
     (repo.repo / ".agitrack").mkdir(parents=True)
 
     monkeypatch.setattr("agitrack.update.selfupdate.running_session_is_stale", lambda root: False)
-    assert _update_banner_html(repo) == ""  # nothing to say
+    # Nothing to say. The markup still carries the (empty) container the page re-renders into.
+    assert update_notices(repo) == []
+    assert 'class="updatebanner"' not in _update_banner_html(repo)
 
     selfupdate.write_state(
         selfupdate.SelfUpdateRecord(
