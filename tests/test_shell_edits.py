@@ -13,6 +13,8 @@ follows. Roughly half of these tests are therefore about what is DECLINED.
 
 from __future__ import annotations
 
+import json
+
 from agitrack.transcripts.shell_edits import edits_from_shell
 
 REPO = "/repo"
@@ -290,6 +292,41 @@ def test_a_relative_path_with_no_recorded_cwd_is_skipped():
     assert edits == [] and state == {}
 
 
+def test_cd_moves_where_relative_writes_land():
+    # Without following `cd`, this was resolved against the session's directory and recorded as
+    # /repo/notes.md — a repo-root file that never existed. The reconstruction invented paths.
+    edits, state = _run("cd sub && cat > notes.md <<'EOF'\nalpha\nEOF\n")
+    assert list(state) == ["/repo/sub/notes.md"]
+    assert edits[0].path == "/repo/sub/notes.md"
+
+
+def test_cd_to_an_absolute_path_outside_the_directory_is_followed_not_folded_in():
+    # Scratch work done elsewhere must keep its real path, so the backtrace's own
+    # outside-the-directory filter can drop it — rather than being counted as a repo change.
+    _, state = _run("cd /elsewhere/tmp && cat > notes.md <<'EOF'\nalpha\nEOF\n")
+    assert list(state) == ["/elsewhere/tmp/notes.md"]
+
+
+def test_cd_upwards_is_normalised():
+    _, state = _run("cd pkg/sub && cd ../other && echo hi > f.txt")
+    assert list(state) == ["/repo/pkg/other/f.txt"]
+
+
+def test_a_cd_the_text_cannot_resolve_makes_later_relative_writes_unresolvable():
+    # `cd $SCRATCH` lands somewhere only the running shell knew. Resolving the write against
+    # the OLD directory would attribute it to a file that was never touched.
+    for command in ("cd $SCRATCH && cat > x.py <<'EOF'\none\nEOF\n", "cd - && echo hi > x.py"):
+        edits, state = _run(command)
+        assert edits == [] and state == {}, command
+
+
+def test_a_subshell_cd_does_not_move_the_lines_after_it():
+    # `(cd pkg && …)` moves nothing for the caller. Letting it persist resolved a later line's
+    # `pkg/mod.py` to `pkg/pkg/mod.py` — a path that has never existed.
+    _, state = _run("(cd pkg && echo one > a.txt)\necho two > pkg/b.txt\n")
+    assert sorted(state) == ["/repo/pkg/a.txt", "/repo/pkg/b.txt"]
+
+
 def test_commands_apply_in_order_within_one_call():
     edits, state = _run("cat > a.txt <<'EOF'\nalpha\nEOF\nsed -i '' 's/alpha/beta/' a.txt\necho gamma >> a.txt\n")
     assert state["/repo/a.txt"] == "beta\ngamma\n"
@@ -430,3 +467,167 @@ def test_opencode_reads_its_bash_tool_against_the_session_directory():
     assert {e.path for e in edits} == {"/r/f.py"}
     assert (sum(e.insertions for e in edits), sum(e.deletions for e in edits)) == (3, 1)
     assert opencode.parse_exported_session(data).turns[0].edits == []
+
+
+# --------------------------------------------------------------------------- sub-agent edits
+#
+# A sub-agent's transcript is not a conversation the user can resume, so it appears in no
+# session listing and nothing else reads it. Its tokens were already recovered; its EDITS were
+# not — so every file a delegated agent wrote was missing from the backtrace, and a turn that
+# fanned all its work out looked like a turn that changed nothing. The work belongs to the turn
+# that delegated it, which is where its tokens already go.
+
+
+def _claude_session_with_subagent(tmp_path, sub_rows):
+    session = tmp_path / "s.jsonl"
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-07-02T09:00:00Z",
+            "message": {"role": "user", "content": "go"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "cwd": "/r",
+            "timestamp": "2026-07-02T09:00:01Z",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {"type": "tool_use", "id": "task-1", "name": "Task", "input": {"subagent_type": "general-purpose"}}
+                ],
+            },
+        },
+    ]
+    session.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    subdir = tmp_path / "s" / "subagents"
+    subdir.mkdir(parents=True)
+    (subdir / "agent-x.jsonl").write_text("\n".join(json.dumps(row) for row in sub_rows) + "\n")
+    (subdir / "agent-x.meta.json").write_text(json.dumps({"toolUseId": "task-1"}))
+    return session
+
+
+def test_claude_subagent_edits_land_on_the_turn_that_launched_it(tmp_path):
+    from agitrack.transcripts import claude
+
+    session = _claude_session_with_subagent(
+        tmp_path,
+        [
+            {
+                "type": "assistant",
+                "uuid": "s1",
+                "cwd": "/r",
+                "isSidechain": True,
+                "message": {
+                    "id": "sm1",
+                    "role": "assistant",
+                    "content": [
+                        # One through the shell and one through an editing tool: a sub-agent
+                        # reaches for both, exactly as the agent that launched it does.
+                        {
+                            "type": "tool_use",
+                            "id": "s-t1",
+                            "name": "Bash",
+                            "input": {"command": "cat > sub.py <<'EOF'\nalpha\nbeta\nEOF\n"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "s-t2",
+                            "name": "Write",
+                            "input": {"file_path": "/r/other.py", "content": "one\n"},
+                        },
+                    ],
+                },
+            }
+        ],
+    )
+    turn = claude.export_session_at(session, collect_edits=True).turns[0]
+    assert sorted(e.path for e in turn.edits) == ["/r/other.py", "/r/sub.py"]
+    assert sum(e.insertions for e in turn.edits) == 3
+    assert claude.export_session_at(session).turns[0].edits == []  # opt-in, and no extra file reads
+
+
+def test_opencode_subagent_edits_land_on_the_turn_that_launched_it(monkeypatch, tmp_path):
+    from agitrack.transcripts import opencode
+
+    def task_part(parent, child):
+        return {
+            "type": "tool",
+            "tool": "task",
+            "state": {"metadata": {"sessionId": child, "parentSessionId": parent}},
+        }
+
+    child = {
+        "info": {"id": "C", "directory": "/r"},
+        "messages": [
+            {
+                "info": {"role": "assistant", "tokens": {"total": 5, "input": 1, "output": 5}},
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {"input": {"command": "cat > sub.py <<'EOF'\nalpha\nbeta\nEOF\n"}},
+                    },
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(opencode, "_export_data", lambda repo, sid: {"C": child}.get(sid))
+    parent = {
+        "info": {"id": "P", "directory": "/r", "time": {"updated": 1_700_000_000_000}},
+        "messages": [
+            {
+                "info": {"id": "u1", "role": "user", "time": {"created": 1_700_000_000_000}},
+                "parts": [{"type": "text", "text": "go"}],
+            },
+            {
+                "info": {
+                    "id": "a1",
+                    "role": "assistant",
+                    "time": {"created": 1_700_000_001_000},
+                    "finish": "stop",
+                    "model": {"providerID": "anthropic", "modelID": "claude"},
+                },
+                "parts": [task_part("P", "C"), {"type": "text", "text": "done", "metadata": {"phase": "final_answer"}}],
+            },
+        ],
+    }
+    work = opencode._collect_subagent_work(tmp_path, "P", parent, collect_edits=True)
+    turn = opencode.parse_exported_session(
+        parent,
+        subagent_tokens={c: u for c, (u, _e) in work.items()},
+        subagent_edits={c: e for c, (_u, e) in work.items()},
+        collect_edits=True,
+    ).turns[0]
+    assert [e.path for e in turn.edits] == ["/r/sub.py"]
+    assert turn.edits[0].insertions == 2
+
+
+def test_codex_subagent_shell_edits_are_collected(monkeypatch, tmp_path):
+    from agitrack.transcripts import codex
+
+    child_rows = [
+        {"type": "session_meta", "payload": {"cwd": "/r", "id": "child"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"cat > sub.py <<\'EOF\'\\nalpha\\nEOF\\n"}',
+            },
+        },
+    ]
+    path = tmp_path / "child.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in child_rows) + "\n")
+    monkeypatch.setattr(codex, "session_transcript_path", lambda sid: path if sid == "child" else None)
+    monkeypatch.setattr(codex, "_spawned_thread_ids", lambda sid: [])
+
+    work = codex._subagent_work("parent", extra_children=["child"], collect_edits=True)
+    _usage, edits = work["child"]
+    assert [e.path for e in edits] == ["/r/sub.py"]
+    assert edits[0].insertions == 1

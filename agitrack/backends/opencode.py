@@ -167,11 +167,13 @@ class OpenCodeBackend:
         # run's token totals. The child session ids streamed through the events above;
         # export each and fold its consumption in (issue: subagent tokens).
         if child_ids:
-            from agitrack.transcripts.opencode import _subagent_tokens_for_session
+            from agitrack.transcripts.opencode import _subagent_work_for_session
 
             visited: set[str] = set()
             for child_id in child_ids:
-                tokens.add(_subagent_tokens_for_session(self.repo, child_id, visited))
+                # Tokens only here: a live run's totals is all this path needs, and asking for
+                # edits would parse every child's tool calls for a number nobody reads.
+                tokens.add(_subagent_work_for_session(self.repo, child_id, visited)[0])
 
         # OpenCode's event stream names no model — verified against the real CLI, none of
         # step_start / text / step_finish carries one — so `parsed_model` is None for every run
