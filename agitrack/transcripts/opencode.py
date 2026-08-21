@@ -693,6 +693,8 @@ def parse_exported_session(
     # The directory the session ran in. OpenCode's edit/write tools record absolute paths but its
     # `bash` tool's commands are relative to this, and both must key `file_state` the same way.
     session_directory = str(info.get("directory") or "")
+    # The harness version, from the export header — OpenCode records one per session.
+    session_version = str(info.get("version") or "")
 
     def flush() -> None:
         nonlocal compactions
@@ -707,6 +709,7 @@ def parse_exported_session(
             mcp_servers=mcp_servers,
             active_skills=turn_skills,
             directory=session_directory,
+            backend_version=session_version,
         )
         # Skills this turn LOADED (the tail past the opening snapshot) carry forward even if the
         # turn also compacted; ones it merely inherited are already in the roster, or were cleared.
@@ -799,6 +802,7 @@ def _build_turn(
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
     active_skills: list[str] | None = None,
     directory: str = "",
+    backend_version: str = "",
 ) -> SessionTurn | None:
     # `active_skills` is the session's live skill roster (see `parse_exported_session`): the turn
     # starts with everything already loaded, and anything it loads itself is added back for the
@@ -872,6 +876,7 @@ def _build_turn(
         # the turn spent reasoning tokens — the only reasoning signal OpenCode
         # reliably exposes (the configured level is not in the export).
         reasoning_effort=effort or ("on" if tokens.reasoning > 0 else None),
+        backend_version=backend_version or None,
         started_at=_message_time(user_info),
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
         agent_messages=agent_messages,

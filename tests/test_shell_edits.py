@@ -662,3 +662,141 @@ def test_codex_subagent_shell_edits_are_collected(monkeypatch, tmp_path):
     _usage, edits = work["child"]
     assert [e.path for e in edits] == ["/r/sub.py"]
     assert edits[0].insertions == 1
+
+
+# --------------------------------------------------------------------------- harness version
+#
+# The agent HARNESS shapes a change as much as the model does — it owns the tool set, the system
+# prompt and the editing style — and it updates itself far more often than the model changes.
+# Measured on this repository, the ratio of shell calls to editing-tool calls tripled over six
+# weeks of CLI releases with the model and permission mode constant; establishing that took
+# re-reading raw transcripts, because no commit recorded which harness made it.
+
+
+def test_claude_records_the_harness_version_per_turn():
+    from agitrack.transcripts import claude
+
+    def turn(uuid, mid, version):
+        return [
+            {
+                "type": "user",
+                "uuid": f"u{uuid}",
+                "timestamp": "2026-07-02T09:00:00Z",
+                "message": {"role": "user", "content": "go"},
+            },
+            {
+                "type": "assistant",
+                "uuid": f"a{uuid}",
+                "version": version,
+                "timestamp": "2026-07-02T09:00:01Z",
+                "message": {
+                    "id": mid,
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "model": "claude-opus-5",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [{"type": "text", "text": "done"}],
+                },
+            },
+        ]
+
+    # A CLI that updates itself MID-CONVERSATION is the reason this is per turn, not per session:
+    # one session spans two versions and only the turn knows which one made its change.
+    rows = [*turn(1, "m1", "2.1.236"), *turn(2, "m2", "2.1.238")]
+    versions = [t.backend_version for t in claude.parse_rows("s", rows).turns]
+    assert versions == ["2.1.236", "2.1.238"]
+
+
+def test_codex_and_opencode_record_the_harness_version():
+    from agitrack.transcripts import codex, opencode
+
+    rows = [
+        {"type": "session_meta", "payload": {"cwd": "/r", "id": "c1", "cli_version": "0.147.0"}},
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+        },
+    ]
+    assert [t.backend_version for t in codex.parse_exported_session(rows).turns] == ["0.147.0"]
+
+    data = {
+        "info": {"id": "s", "directory": "/r", "version": "1.18.16", "time": {"updated": 1}},
+        "messages": [
+            {"info": {"id": "u1", "role": "user", "time": {"created": 1}}, "parts": [{"type": "text", "text": "go"}]},
+            {
+                "info": {
+                    "id": "a1",
+                    "role": "assistant",
+                    "time": {"created": 2},
+                    "finish": "stop",
+                    "model": {"providerID": "a", "modelID": "m"},
+                },
+                "parts": [{"type": "text", "text": "ok", "metadata": {"phase": "final_answer"}}],
+            },
+        ],
+    }
+    assert [t.backend_version for t in opencode.parse_exported_session(data).turns] == ["1.18.16"]
+
+
+def test_the_commit_metadata_carries_the_harness_version_beside_the_backend():
+    from agitrack.commits.message import build_agent_commit_message
+
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[],
+        backend="claude",
+        backend_session_id="s1",
+        agitrack_session_id="a1",
+        model="claude-opus-5",
+        backend_version="2.1.238",
+    )
+    lines = message.splitlines()
+    assert "backend_version: 2.1.238" in lines
+    # Beside the backend it names, and before the model — the provenance reads top to bottom.
+    assert (
+        lines.index("backend: claude") < lines.index("backend_version: 2.1.238") < lines.index("model: claude-opus-5")
+    )
+    # OMITTED when the backend records no version, so an ordinary commit's metadata is unchanged.
+    without = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[],
+        backend="claude",
+        backend_session_id="s1",
+        agitrack_session_id="a1",
+        model="claude-opus-5",
+    )
+    assert "backend_version" not in without
+
+
+def test_the_commit_engine_reports_the_version_that_made_the_LATEST_turn():
+    # A span whose CLI updated itself partway is described by the version that produced the
+    # later turns — the same newest-first rule the model and reasoning effort already follow.
+    from agitrack.transcripts.types import SessionTurn
+
+    turns = [
+        SessionTurn(
+            "u1",
+            "a1",
+            "p",
+            "r",
+            __import__("agitrack.backends.base", fromlist=["TokenUsage"]).TokenUsage(),
+            "claude-opus-5",
+            backend_version="2.1.236",
+        ),
+        SessionTurn(
+            "u2",
+            "a2",
+            "p",
+            "r",
+            __import__("agitrack.backends.base", fromlist=["TokenUsage"]).TokenUsage(),
+            "claude-opus-5",
+            backend_version="2.1.238",
+        ),
+    ]
+    latest = next((t.backend_version for t in reversed(turns) if t.backend_version), None)
+    assert latest == "2.1.238"

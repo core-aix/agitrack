@@ -127,6 +127,12 @@ class CommitStat:
     started_at: str = ""  # AI conversation start, ISO-8601 UTC (agent commits)
     ended_at: str = ""  # AI conversation end, ISO-8601 UTC (agent commits)
     backend: str | None = None
+    # The agent harness version that made this commit (`backend_version:` in the metadata).
+    # Carried here rather than left in the raw block so a reader can group and compare by it —
+    # the harness owns the tool set and editing style, and updates far more often than the
+    # model, so "which harness made this?" is a question the history has to be able to answer.
+    # None for a commit written before the field existed, or by a backend that reports none.
+    backend_version: str | None = None
     model: str | None = None
     tokens: dict[str, int] = field(default_factory=dict)
     insertions: int = 0
@@ -1017,6 +1023,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
+        backend_version=_real_metadata_label(metadata.get("backend_version")),
         model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         covered_commits=(metadata.get("covered_commits") or "").split(),
@@ -1179,6 +1186,7 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
         backend=_real_metadata_label(metadata.get("backend")),
+        backend_version=_real_metadata_label(metadata.get("backend_version")),
         model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         # The metadata block identifies the original commit this constituent was

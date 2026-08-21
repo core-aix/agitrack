@@ -71,6 +71,7 @@ def _turn(
     output: int = 1,
     reasoning_effort: str | None = None,
     assistant_id: str = "aid",
+    backend_version: str | None = None,
 ) -> SessionTurn:
     return SessionTurn(
         "uid",
@@ -81,6 +82,7 @@ def _turn(
         None,
         complete=True,
         reasoning_effort=reasoning_effort,
+        backend_version=backend_version,
     )
 
 
@@ -100,6 +102,40 @@ def test_commit_turns_records_latest_reasoning_effort(tmp_path):
     )
     assert repo.message is not None
     assert "reasoning_effort: high" in repo.message
+
+
+def test_commit_turns_records_the_harness_version_that_made_the_latest_turn(tmp_path):
+    # The agent HARNESS owns the tool set, the system prompt and the editing style, and updates
+    # itself far more often than the model changes — so a commit that names only the backend and
+    # model cannot say what actually produced it. A CLI can also update itself MID-SPAN, which is
+    # why the newest turn's version wins, exactly as the model and reasoning effort do.
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[
+            _turn("a", "done", backend_version="2.1.236"),
+            _turn("b", "done", backend_version="2.1.238"),
+            _turn("c", "done"),  # a later turn without one must not erase it
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "backend_version: 2.1.238" in repo.message
+
+
+def test_commit_turns_omits_the_harness_version_when_no_turn_records_one(tmp_path):
+    # An ordinary commit's metadata is unchanged for a backend that reports no version.
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[_turn("a", "done")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None and "backend_version" not in repo.message
 
 
 @pytest.mark.parametrize("label", ["(background task completed)", "(background monitor update)"])

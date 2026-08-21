@@ -19,7 +19,9 @@ the shell path rather than of whichever tool the model happened to reach for.
 
 from __future__ import annotations
 
+import re
 import shutil
+import subprocess
 
 import pytest
 
@@ -113,3 +115,48 @@ def test_shell_made_edits_reach_the_backtrace(backend_name, tmp_path, monkeypatc
         f"{backend_name}: calc.py was reconstructed even with shell recovery disabled — "
         "the model used an editing tool, so this run proves nothing about the shell path"
     )
+
+
+@pytest.mark.parametrize("backend_name", sorted(_BACKENDS))
+def test_the_recorded_harness_version_matches_the_installed_cli(backend_name, tmp_path):
+    """The version aGiTrack records must be the version that actually ran.
+
+    A mocked transcript can only confirm we read the field we chose; it cannot catch the CLI
+    renaming it, or reporting something other than what `--version` prints. Both would leave
+    every commit carrying a wrong or missing harness version, silently — which is exactly the
+    blind spot this field exists to remove.
+    """
+    backend = _backend_or_skip(backend_name, tmp_path)
+    installed = _installed_version(backend_name)
+
+    result = backend.run(
+        "Reply with exactly the word: pineapple",
+        model=_MODELS[backend_name],
+        session_id=None,
+        timeout_seconds=180,
+    )
+    assert result.exit_code == 0, f"{backend_name} run failed: {result!r}"
+
+    claude._LAST_EXPORT = None
+    view = bt.build_backtrace(tmp_path)
+    recorded = {
+        line.split(": ", 1)[1].strip()
+        for stat in view.dashboard.stats
+        for line in (getattr(stat, "message", "") or "").splitlines()
+        if line.startswith("backend_version: ")
+    }
+    assert recorded, f"{backend_name}: no backend_version reached the metadata at all"
+    assert installed in recorded, f"{backend_name}: recorded {recorded}, but `--version` says {installed}"
+
+
+def _installed_version(backend_name):
+    """The version number the backend's own `--version` prints.
+
+    Each CLI decorates it differently — `2.1.238 (Claude Code)`, `codex-cli 0.147.0`, a bare
+    `1.18.16` — so the comparison is on the dotted number, not the whole line.
+    """
+    executable = shutil.which(_executable(backend_name))
+    output = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=60).stdout
+    match = re.search(r"\d+\.\d+\.\d+\S*", output)
+    assert match, f"{backend_name}: could not read a version out of {output!r}"
+    return match.group(0)

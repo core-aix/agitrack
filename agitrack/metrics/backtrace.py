@@ -896,6 +896,10 @@ def _metadata_lines(source: _Source, session_id: str, turn: SessionTurn) -> list
         f"backend: {source.backend}",
         f"model: {turn.model or 'unknown'}",
     ]
+    # The harness version, when the transcript recorded one — the same field a live commit
+    # carries, so a reconstructed history is comparable with a tracked one.
+    if turn.backend_version:
+        lines.append(f"backend_version: {turn.backend_version}")
     if turn.reasoning_effort:
         lines.append(f"reasoning_effort: {turn.reasoning_effort}")
     if session_id:

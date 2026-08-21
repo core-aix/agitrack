@@ -573,6 +573,13 @@ class CommitEngine:
         # Reasoning effort / thinking level for this commit's turns: the most recent
         # turn that recorded one wins, so the metadata reflects the level in effect
         # at the end of the span (None when no turn revealed it).
+        # The harness version these turns ran under. Newest-first like the model and effort:
+        # a CLI that updated itself mid-span produced the later turns, and that is the version
+        # the commit describes.
+        backend_version = next(
+            (turn.backend_version for turn in reversed(turns) if getattr(turn, "backend_version", None)),
+            None,
+        )
         reasoning_effort = next(
             (turn.reasoning_effort for turn in reversed(turns) if getattr(turn, "reasoning_effort", None)),
             None,
@@ -637,6 +644,7 @@ class CommitEngine:
             backend_session_id=backend_session_id,
             agitrack_session_id=self.state.session_id,
             model=model or self.state.model,
+            backend_version=backend_version,
             reasoning_effort=reasoning_effort,
             conversation_anchor=conversation_anchor,
             token_usage=self.state.pending_token_usage(),

@@ -1591,6 +1591,12 @@ def parse_rows(
                 # _finalize_turn) until the restarted process produces a real reply.
                 continue
             current["stop_reason"] = message.get("stop_reason")
+            # The harness version that produced this message. Last one wins: Claude Code can
+            # update itself mid-conversation, and the version that made the change is the one
+            # worth recording.
+            row_version = row.get("version")
+            if isinstance(row_version, str) and row_version.strip():
+                current["backend_version"] = row_version.strip()
             # Claude Code emits a `thinking` content block whenever extended
             # thinking is enabled, so its presence is the only signal the transcript
             # gives that reasoning was active (the budget itself is never recorded).
@@ -1976,6 +1982,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         ended_at=turn.get("ended_at"),
         compaction_count=int(turn.get("compactions") or 0),
         reasoning_effort=turn.get("reasoning_effort"),
+        backend_version=turn.get("backend_version"),
         agent_messages=list(turn.get("messages") or []),
         queued_followups=list(turn.get("queued_followups") or []),
         mcp_servers=used.mcp_servers,

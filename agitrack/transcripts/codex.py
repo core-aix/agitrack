@@ -615,6 +615,9 @@ def parse_rows(
     # names absolute paths, but a shell command's are relative to this, and the two must land on
     # the SAME key in `file_state` or one file is tracked (and counted) twice.
     rollout_cwd = str(_session_meta(rows).get("cwd") or "")
+    # The harness version, from the rollout header. Codex writes one `session_meta` per rollout,
+    # so unlike Claude's per-row `version` this cannot change mid-conversation.
+    rollout_version = str(_session_meta(rows).get("cli_version") or "")
     current: dict | None = None
     # Ids of message records already counted, so a rollout that repeats a record (Codex writes
     # both an `event_msg` and a mirrored `response_item` for each assistant message) never
@@ -637,6 +640,7 @@ def parse_rows(
                 # merging the two prompts, so the trace keeps one turn per prompt.
                 close(current, complete=False)
             current = _new_turn()
+            current["backend_version"] = rollout_version or None
             current["turn_id"] = str(payload.get("turn_id") or "")
             current["started_at"] = stamp
             continue
@@ -840,6 +844,7 @@ def _finalize(
         started_at=turn["started_at"],
         ended_at=turn["ended_at"],
         reasoning_effort=turn.get("reasoning_effort"),
+        backend_version=turn.get("backend_version"),
         compaction_count=turn["compaction_count"],
         queued_followups=turn["queued_followups"],
         mcp_servers=capability.mcp_servers,

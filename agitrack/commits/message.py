@@ -260,6 +260,7 @@ def build_agent_commit_message(
     backend_session_id: str | None,
     agitrack_session_id: str,
     model: str | None,
+    backend_version: str | None = None,
     reasoning_effort: str | None = None,
     conversation_anchor: str | None = None,
     token_usage: dict[str, int | None] | None = None,
@@ -302,6 +303,7 @@ def build_agent_commit_message(
             backend_session_id=backend_session_id,
             agitrack_session_id=agitrack_session_id,
             model=model,
+            backend_version=backend_version,
             reasoning_effort=reasoning_effort,
             conversation_anchor=conversation_anchor,
             token_usage=token_usage,
@@ -515,6 +517,7 @@ def _trace_and_metadata_lines(
     model: str | None,
     token_usage: dict[str, int | None] | None,
     trace_turn_limit: int,
+    backend_version: str | None = None,
     reasoning_effort: str | None = None,
     conversation_anchor: str | None = None,
     session_name: str | None,
@@ -556,6 +559,14 @@ def _trace_and_metadata_lines(
             # parsing prose. Emitted only when true: an ordinary commit is unchanged.
             *(["interrupted: true"] if interrupted else []),
             f"backend: {backend}",
+            # The agent HARNESS version, beside the backend it names. The harness shapes a change
+            # as much as the model does — it owns the tool set, the system prompt and the
+            # editing style — and it updates itself far more often than the model changes.
+            # Without it, a shift in how commits were produced is invisible in the history:
+            # this repository's shell-to-editing-tool ratio tripled over six weeks of CLI
+            # releases with the model and permission mode constant, and that could only be
+            # established by re-reading raw transcripts that a later cleanup could have removed.
+            *([f"backend_version: {backend_version}"] if backend_version else []),
             f"model: {model or 'unknown'}",
         ]
     )
