@@ -1702,7 +1702,10 @@ def test_background_status_shows_available_update(tmp_path, capsys):
     from agitrack.update.marker import write_update_marker
 
     repo = _init_repo(tmp_path)
-    write_update_marker(repo.repo, current="0.1.16", latest="0.2.0", message="u")
+    # The check's own sentence is what every surface repeats: see `update_reminder_line`.
+    write_update_marker(
+        repo.repo, current="0.1.16", latest="0.2.0", message="aGiTrack update available: 0.1.16 → 0.2.0."
+    )
     assert background_status(repo) == 0
     out = capsys.readouterr().out
     assert "update available" in out.lower() and "0.2.0" in out
@@ -1715,7 +1718,9 @@ def test_precommit_sync_reminds_about_update_on_every_commit(tmp_path, monkeypat
     repo = _init_repo(tmp_path)
     backend = FakeBackend()  # no AI work — the reminder must still show
     _precommit_env(tmp_path, monkeypatch, backend)
-    write_update_marker(repo.repo, current="0.1.16", latest="0.2.0", message="u")
+    write_update_marker(
+        repo.repo, current="0.1.16", latest="0.2.0", message="aGiTrack update available: 0.1.16 → 0.2.0."
+    )
 
     assert precommit_sync(repo) == 0
     err = capsys.readouterr().err

@@ -197,7 +197,21 @@ def _agitrack_version() -> str:
 
 
 def _update_banner_html(repo: "GitRepo | None" = None) -> str:
-    """The update notices shown at the top of a dashboard. Empty when there is nothing to say.
+    """:func:`update_notices` as the markup the page is served with.
+
+    Always a container, even with nothing to say: the page re-renders these from its own polling
+    (see ``renderUpdateNotices`` in `agitrack/metrics/ui.py`), and a notice that only ever arrives
+    with the HTML is a notice that stays on screen until the tab is closed. That is how a message
+    withdrawn hours ago was still being read."""
+    return (
+        '<div id="updatebanners">'
+        + "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in update_notices(repo))
+        + "</div>"
+    )
+
+
+def update_notices(repo: "GitRepo | None" = None) -> list[str]:
+    """The update notices for the top of a dashboard. Empty when there is nothing to say.
 
     aGiTrack updates ITSELF now, so these are only the two cases the user still has to act on,
     and they call for different actions — one line covering both told people to do the wrong thing:
@@ -253,7 +267,7 @@ def _update_banner_html(repo: "GitRepo | None" = None) -> str:
             fallback = None
         if fallback:
             parts.append(fallback)
-    return "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in parts)
+    return parts
 
 
 def dashboard_data(dash: Dashboard) -> dict:

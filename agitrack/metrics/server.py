@@ -261,6 +261,13 @@ class RepoScope:
             # releases every commit reports the same version, and it is precisely those
             # restarts a developer needs the open page to notice.
             state["agitrack_version"] = version_line()
+            # The update notices, so a page that has been open for hours shows what is true NOW.
+            # They are rendered into the HTML as well, for the first paint, but a marker can be
+            # cleared or an update installed while the tab sits there: the banner is the one part
+            # of the page whose whole job is to be current.
+            from agitrack.metrics.web import update_notices
+
+            state["update_notices"] = update_notices(self.repo)
             return json_response(state)
         return None
 

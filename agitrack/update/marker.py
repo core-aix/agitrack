@@ -106,7 +106,9 @@ def update_reminder_line(repo_root: Path) -> str | None:
     message = str(info.get("message") or "").strip()
     if message:
         return message
+    # Only reachable for a record that stored no sentence of its own, which no current check
+    # writes. Kept generic on purpose: without the check's own words there is nothing here to say
+    # WHY it could not be installed, and the pre-self-update advice ("choose 'update', or update
+    # via pip/pipx") described a version of aGiTrack that no longer needs to be updated by hand.
     current, latest = info.get("current", "?"), info.get("latest", "?")
-    return (
-        f"aGiTrack update available: {current} → {latest} (run `agitrack` and choose 'update', or update via pip/pipx)."
-    )
+    return f"aGiTrack update available: {current} → {latest}. Run `agitrack` to update it."

@@ -1137,11 +1137,26 @@ class BacktraceScope:
                         "here. `git init` and then `agitrack` starts recording it."
                     ),
                     "pid": None,
+                    **self._live_page_state(),
                 }
             )
         from agitrack.proxy.background import running_mode
 
-        return json_response(running_mode(self.learn_repo))
+        return json_response({**running_mode(self.learn_repo), **self._live_page_state()})
+
+    def _live_page_state(self) -> dict:
+        """What every polling page needs regardless of what it is showing: which aGiTrack is
+        answering (the page reloads itself when that changes) and the update notices (the page
+        re-renders its banner from them). This view used to answer neither, so a reconstruction
+        left open across an update went on running the old page's JS and showing the old page's
+        notices until someone reloaded it by hand."""
+        from agitrack.metrics.web import update_notices
+        from agitrack.versioning import version_line
+
+        # No repo, deliberately: the reconstruction's own banner is built the same way (see
+        # `_banner_html`), because a reconstruction is about a directory, not about a
+        # session running there. The two must not disagree.
+        return {"agitrack_version": version_line(), "update_notices": update_notices()}
 
     def story_view(self, branch: str) -> tuple[list, dict]:
         """What the storyline is told from HERE: the reconstructed turns and the files each one
