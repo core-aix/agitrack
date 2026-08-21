@@ -42,6 +42,7 @@ from agitrack.metrics.github import cached_logins
 from agitrack.metrics.routing import Response, html_response, json_response
 from agitrack.metrics.web import (
     _filter_stats,
+    parse_meta_filters,
     aggregates_payload,
     commit_diff,
     log_page,
@@ -150,6 +151,9 @@ class RepoScope:
         what makes it safe under the threading server) and the dashboard only ever reads, so
         de-duplicating within it cannot serve a value the request itself invalidated."""
         author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
+        # The advanced filter: repeated `meta=<key>:<op>:<value>` conditions over any recorded
+        # metadata field (see web.parse_meta_filters).
+        meta = parse_meta_filters(query.get("meta") or [])
         frm, to = _int(query, "from", 0), _int(query, "to", 0)
         ref = self._ref(_str(query, "branch"))
         if path in ("", "/", "/index.html"):
@@ -166,12 +170,15 @@ class RepoScope:
                 author=author,
                 backend=backend,
                 model=model,
+                meta=meta,
                 frm=frm,
                 to=to,
                 granularity=_str(query, "granularity"),
             )
             payload["shared_sessions"] = shared_sessions_for(self.repo)
-            payload["insights"] = self._insights(ref, author=author, backend=backend, model=model, frm=frm, to=to)
+            payload["insights"] = self._insights(
+                ref, author=author, backend=backend, model=model, meta=meta, frm=frm, to=to
+            )
             payload["pending"] = self._pending()
             payload["empty_state"] = self._empty_state(self._dashboard(ref))
             return json_response(payload)
@@ -183,6 +190,7 @@ class RepoScope:
                     author=author,
                     backend=backend,
                     model=model,
+                    meta=meta,
                     frm=frm,
                     to=to,
                     offset=_int(query, "offset", 0),
@@ -392,14 +400,22 @@ class RepoScope:
     _INSIGHTS_CACHE_MAX = 16
 
     def _insights(
-        self, ref: str = "HEAD", *, author: str = "", backend: str = "", model: str = "", frm: int = 0, to: int = 0
+        self,
+        ref: str = "HEAD",
+        *,
+        author: str = "",
+        backend: str = "",
+        model: str = "",
+        meta: list[tuple[str, str, str]] | None = None,
+        frm: int = 0,
+        to: int = 0,
     ) -> list[dict]:
         # Insights for the FILTERED view: the same commits the rest of the page is showing.
         # Cached per (tip, filter) — a poll with unchanged filters reuses the result, and a new
         # commit invalidates every entry.
         dash = self._dashboard(ref)
         head = dash.stats[-1].sha if dash.stats else ""
-        key = (ref, head, author, backend, model, frm, to)
+        key = (ref, head, author, backend, model, tuple(meta or ()), frm, to)
         cache = self._insights_cache
         hit = cache.get(key)
         if hit is None:
@@ -407,7 +423,7 @@ class RepoScope:
                 cache.clear()  # the tip moved: every cached slice is stale
             elif len(cache) >= self._INSIGHTS_CACHE_MAX:
                 cache.pop(next(iter(cache)))  # bound the per-tip filter variants
-            stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+            stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
             files, sha_paths = context_from_browser(self._browser(ref), stats)
             hit = build_insights(stats, files, sha_paths)
             cache[key] = hit

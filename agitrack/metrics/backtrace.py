@@ -1159,7 +1159,7 @@ class BacktraceScope:
         from agitrack.metrics import learn as learn_page
         from agitrack.metrics import story as story_page
         from agitrack.metrics.routing import Response, html_response, json_response
-        from agitrack.metrics.web import aggregates_payload, log_page
+        from agitrack.metrics.web import aggregates_payload, log_page, parse_meta_filters
 
         if path == "/state":
             # Answered BEFORE the reconstruction is touched: "is aGiTrack running here?" is a
@@ -1169,6 +1169,9 @@ class BacktraceScope:
         active = self.serving()
         view, browser = active.view, active.browser
         author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
+        # The advanced filter: repeated `meta=<key>:<op>:<value>` conditions over any recorded
+        # metadata field (see web.parse_meta_filters).
+        meta = parse_meta_filters(query.get("meta") or [])
         frm, to = _int(query, "from", 0), _int(query, "to", 0)
         if path in ("", "/", "/index.html"):
             return Response(content_type="text/html; charset=utf-8", body=active.page, cache_control="no-cache")
@@ -1178,6 +1181,7 @@ class BacktraceScope:
                 author=author,
                 backend=backend,
                 model=model,
+                meta=meta,
                 frm=frm,
                 to=to,
                 granularity=_str(query, "granularity"),
@@ -1192,6 +1196,7 @@ class BacktraceScope:
                     author=author,
                     backend=backend,
                     model=model,
+                    meta=meta,
                     frm=frm,
                     to=to,
                     offset=_int(query, "offset", 0),

@@ -324,6 +324,7 @@ def dashboard_data(dash: Dashboard) -> dict:
         "committers": sorted(a for a in dash.committers_with_lines() if a),
         "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
         "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
+        "meta_fields": metadata_filter_fields(dash),
         "commits": commits,
     }
 
@@ -392,11 +393,130 @@ def _covers(dash: Dashboard) -> dict[str, CommitStat]:
     return covers
 
 
-def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm: int, to: int) -> list[CommitStat]:
+# --------------------------------------------------------------------------- advanced filter
+#
+# The named filters (committer/backend/model/date) cover the questions asked most, and cover
+# nothing else. Every commit already carries a full metadata block — harness version, OS,
+# session name, compactions, token counts — and none of it was selectable, so "show me only what
+# Claude Code 2.1.238 produced" or "only the commits from the Ubuntu box" meant reading `git log`
+# by hand. The advanced filter selects on ANY recorded field, without a new named filter (and a
+# new query parameter, and a new dropdown) per field.
+
+# Above this many distinct values a field is offered as free text rather than a dropdown: a
+# select holding 537 conversation anchors is not a control, it is a wall.
+_FACET_VALUE_LIMIT = 100
+
+# `eq` exact, `has` substring (case-insensitive), `ge`/`le` numeric bounds. Anything else is
+# dropped rather than guessed at — a filter that silently means something other than what the
+# URL says would misreport the slice every panel on the page is computed from.
+_META_OPS = frozenset({"eq", "has", "ge", "le"})
+
+
+def parse_meta_filters(raw: list[str]) -> list[tuple[str, str, str]]:
+    """``["system:eq:macOS 15.7.3"]`` -> ``[("system", "eq", "macOS 15.7.3")]``.
+
+    Split at most twice, because a value legitimately contains colons (an ISO timestamp, an
+    `mcp__server__tool` name). Malformed or unknown-operator entries are DROPPED: the filter
+    is applied server-side to every panel, so a condition that cannot be honoured exactly must
+    not be silently relaxed into one that can.
+    """
+    out: list[tuple[str, str, str]] = []
+    for entry in raw:
+        key, _, rest = (entry or "").partition(":")
+        op, _, value = rest.partition(":")
+        if key.strip() and op in _META_OPS and value != "":
+            out.append((key.strip(), op, value))
+    return out
+
+
+def _meta_matches(stat: CommitStat, key: str, op: str, value: str) -> bool:
+    actual = (stat.metadata or {}).get(key)
+    if actual is None:
+        return False
+    if op == "eq":
+        return actual == value
+    if op == "has":
+        return value.casefold() in actual.casefold()
+    try:  # ge / le: both sides must be numbers, or the comparison means nothing
+        return float(actual) >= float(value) if op == "ge" else float(actual) <= float(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _passes_meta(stat: CommitStat, meta: list[tuple[str, str, str]]) -> bool:
+    """Conditions on DIFFERENT keys are ANDed; conditions on the SAME key are ORed.
+
+    That is what makes the control usable as a facet: adding a second value for `system` widens
+    "macOS" to "macOS or Ubuntu", while adding a `backend_version` condition narrows within it.
+    ANDing everything would make two values of one field select nothing at all, which reads as
+    the filter being broken.
+    """
+    by_key: dict[str, list[tuple[str, str, str]]] = {}
+    for condition in meta:
+        by_key.setdefault(condition[0], []).append(condition)
+    return all(any(_meta_matches(stat, key, op, value) for key, op, value in group) for group in by_key.values())
+
+
+def metadata_filter_fields(dash: Dashboard) -> list[dict]:
+    """The fields the advanced filter offers, each with the values actually present.
+
+    Built from the commits in view rather than a hard-coded list, so a field aGiTrack adds later
+    (as `backend_version` was) is filterable the day it lands, with no dashboard change at all.
+    """
+    values: dict[str, set[str]] = {}
+    for stat in dash.stats:
+        for key, value in (stat.metadata or {}).items():
+            values.setdefault(key, set()).add(value)
+    fields = []
+    for key in sorted(values):
+        seen = values[key]
+        numeric = all(_is_number(v) for v in seen)
+        fields.append(
+            {
+                "key": key,
+                "numeric": numeric,
+                # Omitted above the cap: the page offers a text box instead, so a high-cardinality
+                # field stays filterable without shipping every distinct value to the browser.
+                "values": sorted(seen, key=_numeric_sort_key if numeric else str)
+                if len(seen) <= _FACET_VALUE_LIMIT
+                else [],
+                "count": len(seen),
+            }
+        )
+    return fields
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _numeric_sort_key(value: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _filter_stats(
+    dash: Dashboard,
+    *,
+    author: str,
+    backend: str,
+    model: str,
+    frm: int,
+    to: int,
+    meta: list[tuple[str, str, str]] | None = None,
+) -> list[CommitStat]:
     covers = _covers(dash)
     out: list[CommitStat] = []
     for stat in dash.stats:
         if author and author not in dash.committers_of(stat):
+            continue
+        if meta and not _passes_meta(stat, meta):
             continue
         eff_backend, eff_model = _effective(stat, covers)
         if backend and eff_backend != backend:
@@ -556,6 +676,9 @@ def _options(dash: Dashboard) -> dict:
         "committers": sorted(c for c in committers if c),
         "backends": sorted(backends),
         "models": sorted(models),
+        # Every metadata field present in these commits, so the advanced filter can offer them
+        # without the page knowing any field name in advance.
+        "meta_fields": metadata_filter_fields(dash),
         "branches": dash.branches,
     }
 
@@ -566,6 +689,7 @@ def aggregates_payload(
     author: str = "",
     backend: str = "",
     model: str = "",
+    meta: list[tuple[str, str, str]] | None = None,
     frm: int = 0,
     to: int = 0,
     granularity: str = DEFAULT_GRANULARITY,
@@ -573,7 +697,7 @@ def aggregates_payload(
     """All the metric panels for the given filters — no per-commit list, so the
     response stays small no matter how large the repository is. Filter options
     come from the full history so the dropdowns never lose entries."""
-    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
     # Full-history commit-date span (unfiltered) so the from/to date inputs can show
     # — and be bounded to — the real range the dashboard covers.
     dated = [s.timestamp for s in dash.stats if s.timestamp]
@@ -637,6 +761,7 @@ def log_page(
     author: str = "",
     backend: str = "",
     model: str = "",
+    meta: list[tuple[str, str, str]] | None = None,
     frm: int = 0,
     to: int = 0,
     offset: int = 0,
@@ -651,7 +776,7 @@ def log_page(
     fetched on demand — and *only* those commits' blobs are fetched, so a blobless
     partial clone never pulls its whole history just to render one page (the
     full-history scan in :func:`collect_commit_stats` counts from local blobs alone)."""
-    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
@@ -969,6 +1094,36 @@ header{padding:26px 0 18px}
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
 __UI_RANGE_CSS__
+/* The advanced filter. It hangs BELOW the sticky bar rather than expanding it: growing the bar
+   pushes the whole page down every time it opens, and on a phone a bar tall enough to hold three
+   condition rows covers most of the screen. */
+.advwrap{align-self:flex-end;display:inline-flex}
+.advbtn{cursor:pointer;border:1px solid var(--line);color:var(--fg);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:7px 12px;white-space:nowrap}
+.advbtn:hover{border-color:var(--phosphor);color:var(--phosphor)}
+.advbtn[aria-expanded="true"]{border-color:var(--phosphor);color:var(--phosphor)}
+.advbtn .advcount{color:var(--ink);background:var(--phosphor);padding:0 5px;margin-left:6px}
+.advpanel{position:absolute;top:calc(100% + 6px);left:12px;right:12px;z-index:29;background:var(--panel);
+  border:1px solid var(--phosphor-dim);padding:12px 14px;box-shadow:0 10px 26px rgba(0,0,0,.55)}
+.advrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.advrow select,.advrow input{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:6px 9px;min-width:0}
+.advrow select:focus,.advrow input:focus{outline:none;border-color:var(--phosphor)}
+.advrow .advkey{flex:1 1 210px}
+.advrow .advop{flex:0 0 118px}
+.advrow .advval{flex:2 1 240px}
+.advrow .advdel{cursor:pointer;border:1px solid var(--line);color:var(--amber);background:transparent;
+  font-family:var(--mono);font-size:13px;padding:5px 10px}
+.advrow .advdel:hover{border-color:var(--amber)}
+.advfoot{display:flex;gap:10px;align-items:center;margin-top:4px}
+.advadd{cursor:pointer;border:1px solid var(--phosphor-dim);color:var(--phosphor);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:6px 11px}
+.advadd:hover{background:var(--phosphor);color:var(--ink)}
+.advhint{color:var(--dim);font-size:12px}
+@media (max-width:760px){
+  .advpanel{position:static;margin-top:10px}
+  .advrow .advkey,.advrow .advop,.advrow .advval{flex:1 1 100%}
+}
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
@@ -1327,8 +1482,16 @@ __UPDATE_BANNER__
         <button class="dr-done" id="dr-done">done</button>
       </div>
     </div>
+    <span class="advwrap"><button class="advbtn" id="advbtn" aria-expanded="false" aria-controls="advpanel" title="Filter on any field the commits record: harness version, OS, session name, compactions, token counts">advanced</button></span>
     <button class="reset" id="reset">reset</button>
     <span class="loading" id="loading" hidden aria-live="polite"><span class="spin"></span>loading…</span>
+    <div class="advpanel" id="advpanel" hidden>
+      <div id="advrows"></div>
+      <div class="advfoot">
+        <button class="advadd" id="advadd">+ add condition</button>
+        <span class="advhint">Conditions on different fields must all match; several values of the same field match any of them.</span>
+      </div>
+    </div>
   </div>
 
   <!-- Work the BACKTRACE can see and this dashboard cannot: sessions or turns no aGiTrack
@@ -1489,7 +1652,7 @@ const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
 const DEFAULT_BRANCH = INIT.branch || "";
-const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -1536,6 +1699,9 @@ function qs(extra){
   if(state.author) p.set("author", state.author);
   if(state.backend) p.set("backend", state.backend);
   if(state.model) p.set("model", state.model);
+  // Repeated (append, not set): the filter is a LIST of conditions, and several may name the
+  // same field — which is exactly how one field is widened to "any of these values".
+  for(const [k,op,v] of state.meta){ if(k && op && v !== "") p.append("meta", k+":"+op+":"+v); }
   if(state.fromTs) p.set("from", state.fromTs);
   if(state.toTs) p.set("to", state.toTs);
   if(state.granularity) p.set("granularity", state.granularity);
@@ -2223,7 +2389,106 @@ function syncFilters(){
   if(!OPTIONS.committers.includes(state.author)) state.author = "";
   if(!OPTIONS.backends.includes(state.backend)) state.backend = "";
   if(!OPTIONS.models.includes(state.model)) state.model = "";
+  // A branch switch changes which metadata fields exist. Drop conditions on fields this view
+  // does not have, or the page would keep filtering by something the user can no longer see or
+  // clear — an empty dashboard with no visible cause.
+  const known = new Set(metaFields().map(f => f.key));
+  if(known.size) state.meta = state.meta.filter(([k]) => known.has(k));
+  renderAdvanced(); syncAdvBtn();
 }
+
+// --- advanced filter ------------------------------------------------------
+// Every field the commits actually record, offered without the page knowing any field name in
+// advance — so a field aGiTrack adds later is filterable the day it lands. A field with few
+// distinct values gets a dropdown of them; a high-cardinality one (session ids, timestamps,
+// token counts) gets a text box, because a select holding 500 conversation anchors is a wall,
+// not a control. Numeric fields also offer >= and <=.
+const META_OPS = {eq:"is", has:"contains", ge:"\u2265", le:"\u2264"};
+function metaFields(){ return (OPTIONS && OPTIONS.meta_fields) || []; }
+function metaField(key){ return metaFields().find(f => f.key === key) || null; }
+function renderAdvanced(){
+  const host = $("advrows");
+  if(!host) return;
+  const fields = metaFields();
+  if(!fields.length){
+    host.innerHTML = '<div class="advhint">No metadata fields in this view yet — they appear once commits carry an aGiTrack metadata block.</div>';
+    return;
+  }
+  host.innerHTML = state.meta.map(([key,op,val], i) => {
+    const f = metaField(key) || fields[0];
+    const ops = f.numeric ? ["eq","ge","le"] : ["eq","has"];
+    const keyOpts = fields.map(x => `<option value="${esc(x.key)}"${x.key===key?" selected":""}>${esc(x.key)}</option>`).join("");
+    const opOpts = ops.map(o => `<option value="${o}"${o===op?" selected":""}>${META_OPS[o]}</option>`).join("");
+    // A dropdown only for `is` on a field whose values we shipped; everything else is free text.
+    const valCtl = (op === "eq" && f.values && f.values.length)
+      ? `<select class="advval" data-i="${i}" data-part="val">` +
+        f.values.map(v => `<option value="${esc(v)}"${v===val?" selected":""}>${esc(v)}</option>`).join("") + `</select>`
+      : `<input class="advval" data-i="${i}" data-part="val" type="text" value="${esc(val)}" placeholder="value" autocomplete="off">`;
+    return `<div class="advrow">` +
+      `<select class="advkey" data-i="${i}" data-part="key">${keyOpts}</select>` +
+      `<select class="advop" data-i="${i}" data-part="op">${opOpts}</select>` +
+      valCtl +
+      `<button class="advdel" data-i="${i}" title="Remove this condition">&times;</button></div>`;
+  }).join("");
+}
+function syncAdvBtn(){
+  const btn = $("advbtn"); if(!btn) return;
+  const n = state.meta.filter(([k,o,v]) => k && o && v !== "").length;
+  btn.innerHTML = "advanced" + (n ? ` <span class="advcount">${n}</span>` : "");
+}
+// A new condition defaults to the first field and its first value, so it selects something
+// real immediately instead of sitting incomplete until three controls have been touched.
+function newCondition(){
+  const f = metaFields()[0];
+  if(!f) return null;
+  return [f.key, "eq", (f.values && f.values[0]) || ""];
+}
+function wireAdvanced(){
+  const btn = $("advbtn"), panel = $("advpanel");
+  if(!btn || !panel) return;
+  btn.onclick = () => {
+    const open = panel.hidden;
+    panel.hidden = !open;
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if(open && !state.meta.length){ const c = newCondition(); if(c){ state.meta.push(c); } }
+    if(open) renderAdvanced();
+  };
+  $("advadd").onclick = () => { const c = newCondition(); if(c){ state.meta.push(c); renderAdvanced(); } };
+  panel.addEventListener("change", e => {
+    const el = e.target.closest("[data-part]"); if(!el) return;
+    const i = +el.dataset.i, part = el.dataset.part;
+    if(!state.meta[i]) return;
+    if(part === "key"){
+      // Switching field invalidates the operator and value: the new field may not be numeric,
+      // and its values are its own. Re-seed from the new field rather than carrying a value
+      // that belongs to a different field and silently matches nothing.
+      const f = metaField(el.value);
+      state.meta[i] = [el.value, "eq", (f && f.values && f.values[0]) || ""];
+      renderAdvanced();
+    } else if(part === "op"){
+      state.meta[i][1] = el.value;
+      renderAdvanced();   // eq<->has/ge/le swaps the value control between select and text
+    } else {
+      state.meta[i][2] = el.value;
+    }
+    syncAdvBtn(); applyFilters();
+  });
+  // Typing in a text value refilters as you go, like every other control on this bar.
+  panel.addEventListener("input", e => {
+    const el = e.target.closest('input[data-part="val"]'); if(!el) return;
+    const i = +el.dataset.i;
+    if(!state.meta[i]) return;
+    state.meta[i][2] = el.value;
+    syncAdvBtn(); debouncedFilters();
+  });
+  panel.addEventListener("click", e => {
+    const del = e.target.closest(".advdel"); if(!del) return;
+    state.meta.splice(+del.dataset.i, 1);
+    renderAdvanced(); syncAdvBtn(); applyFilters();
+  });
+}
+let ADV_TIMER = 0;
+function debouncedFilters(){ clearTimeout(ADV_TIMER); ADV_TIMER = setTimeout(applyFilters, 300); }
 
 // A filter change refetches the aggregates and resets the log to its first page.
 // PER stays in state; the data range comes from the period filter. A data change
@@ -2497,8 +2762,10 @@ async function init(){
   // picked again, which fires no change event and so used to do nothing at all.
   const showDateRange = on => { $("daterange").hidden = !on; };
   bindRangeControl(() => { applyPeriod(); applyFilters(); });
+  wireAdvanced();
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
+    state.meta=[]; renderAdvanced(); syncAdvBtn();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span

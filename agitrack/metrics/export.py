@@ -313,7 +313,7 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     manifest = json.dumps(files_index, separators=(",", ":")) if files_index else "{}"
     learn = page == "learn"
     lock_ids = {
-        "dash": '["f-author","f-backend","f-model","f-period","f-branch"]',
+        "dash": '["f-author","f-backend","f-model","f-period","f-branch","advbtn"]',
         "learn": "[]",
         "story": '["f-branch"]',
     }[page]
