@@ -2203,6 +2203,69 @@ def test_a_finished_turn_that_changed_code_starts_the_tracker(tmp_path, monkeypa
     assert spawned and "--backend" in spawned[0]
 
 
+def test_auto_start_arms_on_the_recorded_backend_even_when_its_binary_is_not_found(tmp_path, monkeypatch):
+    """A hook that fires BECAUSE an agent session opened must not then conclude there is no agent.
+
+    Auto-start briefly required the recorded backend to pass an install probe, and every machine
+    where that probe answers "no" — CI runners, a backend behind a wrapper or on a PATH the
+    search does not know — stopped auto-starting entirely: two of this suite's own auto-start
+    tests went red the moment they ran somewhere without the CLIs. The recorded backend is taken
+    as recorded; the daemon it spawns is the thing that checks what it can actually run, and
+    moves itself onto another installed agent if it must."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned and spawned[0][-2:] == ["--backend", "claude"]
+
+
+def test_auto_start_picks_an_installed_agent_when_the_repo_has_nothing_recorded(tmp_path, monkeypatch):
+    # The hole on the other side: a repo whose FIRST agent session is the one firing this hook has
+    # no recorded backend at all, and that used to mean no tracker — the session ran unrecorded
+    # until someone committed. Any agent the machine has is a fine starting point, because the
+    # tracker follows whichever one is actually driven.
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)  # no state.json: nothing has ever been recorded here
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: name == "codex")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned and spawned[0][-2:] == ["--backend", "codex"]
+
+
+def test_nothing_starts_where_there_is_no_record_and_no_agent_at_all(tmp_path, monkeypatch):
+    # With nothing recorded and no coding agent on the machine, there is nothing a tracker could
+    # follow; spawning one would only add a daemon that exits with "not installed".
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "agent-wrote-this.txt").write_text("work\n", encoding="utf-8")
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        background_module, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args)
+    )
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned == []
+
+
 def test_a_turn_that_changed_nothing_starts_nothing(tmp_path, monkeypatch):
     # A question-and-answer turn ends like any other. Starting a daemon for it would mean a
     # tracker (and its commit hooks) appearing because someone asked what a function does.

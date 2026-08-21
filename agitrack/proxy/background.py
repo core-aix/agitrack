@@ -754,16 +754,16 @@ def _stop_still_stands(repo: GitRepo) -> bool:
         return False
 
 
-def _usable_backend(preferred: str | None) -> str | None:
+def _installed_backend(preferred: str | None = None) -> str | None:
     """``preferred`` when it names a backend installed on this machine; otherwise any installed
-    backend; otherwise None.
+    backend; otherwise None — i.e. "an agent this machine can actually run".
 
-    Which one is picked matters far less than it used to: a background tracker FOLLOWS whichever
-    backend the person actually opens in the repo (see
-    ``BackgroundRunner._follow_the_driven_backend``), so this only decides where it starts
-    looking. That is why "none recorded" is no longer a reason to refuse to track — it used to
-    be, and a repo whose first agent session was the one firing the auto-start hook got no
-    tracker at all."""
+    Used to answer "is there anything here to track at all?", never to OVERRIDE a backend the
+    repo has recorded: which one a tracker starts on matters far less than it used to (it
+    follows whichever backend the person opens — see
+    ``BackgroundRunner._follow_the_driven_backend``), and a daemon handed a recorded backend
+    that is not installed moves itself onto one that is, without rewriting the user's global
+    default the way an explicit ``--backend`` would."""
     from agitrack.backends.proxy_agents import available_backends
     from agitrack.backends.setup import backend_installed
 
@@ -804,9 +804,15 @@ def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
         return None
     lock.release()  # only probing: the daemon we spawn takes it for real
     state = AgitrackState(repo.repo)
-    backend_name = _usable_backend(_recorded_backend(state) or config.default_backend)
+    # The recorded backend is taken AS RECORDED — not filtered through "is it installed?". This
+    # hook fires when an agent session opens, so an agent is demonstrably running; a probe that
+    # cannot see its binary (a CI box, a wrapper on a path the search does not know) must not be
+    # what decides the repo goes untracked. Only when nothing at all is recorded does the
+    # question become "what could this machine run?", which is still better than the previous
+    # answer — nothing, leaving every repo whose FIRST agent session fired this hook untracked.
+    backend_name = _recorded_backend(state) or config.default_backend or _installed_backend()
     if not backend_name:
-        return None  # no coding agent is installed at all, so there is nothing to track
+        return None
     manual = read_background_mode(repo)
     if manual is None:
         manual = config.manual_commits
@@ -943,8 +949,8 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # trace folded, rc 0, the commit's AI work lost, while `agitrack -s` still reported
         # "Auto-start on commit: on". Ask a question that can be answered with "don't know".
         # ...and a repo with none recorded still gets tracked: the runner below follows whichever
-        # backend the session actually ran on, so any installed one is a fine starting point.
-        backend_name = _usable_backend(_recorded_backend(runner.state) or config.default_backend)
+        # backend the session actually ran on, so any agent this machine has is a fine start.
+        backend_name = _recorded_backend(runner.state) or config.default_backend or _installed_backend()
         if not backend_name:
             return 0
         runner.state.ensure_local_ignore()  # git-ignore .agitrack/ before writing the trailer/ref
@@ -965,7 +971,16 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     # self-sustaining dead state — the tracker stops once and no number of later commits brings
     # it back, which is exactly what was observed. Whether THIS commit carries AI work and
     # whether a tracker should be running from now on are different questions.
-    if config.autotrack_hook != "off" and not _stop_still_stands(repo) and _live_background_pid(repo) is None:
+    if (
+        config.autotrack_hook != "off"
+        and not _stop_still_stands(repo)
+        and _live_background_pid(repo) is None
+        # Spawning a daemon on a machine with no coding agent installed gets a process that
+        # exits seconds later having printed "backend ... is not installed" into background.log,
+        # and a line in the commit output claiming tracking had started. The turns this hook
+        # just recorded are already folded into the commit either way.
+        and _installed_backend(backend_name) is not None
+    ):
         # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
         # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
         # same commit mode as the last run; the *starting* commit is manual regardless.
