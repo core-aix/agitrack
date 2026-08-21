@@ -50,11 +50,19 @@ _HEREDOC = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*
 # a second `>`, and `&>`; the character class stops at anything that ends a word or a command.
 _REDIRECT = re.compile(r"(?<![0-9<>&])(?P<op>>>|>)\s*(?P<path>[^\s;&|<>()]+)")
 _TEE = re.compile(r"\btee\b(?P<flags>(?:\s+-{1,2}[A-Za-z-]+)*)\s+(?P<path>[^\s;&|<>()]+)")
-_PYTHON = re.compile(r"(?:^|[\s;&|(])(?:uv\s+run\s+)?python[23]?(?:\.\d+)?\b")
+# Python is as often invoked by PATH as by name — `./.venv/bin/python - <<PY` is the same
+# script as `python3 - <<PY`, and requiring a bare word missed every one of them (one measured
+# session ran 60+ that way, and its whole reconstruction was the poorer for it).
+_PYTHON = re.compile(r"(?:^|[\s;&|(])(?:uv\s+run\s+)?[\w./~+-]*python[23]?(?:\.\d+)?\b")
 # `echo`/`printf` need not start the line — `mkdir -p x && echo hi > x/f` is ordinary — but the
 # arguments must stop at the next command separator, or the following command is read as payload.
 _ECHO = re.compile(r"(?:^|[\s;&|(])(?P<cmd>echo|printf)\s+(?P<args>[^\n;&|]*)")
 _CD = re.compile(r"(?:^|[\s;&|(])cd\s+(?P<target>[^\s;&|()]+)")
+# `SP=/tmp/work` then `cd $SP` — an agent naming a directory once and reusing it. The value is
+# right there in the command, so the paths that use it are knowable; treating every `$` as
+# unresolvable declined whole sessions that happened to work this way.
+_ASSIGN = re.compile(r"(?:^|[\s;&|(])(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>'[^']*'|\"[^\"$`]*\"|[^\s;&|()'\"$`]*)")
+_VAR = re.compile(r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)")
 _MOVE = re.compile(r"(?:^|[\s;&|(])(?P<cmd>mv|cp|rm)(?P<args>(?:\s+[^\s;&|()]+)+)")
 
 # Shell metacharacters that make a word unresolvable from the text alone. A path holding one
@@ -97,19 +105,42 @@ def _recover(state: dict[str, str], command: str, cwd: str):
     # directory and recorded as a repo-root file that has never existed — the reconstruction
     # invented paths, and scratch work done outside the repo was counted as changes to it.
     here = cwd
+    # Shell variables the command assigns to itself, so `SP=/tmp/w` … `cd $SP` resolves.
+    variables: dict[str, str] = {}
     while index < len(lines):
         line = lines[index]
         index += 1
-        here, line_here = _apply_cd(line, here)
+        _collect_assignments(line, variables)
+        here, line_here = _apply_cd(line, here, variables)
         heredoc = _HEREDOC.search(line)
         if heredoc:
             body, index = _heredoc_body(lines, index, heredoc.group("delim"))
-            yield from _from_heredoc(state, line, body, line_here)
+            yield from _from_heredoc(state, line, body, line_here, variables)
             continue
-        yield from _from_line(state, line, line_here)
+        yield from _from_line(state, line, line_here, variables)
 
 
-def _apply_cd(line: str, here: str) -> tuple[str, str]:
+def _collect_assignments(line: str, variables: dict[str, str]) -> None:
+    """Record ``NAME=value`` assignments on this line, for later ``$NAME`` expansion.
+
+    Only values the text fully determines — a command substitution or a nested unknown
+    ``$OTHER`` is not recorded, so the variable stays unresolvable rather than half-known.
+    """
+    for match in _ASSIGN.finditer(line):
+        value = _expand(_norm_word(match.group("value")), variables)
+        if value and not _UNRESOLVABLE.search(value):
+            variables[match.group("name")] = value
+
+
+def _expand(word: str, variables: dict[str, str]) -> str:
+    """``word`` with every ``$NAME`` / ``${NAME}`` this command assigned substituted in.
+    Unknown names are left as-is, so the caller's ``_UNRESOLVABLE`` check still declines them."""
+    if "$" not in word:
+        return word
+    return _VAR.sub(lambda m: variables.get(m.group("braced") or m.group("bare") or "", m.group(0)), word)
+
+
+def _apply_cd(line: str, here: str, variables: dict[str, str] | None = None) -> tuple[str, str]:
     """``(directory for the lines that follow, directory for THIS line)`` after any ``cd`` on it.
 
     Applied before the line's own writes, since ``cd sub && cat > f`` writes into ``sub``. The
@@ -125,7 +156,7 @@ def _apply_cd(line: str, here: str) -> tuple[str, str]:
     line_here = here
     for match in _CD.finditer(line):
         subshell = match.group(0).startswith("(")
-        target = _norm_word(match.group("target"))
+        target = _expand(_norm_word(match.group("target")), variables or {})
         if not target or _UNRESOLVABLE.search(target) or target == "-":
             return ("" if not subshell else here), ""
         if paths.is_absolute(target):
@@ -157,15 +188,15 @@ def _heredoc_body(lines: list[str], start: int, delim: str) -> tuple[str, int]:
     return ("\n".join(body) + "\n" if body else ""), start
 
 
-def _from_heredoc(state: dict[str, str], line: str, body: str, cwd: str):
+def _from_heredoc(state: dict[str, str], line: str, body: str, cwd: str, variables: dict[str, str]):
     """Edits from a heredoc, dispatched on what the line feeds the body to."""
     if _PYTHON.search(line):
-        yield from _from_python(state, body, cwd)
+        yield from _from_python(state, body, cwd, variables)
         return
     target, append = _write_target(line)
     if not target:
         return
-    path = _resolve(target, cwd)
+    path = _resolve(target, cwd, variables)
     if not path:
         return
     content = state.get(path, "") + body if append else body
@@ -191,22 +222,22 @@ def _write_target(line: str) -> tuple[str, bool]:
     return "", False
 
 
-def _from_line(state: dict[str, str], line: str, cwd: str):
+def _from_line(state: dict[str, str], line: str, cwd: str, variables: dict[str, str]):
     """Edits from a single (non-heredoc) command line."""
-    for edit in _from_python_c(state, line, cwd):
+    for edit in _from_python_c(state, line, cwd, variables):
         yield edit
-    for edit in _from_sed(state, line, cwd):
+    for edit in _from_sed(state, line, cwd, variables):
         yield edit
-    for edit in _from_echo(state, line, cwd):
+    for edit in _from_echo(state, line, cwd, variables):
         yield edit
-    for edit in _from_move(state, line, cwd):
+    for edit in _from_move(state, line, cwd, variables):
         yield edit
 
 
 # --------------------------------------------------------------------------- inline Python
 
 
-def _from_python_c(state: dict[str, str], line: str, cwd: str):
+def _from_python_c(state: dict[str, str], line: str, cwd: str, variables: dict[str, str]):
     """Edits from ``python -c '<source>'`` — the same recovery as a Python heredoc."""
     if not _PYTHON.search(line):
         return
@@ -216,11 +247,11 @@ def _from_python_c(state: dict[str, str], line: str, cwd: str):
         return
     for position, word in enumerate(words):
         if word == "-c" and position + 1 < len(words):
-            yield from _from_python(state, words[position + 1], cwd)
+            yield from _from_python(state, words[position + 1], cwd, variables)
             return
 
 
-def _from_python(state: dict[str, str], source: str, cwd: str) -> list[FileEdit]:
+def _from_python(state: dict[str, str], source: str, cwd: str, variables: dict[str, str]) -> list[FileEdit]:
     """The edits an inline Python script makes, read statically — never executed.
 
     The shape this recovers is the one agents actually write, and it is the shell spelling of
@@ -373,7 +404,7 @@ def _from_python(state: dict[str, str], source: str, cwd: str) -> list[FileEdit]
     for kind, raw_path, payload in operations:
         if raw_path in refused:
             continue
-        resolved = _resolve(raw_path, cwd)
+        resolved = _resolve(raw_path, cwd, variables)
         if not resolved:
             continue
         if kind == "write":
@@ -400,7 +431,7 @@ def _path_literal(node: ast.expr | None) -> str | None:
 # --------------------------------------------------------------------------- sed -i
 
 
-def _from_sed(state: dict[str, str], line: str, cwd: str):
+def _from_sed(state: dict[str, str], line: str, cwd: str, variables: dict[str, str]):
     """Edits from an in-place ``sed``, applied to the tracked content with :mod:`re`.
 
     Only files ALREADY tracked are touched: ``sed`` edits a file that exists, and without its
@@ -413,7 +444,7 @@ def _from_sed(state: dict[str, str], line: str, cwd: str):
         if not scripts or not files:
             continue
         for name in files:
-            path = _resolve(name, cwd)
+            path = _resolve(name, cwd, variables)
             if not path or path not in state:
                 continue
             before = state[path]
@@ -532,13 +563,13 @@ def _split_unescaped(text: str, separator: str) -> list[str]:
 # --------------------------------------------------------------------------- echo / printf
 
 
-def _from_echo(state: dict[str, str], line: str, cwd: str):
+def _from_echo(state: dict[str, str], line: str, cwd: str, variables: dict[str, str]):
     """Edits from ``echo``/``printf`` redirected into a file — the shell's one-line write."""
     for match in _ECHO.finditer(line):
         redirect = _REDIRECT.search(match.group("args"))
         if not redirect:
             continue
-        path = _resolve(redirect.group("path"), cwd)
+        path = _resolve(redirect.group("path"), cwd, variables)
         if not path:
             continue
         payload = _echo_payload(match.group("cmd"), match.group("args")[: redirect.start()])
@@ -579,7 +610,7 @@ def _echo_payload(command: str, arguments: str) -> str | None:
 # --------------------------------------------------------------------------- mv / cp / rm
 
 
-def _from_move(state: dict[str, str], line: str, cwd: str):
+def _from_move(state: dict[str, str], line: str, cwd: str, variables: dict[str, str]):
     """Deletes and renames, for files the session itself is tracking.
 
     Bounded to tracked files on purpose. ``rm`` on a file whose content was never recovered
@@ -597,7 +628,7 @@ def _from_move(state: dict[str, str], line: str, cwd: str):
             continue
         if command == "rm":
             for name in words:
-                path = _resolve(name, cwd)
+                path = _resolve(name, cwd, variables)
                 if path and path in state:
                     edit = make_edit(path, state.pop(path), "", status="deleted")
                     if edit is not None:
@@ -605,7 +636,7 @@ def _from_move(state: dict[str, str], line: str, cwd: str):
             continue
         if len(words) != 2:
             continue  # `mv a b c/` moves into a directory: the destination paths are guesses
-        source, destination = (_resolve(words[0], cwd), _resolve(words[1], cwd))
+        source, destination = (_resolve(words[0], cwd, variables), _resolve(words[1], cwd, variables))
         if not source or not destination or source not in state:
             continue
         content = state[source] if command == "cp" else state.pop(source)
@@ -645,7 +676,7 @@ def _norm_word(word: str) -> str:
     return word.strip().strip("'\"")
 
 
-def _resolve(name: str, cwd: str) -> str:
+def _resolve(name: str, cwd: str, variables: dict[str, str] | None = None) -> str:
     """``name`` as the absolute path the editing tools would have recorded, or ``""``.
 
     Empty for anything the text cannot pin down: a ``$VAR``/glob/substitution, a device
@@ -653,7 +684,7 @@ def _resolve(name: str, cwd: str) -> str:
     path instead would put the same file in ``file_state`` twice — once as ``tests/x.py`` from
     the shell and once as ``/repo/tests/x.py`` from ``Edit`` — and count its lines twice.
     """
-    name = _norm_word(name)
+    name = _expand(_norm_word(name), variables or {})
     if not name or _UNRESOLVABLE.search(name):
         return ""
     if name.startswith("/dev/") or name.startswith("~"):
