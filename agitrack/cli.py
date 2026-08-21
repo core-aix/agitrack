@@ -518,8 +518,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         dest="log_file",
         default=None,
         metavar="PATH",
-        help="append notable aGiTrack events (a daemon starting or stopping, an AI change "
-        "detected, a commit made, an update available) to PATH — a plain-text log you can "
+        help="append notable aGiTrack events (a daemon starting or stopping, a tracker following "
+        "you to another coding agent, an AI change detected, a commit made, an update available) to PATH — a plain-text log you can "
         "`tail -f`. Works in every mode: the TUI, -b, --prompt and --json. A relative path is "
         "resolved against the repo root, and a log inside the repo is git-ignored for you. Also "
         "settable via 'log_file' in config.",

@@ -64,12 +64,20 @@ def _git(repo: GitRepo, *args: str) -> str:
 class FakeBackend:
     name = "claude"
 
-    def __init__(self) -> None:
+    def __init__(self, name: str | None = None) -> None:
         self.sessions: dict[str, ExportedSession] = {}
         self.latest: str | None = None
+        if name is not None:
+            self.name = name
+        # What `repo_activity` reports: when this backend last saw a human here. None means
+        # "never used in this repo", which is what every backend says in a fresh tmp repo.
+        self.activity: float | None = None
 
     def latest_session_id(self, repo):
         return self.latest
+
+    def repo_activity(self, repo):
+        return self.activity
 
     def export_session(self, repo, session_id):
         return self.sessions.get(session_id)
@@ -1948,12 +1956,15 @@ def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
 # --- commit guidance in background mode -------------------------------------
 
 
-def _guidance_runner(tmp_path, *, backend="claude", guidance=True):
+def _guidance_runner(tmp_path, *, backend="claude", guidance=True, installed=None):
     repo = _init_repo(tmp_path)
     state = AgitrackState(tmp_path, default_backend=backend)
     gc = GlobalConfig(path=tmp_path / "gc.json")
     runner = BackgroundRunner(repo, commit_guidance=guidance, _global_config=gc, _state=state)
     runner.backend = FakeBackend()
+    # Which agents this machine has decides which hooks get written, so the test says so instead
+    # of inheriting whatever the developer happens to have installed.
+    runner._installed_backends = lambda: list(installed if installed is not None else [backend])
     return runner, repo
 
 
@@ -1994,7 +2005,7 @@ def test_a_backend_with_nowhere_to_put_the_note_is_left_alone(tmp_path):
     # half-measure — and no stray .claude/ or .opencode/ config for a note it cannot carry.
     # (Codex is no longer in this category: since 0.147 its SessionStart hook carries the note,
     # see test_codex_gets_the_note_through_its_own_hooks_file.)
-    runner, repo = _guidance_runner(tmp_path, backend="opencode")
+    runner, repo = _guidance_runner(tmp_path, backend="opencode", installed=["opencode"])
     runner.state.backend = "opencode"
 
     runner._install_commit_guidance()
@@ -2009,12 +2020,161 @@ def test_codex_gets_the_note_through_its_own_hooks_file(tmp_path):
     told that aGiTrack is committing for it instead of committing its own work."""
     from agitrack.backends import codex_settings
 
-    runner, repo = _guidance_runner(tmp_path, backend="codex")
+    runner, repo = _guidance_runner(tmp_path, backend="codex", installed=["codex"])
     runner.state.backend = "codex"
 
     runner._install_commit_guidance()
 
     assert codex_settings.hook_is_installed(tmp_path, codex_settings.SESSION_NOTE_HOOK)
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_the_note_reaches_every_agent_the_machine_can_open(tmp_path):
+    """The note is a promise about THIS REPOSITORY — "aGiTrack commits for you here" — and the
+    tracker keeps that promise for whichever agent is opened (see
+    `test_the_tracker_follows_the_backend_the_user_actually_opened`). Telling only the backend
+    that happens to be tracked at install time left the agent the person actually opened
+    uninformed, so it committed its own work: the duplicate-commit mess the note exists to
+    prevent, in the one situation nobody was watching for."""
+    from agitrack.backends import claude_settings, codex_settings
+
+    runner, repo = _guidance_runner(tmp_path, backend="opencode", installed=["opencode", "claude", "codex"])
+    runner.state.backend = "opencode"
+
+    runner._install_commit_guidance()
+
+    assert claude_settings.hook_is_installed(repo.repo) is True
+    assert codex_settings.hook_is_installed(tmp_path, codex_settings.SESSION_NOTE_HOOK)
+    assert not (tmp_path / ".opencode").exists()  # still no half-measure where there is no channel
+
+
+def test_auto_start_is_armed_for_every_agent_the_machine_can_open(tmp_path):
+    # Auto-start has to fire for whichever agent is opened NEXT, which is not necessarily the one
+    # opened last. Arming only the tracked backend meant opening a different agent started no
+    # tracker at all, and that session ran unrecorded until someone committed by hand.
+    from agitrack.backends import agent_hooks
+
+    runner, repo = _guidance_runner(tmp_path, backend="claude", installed=["claude", "codex", "opencode"])
+
+    runner._install_change_autostart_hook()
+
+    assert sorted(agent_hooks.installed_autostart_backends(repo.repo)) == ["claude", "codex", "opencode"]
+
+
+# --- following the backend the user actually opened -------------------------
+
+
+def _following_runner(tmp_path, monkeypatch, *, recorded="opencode", stub_hooks=True):
+    """A tracker whose RECORDED backend is not the one being driven — the shape of the bug."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend=recorded)
+    gc = GlobalConfig(path=tmp_path / "gc.json")
+    runner = BackgroundRunner(repo, manual_commits=False, _global_config=gc, _state=state)
+    runner._make_summarizer = lambda: None
+    runner._summarization_enabled = lambda: False
+    quiet = FakeBackend(recorded)  # the backend the repo is recorded against: nothing happens here
+    driven = FakeBackend("claude")  # the agent the person actually opened
+    runner.backend = quiet
+    runner._installed_backends = lambda: [recorded, "claude"]
+    if stub_hooks:  # hook writing has its own tests; most of these are about what gets tracked
+        runner._install_commit_guidance = lambda: None
+        runner._install_change_autostart_hook = lambda: None
+    monkeypatch.setattr(background_module, "make_proxy_agent", lambda name: driven if name == "claude" else quiet)
+    return runner, repo, state, quiet, driven
+
+
+def test_the_tracker_follows_the_backend_the_user_actually_opened(tmp_path, monkeypatch):
+    """THE BUG, and the reason this whole mechanism exists.
+
+    A background tracker observes work it did not start, so the backend recorded for a repo is
+    only ever a GUESS about which agent the person will open — seeded, the first time anything
+    tracked here, from the GLOBAL default. Measured live: a repo recorded against OpenCode
+    (the global default) while the entire session ran on Claude Code. The tracker polled
+    OpenCode's store for 90 minutes, found nothing because there was nothing there, recorded no
+    turn, and the pre-commit flush had nothing to fold — so the user's own commit carried no
+    trace, no tokens and no model, and ~148k output tokens of work were tracked nowhere. The
+    person is free to choose their agent per session; the tracker follows them."""
+    runner, repo, state, _quiet, driven = _following_runner(tmp_path, monkeypatch)
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    driven.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    driven.activity = 1_000.0  # the only backend with any activity in this repo
+
+    assert runner._process_once() is True
+
+    assert state.backend == "claude"  # ...and it stays there for the turns that follow
+    assert "backend: claude" in _git(repo, "log", "-1", "--format=%B", runner._manual.ref())
+
+
+def test_a_backend_used_once_last_month_never_steals_the_live_session(tmp_path, monkeypatch):
+    # The comparison has to be between CONVERSATION TIMES, not "does this backend have a session
+    # here at all". A repo where Claude was opened once, long ago, must not pull the tracker off
+    # the session running right now on the backend it is already following.
+    runner, repo, state, quiet, driven = _following_runner(tmp_path, monkeypatch)
+    quiet.activity = 2_000.0  # the live session
+    driven.activity = 1_000.0  # last month
+    quiet.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+
+    assert runner._process_once() is True
+
+    assert state.backend == "opencode"
+
+
+def test_a_turn_in_flight_is_never_abandoned_for_another_backend(tmp_path, monkeypatch):
+    # A turn in flight is one this tracker still owes a commit. Going to look at another store
+    # mid-turn would drop its trace and tokens on the floor, so the switch waits.
+    runner, _repo, state, _quiet, driven = _following_runner(tmp_path, monkeypatch)
+    driven.activity = 5_000.0
+    runner._in_flight = {"backend": "opencode", "prompt": "still working"}
+
+    runner._follow_the_driven_backend()
+
+    assert state.backend == "opencode"
+
+
+def test_switching_backends_keeps_the_old_conversation_to_come_back_to(tmp_path, monkeypatch):
+    # Switching is not forgetting: the person moving back to their other agent should land on the
+    # conversation they left, not on whatever happens to be newest in that store.
+    runner, _repo, state, _quiet, driven = _following_runner(tmp_path, monkeypatch)
+    state.backend_session_id = "opencode-chat"
+    driven.activity = 5_000.0
+
+    runner._follow_the_driven_backend()
+
+    assert state.backend == "claude"
+    assert state.stored_backend_session("opencode") == "opencode-chat"
+
+
+def test_a_backend_whose_store_cannot_be_read_never_takes_over(tmp_path, monkeypatch):
+    # A probe that raises means "no answer", not "now". An unreadable or half-migrated store must
+    # never be able to pull the tracker off the backend that is actually working.
+    runner, _repo, state, _quiet, driven = _following_runner(tmp_path, monkeypatch)
+
+    def boom(_repo):
+        raise OSError("store is unreadable")
+
+    driven.repo_activity = boom
+
+    runner._follow_the_driven_backend()
+
+    assert state.backend == "opencode"
+
+
+def test_the_commit_hooks_own_tracker_follows_without_arming_anything(tmp_path, monkeypatch):
+    """`precommit_sync` builds a runner of its own during `git commit`, and it follows the driven
+    backend too — that is what puts the session's trace into a commit made while no daemon is
+    running. But it is a hook, not a daemon: publishing a handshake would advertise a tracker
+    whose pid dies with the commit, and installing the commit-guidance note would promise "aGiTrack
+    commits for you" in a repo where nothing is about to run and then never take it back."""
+    runner, repo, state, _quiet, driven = _following_runner(tmp_path, monkeypatch, stub_hooks=False)
+    driven.activity = 5_000.0
+
+    runner._follow_the_driven_backend()
+
+    assert state.backend == "claude"  # it still tracks the right conversation
+    assert not background_handshake_path(repo).exists()
     assert not (tmp_path / ".claude").exists()
 
 

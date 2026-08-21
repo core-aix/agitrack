@@ -17,12 +17,17 @@ the backends gain features (Codex could carry neither before 0.147), and is need
 places: the daemon's start-up and teardown, ``agitrack stop`` / ``--remove-hooks``, and the
 interactive TUI, which displaces the persistent hook while it owns the repository.
 
-REMOVAL IS NEVER BACKEND-SCOPED. A repository's backend changes — the same repo can be driven
-by Claude today and Codex tomorrow — so a stop that only cleaned up the CURRENT backend would
-leave the previous one's hook armed to start a tracker the user just asked to stop. Every
-removal therefore sweeps all three. Installation stays scoped to the backend actually in use:
-writing hooks for backends the user does not run would litter their repo with config for tools
-that are not there.
+NEITHER HALF IS BACKEND-SCOPED. A repository's backend changes — the same repo can be driven
+by Claude today and Codex tomorrow, and nothing says the person announced that to aGiTrack — so:
+
+* a stop that only cleaned up the CURRENT backend would leave the previous one's hook armed to
+  start a tracker the user just asked to stop. Every removal sweeps all three.
+* installing only for the current backend armed auto-start, and delivered the commit-guidance
+  note, for the one agent the person might not open next. Opening a different one then started
+  no tracker and told that agent nothing, so it committed its own work — the failure this
+  module's callers now avoid by installing for every backend INSTALLED ON THE MACHINE. That is
+  the honest reading of "tools that are not there": a backend the user has no binary for still
+  gets nothing written for it.
 """
 
 from __future__ import annotations
@@ -91,13 +96,19 @@ def installed_autostart_backends(repo: Path) -> list[str]:
     return armed
 
 
-def startup_notice(repo: Path, backend: str | None) -> str | None:
+def startup_notice(repo: Path) -> str | None:
     """Anything the user must do themselves for these hooks to work, or None.
 
     Only Codex has such a step (it requires a person to review a new hook before it runs), and
-    only when its hook is actually installed — see ``codex_settings.trust_reminder``."""
-    if backend != "codex":
-        return None
+    only when its hook is actually installed — see ``codex_settings.trust_reminder``, which
+    checks exactly that.
+
+    It used to take the tracked backend and answer None unless that was Codex. Now that hooks
+    are armed for every installed backend, a repo tracked on Claude can carry Codex's hooks too
+    — and the person opening Codex there meets its "Hooks need review" prompt with nothing
+    having told them why, or (worse) misses it and Codex silently skips the hook that would have
+    started tracking. Whether the hook is on disk is the condition that matters, not which agent
+    happens to be tracked today."""
     try:
         return codex_settings.trust_reminder(repo)
     except Exception:

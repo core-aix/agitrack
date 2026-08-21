@@ -58,6 +58,45 @@ def test_session_cwd_reads_last_recorded_cwd(monkeypatch, tmp_path):
     assert claude_session.session_cwd("missing") is None
 
 
+def test_repo_activity_answers_when_this_repo_last_had_a_conversation(monkeypatch, tmp_path):
+    """The cross-backend probe: the background tracker asks every installed backend this, every
+    cycle, to find out which agent the person is actually driving (see
+    ``BackgroundRunner._follow_the_driven_backend``). It has to answer from CONTENT timestamps —
+    aGiTrack itself rewrites transcripts without adding a message, and an mtime it bumped would
+    let a dead conversation here beat a live one on another backend."""
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    (proj / "old.jsonl").write_text('{"type":"user","timestamp":"2026-08-01T10:00:00Z"}\n', encoding="utf-8")
+    (proj / "new.jsonl").write_text('{"type":"user","timestamp":"2026-08-09T18:30:00Z"}\n', encoding="utf-8")
+
+    from datetime import datetime, timezone
+
+    when = claude_session.repo_activity(repo)
+
+    assert when == datetime(2026, 8, 9, 18, 30, tzinfo=timezone.utc).timestamp()
+    # A repo Claude has never been opened in says so, rather than reporting a time of 0 that
+    # would read as "used, long ago" and take part in the comparison.
+    assert claude_session.repo_activity(tmp_path / "never-used") is None
+
+
+def test_repo_activity_ignores_transcripts_no_human_drove(monkeypatch, tmp_path):
+    # SDK / `claude -p` transcripts land in the same directory. Counting them as activity would
+    # hand the tracker to Claude because an agent on some OTHER backend fanned work out to it.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    (proj / "worker.jsonl").write_text(
+        '{"type":"user","promptSource":"sdk","timestamp":"2026-08-09T18:30:00Z"}\n', encoding="utf-8"
+    )
+
+    assert claude_session.repo_activity(repo) is None
+
+
 def test_session_transcript_path_and_mtime(monkeypatch, tmp_path):
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))

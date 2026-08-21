@@ -1248,6 +1248,47 @@ def latest_session_id(repo: Path) -> str | None:
     return None
 
 
+# How many rollout files the repo-activity probe reads back through, newest mtime first, and
+# how many thread rows it considers. The probe runs for every installed backend on every
+# tracker cycle, so it must not scale with the user's whole Codex history. Anything a person is
+# driving right now is the newest thing on disk, so the caps cost a live session nothing.
+_ACTIVITY_SCAN_LIMIT = 8
+_ACTIVITY_ROW_LIMIT = 200
+
+
+def repo_activity(repo: Path) -> float | None:
+    """Epoch seconds of the newest HUMAN-driven activity recorded for ``repo`` on this backend,
+    or None when Codex holds no recent conversation for it.
+
+    See :func:`agitrack.transcripts.claude.repo_activity` for what the background tracker does
+    with this. Both sources are consulted because neither alone is complete: the state db is
+    opened ``immutable`` (see :func:`_query`), so rows for the session being written RIGHT NOW —
+    exactly the one this probe exists to notice — can still be in the WAL and invisible, and the
+    rollout files answer that; the db in turn covers a session whose file mtime aGiTrack itself
+    bumped by staging it."""
+    newest: float | None = None
+    for row in _query(
+        f"SELECT cwd, updated_at, source FROM threads ORDER BY updated_at DESC LIMIT {_ACTIVITY_ROW_LIMIT}"
+    ):
+        if str(row.get("source") or "") == "exec":
+            continue  # headless `codex exec` (aGiTrack's own summarizer looks like this), not a conversation
+        if not _same_repo(row.get("cwd"), repo):
+            continue
+        seconds = row.get("updated_at")
+        if isinstance(seconds, int) and seconds > 0:
+            newest = float(seconds)
+            break  # rows are newest-first, so the first match for this repo is the answer
+    for path in _rollout_files()[:_ACTIVITY_SCAN_LIMIT]:
+        header = _read_header(path)
+        if _is_agent_thread(header) or str(header.get("source") or "") == "exec":
+            continue
+        if not _same_repo(header.get("cwd"), repo):
+            continue
+        newest = max(newest or 0.0, _mtime(path))
+        break
+    return newest
+
+
 def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
     """Every session recorded anywhere under ``directory``, paired with its rollout path —
     the discovery pass behind ``--backtrace`` and ``--share-sessions``."""

@@ -124,6 +124,20 @@ def test_liveness_signals_are_safe_on_an_unknown_session(backend_name, tmp_path)
 
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
+def test_repo_activity_is_honest_about_a_directory_nothing_ran_in(backend_name, tmp_path):
+    """Every backend has to answer the cross-backend activity probe, and answer it the same way.
+
+    The background tracker compares these numbers across backends to decide which agent the
+    person is actually driving, so "never used here" must be None — not 0.0, not the current
+    time. A backend reporting a number for a repo it has never seen would take the tracker off
+    the backend that is really running, which is the exact failure the probe exists to prevent.
+    """
+    agent = make_proxy_agent(backend_name)
+
+    assert agent.repo_activity(tmp_path) is None
+
+
+@pytest.mark.parametrize("backend_name", BACKENDS)
 def test_new_import_id_is_distinct_per_call(backend_name):
     # "Keep both" re-imports a shared conversation alongside the local copy of the same id.
     # A backend that returned a constant would overwrite the very copy it means to preserve.

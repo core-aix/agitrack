@@ -239,6 +239,8 @@ Background mode **always runs without a worktree** (it implies `--no-worktree`),
 
 Only **one** aGiTrack may run per repository (a foreground TUI or a background daemon — never both, and never two), so they can't fight over commits; a second start is refused. Enable background mode for every run with `"background": true` in `~/.agitrack/config.json`.
 
+**Whichever agent you open.** A background tracker is not tied to one backend. It watches every coding agent **installed on your machine** and follows the one you actually drive in this repo: start it while your default is OpenCode, then open Claude Code, and those turns are tracked as Claude's — the commit metadata names the backend that really did the work. Every installed backend's session-start hook is armed too, so any of them can start the tracker again after a reboot, and each gets aGiTrack's commit-guidance note where its CLI has a channel for one. Which backend is followed is decided by whose conversation *in this repository* was active most recently, so a backend you used here once last month never steals a session running now; a turn in flight is never abandoned mid-way.
+
 Only **repo-local AI work is ever tracked.** aGiTrack keys the backend session strictly to this repository's directory (Claude by its per-directory transcript store; Codex and OpenCode by each session's recorded working directory), so a session you drive in a *different* repo is never picked up by this repo's tracker.
 
 #### Never forget to start it: track (or auto-start) on commit

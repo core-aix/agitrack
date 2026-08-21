@@ -30,7 +30,23 @@ _EXCLUDE_PATH_CACHE: dict[Path, Path] = {}
 # An exclude entry has no effect on a file the repo already TRACKS, which is the correct
 # behaviour here: a team that deliberately commits that file keeps deciding for themselves.
 # What protects THEM is `add_tracked()`'s scaffolding filter (git/repo.py).
-_EXCLUDE_LINES = (".agitrack/", ".claude/settings.local.json")
+# The other two backends' session-start hooks are here for the same reason, and they matter more
+# now that every INSTALLED backend gets one (see backends/agent_hooks.py): a repo can pick up
+# aGiTrack files for an agent its owner never opens. `.opencode/plugin/agitrack-autostart.js` is
+# aGiTrack's alone and lives in the user's SOURCE TREE rather than in a dot-config the tools
+# hide — without the exclude it shows up as `?? .opencode/` and gets swept into the user's own
+# `git add .` (seen live: aGiTrack's plugin committed as part of someone's first commit).
+# `.codex/hooks.json` is a file aGiTrack MERGES into rather than owns, so excluding it is the one
+# entry here with a cost: a team that hand-writes Codex project hooks and has not committed them
+# yet stops seeing that file in `git status`. It is still the right trade — an exclude never
+# affects a TRACKED file, so a team that does commit it is untouched, while every other repo is
+# spared an untracked file it did not ask for and did not create.
+_EXCLUDE_LINES = (
+    ".agitrack/",
+    ".claude/settings.local.json",
+    ".codex/hooks.json",
+    ".opencode/plugin/agitrack-autostart.js",
+)
 
 
 class AgitrackState:

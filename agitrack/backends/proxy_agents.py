@@ -241,6 +241,20 @@ class ProxyAgent(Protocol):
 
     def latest_session_id(self, repo: Path) -> str | None: ...
 
+    def repo_activity(self, repo: Path) -> float | None:
+        """Epoch seconds of the newest HUMAN-driven activity this backend has recorded for
+        ``repo``, or None when it has none.
+
+        WHY IT IS NOT ``latest_session_id``. The background tracker follows whichever backend
+        the person is actually driving, so on every cycle it has to ask this of EVERY installed
+        backend — including the two they are not using. ``latest_session_id`` is the wrong
+        question to ask that often: on OpenCode it shells out to ``opencode session list``, a
+        ~0.4 s subprocess. So each backend answers "has anything happened here lately?" from the
+        cheapest source it has (a bounded transcript scan, one read-only db query), and only the
+        WINNER is asked the expensive question. Timestamps are compared ACROSS backends, so each
+        implementation must report genuine conversation activity — not a file mtime aGiTrack's
+        own staging may have bumped, which would hand the race to a dead conversation."""
+
     # --- turn-end liveness ---------------------------------------------------
     #
     # ``_backend_idle_for`` needs a signal that advances ONLY on real backend work, to tell an
@@ -382,6 +396,9 @@ class OpenCodeProxyAgent:
     def latest_session_id(self, repo: Path) -> str | None:
         return opencode_session.latest_session_id(repo)
 
+    def repo_activity(self, repo: Path) -> float | None:
+        return opencode_session.repo_activity(repo)
+
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         return opencode_session.list_sessions(repo)
 
@@ -486,6 +503,9 @@ class ClaudeProxyAgent:
 
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)
+
+    def repo_activity(self, repo: Path) -> float | None:
+        return claude_session.repo_activity(repo)
 
     def session_last_activity(self, session_id: str) -> float | None:
         return claude_session.session_last_activity(session_id)
@@ -595,6 +615,9 @@ class CodexProxyAgent:
 
     def latest_session_id(self, repo: Path) -> str | None:
         return codex_session.latest_session_id(repo)
+
+    def repo_activity(self, repo: Path) -> float | None:
+        return codex_session.repo_activity(repo)
 
     def session_last_activity(self, session_id: str) -> float | None:
         return codex_session.session_last_activity(session_id)

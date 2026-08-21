@@ -31,6 +31,7 @@ __all__ = [
     "turns_after",
     "latest_session_id",
     "list_sessions",
+    "repo_activity",
     "list_worktree_sessions",
     "sessions_under",
     "session_belongs_to_repo",
@@ -211,6 +212,35 @@ def latest_session_id(repo: Path) -> str | None:
     # session's own).
     project = _project_dir(repo)
     return max(pool, key=lambda ref: _content_updated(project / f"{ref.id}.jsonl", ref.updated)).id
+
+
+# How many conversations a repo-activity probe looks at, newest file first. The probe is asked
+# of EVERY installed backend on every tracker cycle — including backends nobody is driving — so
+# it has to stay cheap in a project directory holding hundreds of past conversations. A session
+# a person is driving right now is being appended to, so it is always among the newest few by
+# mtime; the cap costs an active conversation nothing.
+_ACTIVITY_SCAN_LIMIT = 8
+
+
+def repo_activity(repo: Path) -> float | None:
+    """Epoch seconds of the newest HUMAN-driven activity recorded for ``repo`` on this backend,
+    or None when this backend holds no conversation for it at all.
+
+    This is how the background tracker tells WHICH backend the person is actually using
+    (``BackgroundRunner._tracked_session_id``): it is asked of every installed backend, and the
+    newest answer wins. It exists as a separate, deliberately cheap question because the real
+    listing is not cheap on every backend — OpenCode's costs a ~0.4 s subprocess — and paying
+    that for backends the user is not running, several times a minute, is not acceptable.
+
+    Content timestamps, not file mtimes: aGiTrack's own staging rewrites transcripts without
+    adding a message (see :func:`_content_updated`), and an mtime bumped by aGiTrack itself
+    would let a dead conversation here outrank a live one on another backend — a switch to the
+    wrong backend, which is the exact failure this whole probe exists to prevent."""
+    refs = sorted(list_sessions(repo), key=lambda ref: ref.updated, reverse=True)[:_ACTIVITY_SCAN_LIMIT]
+    if not refs:
+        return None
+    project = _project_dir(repo)
+    return max(_content_updated(project / f"{ref.id}.jsonl", ref.updated) for ref in refs)
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
