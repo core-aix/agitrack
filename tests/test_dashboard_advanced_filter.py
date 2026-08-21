@@ -149,3 +149,60 @@ def test_a_high_cardinality_field_is_offered_without_shipping_every_value():
     assert field["count"] == 150 and field["values"] == []
     # …and it still filters.
     assert _filtered(dash, ["conversation_anchor:eq:msg_7"]) == ["s7"]
+
+
+# --------------------------------------------------------------------------- ranges
+
+
+def test_bounds_order_versions_numbers_and_timestamps_naturally():
+    # The three things worth bounding cannot share one comparison rule: plain string order puts
+    # 2.1.9 AFTER 2.1.10, and plain numeric order cannot read a timestamp at all. `ge`/`le`
+    # parsed both sides as floats before this, so a date or version bound matched NOTHING and
+    # read as "no commits" rather than as a filter that could not run.
+    dash = _dash(
+        _stat("old", backend_version="2.1.9", agent_started_at="2026-07-30T09:00:00Z", context_tokens="9000"),
+        _stat("new", backend_version="2.1.10", agent_started_at="2026-08-15T09:00:00Z", context_tokens="10000"),
+    )
+    assert _filtered(dash, ["backend_version:ge:2.1.10"]) == ["new"]
+    assert _filtered(dash, ["agent_started_at:ge:2026-08-01T00:00:00Z"]) == ["new"]
+    assert _filtered(dash, ["context_tokens:ge:10000"]) == ["new"]
+
+
+def test_between_is_inclusive_of_both_ends():
+    dash = _dash(
+        _stat("a", context_tokens="50000"),
+        _stat("b", context_tokens="100000"),
+        _stat("c", context_tokens="300000"),
+        _stat("d", context_tokens="500000"),
+        _stat("e", context_tokens="900000"),
+    )
+    assert _filtered(dash, ["context_tokens:between:100000..500000"]) == ["b", "c", "d"]
+
+
+def test_a_range_end_may_be_left_open():
+    # "up to X" and "from X" are both real questions, and a half-filled range should ask the
+    # one the reader actually typed rather than nothing at all.
+    dash = _dash(_stat("a", context_tokens="50000"), _stat("b", context_tokens="500000"))
+    assert _filtered(dash, ["context_tokens:between:..100000"]) == ["a"]
+    assert _filtered(dash, ["context_tokens:between:100000.."]) == ["b"]
+
+
+def test_a_range_over_versions_and_dates_reads_the_same_way():
+    dash = _dash(
+        _stat("a", backend_version="2.1.220", agent_started_at="2026-07-05T09:00:00Z"),
+        _stat("b", backend_version="2.1.236", agent_started_at="2026-08-19T09:00:00Z"),
+        _stat("c", backend_version="2.1.238", agent_started_at="2026-08-21T09:00:00Z"),
+    )
+    assert _filtered(dash, ["backend_version:between:2.1.230..2.1.237"]) == ["b"]
+    assert _filtered(dash, ["agent_started_at:between:2026-08-01..2026-08-20"]) == ["b"]
+
+
+def test_a_between_without_a_separator_matches_nothing_rather_than_becoming_a_bound():
+    # Better no rows than silently applying a bound the user did not write.
+    dash = _dash(_stat("a", context_tokens="50000"))
+    assert _filtered(dash, ["context_tokens:between:50000"]) == []
+
+
+def test_an_entirely_open_range_selects_every_commit_that_HAS_the_field():
+    dash = _dash(_stat("a", context_tokens="50000"), _stat("b"))
+    assert _filtered(dash, ["context_tokens:between:.."]) == ["a"]

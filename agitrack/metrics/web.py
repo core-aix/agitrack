@@ -406,10 +406,35 @@ def _covers(dash: Dashboard) -> dict[str, CommitStat]:
 # select holding 537 conversation anchors is not a control, it is a wall.
 _FACET_VALUE_LIMIT = 100
 
-# `eq` exact, `has` substring (case-insensitive), `ge`/`le` numeric bounds. Anything else is
-# dropped rather than guessed at — a filter that silently means something other than what the
-# URL says would misreport the slice every panel on the page is computed from.
-_META_OPS = frozenset({"eq", "has", "ge", "le"})
+# `eq` exact, `has` substring (case-insensitive), `ge`/`le` bounds, `between` an inclusive
+# range written `LOW..HIGH`. Anything else is dropped rather than guessed at — a filter that
+# silently means something other than what the URL says would misreport the slice every panel
+# on the page is computed from.
+_META_OPS = frozenset({"eq", "has", "ge", "le", "between"})
+
+# What separates a range's two ends. `..` reads as a range and appears in no value any of these
+# fields carries; a value that does contain it can still be bounded with `ge` and `le` separately.
+RANGE_SEPARATOR = ".."
+
+# Splits a value into digit and non-digit runs, so ordering is NATURAL rather than lexical.
+# It has to be: bounds are wanted on token counts (numbers), timestamps (ISO-8601) and harness
+# versions, and the three cannot share one rule otherwise — plain string order puts 2.1.9 after
+# 2.1.10, and plain numeric order cannot read a timestamp at all. Before this, `ge`/`le` parsed
+# both sides as floats and returned False for anything else, so a date or version bound matched
+# NOTHING and looked like a filter with no results rather than a filter that could not run.
+_ORDER_CHUNKS = re.compile(r"(\d+)")
+
+
+def _order_key(value: str) -> tuple:
+    return tuple((1, int(part)) if part.isdigit() else (0, part) for part in _ORDER_CHUNKS.split(value) if part != "")
+
+
+def _at_least(actual: str, bound: str) -> bool:
+    return _order_key(actual) >= _order_key(bound)
+
+
+def _at_most(actual: str, bound: str) -> bool:
+    return _order_key(actual) <= _order_key(bound)
 
 
 def parse_meta_filters(raw: list[str]) -> list[tuple[str, str, str]]:
@@ -437,10 +462,14 @@ def _meta_matches(stat: CommitStat, key: str, op: str, value: str) -> bool:
         return actual == value
     if op == "has":
         return value.casefold() in actual.casefold()
-    try:  # ge / le: both sides must be numbers, or the comparison means nothing
-        return float(actual) >= float(value) if op == "ge" else float(actual) <= float(value)
-    except (TypeError, ValueError):
-        return False
+    if op == "between":
+        low, separator, high = value.partition(RANGE_SEPARATOR)
+        if not separator:
+            return False  # not a range at all; better no rows than a bound the user did not write
+        low, high = low.strip(), high.strip()
+        # An open end is allowed: `..500` is "up to 500" and `100..` is "from 100".
+        return (not low or _at_least(actual, low)) and (not high or _at_most(actual, high))
+    return _at_least(actual, value) if op == "ge" else _at_most(actual, value)
 
 
 def _passes_meta(stat: CommitStat, meta: list[tuple[str, str, str]]) -> bool:
@@ -1112,6 +1141,8 @@ __UI_RANGE_CSS__
 .advrow .advkey{flex:1 1 210px}
 .advrow .advop{flex:0 0 118px}
 .advrow .advval{flex:2 1 240px}
+.advrow .advend{flex:1 1 130px}
+.advrow .advdash{color:var(--dim);padding:0 2px}
 .advrow .advdel{cursor:pointer;border:1px solid var(--line);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:13px;padding:5px 10px}
 .advrow .advdel:hover{border-color:var(--amber)}
@@ -2393,8 +2424,19 @@ function syncFilters(){
   // does not have, or the page would keep filtering by something the user can no longer see or
   // clear — an empty dashboard with no visible cause.
   const known = new Set(metaFields().map(f => f.key));
-  if(known.size) state.meta = state.meta.filter(([k]) => known.has(k));
-  renderAdvanced(); syncAdvBtn();
+  const kept = known.size ? state.meta.filter(([k]) => known.has(k)) : state.meta;
+  const pruned = kept.length !== state.meta.length;
+  state.meta = kept;
+  // Re-render ONLY when the offered fields actually changed (a branch switch) or a condition
+  // was pruned. Every filter change refetches and lands back here, and re-rendering then tore
+  // out the very controls the reader was still filling in: typing a range's second bound was
+  // wiped the moment the first bound's results arrived, because the element being edited was
+  // replaced. Never re-render while the focus is inside the panel, for the same reason.
+  const signature = [...known].sort().join("\u0000");
+  const editing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#advpanel");
+  if((pruned || signature !== ADV_SIG) && !editing) renderAdvanced();
+  ADV_SIG = signature;
+  syncAdvBtn();
 }
 
 // --- advanced filter ------------------------------------------------------
@@ -2403,7 +2445,12 @@ function syncFilters(){
 // distinct values gets a dropdown of them; a high-cardinality one (session ids, timestamps,
 // token counts) gets a text box, because a select holding 500 conversation anchors is a wall,
 // not a control. Numeric fields also offer >= and <=.
-const META_OPS = {eq:"is", has:"contains", ge:"\u2265", le:"\u2264"};
+const META_OPS = {eq:"is", has:"contains", between:"between", ge:"\u2265", le:"\u2264"};
+const RANGE_SEP = "..";
+// Bounds are offered on EVERY field, not just numeric ones: the ranges worth asking for are
+// token counts, timestamps and harness versions, and only the first is a number. The server
+// orders all three naturally (see _order_key), so 2.1.9 sorts before 2.1.10.
+function opsFor(f){ return f.numeric ? ["eq","between","ge","le"] : ["eq","has","between","ge","le"]; }
 function metaFields(){ return (OPTIONS && OPTIONS.meta_fields) || []; }
 function metaField(key){ return metaFields().find(f => f.key === key) || null; }
 function renderAdvanced(){
@@ -2416,14 +2463,28 @@ function renderAdvanced(){
   }
   host.innerHTML = state.meta.map(([key,op,val], i) => {
     const f = metaField(key) || fields[0];
-    const ops = f.numeric ? ["eq","ge","le"] : ["eq","has"];
+    const ops = opsFor(f);
     const keyOpts = fields.map(x => `<option value="${esc(x.key)}"${x.key===key?" selected":""}>${esc(x.key)}</option>`).join("");
     const opOpts = ops.map(o => `<option value="${o}"${o===op?" selected":""}>${META_OPS[o]}</option>`).join("");
-    // A dropdown only for `is` on a field whose values we shipped; everything else is free text.
-    const valCtl = (op === "eq" && f.values && f.values.length)
-      ? `<select class="advval" data-i="${i}" data-part="val">` +
-        f.values.map(v => `<option value="${esc(v)}"${v===val?" selected":""}>${esc(v)}</option>`).join("") + `</select>`
-      : `<input class="advval" data-i="${i}" data-part="val" type="text" value="${esc(val)}" placeholder="value" autocomplete="off">`;
+    // A range needs two ends, so it gets two controls; `is` on a field whose values we shipped
+    // gets a dropdown; everything else is free text.
+    let valCtl;
+    if(op === "between"){
+      const cut = val.indexOf(RANGE_SEP);
+      const lo = cut < 0 ? val : val.slice(0, cut), hi = cut < 0 ? "" : val.slice(cut + RANGE_SEP.length);
+      const end = (part, v, ph) => (f.values && f.values.length)
+        ? `<select class="advval advend" data-i="${i}" data-part="${part}">` +
+          `<option value=""${v===""?" selected":""}>${ph}</option>` +
+          f.values.map(x => `<option value="${esc(x)}"${x===v?" selected":""}>${esc(x)}</option>`).join("") + `</select>`
+        : `<input class="advval advend" data-i="${i}" data-part="${part}" type="text" value="${esc(v)}" placeholder="${ph}" autocomplete="off">`;
+      // Either end may be left blank — "up to X" and "from X" are both real questions.
+      valCtl = end("lo", lo, "from (any)") + `<span class="advdash">\u2192</span>` + end("hi", hi, "to (any)");
+    } else if(op === "eq" && f.values && f.values.length){
+      valCtl = `<select class="advval" data-i="${i}" data-part="val">` +
+        f.values.map(v => `<option value="${esc(v)}"${v===val?" selected":""}>${esc(v)}</option>`).join("") + `</select>`;
+    } else {
+      valCtl = `<input class="advval" data-i="${i}" data-part="val" type="text" value="${esc(val)}" placeholder="value" autocomplete="off">`;
+    }
     return `<div class="advrow">` +
       `<select class="advkey" data-i="${i}" data-part="key">${keyOpts}</select>` +
       `<select class="advop" data-i="${i}" data-part="op">${opOpts}</select>` +
@@ -2431,9 +2492,18 @@ function renderAdvanced(){
       `<button class="advdel" data-i="${i}" title="Remove this condition">&times;</button></div>`;
   }).join("");
 }
+function closeAdvanced(){
+  const panel = $("advpanel"), btn = $("advbtn");
+  if(!panel || panel.hidden) return;
+  panel.hidden = true;
+  if(btn) btn.setAttribute("aria-expanded", "false");
+}
 function syncAdvBtn(){
   const btn = $("advbtn"); if(!btn) return;
-  const n = state.meta.filter(([k,o,v]) => k && o && v !== "").length;
+  // A range with both ends blank is not a condition anyone set, so it must not show in the
+  // badge as though the view were filtered.
+  const active = ([k,o,v]) => k && o && v !== "" && !(o === "between" && v.split(RANGE_SEP).every(x => !x.trim()));
+  const n = state.meta.filter(active).length;
   btn.innerHTML = "advanced" + (n ? ` <span class="advcount">${n}</span>` : "");
 }
 // A new condition defaults to the first field and its first value, so it selects something
@@ -2454,6 +2524,18 @@ function wireAdvanced(){
     if(open) renderAdvanced();
   };
   $("advadd").onclick = () => { const c = newCondition(); if(c){ state.meta.push(c); renderAdvanced(); } };
+  // Close on a click anywhere else, and on Escape — a panel that floats over the page and only
+  // closes via the button it came from is a panel the reader has to remember how to dismiss.
+  // Bound once, on the document, in the CAPTURE phase so a click on some other control both
+  // closes this and still reaches that control.
+  document.addEventListener("mousedown", e => {
+    if(panel.hidden) return;
+    if(e.target.closest("#advpanel") || e.target.closest("#advbtn")) return;
+    closeAdvanced();
+  }, true);
+  document.addEventListener("keydown", e => {
+    if(e.key === "Escape" && !panel.hidden){ closeAdvanced(); btn.focus(); }
+  });
   panel.addEventListener("change", e => {
     const el = e.target.closest("[data-part]"); if(!el) return;
     const i = +el.dataset.i, part = el.dataset.part;
@@ -2466,8 +2548,15 @@ function wireAdvanced(){
       state.meta[i] = [el.value, "eq", (f && f.values && f.values[0]) || ""];
       renderAdvanced();
     } else if(part === "op"){
+      const wasRange = state.meta[i][1] === "between", isRange = el.value === "between";
       state.meta[i][1] = el.value;
-      renderAdvanced();   // eq<->has/ge/le swaps the value control between select and text
+      // Leaving a range collapses `lo..hi` to its low end rather than carrying the separator
+      // into a single-value operator, where it would match nothing.
+      if(wasRange && !isRange) state.meta[i][2] = String(state.meta[i][2]).split(RANGE_SEP)[0];
+      if(!wasRange && isRange) state.meta[i][2] = String(state.meta[i][2]) + RANGE_SEP;
+      renderAdvanced();   // the operator decides whether the value is one control or two
+    } else if(part === "lo" || part === "hi"){
+      state.meta[i][2] = rangeValue(i, part, el.value);
     } else {
       state.meta[i][2] = el.value;
     }
@@ -2475,10 +2564,12 @@ function wireAdvanced(){
   });
   // Typing in a text value refilters as you go, like every other control on this bar.
   panel.addEventListener("input", e => {
-    const el = e.target.closest('input[data-part="val"]'); if(!el) return;
+    const el = e.target.closest('input[data-part="val"],input[data-part="lo"],input[data-part="hi"]');
+    if(!el) return;
     const i = +el.dataset.i;
     if(!state.meta[i]) return;
-    state.meta[i][2] = el.value;
+    const part = el.dataset.part;
+    state.meta[i][2] = (part === "val") ? el.value : rangeValue(i, part, el.value);
     syncAdvBtn(); debouncedFilters();
   });
   panel.addEventListener("click", e => {
@@ -2487,7 +2578,18 @@ function wireAdvanced(){
     renderAdvanced(); syncAdvBtn(); applyFilters();
   });
 }
+// One end changed: rebuild the `lo..hi` the server reads, keeping the other end as it was.
+function rangeValue(i, part, value){
+  const current = String((state.meta[i] || [])[2] || "");
+  const cut = current.indexOf(RANGE_SEP);
+  let lo = cut < 0 ? current : current.slice(0, cut);
+  let hi = cut < 0 ? "" : current.slice(cut + RANGE_SEP.length);
+  if(part === "lo") lo = value; else hi = value;
+  return lo + RANGE_SEP + hi;
+}
 let ADV_TIMER = 0;
+// The field set the panel was last drawn for; see fillSelects for why it is remembered.
+let ADV_SIG = null;
 function debouncedFilters(){ clearTimeout(ADV_TIMER); ADV_TIMER = setTimeout(applyFilters, 300); }
 
 // A filter change refetches the aggregates and resets the log to its first page.
