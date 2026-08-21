@@ -522,12 +522,12 @@ def test_collect_subagent_tokens_recurses_into_nested_subagents(monkeypatch, tmp
     monkeypatch.setattr(O, "_export_data", lambda repo, sid: exports.get(sid))
 
     parent_data = {"info": {"id": "P"}, "messages": [{"info": {"role": "assistant"}, "parts": [_task_part("P", "C")]}]}
-    token_map = O._collect_subagent_tokens(tmp_path, "P", parent_data)
+    work = O._collect_subagent_work(tmp_path, "P", parent_data)
 
-    assert set(token_map) == {"C"}
+    assert set(work) == {"C"}
     # child output 50 + grandchild output 7, accounted once despite the C->G->C cycle.
-    assert token_map["C"].subagent_output == 57
-    assert token_map["C"].subagent_input == 7  # 5 + 2
+    assert work["C"][0].subagent_output == 57
+    assert work["C"][0].subagent_input == 7  # 5 + 2
 
 
 def test_opencode_bare_run_is_watchdog_capped(monkeypatch):

@@ -18,6 +18,7 @@ from agitrack.fileio import safe_is_dir
 # ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
 # names must already exist here or that cycle fails when opencode is the first module imported.
 from agitrack.transcripts import capabilities
+from agitrack.transcripts.shell_edits import edits_from_shell
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 from agitrack.transcripts.edits import (
     content_from_read_output,
@@ -273,10 +274,11 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     # for. That is why `live_subagent_ids` stays empty here while Claude and Codex — whose
     # sub-agents outlive the launching turn — have to track it. Verified live against
     # opencode 1.18.16: the sub-agent's file was already on disk when the turn's reply landed.
-    subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
+    subagent_work = _collect_subagent_work(repo, session_id, data, collect_edits=collect_edits)
     return parse_exported_session(
         data,
-        subagent_tokens=subagent_tokens,
+        subagent_tokens={child: usage for child, (usage, _edits) in subagent_work.items()},
+        subagent_edits={child: edits for child, (_usage, edits) in subagent_work.items()},
         collect_edits=collect_edits,
         mcp_servers=configured_mcp_servers(repo),
     )
@@ -303,37 +305,62 @@ def _export_data(repo: Path, session_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _collect_subagent_tokens(repo: Path, session_id: str, data: dict) -> dict[str | None, TokenUsage]:
-    """Token usage of every sub-agent the session spawned, keyed by the DIRECT child
-    session id the parent's ``task`` part references, so `parse_exported_session` can
-    attribute each to the turn that launched it. A child's total rolls up its own
-    consumption plus any nested sub-agents'. Empty (and no extra exports) when the
-    session used no sub-agents — the common case has zero overhead."""
-    out: dict[str | None, TokenUsage] = {}
+def _collect_subagent_work(
+    repo: Path, session_id: str, data: dict, *, collect_edits: bool = False
+) -> dict[str | None, tuple[TokenUsage, list[FileEdit]]]:
+    """Token usage AND file edits of every sub-agent the session spawned, keyed by the DIRECT
+    child session id the parent's ``task`` part references, so `parse_exported_session` can
+    attribute each to the turn that launched it. A child's total rolls up its own consumption
+    plus any nested sub-agents'. Empty (and no extra exports) when the session used no
+    sub-agents — the common case has zero overhead.
+
+    Edits ride along with the tokens rather than in a second pass because each child costs an
+    `opencode export` subprocess; walking twice would double that. They were missing entirely
+    before: a child session is hidden from `session list`, so nothing else reads it, and every
+    file a delegated agent wrote was absent from `--backtrace` — a turn that fanned its work
+    out looked like a turn that changed nothing."""
+    out: dict[str | None, tuple[TokenUsage, list[FileEdit]]] = {}
     visited: set[str] = {session_id}
     for message in _as_list(data.get("messages")):
         for child_id in _task_child_session_ids(message.get("parts")):
-            out.setdefault(child_id, TokenUsage()).add(_subagent_tokens_for_session(repo, child_id, visited))
+            usage, edits = _subagent_work_for_session(repo, child_id, visited, collect_edits=collect_edits)
+            previous = out.setdefault(child_id, (TokenUsage(), []))
+            previous[0].add(usage)
+            previous[1].extend(edits)
     return out
 
 
-def _subagent_tokens_for_session(repo: Path, child_id: str, visited: set[str]) -> TokenUsage:
-    # Sum a sub-agent child session's own assistant token usage PLUS all of its nested
-    # sub-agents', as sub-agent buckets. `visited` guards against cycles / re-exporting.
+def _subagent_work_for_session(
+    repo: Path, child_id: str, visited: set[str], *, collect_edits: bool = False
+) -> tuple[TokenUsage, list[FileEdit]]:
+    # A sub-agent child session's own assistant token usage and file edits, PLUS all of its
+    # nested sub-agents'. `visited` guards against cycles / re-exporting. The child gets its
+    # OWN `file_state`: its work runs inside the parent's turn, so there is no true ordering to
+    # share a baseline with, and an isolated one can only miss an overlap rather than corrupt
+    # the parent's reconstruction.
     usage = TokenUsage()
+    edits: list[FileEdit] = []
     if not child_id or child_id in visited:
-        return usage
+        return usage, edits
     visited.add(child_id)
     data = _export_data(repo, child_id)
     if data is None:
-        return usage
+        return usage, edits
+    directory = str(_as_dict(data.get("info")).get("directory") or "")
+    file_state: dict[str, str] = {}
     for message in _as_list(data.get("messages")):
         info = _as_dict(message.get("info"))
         if info.get("role") == "assistant":
             usage.add(_subagent_message_tokens(info, message.get("parts")))
+            if collect_edits:
+                edits.extend(_edits_from_parts(message.get("parts"), file_state, cwd=directory))
         for grand_id in _task_child_session_ids(message.get("parts")):
-            usage.add(_subagent_tokens_for_session(repo, grand_id, visited))
-    return usage
+            nested_usage, nested_edits = _subagent_work_for_session(
+                repo, grand_id, visited, collect_edits=collect_edits
+            )
+            usage.add(nested_usage)
+            edits.extend(nested_edits)
+    return usage, edits
 
 
 def _task_child_session_ids(parts: object) -> set[str]:
@@ -630,6 +657,7 @@ def parse_exported_session(
     data: dict,
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+    subagent_edits: "dict[str | None, list[FileEdit]] | None" = None,
     collect_edits: bool = False,
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> ExportedSession:
@@ -662,6 +690,9 @@ def parse_exported_session(
     # Per-session running content of each edited file, so each edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
+    # The directory the session ran in. OpenCode's edit/write tools record absolute paths but its
+    # `bash` tool's commands are relative to this, and both must key `file_state` the same way.
+    session_directory = str(info.get("directory") or "")
 
     def flush() -> None:
         nonlocal compactions
@@ -675,6 +706,7 @@ def parse_exported_session(
             file_state=file_state,
             mcp_servers=mcp_servers,
             active_skills=turn_skills,
+            directory=session_directory,
         )
         # Skills this turn LOADED (the tail past the opening snapshot) carry forward even if the
         # turn also compacted; ones it merely inherited are already in the roster, or were cleared.
@@ -717,7 +749,25 @@ def parse_exported_session(
             assistant_group.append(message)
     flush()
     _attribute_subagent_tokens(turns, child_ids_per_turn, subagent_tokens)
+    _attribute_subagent_edits(turns, child_ids_per_turn, subagent_edits)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+
+
+def _attribute_subagent_edits(
+    turns: list[SessionTurn],
+    child_ids_per_turn: list[set[str]],
+    subagent_edits: "dict[str | None, list[FileEdit]] | None",
+) -> None:
+    """Add each sub-agent's file edits to the turn whose ``task`` call launched it, by the same
+    rule its tokens follow — the work belongs to the delegating prompt, and a turn reporting a
+    sub-agent's tokens beside none of its files would be describing half of what happened."""
+    if not subagent_edits or not turns:
+        return
+    for child_id, edits in subagent_edits.items():
+        if not edits:
+            continue
+        index = next((i for i, ids in enumerate(child_ids_per_turn) if child_id in ids), len(turns) - 1)
+        turns[index].edits.extend(edits)
 
 
 def _attribute_subagent_tokens(
@@ -748,6 +798,7 @@ def _build_turn(
     file_state: dict[str, str] | None = None,
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
     active_skills: list[str] | None = None,
+    directory: str = "",
 ) -> SessionTurn | None:
     # `active_skills` is the session's live skill roster (see `parse_exported_session`): the turn
     # starts with everything already loaded, and anything it loads itself is added back for the
@@ -779,7 +830,9 @@ def _build_turn(
         model = _model_name(assistant_info) or model
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
-            edits.extend(_edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}))
+            edits.extend(
+                _edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}, cwd=directory)
+            )
         _collect_capabilities(assistant.get("parts"), tool_names, subagents, skills)
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
@@ -872,11 +925,17 @@ def _collect_capabilities(parts: object, tool_names: list[str], subagents: list[
             subagents.append(agent.strip())
 
 
-def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdit]:
+def _edits_from_parts(parts: object, file_state: dict[str, str], *, cwd: str = "") -> list[FileEdit]:
     """The file edits in an assistant message's ``tool`` parts (OpenCode's edit / write /
-    patch tools), reconstructed from each call's input — used by the backtrace exporter.
-    Non-editing tools (read, bash, webfetch, …) are ignored. ``file_state`` (per session,
-    mutated) tracks each file's current content so each edit's diff is the incremental change."""
+    patch / bash tools), reconstructed from each call's input — used by the backtrace exporter.
+    ``file_state`` (per session, mutated) tracks each file's current content so each edit's diff
+    is the incremental change.
+
+    ``bash`` is read through :func:`agitrack.transcripts.shell_edits.edits_from_shell`: a heredoc
+    or `sed -i` run there changes the repository exactly as the `write` tool does, and counting
+    only the editing tools reported a fraction of the session's real lines. ``cwd`` is the
+    session's directory, which resolves those commands' relative paths onto the same keys the
+    editing tools' absolute ones use."""
     if not isinstance(parts, list):
         return []
     out: list[FileEdit] = []
@@ -889,6 +948,9 @@ def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdi
         inp = raw_input if isinstance(raw_input, dict) else {}
         path = inp.get("filePath") or inp.get("file_path") or inp.get("path") or ""
         if not isinstance(path, str):
+            continue
+        if tool == "bash":
+            out.extend(edits_from_shell(file_state, str(inp.get("command") or inp.get("cmd") or ""), cwd=cwd))
             continue
         if tool == "read":
             # The read's output is the file's pre-existing content: seed it so a later whole-file

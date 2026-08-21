@@ -836,7 +836,7 @@ what my past coding-agent sessions did here."
 ```mermaid
 flowchart TD
   bt["agitrack --backtrace [text|html|stop|status|commit]"] --> disc[["Discover every Claude/Codex/OpenCode session whose recorded cwd is this directory (or a subdirectory)"]]
-  disc --> exp[["Export each session; recover every turn's file edits from the tool calls (Edit/Write/MultiEdit)"]]
+  disc --> exp[["Export each session; recover every turn's file edits from the tool calls — the editing tools (Edit/Write/MultiEdit, apply_patch) AND the shell (heredocs, inline Python, sed -i, echo, mv/rm)"]]
   exp --> map[["Map each turn → a virtual commit: model, tokens, timings, per-file diff, and the user↔agent trace (final response only, exactly as a real aGiTrack commit)"]]
   map --> mode{mode}
   mode -->|text| txt[["Print a one-shot report"]]
@@ -855,6 +855,16 @@ flowchart TD
   end
 ```
 
+- **Shell edits count too.** An agent edits through its shell as much as through its editing
+  tools — Claude Code's auto mode explicitly tells it to — so the recovery reads the recorded
+  command text as well: a `cat`/`tee` heredoc, an inline Python `read_text`/`replace`/`write_text`
+  script, `sed -i`, `echo`/`printf` redirects, and `mv`/`cp`/`rm` of files the session itself
+  wrote, following `cd` so work done elsewhere is not recorded as a change to this directory. Sub-agent work counts too: a delegated agent's transcript is a separate file nothing else reads, and its edits are attributed to the turn that launched it, exactly as its tokens already were. Nothing is ever executed; it is a parse of text the transcript already holds. Measured
+  against this repository's own tracked commits, a session reconstructed 31.5% of the recorded
+  lines before and ~99% per commit after. Anything the text cannot pin down exactly — a script
+  that computes its output, `uv lock` and other subprocess side effects, a `$VAR` in a path — is
+  skipped rather than guessed, because the reconstruction is the baseline every later diff is
+  taken against.
 - **View** (`text` / `html` / bare): nothing is written and nothing is uploaded. The served view
   is built once and cached (re-exporting per poll would be far too slow). Committer chrome and the
   commit hash are hidden — a reconstructed turn has no committer and no real commit — and only the
@@ -873,8 +883,8 @@ flowchart TD
   new branch first.
 
 Implementation: `agitrack/metrics/backtrace.py` (view + daemon), `agitrack/metrics/backtrace_commit.py`
-(the `commit` replay), `agitrack/metrics/files.py` (file browser), `agitrack/transcripts/` (edit
-recovery).
+(the `commit` replay), `agitrack/metrics/files.py` (file browser), `agitrack/transcripts/edits.py`
+(editing-tool recovery) and `agitrack/transcripts/shell_edits.py` (shell recovery).
 
 ## 14. Learn page (dashboard `/learn`): the agent coaches the user
 
@@ -936,6 +946,13 @@ at, including one you have only fetched: a branch someone else pushed exists as
 arriving does not move the branch you are currently viewing, so the page notices it by watching
 the set of branch names, not just the tip of the one on screen: pull, and it is in the dropdown on
 the next poll, with no reload and no restart.
+
+**And they disappear when they are deleted.** Git leaves `origin/<name>` behind forever unless you
+fetch with `--prune`, so the list would otherwise fill with branches that were merged and removed
+long ago. aGiTrack asks the remote which branches it still has, in the background and at most
+every few minutes, and drops the rest from the dropdown. It never deletes anything: your refs stay
+exactly as git left them, only the list is filtered. If the remote cannot be reached, nothing is
+hidden, because a branch missing because your network was down is worse than a branch that lingers.
 
 **People are identified per branch.** GitHub's commit listing covers the default branch only, so a
 contributor whose work is on the branch you just pulled used to show under their raw git name

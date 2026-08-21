@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import subprocess
 import time
+
+import pytest
 from pathlib import Path
 
 from agitrack.git import GitRepo
@@ -240,3 +242,118 @@ def test_cached_logins_never_blocks_the_poll_on_the_new_branchs_crawl(tmp_path, 
     _only_fake_gh(monkeypatch, lambda *a, **k: (_ for _ in ()).throw(AssertionError("crawled in-request")))
 
     assert github.cached_logins(repo, "origin/feature-x") == {"a": "alice", "b": "bob"}
+
+
+# --- a branch DELETED on the remote must stop being offered -----------------
+
+
+def _wait_for(predicate, *, tries: int = 40, delay: float = 0.1):
+    """Poll until the background remote check has landed. Bounded, never a bare sleep."""
+    for _ in range(tries):
+        value = predicate()
+        if value:
+            return value
+        time.sleep(delay)
+    return predicate()
+
+
+def test_a_branch_deleted_on_the_remote_is_no_longer_offered(tmp_path):
+    """Git never removes a remote-tracking ref on a plain `git fetch` — only `--prune` does, and
+    most people never pass it. So a clone keeps `refs/remotes/origin/<name>` for every branch ever
+    pushed, and the selector filled up with branches that had been merged and deleted long ago."""
+    from agitrack.metrics import remote_branches
+
+    repo, origin = _origin_with_a_branch(tmp_path)
+    remote_branches._reset_cache_for_tests()
+    assert "origin/feature-x" in repo.list_remote_branches()
+
+    _git(origin, "branch", "-D", "feature-x")  # deleted upstream
+    _git(repo.repo, "fetch", "-q", "origin")  # ...and a plain fetch does NOT clean it up
+    assert "origin/feature-x" in repo.list_remote_branches(), "git itself still has the stale ref"
+
+    branches = _wait_for(lambda: viewable_branches(repo) if "origin/feature-x" not in viewable_branches(repo) else None)
+
+    assert branches == ["main"]
+    # ...and the user's refs are untouched: the display is filtered, the repository is not edited.
+    assert "origin/feature-x" in repo.list_remote_branches()
+
+
+def test_a_branch_the_remote_still_has_stays_offered(tmp_path):
+    # The other half: the check must not over-prune. A fetched branch that still exists upstream
+    # is exactly the case the selector was taught to show in the first place.
+    from agitrack.metrics import remote_branches
+
+    repo, _origin = _origin_with_a_branch(tmp_path)
+    remote_branches._reset_cache_for_tests()
+
+    branches = _wait_for(lambda: viewable_branches(repo) if len(viewable_branches(repo)) == 2 else None)
+
+    assert branches == ["main", "origin/feature-x"]
+
+
+def test_a_remote_that_cannot_be_asked_hides_nothing(tmp_path):
+    """Fail OPEN. Not knowing is never a reason to hide a branch: a remote that is unreachable,
+    needs a credential we do not have, or has simply gone away leaves its branches all showing.
+    Hiding one because the network was down would be a worse failure than showing a stale one."""
+    from agitrack.metrics import remote_branches
+
+    repo, _origin = _origin_with_a_branch(tmp_path)
+    remote_branches._reset_cache_for_tests()
+    _git(repo.repo, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    assert repo.remote_head_branches("origin") is None  # genuinely unaskable
+    for _ in range(5):
+        assert viewable_branches(repo) == ["main", "origin/feature-x"]
+        time.sleep(0.1)
+
+
+def test_the_remote_check_never_blocks_the_request(tmp_path, monkeypatch):
+    # It runs on a page that polls. A cold cache answers "nothing known" immediately and the
+    # entries settle a poll or two later, exactly like the GitHub login crawl beside it.
+    from agitrack.metrics import remote_branches
+
+    repo, _origin = _origin_with_a_branch(tmp_path)
+    remote_branches._reset_cache_for_tests()
+    monkeypatch.setattr(
+        GitRepo,
+        "remote_head_branches",
+        lambda self, remote="origin", *, timeout=0: pytest.fail("the remote was dialled inside the request"),
+    )
+
+    # Cold: shows everything the clone has, without asking anyone.
+    assert viewable_branches(repo) == ["main", "origin/feature-x"]
+
+
+def test_no_remote_only_branches_means_no_remote_check_at_all(tmp_path, monkeypatch):
+    # A repo whose every remote branch is also checked out locally displays nothing from
+    # `refs/remotes/`, so there is nothing to verify and no reason to touch the network.
+    from agitrack.metrics import remote_branches
+
+    repo, _origin = _origin_with_a_branch(tmp_path)
+    remote_branches._reset_cache_for_tests()
+    _git(repo.repo, "branch", "feature-x", "origin/feature-x")
+    asked: list[str] = []
+    monkeypatch.setattr(remote_branches, "live_branches", lambda repo, remotes: asked.append("x") or {})
+
+    viewable_branches(repo)
+
+    assert asked == []
+
+
+def test_pruning_matches_on_the_remote_name_not_the_first_slash(tmp_path):
+    # `origin/release/2.1` is remote `origin`, branch `release/2.1` — splitting on the first
+    # slash happens to work, but only because remote names cannot contain one. Match on the
+    # actual remote so a slashed branch name is never mis-attributed.
+    from agitrack.metrics.remote_branches import prune_stale
+
+    names = ["origin/release/2.1", "origin/gone/old", "upstream/main"]
+    live = {"origin": {"release/2.1"}}  # `upstream` was not asked about
+
+    assert prune_stale(names, live) == ["origin/release/2.1", "upstream/main"]
+
+
+def test_nothing_is_pruned_when_no_remote_could_be_asked(tmp_path):
+    from agitrack.metrics.remote_branches import prune_stale
+
+    names = ["origin/a", "origin/b"]
+    assert prune_stale(names, {}) == names

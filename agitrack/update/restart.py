@@ -22,22 +22,25 @@ On top of that, the SAME new fingerprint must be seen on two consecutive checks 
 minute apart) before acting, so even a mid-copy state that happens to parse can never
 trigger an exec into a half-written tree.
 
-How the swap happens differs by daemon. The dashboard and backtrace daemons do a
-SPAWN-AND-VERIFY handoff in their own serve loops: spawn the replacement, wait for its
-handshake, and only exit once it provably serves — a replacement that crashes on a
-broken update fails verification and the old daemon keeps serving and retries. The
-background tracker replaces itself via :func:`exec_replacement`
-(:func:`agitrack.daemons._daemon_command`, which also handles frozen builds): on POSIX
-``os.execv`` — pid preserved, and file descriptors are close-on-exec so the repo lock
-releases at the boundary — and on Windows, where there is no exec, the SAME
-spawn-and-verify handoff (see ``verify`` on :func:`exec_replacement`).
+EVERY daemon swaps the same way: SPAWN-AND-VERIFY. Spawn the replacement, wait for it to
+prove it is up (its own handshake), and only exit once it has — a replacement that crashes
+on a broken update fails verification, and the old daemon keeps running on the code it
+already loaded and retries later. The dashboard and backtrace daemons do this inline in
+their serve loops; the background tracker goes through :func:`exec_replacement`
+(:func:`agitrack.daemons._daemon_command`, which also handles frozen builds), releasing the
+repo lock before the spawn and taking it back if the successor never appears.
 
-Windows used to be a bare ``Popen`` + ``os._exit(0)``, which is fire-and-forget: it could
-not tell a successor that took over from one that died on the way up, so a failed restart
-left the repo with no tracker at all — silently, and with a success exit code. The reason
-given for not verifying was that the old daemon held the repo lock and a handoff would
-deadlock on it; the tracker now RELEASES that lock before spawning and takes it back if the
-successor never appears, which removes the deadlock and the silence together.
+Both platforms took a detour to get here, and for the same reason. Windows was a bare
+``Popen`` + ``os._exit(0)``: fire-and-forget, unable to tell a successor that took over from
+one that died on the way up, so a failed restart left the repo with no tracker at all —
+silently, with a success exit code. POSIX was ``os.execv``, which cannot keep the guarantee
+at all: exec replaces the process image, so a successor that dies on import leaves nothing
+behind to fall back to. Measured on a real pip install with a broken upgrade staged: the
+tracker logged "restarting on the new version", exec'd, the successor died on a SyntaxError,
+and the repository was left untracked — while the dashboard hub in the same experiment
+survived, because it verified. The objection to verifying on POSIX was that the old daemon
+held the repo lock and a handoff would deadlock on it; it now releases that lock before
+spawning, which removes the deadlock and the silence together.
 """
 
 from __future__ import annotations
@@ -321,43 +324,54 @@ def exec_replacement(
     treats that as "resume on the current code and retry later", so a failed restart
     never strands a dead daemon (see the retry loops in the daemons).
 
-    ``verify(pid)`` makes that contract real on Windows, where there is no exec. The old code
-    was ``Popen(...)`` followed immediately by ``os._exit(0)``: fire-and-forget. ``Popen``
-    returns as soon as the process is CREATED, which says nothing about whether it went on to
-    track anything — so this function could never "return because the restart failed", and a
-    successor that died during startup left the repo with no tracker at all, exit code 0, and
-    nothing in the log. That is a measured outcome, not a theoretical one: the successor lost
-    the race for the repo lock its dying predecessor still held, decided a live tracker was
-    already running, and exited.
+    ``verify(pid)`` is what makes that contract real, on EVERY platform. The old code was
+    ``Popen(...)`` followed immediately by ``os._exit(0)``: fire-and-forget. ``Popen`` returns as
+    soon as the process is CREATED, which says nothing about whether it went on to track
+    anything — so this function could never "return because the restart failed", and a successor
+    that died during startup left the repo with no tracker at all, exit code 0, and nothing in
+    the log. That is a measured outcome, not a theoretical one: the successor lost the race for
+    the repo lock its dying predecessor still held, decided a live tracker was already running,
+    and exited.
 
-    With ``verify`` the Windows path becomes the same SPAWN-AND-VERIFY handoff the dashboard
-    and backtrace daemons already use: spawn, wait for the successor to prove it is up, and
-    only then exit. A successor that does not come up is terminated and this returns, so the
-    caller keeps running on the old code — which is the whole point of restarting only into an
-    install that works.
+    So the handoff is SPAWN-AND-VERIFY, the same one the dashboard and backtrace daemons use:
+    spawn, wait for the successor to prove it is up, and only then exit. A successor that does
+    not come up is terminated and this returns, so the caller keeps running on the old code —
+    which is the whole point of restarting only into an install that works.
 
-    POSIX still uses ``os.execv``: the pid is preserved and the lock fd is close-on-exec, so
-    there is no handoff to verify — the process either becomes the new code or dies as itself."""
+    **POSIX used to ``os.execv`` here, and that is exactly the guarantee it could not keep.**
+    exec replaces the process image: if the new code cannot even be imported — a half-written
+    install, a broken release, a wheel whose ``__main__`` does not parse — there is no old
+    process left to fall back to. Measured on a real pip install: with a deliberately broken
+    upgrade in place, the tracker logged "restarting on the new version", exec'd, the successor
+    died on a SyntaxError, and the repository was left with no tracker at all. The dashboard hub
+    in the same experiment survived, because it verifies. Preserving the pid is not worth the
+    daemon; a caller that needs the successor's pid reads it from the handshake, which is what
+    ``verify`` waits for anyway."""
+    import subprocess
+
     try:
         log(f"aGiTrack updated on disk (running {RUNNING_VERSION}); restarting on the new version.")
         if os.name == "nt":
-            import subprocess
-
             from agitrack.proc import console_isolation_kwargs
 
-            child = subprocess.Popen(  # noqa: S603 - our own re-launch command
-                command,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-                **console_isolation_kwargs(),
-            )
-            if verify is None:
-                os._exit(0)
-            if _replacement_came_up(child, verify, verify_seconds, log):
-                os._exit(0)
-            _abandon_replacement(child, log)
-            return
-        os.execv(command[0], command)
+            spawn_kwargs = console_isolation_kwargs()
+        else:
+            # The successor has to OUTLIVE us: we exit the moment it proves it is up, and a child
+            # left in this process's session would go down with the terminal that started us.
+            from agitrack.proc import detach_kwargs
+
+            spawn_kwargs = detach_kwargs()
+        child = subprocess.Popen(  # noqa: S603 - our own re-launch command
+            command,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            **spawn_kwargs,
+        )
+        if verify is None:
+            os._exit(0)
+        if _replacement_came_up(child, verify, verify_seconds, log):
+            os._exit(0)
+        _abandon_replacement(child, log)
     except Exception as error:
         log(f"restart after update failed: {error!r}")
 
