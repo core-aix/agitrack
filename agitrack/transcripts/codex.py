@@ -1071,6 +1071,7 @@ def _subagent_work(
         file_state: dict[str, str] = {}
         path = session_transcript_path(child)
         if path is not None:
+            child_cwd = str(_session_meta(_read_rows(path)).get("cwd") or "")
             for row in _read_rows(path):
                 _, payload_kind = _row_kind(row)
                 payload = _payload(row)
@@ -1084,6 +1085,11 @@ def _subagent_work(
                     item = _as_dict(payload.get("item"))
                     if str(item.get("type") or "") == "FileChange":
                         edits.extend(_patch_edits(item, file_state))
+                elif collect_edits and payload_kind in ("function_call", "custom_tool_call"):
+                    # A sub-agent reaches for the shell as readily as the thread that spawned
+                    # it, and only `apply_patch` was being read here.
+                    for command, workdir in _shell_commands(_tool_name(payload), payload):
+                        edits.extend(edits_from_shell(file_state, command, cwd=workdir or child_cwd))
         for nested_usage, nested_edits in _subagent_work(child, visited, collect_edits=collect_edits).values():
             usage.add(nested_usage)
             edits.extend(nested_edits)

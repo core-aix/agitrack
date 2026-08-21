@@ -32,6 +32,7 @@ model exactly — a script that computes its output, a BRE-only ``sed`` pattern,
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import shlex
 import warnings
@@ -50,7 +51,10 @@ _HEREDOC = re.compile(r"<<-?\s*(?P<quote>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*
 _REDIRECT = re.compile(r"(?<![0-9<>&])(?P<op>>>|>)\s*(?P<path>[^\s;&|<>()]+)")
 _TEE = re.compile(r"\btee\b(?P<flags>(?:\s+-{1,2}[A-Za-z-]+)*)\s+(?P<path>[^\s;&|<>()]+)")
 _PYTHON = re.compile(r"(?:^|[\s;&|(])(?:uv\s+run\s+)?python[23]?(?:\.\d+)?\b")
-_ECHO = re.compile(r"^\s*(?P<cmd>echo|printf)\s+(?P<args>.*)$")
+# `echo`/`printf` need not start the line — `mkdir -p x && echo hi > x/f` is ordinary — but the
+# arguments must stop at the next command separator, or the following command is read as payload.
+_ECHO = re.compile(r"(?:^|[\s;&|(])(?P<cmd>echo|printf)\s+(?P<args>[^\n;&|]*)")
+_CD = re.compile(r"(?:^|[\s;&|(])cd\s+(?P<target>[^\s;&|()]+)")
 _MOVE = re.compile(r"(?:^|[\s;&|(])(?P<cmd>mv|cp|rm)(?P<args>(?:\s+[^\s;&|()]+)+)")
 
 # Shell metacharacters that make a word unresolvable from the text alone. A path holding one
@@ -88,15 +92,52 @@ def _recover(state: dict[str, str], command: str, cwd: str):
     text = command if command.endswith("\n") else command + "\n"
     lines = text.split("\n")
     index = 0
+    # The command's OWN working directory, which `cd` moves and the transcript does not record.
+    # Without following it, `cd /elsewhere && cat > notes.md` was resolved against the session's
+    # directory and recorded as a repo-root file that has never existed — the reconstruction
+    # invented paths, and scratch work done outside the repo was counted as changes to it.
+    here = cwd
     while index < len(lines):
         line = lines[index]
         index += 1
+        here, line_here = _apply_cd(line, here)
         heredoc = _HEREDOC.search(line)
         if heredoc:
             body, index = _heredoc_body(lines, index, heredoc.group("delim"))
-            yield from _from_heredoc(state, line, body, cwd)
+            yield from _from_heredoc(state, line, body, line_here)
             continue
-        yield from _from_line(state, line, cwd)
+        yield from _from_line(state, line, line_here)
+
+
+def _apply_cd(line: str, here: str) -> tuple[str, str]:
+    """``(directory for the lines that follow, directory for THIS line)`` after any ``cd`` on it.
+
+    Applied before the line's own writes, since ``cd sub && cat > f`` writes into ``sub``. The
+    two differ for a SUBSHELL: ``(cd pkg && …)`` moves nothing for the caller, and letting it
+    persist made a later line's ``pkg/mod.py`` resolve to ``pkg/pkg/mod.py`` — a path that has
+    never existed. Inventing paths is the failure mode this whole function exists to remove, so
+    a parenthesised ``cd`` is deliberately scoped to its own line.
+
+    A target the text cannot pin down (``cd $VAR``, ``cd -``, a bare ``cd``) yields ``""``,
+    which makes every later relative path unresolvable and therefore skipped. Guessing the old
+    directory would keep attributing writes to files that were never touched.
+    """
+    line_here = here
+    for match in _CD.finditer(line):
+        subshell = match.group(0).startswith("(")
+        target = _norm_word(match.group("target"))
+        if not target or _UNRESOLVABLE.search(target) or target == "-":
+            return ("" if not subshell else here), ""
+        if paths.is_absolute(target):
+            moved = paths.slash(target).rstrip("/")
+        elif not line_here:
+            return ("" if not subshell else here), ""
+        else:
+            moved = posixpath.normpath(paths.slash(line_here).rstrip("/") + "/" + paths.slash(target))
+        line_here = moved
+        if not subshell:
+            here = moved
+    return here, line_here
 
 
 def _heredoc_body(lines: list[str], start: int, delim: str) -> tuple[str, int]:
@@ -493,22 +534,20 @@ def _split_unescaped(text: str, separator: str) -> list[str]:
 
 def _from_echo(state: dict[str, str], line: str, cwd: str):
     """Edits from ``echo``/``printf`` redirected into a file — the shell's one-line write."""
-    match = _ECHO.match(line)
-    if not match:
-        return
-    redirect = _REDIRECT.search(match.group("args"))
-    if not redirect:
-        return
-    path = _resolve(redirect.group("path"), cwd)
-    if not path:
-        return
-    payload = _echo_payload(match.group("cmd"), match.group("args")[: redirect.start()])
-    if payload is None:
-        return
-    content = state.get(path, "") + payload if redirect.group("op") == ">>" else payload
-    edit = tracked_edit(state, path, write=content)
-    if edit is not None:
-        yield edit
+    for match in _ECHO.finditer(line):
+        redirect = _REDIRECT.search(match.group("args"))
+        if not redirect:
+            continue
+        path = _resolve(redirect.group("path"), cwd)
+        if not path:
+            continue
+        payload = _echo_payload(match.group("cmd"), match.group("args")[: redirect.start()])
+        if payload is None:
+            continue
+        content = state.get(path, "") + payload if redirect.group("op") == ">>" else payload
+        edit = tracked_edit(state, path, write=content)
+        if edit is not None:
+            yield edit
 
 
 def _echo_payload(command: str, arguments: str) -> str | None:
@@ -601,6 +640,11 @@ def _invocations(line: str, program: str) -> list[list[str]]:
     return out
 
 
+def _norm_word(word: str) -> str:
+    """A shell word with its surrounding quotes removed."""
+    return word.strip().strip("'\"")
+
+
 def _resolve(name: str, cwd: str) -> str:
     """``name`` as the absolute path the editing tools would have recorded, or ``""``.
 
@@ -609,7 +653,7 @@ def _resolve(name: str, cwd: str) -> str:
     path instead would put the same file in ``file_state`` twice — once as ``tests/x.py`` from
     the shell and once as ``/repo/tests/x.py`` from ``Edit`` — and count its lines twice.
     """
-    name = name.strip().strip("'\"")
+    name = _norm_word(name)
     if not name or _UNRESOLVABLE.search(name):
         return ""
     if name.startswith("/dev/") or name.startswith("~"):

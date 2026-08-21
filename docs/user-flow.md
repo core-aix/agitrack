@@ -859,7 +859,7 @@ flowchart TD
   tools — Claude Code's auto mode explicitly tells it to — so the recovery reads the recorded
   command text as well: a `cat`/`tee` heredoc, an inline Python `read_text`/`replace`/`write_text`
   script, `sed -i`, `echo`/`printf` redirects, and `mv`/`cp`/`rm` of files the session itself
-  wrote. Nothing is ever executed; it is a parse of text the transcript already holds. Measured
+  wrote, following `cd` so work done elsewhere is not recorded as a change to this directory. Sub-agent work counts too: a delegated agent's transcript is a separate file nothing else reads, and its edits are attributed to the turn that launched it, exactly as its tokens already were. Nothing is ever executed; it is a parse of text the transcript already holds. Measured
   against this repository's own tracked commits, a session reconstructed 31.5% of the recorded
   lines before and ~99% per commit after. Anything the text cannot pin down exactly — a script
   that computes its output, `uv lock` and other subprocess side effects, a `$VAR` in a path — is

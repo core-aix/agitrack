@@ -274,10 +274,11 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     # for. That is why `live_subagent_ids` stays empty here while Claude and Codex — whose
     # sub-agents outlive the launching turn — have to track it. Verified live against
     # opencode 1.18.16: the sub-agent's file was already on disk when the turn's reply landed.
-    subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
+    subagent_work = _collect_subagent_work(repo, session_id, data, collect_edits=collect_edits)
     return parse_exported_session(
         data,
-        subagent_tokens=subagent_tokens,
+        subagent_tokens={child: usage for child, (usage, _edits) in subagent_work.items()},
+        subagent_edits={child: edits for child, (_usage, edits) in subagent_work.items()},
         collect_edits=collect_edits,
         mcp_servers=configured_mcp_servers(repo),
     )
@@ -304,37 +305,62 @@ def _export_data(repo: Path, session_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _collect_subagent_tokens(repo: Path, session_id: str, data: dict) -> dict[str | None, TokenUsage]:
-    """Token usage of every sub-agent the session spawned, keyed by the DIRECT child
-    session id the parent's ``task`` part references, so `parse_exported_session` can
-    attribute each to the turn that launched it. A child's total rolls up its own
-    consumption plus any nested sub-agents'. Empty (and no extra exports) when the
-    session used no sub-agents — the common case has zero overhead."""
-    out: dict[str | None, TokenUsage] = {}
+def _collect_subagent_work(
+    repo: Path, session_id: str, data: dict, *, collect_edits: bool = False
+) -> dict[str | None, tuple[TokenUsage, list[FileEdit]]]:
+    """Token usage AND file edits of every sub-agent the session spawned, keyed by the DIRECT
+    child session id the parent's ``task`` part references, so `parse_exported_session` can
+    attribute each to the turn that launched it. A child's total rolls up its own consumption
+    plus any nested sub-agents'. Empty (and no extra exports) when the session used no
+    sub-agents — the common case has zero overhead.
+
+    Edits ride along with the tokens rather than in a second pass because each child costs an
+    `opencode export` subprocess; walking twice would double that. They were missing entirely
+    before: a child session is hidden from `session list`, so nothing else reads it, and every
+    file a delegated agent wrote was absent from `--backtrace` — a turn that fanned its work
+    out looked like a turn that changed nothing."""
+    out: dict[str | None, tuple[TokenUsage, list[FileEdit]]] = {}
     visited: set[str] = {session_id}
     for message in _as_list(data.get("messages")):
         for child_id in _task_child_session_ids(message.get("parts")):
-            out.setdefault(child_id, TokenUsage()).add(_subagent_tokens_for_session(repo, child_id, visited))
+            usage, edits = _subagent_work_for_session(repo, child_id, visited, collect_edits=collect_edits)
+            previous = out.setdefault(child_id, (TokenUsage(), []))
+            previous[0].add(usage)
+            previous[1].extend(edits)
     return out
 
 
-def _subagent_tokens_for_session(repo: Path, child_id: str, visited: set[str]) -> TokenUsage:
-    # Sum a sub-agent child session's own assistant token usage PLUS all of its nested
-    # sub-agents', as sub-agent buckets. `visited` guards against cycles / re-exporting.
+def _subagent_work_for_session(
+    repo: Path, child_id: str, visited: set[str], *, collect_edits: bool = False
+) -> tuple[TokenUsage, list[FileEdit]]:
+    # A sub-agent child session's own assistant token usage and file edits, PLUS all of its
+    # nested sub-agents'. `visited` guards against cycles / re-exporting. The child gets its
+    # OWN `file_state`: its work runs inside the parent's turn, so there is no true ordering to
+    # share a baseline with, and an isolated one can only miss an overlap rather than corrupt
+    # the parent's reconstruction.
     usage = TokenUsage()
+    edits: list[FileEdit] = []
     if not child_id or child_id in visited:
-        return usage
+        return usage, edits
     visited.add(child_id)
     data = _export_data(repo, child_id)
     if data is None:
-        return usage
+        return usage, edits
+    directory = str(_as_dict(data.get("info")).get("directory") or "")
+    file_state: dict[str, str] = {}
     for message in _as_list(data.get("messages")):
         info = _as_dict(message.get("info"))
         if info.get("role") == "assistant":
             usage.add(_subagent_message_tokens(info, message.get("parts")))
+            if collect_edits:
+                edits.extend(_edits_from_parts(message.get("parts"), file_state, cwd=directory))
         for grand_id in _task_child_session_ids(message.get("parts")):
-            usage.add(_subagent_tokens_for_session(repo, grand_id, visited))
-    return usage
+            nested_usage, nested_edits = _subagent_work_for_session(
+                repo, grand_id, visited, collect_edits=collect_edits
+            )
+            usage.add(nested_usage)
+            edits.extend(nested_edits)
+    return usage, edits
 
 
 def _task_child_session_ids(parts: object) -> set[str]:
@@ -631,6 +657,7 @@ def parse_exported_session(
     data: dict,
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+    subagent_edits: "dict[str | None, list[FileEdit]] | None" = None,
     collect_edits: bool = False,
     mcp_servers: "frozenset[str] | set[str] | tuple[str, ...]" = (),
 ) -> ExportedSession:
@@ -722,7 +749,25 @@ def parse_exported_session(
             assistant_group.append(message)
     flush()
     _attribute_subagent_tokens(turns, child_ids_per_turn, subagent_tokens)
+    _attribute_subagent_edits(turns, child_ids_per_turn, subagent_edits)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+
+
+def _attribute_subagent_edits(
+    turns: list[SessionTurn],
+    child_ids_per_turn: list[set[str]],
+    subagent_edits: "dict[str | None, list[FileEdit]] | None",
+) -> None:
+    """Add each sub-agent's file edits to the turn whose ``task`` call launched it, by the same
+    rule its tokens follow — the work belongs to the delegating prompt, and a turn reporting a
+    sub-agent's tokens beside none of its files would be describing half of what happened."""
+    if not subagent_edits or not turns:
+        return
+    for child_id, edits in subagent_edits.items():
+        if not edits:
+            continue
+        index = next((i for i, ids in enumerate(child_ids_per_turn) if child_id in ids), len(turns) - 1)
+        turns[index].edits.extend(edits)
 
 
 def _attribute_subagent_tokens(
