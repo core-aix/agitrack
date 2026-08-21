@@ -449,8 +449,15 @@ def parse_meta_filters(raw: list[str]) -> list[tuple[str, str, str]]:
     for entry in raw:
         key, _, rest = (entry or "").partition(":")
         op, _, value = rest.partition(":")
-        if key.strip() and op in _META_OPS and value != "":
-            out.append((key.strip(), op, value))
+        if not (key.strip() and op in _META_OPS and value != ""):
+            continue
+        # A range with NEITHER end filled in is a condition the reader has not written yet, so
+        # it must not filter. It used to select every commit that merely HAD the field, which
+        # silently shrank the view the moment `between` was picked — while the button's badge,
+        # which already ignored an empty range, still said nothing was filtered.
+        if op == "between" and not any(end.strip() for end in value.split(RANGE_SEPARATOR)):
+            continue
+        out.append((key.strip(), op, value))
     return out
 
 
@@ -1150,6 +1157,11 @@ __UI_RANGE_CSS__
 .advadd{cursor:pointer;border:1px solid var(--phosphor-dim);color:var(--phosphor);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:6px 11px}
 .advadd:hover{background:var(--phosphor);color:var(--ink)}
+.advapply{cursor:pointer;border:1px solid var(--phosphor);color:var(--ink);background:var(--phosphor);
+  font-family:var(--mono);font-size:12.5px;padding:6px 14px;font-weight:600}
+.advapply:hover{filter:brightness(1.15)}
+/* Nothing to apply: still clickable (it closes the panel) but visibly not the next step. */
+.advapply.clean{background:transparent;color:var(--dim);border-color:var(--line);font-weight:400}
 .advhint{color:var(--dim);font-size:12px}
 @media (max-width:760px){
   .advpanel{position:static;margin-top:10px}
@@ -1520,6 +1532,7 @@ __UPDATE_BANNER__
       <div id="advrows"></div>
       <div class="advfoot">
         <button class="advadd" id="advadd">+ add condition</button>
+        <button class="advapply" id="advapply">apply</button>
         <span class="advhint">Conditions on different fields must all match; several values of the same field match any of them.</span>
       </div>
     </div>
@@ -2434,7 +2447,8 @@ function syncFilters(){
   // replaced. Never re-render while the focus is inside the panel, for the same reason.
   const signature = [...known].sort().join("\u0000");
   const editing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#advpanel");
-  if((pruned || signature !== ADV_SIG) && !editing) renderAdvanced();
+  if(pruned && advDraft) advDraft = advDraft.filter(([k]) => known.has(k));
+  if((pruned || signature !== ADV_SIG) && !editing){ renderAdvanced(); syncApply(); }
   ADV_SIG = signature;
   syncAdvBtn();
 }
@@ -2452,6 +2466,25 @@ const RANGE_SEP = "..";
 // orders all three naturally (see _order_key), so 2.1.9 sorts before 2.1.10.
 function opsFor(f){ return f.numeric ? ["eq","between","ge","le"] : ["eq","has","between","ge","le"]; }
 function metaFields(){ return (OPTIONS && OPTIONS.meta_fields) || []; }
+// The conditions being EDITED, which are not the conditions being applied. Filtering live on
+// every keystroke and every dropdown meant the page refetched midway through a half-written
+// condition — picking a field applied that field's first value, and typing a range's low bound
+// filtered on it before the high bound existed. The panel now edits a draft and `apply` commits
+// it. `state.meta` stays the applied set, so it alone decides what the URL and the page show.
+let advDraft = null;
+function draft(){ if(!advDraft) advDraft = state.meta.map(c => c.slice()); return advDraft; }
+function activeConditions(list){
+  return list.filter(([k,o,v]) => k && o && v !== "" &&
+    !(o === "between" && v.split(RANGE_SEP).every(x => !x.trim())));
+}
+function advDirty(){ return JSON.stringify(activeConditions(draft())) !== JSON.stringify(state.meta); }
+function syncApply(){
+  const btn = $("advapply"); if(!btn) return;
+  const dirty = advDirty();
+  btn.classList.toggle("clean", !dirty);
+  btn.textContent = dirty ? "apply" : "close";
+  btn.title = dirty ? "Apply these conditions to the whole page" : "No unapplied changes";
+}
 function metaField(key){ return metaFields().find(f => f.key === key) || null; }
 function renderAdvanced(){
   const host = $("advrows");
@@ -2461,7 +2494,7 @@ function renderAdvanced(){
     host.innerHTML = '<div class="advhint">No metadata fields in this view yet — they appear once commits carry an aGiTrack metadata block.</div>';
     return;
   }
-  host.innerHTML = state.meta.map(([key,op,val], i) => {
+  host.innerHTML = draft().map(([key,op,val], i) => {
     const f = metaField(key) || fields[0];
     const ops = opsFor(f);
     const keyOpts = fields.map(x => `<option value="${esc(x.key)}"${x.key===key?" selected":""}>${esc(x.key)}</option>`).join("");
@@ -2502,8 +2535,7 @@ function syncAdvBtn(){
   const btn = $("advbtn"); if(!btn) return;
   // A range with both ends blank is not a condition anyone set, so it must not show in the
   // badge as though the view were filtered.
-  const active = ([k,o,v]) => k && o && v !== "" && !(o === "between" && v.split(RANGE_SEP).every(x => !x.trim()));
-  const n = state.meta.filter(active).length;
+  const n = state.meta.length;   // what is APPLIED, never what is merely typed
   btn.innerHTML = "advanced" + (n ? ` <span class="advcount">${n}</span>` : "");
 }
 // A new condition defaults to the first field and its first value, so it selects something
@@ -2520,10 +2552,11 @@ function wireAdvanced(){
     const open = panel.hidden;
     panel.hidden = !open;
     btn.setAttribute("aria-expanded", open ? "true" : "false");
-    if(open && !state.meta.length){ const c = newCondition(); if(c){ state.meta.push(c); } }
-    if(open) renderAdvanced();
+    advDraft = state.meta.map(c => c.slice());
+    if(open && !advDraft.length){ const c = newCondition(); if(c){ advDraft.push(c); } }
+    if(open){ renderAdvanced(); syncApply(); }
   };
-  $("advadd").onclick = () => { const c = newCondition(); if(c){ state.meta.push(c); renderAdvanced(); } };
+  $("advadd").onclick = () => { const c = newCondition(); if(c){ draft().push(c); renderAdvanced(); syncApply(); } };
   // Close on a click anywhere else, and on Escape — a panel that floats over the page and only
   // closes via the button it came from is a panel the reader has to remember how to dismiss.
   // Bound once, on the document, in the CAPTURE phase so a click on some other control both
@@ -2539,64 +2572,74 @@ function wireAdvanced(){
   // bubbles from whatever inside the panel has focus — and the button keeps focus until the
   // reader moves into it. A click outside already dismisses the panel, which covers the one
   // case this cannot: focus having left the control entirely.
+  const applyDraft = () => {
+    state.meta = activeConditions(draft());
+    advDraft = state.meta.map(c => c.slice());
+    closeAdvanced();          // the panel floats over the results it just changed
+    syncAdvBtn(); applyFilters();
+  };
+  // "close" when there is nothing to apply, so the button is never a dead end.
+  $("advapply").onclick = () => { if(advDirty()) applyDraft(); else { closeAdvanced(); btn.focus(); } };
+  // Enter in a value box is the same intent as pressing apply.
+  panel.addEventListener("keydown", e => {
+    if(e.key === "Enter" && e.target.closest("input")){ e.preventDefault(); applyDraft(); }
+  });
   const escapes = e => { if(e.key === "Escape" && !panel.hidden){ closeAdvanced(); btn.focus(); } };
   panel.addEventListener("keydown", escapes);
   btn.addEventListener("keydown", escapes);
   panel.addEventListener("change", e => {
     const el = e.target.closest("[data-part]"); if(!el) return;
     const i = +el.dataset.i, part = el.dataset.part;
-    if(!state.meta[i]) return;
+    if(!draft()[i]) return;
     if(part === "key"){
       // Switching field invalidates the operator and value: the new field may not be numeric,
       // and its values are its own. Re-seed from the new field rather than carrying a value
       // that belongs to a different field and silently matches nothing.
       const f = metaField(el.value);
-      state.meta[i] = [el.value, "eq", (f && f.values && f.values[0]) || ""];
+      draft()[i] = [el.value, "eq", (f && f.values && f.values[0]) || ""];
       renderAdvanced();
     } else if(part === "op"){
-      const wasRange = state.meta[i][1] === "between", isRange = el.value === "between";
-      state.meta[i][1] = el.value;
+      const wasRange = draft()[i][1] === "between", isRange = el.value === "between";
+      draft()[i][1] = el.value;
       // Leaving a range collapses `lo..hi` to its low end rather than carrying the separator
       // into a single-value operator, where it would match nothing.
-      if(wasRange && !isRange) state.meta[i][2] = String(state.meta[i][2]).split(RANGE_SEP)[0];
-      if(!wasRange && isRange) state.meta[i][2] = String(state.meta[i][2]) + RANGE_SEP;
+      if(wasRange && !isRange) draft()[i][2] = String(draft()[i][2]).split(RANGE_SEP)[0];
+      if(!wasRange && isRange) draft()[i][2] = String(draft()[i][2]) + RANGE_SEP;
       renderAdvanced();   // the operator decides whether the value is one control or two
     } else if(part === "lo" || part === "hi"){
-      state.meta[i][2] = rangeValue(i, part, el.value);
+      draft()[i][2] = rangeValue(i, part, el.value);
     } else {
-      state.meta[i][2] = el.value;
+      draft()[i][2] = el.value;
     }
-    syncAdvBtn(); applyFilters();
+    syncApply();
   });
   // Typing in a text value refilters as you go, like every other control on this bar.
   panel.addEventListener("input", e => {
     const el = e.target.closest('input[data-part="val"],input[data-part="lo"],input[data-part="hi"]');
     if(!el) return;
     const i = +el.dataset.i;
-    if(!state.meta[i]) return;
+    if(!draft()[i]) return;
     const part = el.dataset.part;
-    state.meta[i][2] = (part === "val") ? el.value : rangeValue(i, part, el.value);
-    syncAdvBtn(); debouncedFilters();
+    draft()[i][2] = (part === "val") ? el.value : rangeValue(i, part, el.value);
+    syncApply();
   });
   panel.addEventListener("click", e => {
     const del = e.target.closest(".advdel"); if(!del) return;
-    state.meta.splice(+del.dataset.i, 1);
-    renderAdvanced(); syncAdvBtn(); applyFilters();
+    draft().splice(+del.dataset.i, 1);
+    renderAdvanced(); syncApply();
   });
 }
 // One end changed: rebuild the `lo..hi` the server reads, keeping the other end as it was.
 function rangeValue(i, part, value){
-  const current = String((state.meta[i] || [])[2] || "");
+  const current = String((draft()[i] || [])[2] || "");
   const cut = current.indexOf(RANGE_SEP);
   let lo = cut < 0 ? current : current.slice(0, cut);
   let hi = cut < 0 ? "" : current.slice(cut + RANGE_SEP.length);
   if(part === "lo") lo = value; else hi = value;
   return lo + RANGE_SEP + hi;
 }
-let ADV_TIMER = 0;
 // The field set the panel was last drawn for; see fillSelects for why it is remembered.
 let ADV_SIG = null;
-function debouncedFilters(){ clearTimeout(ADV_TIMER); ADV_TIMER = setTimeout(applyFilters, 300); }
 
 // A filter change refetches the aggregates and resets the log to its first page.
 // PER stays in state; the data range comes from the period filter. A data change
@@ -2873,7 +2916,7 @@ async function init(){
   wireAdvanced();
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
-    state.meta=[]; renderAdvanced(); syncAdvBtn();
+    state.meta=[]; advDraft=null; renderAdvanced(); syncAdvBtn(); syncApply();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span

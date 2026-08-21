@@ -203,6 +203,13 @@ def test_a_between_without_a_separator_matches_nothing_rather_than_becoming_a_bo
     assert _filtered(dash, ["context_tokens:between:50000"]) == []
 
 
-def test_an_entirely_open_range_selects_every_commit_that_HAS_the_field():
+def test_a_range_with_neither_end_filled_in_does_not_filter_at_all():
+    # Picking "between" and typing nothing is a condition the reader has not written yet. It
+    # used to select every commit that merely HAD the field, so the view shrank the instant the
+    # operator was chosen — while the button's badge, which already ignored an empty range,
+    # still reported nothing filtered.
     dash = _dash(_stat("a", context_tokens="50000"), _stat("b"))
-    assert _filtered(dash, ["context_tokens:between:.."]) == ["a"]
+    assert _filtered(dash, ["context_tokens:between:.."]) == ["a", "b"]
+    assert parse_meta_filters(["context_tokens:between:.."]) == []
+    # One end alone is a real condition and still applies.
+    assert _filtered(dash, ["context_tokens:between:..100000"]) == ["a"]
