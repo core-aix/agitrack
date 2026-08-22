@@ -441,6 +441,29 @@ def test_subject_truncates_at_word_ends_with_ellipsis():
     assert hard.endswith("…") and len(hard) == bt._SUBJECT_MAX  # spaceless: hard cut, still marked
 
 
+def test_a_reconstructed_subject_is_masked_like_every_other_prompt_the_page_shows():
+    """Reported: the backtrace dashboard showed an absolute path, because the user's prompt had
+    one in it. A REAL commit's subject reaches the page through `collect._parse_commit`, which
+    masks the whole body at the single funnel every commit enters by — but a reconstructed turn
+    never passes through it. Its text comes straight out of a backend transcript that no commit
+    ever sanitized, so the subject published the machine's layout (and would have published a
+    secret in a prompt's first line the same way)."""
+    subject = bt._subject(_turn("look at /Users/me/Code/client-work/auth.py, key sk-ant-api03-AAAAAAAAAAAAAAAAAAAA"))
+
+    assert "/Users/me" not in subject and "sk-ant-api03" not in subject
+    assert "[PATH]" in subject and "[REDACTED]" in subject
+
+
+def test_the_masking_happens_before_the_subject_is_truncated():
+    # The other order would let a cut land inside a path or a token and leave the tail of it on
+    # the page, in a form no later pass recognises.
+    long_path = "/Users/me/Code/client-work/" + "deep/" * 40 + "file.py"
+    subject = bt._subject(_turn(f"open {long_path} please"))
+
+    assert "/Users/me" not in subject and "deep/" not in subject
+    assert subject.startswith("open [PATH]")
+
+
 def _turn(
     prompt: str,
     *,

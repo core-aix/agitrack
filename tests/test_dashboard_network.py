@@ -16,7 +16,9 @@ import pytest
 # pyproject.toml): ports are a GLOBAL resource, so concurrent workers race for them — the
 # consecutive-allocation tests assert that base+1 and base+2 are still free, which another
 # worker can falsify between choosing the base and binding it. Unlike a slow test this cannot
-# be fixed by waiting longer; the contention has to be removed.
+# be fixed by waiting longer; the contention has to be removed. The OTHER half of that
+# contention is the rest of the machine, which no test-runner setting can pin — see
+# `_free_ports`.
 pytestmark = pytest.mark.xdist_group("net")
 
 
@@ -207,16 +209,47 @@ class _Listener:
         self.sock.close()
 
 
-def _free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+# Where to look for a run of free ports, and deliberately BELOW every platform's ephemeral
+# range (Windows and macOS hand out 49152+, Linux 32768+). Asking the OS for a free port with
+# `bind(("", 0))` draws from exactly that pool — the pool it is also handing to every other
+# process on the box — so "the OS said this port is free" says nothing about the NEXT one, and
+# the consecutive-allocation tests need two or three in a row. That assumption is what failed on
+# a Windows CI runner: the probe returned 49683, something else took 49684 in the meantime, and
+# `bind_scanning` correctly skipped to 49685 while the test insisted on 49684. Down here the OS
+# never assigns a port on its own, so only a service explicitly listening can be in the way —
+# and the scan below steps over those.
+_PORT_SEARCH_WINDOW = range(20000, 32000)
+
+
+def _free_ports(count: int) -> int:
+    """The first port of a run of ``count`` consecutive bindable ports.
+
+    The whole run is bound at once — exclusively, the way the real server binds (see
+    ``_Listener``) — and only then released, so "these N ports are free" is CHECKED rather than
+    assumed from one probe. What remains is a race so much narrower it is a different kind of
+    thing: a port the OS will not hand out by itself, in the instant between the release and the
+    bind under test."""
+    for base in _PORT_SEARCH_WINDOW:
+        held = []
+        try:
+            for candidate in range(base, base + count):
+                sock = socket.socket()
+                bind_exclusively(sock)
+                sock.bind(("127.0.0.1", candidate))
+                held.append(sock)
+        except OSError:
+            continue  # something is on this run; step over it
+        finally:
+            for sock in held:
+                sock.close()
+        return base
+    pytest.fail(f"no run of {count} consecutive free ports in {_PORT_SEARCH_WINDOW}")
 
 
 def test_ports_are_allocated_consecutively_for_multiple_instances():
     # The reported annoyance: instance 1 got 8765 and every later one got a random
     # ephemeral port. They must march 8765, 8766, 8767 instead.
-    base = _free_port()
+    base = _free_ports(3)
     servers = []
     try:
         for expected in range(base, base + 3):
@@ -229,7 +262,7 @@ def test_ports_are_allocated_consecutively_for_multiple_instances():
 
 
 def test_scan_skips_a_port_held_by_something_else():
-    base = _free_port()
+    base = _free_ports(2)  # the blocker's port, and the one the scan must move on to
     blocker = _Listener(("127.0.0.1", base))
     try:
         server = bind_scanning(_Listener, "127.0.0.1", base)
@@ -251,7 +284,7 @@ def test_port_zero_still_means_let_the_os_choose():
 
 def test_exhausted_span_falls_back_to_an_ephemeral_port():
     # Better a working dashboard on an odd port than no dashboard at all.
-    base = _free_port()
+    base = _free_ports(1)  # only the blocked port matters here; span=1 tries nothing else
     blocker = _Listener(("127.0.0.1", base))
     try:
         server = bind_scanning(_Listener, "127.0.0.1", base, span=1)  # only the taken port tried

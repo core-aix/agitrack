@@ -311,3 +311,31 @@ def test_the_in_flight_trailer_is_covered_too(tmp_path):
 
     assert "acme-billing" not in trailer
     assert FOREIGN_REPO_MASK in trailer
+
+
+def test_a_reconstructed_backtrace_commit_is_redacted_but_the_dashboard_view_is_not(tmp_path):
+    """`--backtrace commit` writes REAL commits onto a branch made to be pushed, and it builds
+    them from months of transcripts at once — so it carries every project the user mentioned
+    across all of it. The backtrace DASHBOARD renders the same turns into a page on localhost
+    that is written nowhere; redacting there would only take information away from the one person
+    already entitled to it."""
+    from agitrack.backends.base import TokenUsage
+    from agitrack.metrics.backtrace_commit import _TurnRec, _annotation
+
+    _known(tmp_path / "here", tmp_path / "acme-billing")
+    turn = _TurnRec(
+        ended_at=2,
+        started_at=1,
+        files={"x.py"},
+        backend="claude",
+        model="opus",
+        tokens=TokenUsage(),
+        user_prompt="port the retry fix from acme-billing",
+        final_response="Done, mirroring acme-billing/lib/retry.py.",
+    )
+
+    annotated = _annotation([turn], str(tmp_path / "here"))
+    assert "acme-billing" not in annotated and FOREIGN_REPO_MASK in annotated
+
+    # The same builder with no repo named — the dashboard's call — leaves the text alone.
+    assert "acme-billing" in _annotation([turn])

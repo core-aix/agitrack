@@ -403,9 +403,16 @@ def _without_attribution_only_metadata(message: str) -> str:
     return "".join(out).rstrip()
 
 
-def _annotation(turns: list[_TurnRec]) -> str:
+def _annotation(turns: list[_TurnRec], repo_root: str | None = None) -> str:
     """The ``# Interaction Trace`` + ``# aGiTrack Metadata`` block to append to a commit, built from
-    the turns that produced it — rendered in the exact format a real aGiTrack commit uses."""
+    the turns that produced it — rendered in the exact format a real aGiTrack commit uses.
+
+    ``repo_root`` is this repository, so other projects' names are kept out of the trace exactly
+    as a live commit keeps them out (agitrack/commits/foreign.py). It matters MORE here, not
+    less: these commits are reconstructed from months of transcripts at once, so they carry every
+    project the user happened to mention across all of it, and the branch they land on is written
+    to be pushed. (The backtrace DASHBOARD is a different surface — a local view of local
+    transcripts, published nowhere — and deliberately does not redact.)"""
     ordered = sorted(turns, key=lambda t: t.ended_at)
     trace: list[dict] = []
     tokens = TokenUsage()
@@ -452,6 +459,7 @@ def _annotation(turns: list[_TurnRec]) -> str:
         covered_commits=None,
         started_at=min(starts) if starts else None,
         ended_at=max(ends) if ends else None,
+        repo_root=repo_root,
     )
     return "\n".join(lines)
 
@@ -480,7 +488,11 @@ def _replay(repo, commits: list[str], ai_map: dict[str, list[_TurnRec]], new_bra
         # is dropped rather than left beside the annotation: two metadata blocks would read as a
         # squash aggregate whose user constituent carries nothing.
         if turns and not carries_ai_history(message):
-            message = _without_attribution_only_metadata(message).rstrip() + "\n\n" + _annotation(turns) + "\n"
+            # Only the ANNOTATION is redacted, never the commit's own original message: this
+            # command promises to preserve the history it rewrites and add metadata beside it,
+            # and the subject is the author's, not aGiTrack's.
+            annotation = _annotation(turns, str(repo.repo))
+            message = _without_attribution_only_metadata(message).rstrip() + "\n\n" + annotation + "\n"
 
         args = ["git", "commit-tree", tree]
         for parent in new_parents:
