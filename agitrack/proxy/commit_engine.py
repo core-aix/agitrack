@@ -626,6 +626,10 @@ class CommitEngine:
             self.state.trace_turn_limit,
             interrupted=interrupted,
             changed_paths=changed_paths,
+            # The summarizer's SOLE input, so it is redacted before the LLM ever sees it: a
+            # summary written from text that still named another project would put the name back
+            # into the subject line in the summarizer's own words, where no pattern can find it.
+            repo_root=getattr(self.repo, "repo", None),
         )
         summary_text: str | None = None
         summary_metadata: list[str] | None = None
@@ -660,6 +664,12 @@ class CommitEngine:
             capabilities=capability_metadata,
             interrupted=interrupted,
             changed_paths=changed_paths,
+            # Which repository this is, so the names of the user's OTHER projects can be taken
+            # out of the prompt, the reply and the summary. In worktree mode this is the session
+            # worktree rather than the base repo, which is the same answer for this purpose: the
+            # base is one of its parents, and `foreign` treats the whole line as "not another
+            # project" (agitrack/commits/foreign.py).
+            repo_root=getattr(self.repo, "repo", None),
         )
         if manual_record_fn is not None:
             # Manual-commit mode: record the turn as a hidden latent commit on the side

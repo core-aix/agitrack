@@ -9200,10 +9200,16 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 + build_manual_squash_trailer(
                     agitrack_session_id=self.state.session_id,
                     latent_bodies=self._manual_pending_bodies(),
+                    # getattr, not `repo.repo`: this path is reached with a repo STAND-IN in
+                    # tests, and an unknown root only means "redact nothing" (fail-open), which
+                    # is never worth an AttributeError on the user's commit.
+                    repo_root=getattr(repo, "repo", None),
                 )
             )
         else:
-            commit_message = build_user_commit_message(message=message, agitrack_session_id=state.session_id)
+            commit_message = build_user_commit_message(
+                message=message, agitrack_session_id=state.session_id, repo_root=getattr(repo, "repo", None)
+            )
         try:
             repo.commit(commit_message)
         except Exception as error:
@@ -9834,7 +9840,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             if repo.has_staged_changes():
                 return None
             message = repo.commit_message("HEAD")
-            amended = apply_summary_to_message(message, summary, summary_metadata=metadata)
+            amended = apply_summary_to_message(
+                message, summary, summary_metadata=metadata, repo_root=getattr(repo, "repo", None)
+            )
             if amended == message:
                 return None  # already summarized: never amend twice
             new_short = repo.amend_commit(amended)

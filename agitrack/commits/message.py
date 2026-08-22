@@ -3,9 +3,11 @@ from __future__ import annotations
 import platform
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from textwrap import wrap
 
 from agitrack import __version__
+from agitrack.commits.foreign import redact_foreign_repos
 from agitrack.transcripts.capabilities import FIELDS as CAPABILITY_FIELDS
 
 
@@ -31,6 +33,19 @@ def _system_info() -> str:
     # Keep the metadata line within the 72-char commit-body width even for an
     # unusually long distro string.
     return info.strip()[:60] or "unknown"
+
+
+def _finish(lines: list[str], repo_root: str | Path | None) -> str:
+    """Join a built message and take OTHER projects' names out of it.
+
+    The last step of every builder, and deliberately a step over the FINISHED text rather than
+    one more thing each of the dozen places that mask a fragment has to remember. Foreign-repo
+    redaction is the only masking that needs to know which repository is being committed to, and
+    threading that through `_summary_lead_lines`, `_trace_role_lines`, `_note_block` and the rest
+    would put the same argument in eight private signatures for one pass that reads the same
+    answer each time. ``repo_root=None`` (a caller that has not said which repo it is) leaves the
+    text exactly as built — see :func:`agitrack.commits.foreign.redact_foreign_repos`."""
+    return redact_foreign_repos("\n".join(lines).rstrip() + "\n", repo_root)
 
 
 DEFAULT_SUBJECT = "No subject provided"
@@ -276,16 +291,17 @@ def build_agent_commit_message(
     capabilities: dict[str, list[str]] | None = None,
     interrupted: bool = False,
     changed_paths: list[str] | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
         # rest of it is the first paragraph of the body (no # Summary section).
         # The prompts are not duplicated into the message — the interaction trace
         # below already carries them verbatim.
-        lines = _summary_lead_lines(summary, interrupted=interrupted)
+        lines = _summary_lead_lines(summary, interrupted=interrupted, repo_root=repo_root)
     else:
         subject_prompt, full_subject = _subject_parts(
-            _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGITRACK_SUBJECT_PREFIX)
+            _mask_secrets(latest_prompt, repo_root), width=MAX_SUBJECT_WIDTH - len(AGITRACK_SUBJECT_PREFIX)
         )
         lines = [f"{AGITRACK_SUBJECT_PREFIX}{_interrupted_subject(subject_prompt, interrupted)}"]
         if full_subject:
@@ -318,9 +334,10 @@ def build_agent_commit_message(
             capabilities=capabilities,
             interrupted=interrupted,
             changed_paths=changed_paths,
+            repo_root=repo_root,
         )
     )
-    return "\n".join(lines).rstrip() + "\n"
+    return _finish(lines, repo_root)
 
 
 def apply_summary_to_message(
@@ -328,6 +345,7 @@ def apply_summary_to_message(
     summary: str,
     *,
     summary_metadata: list[str] | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     """Rewrite an existing agent commit message so the summary leads (#8).
 
@@ -359,12 +377,12 @@ def apply_summary_to_message(
     # Read the fact back off the message being amended (the async path amends a commit built
     # elsewhere, so no caller has to thread the flag through): the summary-led subject must
     # carry the same mark the originally built subject did.
-    new_lines = _summary_lead_lines(summary, interrupted="\ninterrupted: true" in message)
+    new_lines = _summary_lead_lines(summary, interrupted="\ninterrupted: true" in message, repo_root=repo_root)
     new_lines.append("")
     new_lines.extend(rest)
     if summary_metadata:
         new_lines = _insert_before_version_line(new_lines, summary_metadata)
-    return "\n".join(new_lines).rstrip() + "\n"
+    return _finish(new_lines, repo_root)
 
 
 def summary_metadata_lines(
@@ -409,7 +427,7 @@ def _interrupted_subject(subject: str, interrupted: bool) -> str:
     return f"{INTERRUPTED_SUBJECT_MARK}{subject}"
 
 
-def _summary_lead_lines(summary: str, *, interrupted: bool = False) -> list[str]:
+def _summary_lead_lines(summary: str, *, interrupted: bool = False, repo_root: str | Path | None = None) -> list[str]:
     """Subject + leading body for a summarized message.
 
     Mirrors the prompt-led layout: the summary's first line is the subject
@@ -418,7 +436,7 @@ def _summary_lead_lines(summary: str, *, interrupted: bool = False) -> list[str]
     there is no separate ``# Summary`` section. A leading bare "Summary" header
     line is skipped so the subject is never just the word "summary".
     """
-    text_lines = _mask_secrets(summary).strip().splitlines()
+    text_lines = _mask_secrets(summary, repo_root).strip().splitlines()
     first_index = next(
         (i for i, line in enumerate(text_lines) if line.strip() and not _is_summary_header(line)),
         None,
@@ -458,7 +476,7 @@ indistinguishable from something they typed — and that trace is the summarizer
 the summary read the wake-up as a request. It is an event; it renders as one."""
 
 
-def _trace_role_lines(item: dict) -> list[str]:
+def _trace_role_lines(item: dict, repo_root: str | Path | None = None) -> list[str]:
     """The rendered lines for one trace entry — its "## User"/"## Agent" role heading plus the
     masked, heading-nested body — or an EMPTY list when the entry has no textual content. A
     blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while the
@@ -467,7 +485,7 @@ def _trace_role_lines(item: dict) -> list[str]:
     An :data:`TRACE_EVENT_ROLE` entry is NOT a speaker and gets no role heading: it renders as a
     note (the same blockquote form the lead-in notes use) naming the event, so a reader — and the
     summarizer — can see the agent continued on its own rather than answering anybody."""
-    content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
+    content = _nest_headings_under_role(_mask_secrets(item.get("content", ""), repo_root))
     if not content.strip():
         return []
     role = item.get("role", "").strip().lower()
@@ -490,6 +508,7 @@ def render_interaction_trace(
     *,
     interrupted: bool = False,
     changed_paths: list[str] | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     """The interaction-trace body exactly as it is appended to an aGiTrack commit:
     role headings plus masked, heading-nested content (same as the commit's
@@ -504,7 +523,7 @@ def render_interaction_trace(
     ``_interrupted_changes_sentence``). Both are ignored unless the turn was interrupted."""
     lines: list[str] = list(_interrupted_note_lines(interrupted, changed_paths))
     for item in _limit_trace_turns(trace, trace_turn_limit):
-        lines.extend(_trace_role_lines(item))
+        lines.extend(_trace_role_lines(item, repo_root))
     return "\n".join(lines).strip()
 
 
@@ -530,6 +549,7 @@ def _trace_and_metadata_lines(
     capabilities: dict[str, list[str]] | None = None,
     interrupted: bool = False,
     changed_paths: list[str] | None = None,
+    repo_root: str | Path | None = None,
 ) -> list[str]:
     lines: list[str] = [TRACE_HEADER, ""]
     # The interruption leads every other note: it changes how the whole trace below
@@ -548,7 +568,7 @@ def _trace_and_metadata_lines(
     for item in _limit_trace_turns(trace, trace_turn_limit):
         # Nest each message's own headings under its "## User"/"## Agent" role heading (so a
         # message's "# Title" can't outrank the role) and skip empty entries (see _trace_role_lines).
-        lines.extend(_trace_role_lines(item))
+        lines.extend(_trace_role_lines(item, repo_root))
 
     lines.extend(
         [
@@ -786,13 +806,14 @@ def build_agent_merge_message(
     backend: str,
     backend_session_id: str | None = None,
     conflicting_commits: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     """Commit message for a merge whose conflicts an agent resolved."""
     subject = f"{AGENT_MERGE_SUBJECT_PREFIX}integrate {session_name or source_branch} into {base_branch}"
     lines = [_subject_text(subject, width=MAX_SUBJECT_WIDTH), ""]
     if conflicting_commits and conflicting_commits.strip():
         lines.extend(["# Resolved Against Base Commits", ""])
-        lines.extend(_body_lines(_mask_secrets(conflicting_commits)))
+        lines.extend(_body_lines(_mask_secrets(conflicting_commits, repo_root)))
         lines.append("")
     lines.extend(
         [
@@ -808,18 +829,19 @@ def build_agent_merge_message(
             f"agitrack_version: {__version__}",
         ]
     )
-    return "\n".join(lines).rstrip() + "\n"
+    return _finish(lines, repo_root)
 
 
 def build_user_commit_message(
     *,
     message: str | None,
     agitrack_session_id: str,
+    repo_root: str | Path | None = None,
 ) -> str:
     user_message = message.strip() if message else ""
     if not user_message:
         raise ValueError("User commit message is required")
-    subject, full_subject = _subject_parts(_mask_secrets(user_message), width=MAX_SUBJECT_WIDTH)
+    subject, full_subject = _subject_parts(_mask_secrets(user_message, repo_root), width=MAX_SUBJECT_WIDTH)
     lines = [subject]
     if full_subject:
         # Blank line first, so git's subject is the first sentence and not the whole
@@ -837,10 +859,12 @@ def build_user_commit_message(
             f"agitrack_version: {__version__}",
         ]
     )
-    return "\n".join(lines).rstrip() + "\n"
+    return _finish(lines, repo_root)
 
 
-def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list[str]) -> str:
+def build_manual_squash_trailer(
+    *, agitrack_session_id: str, latent_bodies: list[str], repo_root: str | Path | None = None
+) -> str:
     """The tracking text a manual-commit-mode git hook appends to the user's own commit
     message, so the single commit carries the whole session's interaction record.
 
@@ -880,7 +904,7 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
             f"agitrack_version: {__version__}",
         ]
     )
-    return "\n\n".join([header, *turn_blocks]).rstrip() + "\n"
+    return redact_foreign_repos("\n\n".join([header, *turn_blocks]).rstrip() + "\n", repo_root)
 
 
 def build_in_flight_trailer(
@@ -890,6 +914,7 @@ def build_in_flight_trailer(
     backend_session_id: str | None,
     model: str | None,
     prompt: str | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     """The tracking text for a commit the AGENT makes ITSELF, in the middle of a turn.
 
@@ -932,9 +957,9 @@ def build_in_flight_trailer(
     body: list[str] = [TRACE_HEADER, "", *note, ""]
     if prompt and prompt.strip():
         # _trace_role_lines masks and heading-nests the prompt, exactly as a real trace does.
-        body.extend(_trace_role_lines({"role": "user", "content": prompt}))
+        body.extend(_trace_role_lines({"role": "user", "content": prompt}, repo_root))
     body.extend(lines)
-    return "\n".join(body).strip() + "\n"
+    return redact_foreign_repos("\n".join(body).strip() + "\n", repo_root)
 
 
 def build_pending_trailer(
@@ -942,6 +967,7 @@ def build_pending_trailer(
     agitrack_session_id: str,
     latent_bodies: list[str],
     in_flight: dict | None = None,
+    repo_root: str | Path | None = None,
 ) -> str:
     """The trailer the ``prepare-commit-msg`` hook folds into the commit being made — the one
     entry point every mode renders through, so they all attribute a commit identically.
@@ -954,13 +980,15 @@ def build_pending_trailer(
     ``in_flight`` must be None whenever no agent turn is running OR the agent has not changed
     the working tree, which preserves the promise that a purely human commit is left untouched.
     """
-    trailer = build_manual_squash_trailer(agitrack_session_id=agitrack_session_id, latent_bodies=latent_bodies)
+    trailer = build_manual_squash_trailer(
+        agitrack_session_id=agitrack_session_id, latent_bodies=latent_bodies, repo_root=repo_root
+    )
     if trailer or not in_flight:
         return trailer
-    return build_in_flight_trailer(agitrack_session_id=agitrack_session_id, **in_flight)
+    return build_in_flight_trailer(agitrack_session_id=agitrack_session_id, repo_root=repo_root, **in_flight)
 
 
-def build_auto_fold_message(latent_bodies: list[str]) -> str:
+def build_auto_fold_message(latent_bodies: list[str], *, repo_root: str | Path | None = None) -> str:
     """Commit message for an **AUTO-mode fold**: aGiTrack commits the pending agent turn(s) *itself*,
     so the message must read like a clean AGENT commit — NOT the manual "squash into a user commit"
     format (which leads with a generic ``<aGiTrack> commit agent turns`` subject and a spurious
@@ -979,11 +1007,12 @@ def build_auto_fold_message(latent_bodies: list[str]) -> str:
     if not bodies:
         return ""
     if len(bodies) == 1:
-        return bodies[0].rstrip() + "\n"  # a clean single agent commit (summary leads when present)
+        # A clean single agent commit (summary leads when present).
+        return redact_foreign_repos(bodies[0].rstrip() + "\n", repo_root)
     # Several turns folded at once: lead with the newest turn's subject, then every turn's full body
     # (oldest-first, like any squash) — each already carries its own commit_type: agent metadata.
     newest_subject = bodies[-1].splitlines()[0].strip() or f"{AGITRACK_SUBJECT_PREFIX}agent turns"
-    return newest_subject + "\n\n" + "\n\n".join(bodies).rstrip() + "\n"
+    return redact_foreign_repos(newest_subject + "\n\n" + "\n\n".join(bodies).rstrip() + "\n", repo_root)
 
 
 def _subject_text(text: str, *, width: int) -> str:
@@ -1104,9 +1133,16 @@ def mask_paths(text: str) -> str:
     return PATH_RE.sub(replace, text)
 
 
-def _mask_secrets(text: object) -> str:
+def _mask_secrets(text: object, repo_root: str | Path | None = None) -> str:
     """Make arbitrary agent/user text safe to publish in a commit message: strip terminal
-    escapes and control characters, redact secrets, and mask absolute filesystem paths."""
+    escapes and control characters, redact secrets, mask absolute filesystem paths, and — when
+    the caller says which repository this is — take out the names of the user's OTHER projects.
+
+    The foreign-repo pass happens HERE, on the raw text, and not only in :func:`_finish` on the
+    finished message, because the message is hard-wrapped to 72 columns in between: a real commit
+    came out carrying ``acme-\nbilling/lib/retry.py``, split at the hyphen by ``textwrap`` and so
+    invisible to any pattern working on the wrapped result. Redaction has to see the text as the
+    agent wrote it. `_finish` stays as the backstop for what does not pass through here."""
     value = str(text or "")
     value = MOUSE_REPORT_RE.sub("", value)
     value = MOUSE_REPORT_FRAGMENT_RE.sub("", value)
@@ -1115,8 +1151,10 @@ def _mask_secrets(text: object) -> str:
     value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)
     for pattern in SECRET_TOKEN_RES:
         value = pattern.sub(SECRET_MASK, value)
-    # Last: path masking must not re-scan the "[REDACTED]" markers the steps above inserted.
-    return mask_paths(value)
+    # Path masking must not re-scan the "[REDACTED]" markers the steps above inserted; the
+    # foreign-repo pass runs last for the same reason, and because an absolute path into another
+    # project is already gone by then.
+    return redact_foreign_repos(mask_paths(value), repo_root)
 
 
 def _token_value(token_usage: dict[str, int | None] | None, key: str) -> int | str:

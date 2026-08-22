@@ -124,7 +124,9 @@ MODES: tuple[Mode, ...] = (
         name="status",
         headline="status",
         summary="Report what aGiTrack is currently running for this repository, and in which mode.",
-        argv=("-s",),
+        # The bare-word spelling, so the menu shows `agitrack status` next to `agitrack stop`
+        # rather than a flag beside a command. `-s` / `--status` still mean the same thing.
+        argv=("status",),
     ),
     Mode(
         name="stop",

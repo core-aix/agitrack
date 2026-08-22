@@ -1,9 +1,10 @@
-"""The mode surface: `-i`, the bare-`agitrack` menu, and `agitrack stop`.
+"""The mode surface: `-i`, the bare-`agitrack` menu, and the bare-word commands.
 
 aGiTrack runs in several quite different modes and, for a long time, a bare `agitrack` silently
 started the one that happened to be the historical default. These cover the replacement: a menu
-that says the modes exist, a flag for each, and one stop command that does not require knowing
-which mode is holding the repository.
+that says the modes exist, a flag for each, one stop command that does not require knowing
+which mode is holding the repository, and a typo answered by naming the commands that exist
+rather than by launching an agent session with the typo as its prompt.
 """
 
 from __future__ import annotations
@@ -323,3 +324,80 @@ def test_stop_on_an_idle_repo_says_so_and_succeeds(tmp_path, capsys):
     repo = GitRepo.init(tmp_path)
     assert stop_everything(repo) == 0
     assert "not running" in capsys.readouterr().out
+
+
+# --- `agitrack status` and unknown commands ----------------------------------------------------
+
+
+def test_status_is_recognised_as_a_command(tmp_path, monkeypatch):
+    # `agitrack status` is the bare-word spelling of `-s`, and must reach the same reporter.
+    from agitrack.git import GitRepo
+
+    GitRepo.init(tmp_path)
+    seen: list[object] = []
+    monkeypatch.setattr("agitrack.proxy.background.repo_status", lambda repo: seen.append(repo) or 0)
+
+    assert cli.main(["--repo", str(tmp_path), "status"]) == 0
+    assert cli.main(["status", "--repo", str(tmp_path)]) == 0
+    assert len(seen) == 2
+
+
+def test_status_command_reports_without_starting_anything(tmp_path, monkeypatch, capsys):
+    from agitrack.git import GitRepo
+
+    GitRepo.init(tmp_path)
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("status must not start a session"))
+
+    assert cli.main(["status", "--repo", str(tmp_path)]) == 0
+    assert "not running" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("token", ["statsu", "start", "run", "dashboard"])
+def test_an_unknown_command_is_named_and_nothing_is_started(token, monkeypatch, capsys):
+    # It used to fall through to the backend as a PROMPT, so a typo launched a whole agent
+    # session with the typo as its task.
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("a typo must not start a session"))
+    monkeypatch.setattr(cli, "BackgroundRunner", lambda *a, **k: pytest.fail("nor a background tracker"))
+
+    assert cli.main([token]) == 2
+    out = capsys.readouterr().out
+    assert f"Unknown command: {token}" in out
+    for known in cli._COMMANDS:
+        assert known in out  # the known commands are listed, so the user can pick the right one
+
+
+def test_an_unknown_command_is_caught_after_the_options_too(tmp_path, monkeypatch, capsys):
+    from agitrack.git import GitRepo
+
+    GitRepo.init(tmp_path)
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("a typo must not start a session"))
+
+    assert cli.main(["--repo", str(tmp_path), "statsu"]) == 2
+    assert "Unknown command: statsu" in capsys.readouterr().out
+
+
+def test_a_prompt_is_not_mistaken_for_a_command():
+    # One bare word is a command attempt; a sentence, a flag or a path is not.
+    assert cli._looks_like_a_command("statsu")
+    assert not cli._looks_like_a_command("fix the bug")
+    assert not cli._looks_like_a_command("--repo")
+    assert not cli._looks_like_a_command("/tmp/somewhere")
+    assert not cli._looks_like_a_command("")
+
+
+def test_a_word_forwarded_with_the_separator_stays_a_prompt(monkeypatch):
+    # `agitrack -- statsu` explicitly asks for the word to go to the backend; the unknown-command
+    # guard must not intercept it, or there would be no way to send a one-word prompt.
+    from tests.test_cli import _stub_launch
+
+    captured = _stub_launch(monkeypatch)
+    assert cli.main(["--", "statsu"]) == 0
+    assert captured["backend_args"] == ["statsu"]
+
+
+def test_a_quoted_sentence_still_reaches_the_backend(monkeypatch):
+    from tests.test_cli import _stub_launch
+
+    captured = _stub_launch(monkeypatch)
+    assert cli.main(["fix the bug"]) == 0
+    assert captured["backend_args"] == ["fix the bug"]

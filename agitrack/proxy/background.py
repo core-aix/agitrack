@@ -383,6 +383,43 @@ def _abbreviated_repo(repo: GitRepo) -> str:
         return str(getattr(repo, "repo", "?"))
 
 
+def autostart_armed(directory: Path) -> bool:
+    """Whether something is in place to start tracking ``directory`` ON ITS OWN — the git
+    pre-commit hook, or a backend's session-start hook — with none of the standing refusals in
+    the way. A PATH, not a GitRepo: the dashboard asks this for every repository in its switcher
+    (see :func:`agitrack.git.hooks.hooks_dir_for_path`).
+
+    This is the difference between a repository that is merely idle and one that is finished
+    with. Both have no process running, and for a long time the dashboard called both "off" and
+    listed both forever — so a project that starts tracking itself the moment you commit looked
+    exactly like a scratch directory nobody will ever open again.
+
+    The refusals are the SAME ones :func:`_autostart_daemon_args` applies when a hook actually
+    fires, and in the same order, because a hook that would be turned away is not armed:
+    the ``autotrack_hook`` preference being off, and a recorded `agitrack stop` that still
+    stands. Anything unreadable answers False — claiming a repo will restart itself when it
+    will not is the worse of the two mistakes here.
+
+    Both triggers count. :func:`autostart_status_line` reports the pre-commit one specifically
+    (its subject is "will THIS COMMIT be tracked"); this one's subject is "will aGiTrack come
+    back here by itself", which a backend's session-start hook also answers yes to."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(directory)
+        if config.autotrack_hook == "off":
+            return False
+        if tracking_gap.gap_is_open(directory):
+            return False
+        hooks_dir = git_hooks.hooks_dir_for_path(directory)
+        if hooks_dir is not None and git_hooks.is_autotrack_hook(hooks_dir / "pre-commit"):
+            return True
+        from agitrack.backends import agent_hooks
+
+        return bool(agent_hooks.installed_autostart_backends(directory))
+    except Exception:
+        return False
+
+
 def autostart_status_line(repo: GitRepo) -> str:
     """One line saying whether a commit made with aGiTrack down will actually be tracked.
 
@@ -440,12 +477,13 @@ def running_mode(repo: GitRepo) -> dict:
     dashboard says it in its header, because a page that looks identical whether or not anything
     is being tracked cannot answer "is this on?", which is the first thing anyone asks of it.
 
-    Returns ``{"running", "kind", "label", "detail", "pid"}``. ``kind`` is one of ``background``,
-    ``interactive``, ``unknown`` (something holds the repo lock but left no mode record) or
-    ``none``. Never raises: an unreadable repository reports "not tracking" rather than breaking
-    the page that asked.
+    Returns ``{"running", "armed", "kind", "label", "detail", "pid"}``. ``kind`` is one of
+    ``background``, ``interactive``, ``unknown`` (something holds the repo lock but left no mode
+    record), ``armed`` (nothing running, but a hook will start one — see :func:`autostart_armed`)
+    or ``none``. Never raises: an unreadable repository reports "not tracking" rather than
+    breaking the page that asked.
     """
-    unknown = {"running": False, "kind": "none", "label": "not tracking", "detail": "", "pid": None}
+    unknown = {"running": False, "armed": False, "kind": "none", "label": "not tracking", "detail": "", "pid": None}
     try:
         from agitrack.git import RepoLock
 
@@ -456,6 +494,7 @@ def running_mode(repo: GitRepo) -> dict:
             backend = str(info.get("backend") or "?")
             return {
                 "running": True,
+                "armed": False,  # something is already running; auto-start is not the question
                 "kind": "background",
                 "label": f"tracking · background · {commits}",
                 "detail": (
@@ -471,6 +510,7 @@ def running_mode(repo: GitRepo) -> dict:
             worktree = "worktree" if proxy.get("worktree") else "your working tree"
             return {
                 "running": True,
+                "armed": False,  # something is already running; auto-start is not the question
                 "kind": "interactive",
                 "label": f"tracking · interactive · {commits}",
                 "detail": (
@@ -482,13 +522,32 @@ def running_mode(repo: GitRepo) -> dict:
         if isinstance(owner, int) and pid_alive(owner):
             return {
                 "running": True,
+                "armed": False,  # something is already running; auto-start is not the question
                 "kind": "unknown",
                 "label": "tracking",
                 "detail": f"aGiTrack holds this repository (PID {owner}); the mode was not recorded.",
                 "pid": owner,
             }
+        # Nothing is running — but "idle" and "finished with" are different states, and saying
+        # "not tracking" to both was wrong in the direction that costs the user work: with the
+        # auto-start hook in place, the very next commit (or agent session) starts a tracker and
+        # the work IS recorded. The page header and the switcher both read this.
+        if autostart_armed(Path(repo.repo)):
+            return {
+                "running": False,
+                "armed": True,
+                "kind": "armed",
+                "label": "auto-start armed",
+                "detail": (
+                    "aGiTrack is not running here right now, but auto-start is armed: your next "
+                    "commit — or opening an agent in this repository — starts the tracker. Turn "
+                    "it off for good with `agitrack --remove-hooks`."
+                ),
+                "pid": None,
+            }
         return {
             "running": False,
+            "armed": False,
             "kind": "none",
             "label": "not tracking",
             "detail": (
@@ -2214,7 +2273,7 @@ class BackgroundRunner:
         if not force and not self._fold_summary_ready(tip):
             return  # retry next cycle
         bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
-        message = build_auto_fold_message(bodies)
+        message = build_auto_fold_message(bodies, repo_root=self.repo.repo)
         if not message:
             return
         try:

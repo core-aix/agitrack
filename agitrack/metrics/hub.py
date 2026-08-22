@@ -262,6 +262,13 @@ class _Mounts:
             self._backtrace.pop(slug, None)
             self._backtrace_live.pop(slug, None)
 
+    def is_open(self, slug: str) -> bool:
+        """Whether this hub has actually built a view for ``slug`` — i.e. someone opened this
+        repository here. Cheap and in-memory: it is asked once per row while drawing the
+        switcher, which is why it reads the mount table rather than the registry."""
+        with self._lock:
+            return slug in self._active or slug in self._backtrace
+
 
 # --------------------------------------------------------------------------- open pages
 #
@@ -511,27 +518,60 @@ class HubRouter:
     # ------------------------------------------------------------------ hub pages
 
     def _root(self) -> Response:
-        """Send the visitor to the repository they used last, in the view that fits it."""
+        """Send the visitor to the repository they used last, in the view that fits it.
+
+        "Last used" is read from the repositories the switcher OFFERS (:meth:`repo_list`), not
+        from the registry directly: landing on a repository that is then missing from the
+        switcher above it is a page arguing with itself. Only if nothing qualifies does the
+        registry's own most-recent entry stand — arriving somewhere beats a dead end, and opening
+        it mounts it, which puts it in the switcher."""
+        listed = {row["slug"] for row in self.repo_list()}
         entries = repo_registry.list_repos()
         if not entries:
             return html_response(_no_repos_html())
-        entry = entries[0]
+        entry = next((e for e in entries if e.slug in listed), entries[0])
         return redirect(mount_path(entry.slug, preferred_view(entry.directory)))
 
     def repo_list(self) -> list[dict]:
         """Every repository the hub can switch to, most recently used first (see
         :func:`_served_repos` for what "every" means).
 
+        A repository is listed while aGiTrack is DOING something for it, or would: one that is
+        being tracked right now, one whose auto-start hook will start a tracker on the next commit
+        or agent session, and one someone has opened in this hub (which always includes the page
+        asking, so the switcher can never contradict the header above it). A repository that is
+        none of those is finished with — nothing runs there, nothing will, and nobody is looking
+        at it — and listing it forever was how a switcher ended up mostly full of scratch
+        directories from months ago. The entry is kept, not deleted: working in the repo again, or
+        opening it with `agitrack -d`, brings it straight back.
+
         Deliberately cheap: no dashboard is built to answer it. The page header polls this to fill
         its switcher, and a hub with ten projects mounted must not walk ten histories to draw a
-        dropdown. The per-repo tracking state costs a handshake file and a pid check each, which
-        is on the same order as listing the repositories at all — and it is what turns the
-        switcher from a list of names into an answer to "where am I actually tracking?"."""
+        dropdown. The per-repo tracking state costs a handshake file and a pid check each, plus a
+        hook file for an idle one, which is on the same order as listing the repositories at all —
+        and it is what turns the switcher from a list of names into an answer to "where am I
+        actually tracking?"."""
         from agitrack.proxy.background import running_mode_for
 
         out = []
+        live = _live_daemon_repos()
         for entry in _served_repos():
             state = running_mode_for(entry.directory)
+            running = bool(state.get("running")) or str(Path(entry.path).expanduser()) in live
+            if not (running or state.get("armed") or self.mounts.is_open(entry.slug)):
+                continue
+            if running and not state.get("running"):
+                # Registered as a daemon, but with no handshake to describe it — a tracker that
+                # died without clearing its files, or one older than they are. The row says what
+                # is certain (something is running here) and does not invent the rest.
+                state = {
+                    **state,
+                    "running": True,
+                    "armed": False,
+                    "kind": "unknown",
+                    "label": "tracking",
+                    "detail": "A tracker is registered for this repository; its mode was not recorded.",
+                }
             out.append(
                 {
                     "slug": entry.slug,
@@ -562,6 +602,22 @@ class HubRouter:
             repo_registry.set_view(entry.path, view)
 
 
+def _live_daemon_repos() -> set[str]:
+    """The repositories a daemon is registered for right now, as resolved paths.
+
+    A SECOND opinion on "is anything running here", next to the handshake files
+    :func:`running_mode_for` reads. They can disagree — a tracker that died without tearing down
+    leaves a stale handshake, and one that predates handshake-writing leaves none — and the
+    switcher must resolve that disagreement toward listing the repository: a project aGiTrack is
+    demonstrably running on may never be missing from it."""
+    try:
+        from agitrack import daemons
+
+        return {str(Path(path).expanduser()) for path in daemons.running_repos()}
+    except Exception:
+        return set()
+
+
 def _served_repos() -> list:
     """The repositories the switcher offers: every one aGiTrack is RUNNING on right now, plus
     every one it remembers having worked on (which is what keeps a repo listed after its tracker
@@ -586,12 +642,9 @@ def _served_repos() -> list:
     do not normally coexist; this makes the outcome independent of that ordering.)"""
     entries = repo_registry.list_repos()
     known = {str(Path(entry.path).expanduser()) for entry in entries}
-    try:
-        from agitrack import daemons
-
-        live = daemons.running_repos()
-    except Exception:
-        return entries  # the switcher must draw even if the daemon registry cannot be read
+    # Empty when the daemon registry cannot be read: the union is an enhancement, never a
+    # precondition for drawing the switcher.
+    live = _live_daemon_repos()
     added = False
     for path in live:
         if path in known or not Path(path).is_dir():
@@ -617,7 +670,10 @@ def _short_state(state: dict) -> str:
     auto commits") and is far too long next to twenty repository names, so the row keeps the part
     that differs between repositories and drops the word they would all share."""
     if not state.get("running"):
-        return "off"
+        # Not "off": a repo with the auto-start hook in place is one commit away from tracking
+        # again, and a switcher that spells that the same as a dead scratch directory is hiding
+        # the only difference between them that matters.
+        return "auto-start" if state.get("armed") else "off"
     kind = str(state.get("kind") or "")
     if kind == "background":
         return "background" + (" · manual" if "manual" in str(state.get("label") or "") else "")

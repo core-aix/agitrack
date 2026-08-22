@@ -275,6 +275,44 @@ def is_autotrack_hook(path: Path) -> bool:
     return _hook_has_marker(path, _AUTOTRACK_MARKER)
 
 
+def hooks_dir_for_path(directory: Path) -> Path | None:
+    """The shared hooks directory of the repository at *directory*, read from the filesystem
+    alone — or None when there is no git repository there.
+
+    :meth:`GitRepo.hooks_dir` is the authority and answers the same question by asking git
+    (``rev-parse --git-common-dir``), which is the right thing to do when a repository is already
+    open. This exists for the one caller that has neither: the dashboard's repository switcher
+    asks "is auto-start armed here?" for EVERY repository it lists, on an endpoint the page header
+    polls, and opening a repo per row would put a `git` subprocess on the path of drawing a
+    dropdown (two dozen of them for a user with two dozen projects).
+
+    The layout it reads is git's own and stable: ``.git`` is a directory in a normal checkout, and
+    a file holding ``gitdir: <path>`` in a linked worktree, whose ``commondir`` names the shared
+    git dir the hooks live in. Anything it cannot make sense of is None — a caller that cannot
+    find the hooks must conclude "not armed", never "armed"."""
+    dot_git = directory / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git / "hooks"
+        if not dot_git.is_file():
+            return None
+        pointer = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+        if not pointer.startswith("gitdir:"):
+            return None
+        git_dir = Path(pointer.split(":", 1)[1].strip())
+        if not git_dir.is_absolute():
+            git_dir = directory / git_dir
+        # A linked worktree's own git dir holds only its refs; the hooks are the REPOSITORY's,
+        # under the common dir this file points at (relatively, in git's own writing).
+        common = git_dir / "commondir"
+        if common.is_file():
+            target = Path(common.read_text(encoding="utf-8", errors="replace").strip())
+            git_dir = target if target.is_absolute() else git_dir / target
+        return git_dir / "hooks"
+    except OSError:
+        return None
+
+
 def autotrack_hook_version(path: Path) -> str | None:
     """The aGiTrack version stamped into the installed auto-track ``pre-commit`` hook at *path*, or
     ``None`` when *path* isn't our hook or predates version stamping (an older schema with no line)."""

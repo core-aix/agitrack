@@ -29,7 +29,7 @@ from typing import Callable
 
 from agitrack import paths
 from agitrack.commits import METADATA_HEADER
-from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
+from agitrack.commits.message import _mask_secrets, _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
 from agitrack.metrics.routing import Response
@@ -750,7 +750,10 @@ def _session_to_stats(
                 patch = patch[:_MAX_PATCH_CHARS] + "\n… (diff truncated)\n"
             diffs[sha] = patch
         timestamp = turn.ended_at or turn.started_at or int(updated or 0)
-        prompts = [p for p in (turn.user_prompt, *turn.queued_followups) if p.strip()]
+        # Same masking as the subject and the message body below, and for the same reason: these
+        # are shown verbatim in the commit panel and the story, and their source is a raw
+        # transcript, not a sanitized commit message.
+        prompts = [_mask_secrets(p) for p in (turn.user_prompt, *turn.queued_followups) if p.strip()]
         stats.append(
             CommitStat(
                 sha=sha,
@@ -771,7 +774,7 @@ def _session_to_stats(
                 tokens=_tokens_dict(turn),
                 insertions=insertions,
                 deletions=deletions,
-                prompt=turn.user_prompt,
+                prompt=_mask_secrets(turn.user_prompt),
                 user_prompts=prompts,
                 message=_message(source, session_id, turn),
             )
@@ -807,8 +810,16 @@ def _subject(turn: SessionTurn) -> str:
     """A one-line label for the turn: the first non-empty line of its prompt, trimmed.
     A long line is cut at a WORD end and marked with an ellipsis — never mid-word
     (mirroring the dashboard's client-side truncSubject; a hard cut remains only when
-    a single word fills more than half the cap)."""
-    for line in turn.user_prompt.splitlines():
+    a single word fills more than half the cap).
+
+    MASKED, like every other prompt text the dashboard shows. A real commit's subject reaches
+    the page through `collect._parse_commit`, which masks the whole body once at the single
+    funnel every commit enters by — but a reconstructed turn never passes through it: its text
+    comes straight out of a backend transcript that no commit ever sanitized. So the subject
+    showed an absolute path verbatim (reported), and would have shown a secret the same way.
+    Masked BEFORE the truncation, so a cut can never split a path or a token into something the
+    masking no longer recognises."""
+    for line in _mask_secrets(turn.user_prompt).splitlines():
         line = line.strip()
         if not line:
             continue
@@ -879,6 +890,12 @@ def _message(source: _Source, session_id: str, turn: SessionTurn) -> str:
             trace.append({"role": "user", "content": followup})
     if turn.final_response.strip():
         trace.append({"role": "agent", "content": turn.final_response})
+    # No `repo_root`, so other projects' names are NOT redacted here — deliberately. This body is
+    # the backtrace DASHBOARD's view of a reconstructed turn: local text, built from local
+    # transcripts, rendered into a page on localhost and written to no commit. Redaction exists to
+    # keep names out of what gets PUBLISHED, and blanking them here would only take information
+    # away from the one person already entitled to it. `--backtrace commit`, which does write real
+    # commits, redacts (metrics/backtrace_commit.py).
     body = render_interaction_trace(trace, trace_turn_limit=len(trace) + 1)
 
     lines = [_subject(turn), ""]

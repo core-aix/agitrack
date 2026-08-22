@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -222,7 +223,12 @@ def _looks_like_a_long_path_failure(message: str) -> bool:
 # Bare-word commands aGiTrack answers, as opposed to flags. Kept deliberately tiny: everything
 # else is a flag, and every word promoted to a command is one that can no longer be the first
 # word of a bare prompt (`agitrack "stop the retry loop"` still works — see _split_command).
-_COMMANDS = ("stop",)
+# The description is what `agitrack <typo>` lists, so it is written for someone who does not
+# yet know what the command does.
+_COMMANDS: dict[str, str] = {
+    "status": "report whether aGiTrack is running for this repository, and in which mode",
+    "stop": "stop whatever aGiTrack is running for this repository, in any mode",
+}
 
 
 def _split_command(argv: list[str]) -> tuple[str | None, list[str]]:
@@ -236,6 +242,41 @@ def _split_command(argv: list[str]) -> tuple[str | None, list[str]]:
     if argv and argv[0] in _COMMANDS:
         return argv[0], argv[1:]
     return None, argv
+
+
+# A command is one word: a letter first, then letters/digits and the punctuation a
+# subcommand may reasonably carry. Deliberately excludes whitespace (a prompt), a
+# leading digit, and anything path-like.
+_COMMAND_WORD = re.compile(r"[a-zA-Z][a-zA-Z0-9._-]*")
+
+
+def _looks_like_a_command(token: str) -> bool:
+    """Whether ``token`` is a word typed in a command's position rather than a prompt.
+
+    aGiTrack forwards what it does not recognize to the backend, which used to mean a MISTYPED
+    command (`agitrack statsu`) silently launched a whole interactive agent session with the typo
+    as its prompt — the one outcome nobody wants from a typo. A single bare word is a command
+    attempt; a sentence is a prompt. So: one word, no whitespace, starting with a letter, and not
+    a flag. Anything else — `agitrack "fix the bug"`, a path, `--anything` — is left alone, and
+    `agitrack -- statsu` still forwards the word verbatim."""
+    if not token or token.startswith("-"):
+        return False
+    return bool(_COMMAND_WORD.fullmatch(token))
+
+
+def _unknown_command(token: str) -> int:
+    """Report a bare word that is not one of aGiTrack's commands, list the ones that are, and
+    exit 2 (the conventional code for "you typed it wrong") WITHOUT starting anything."""
+    print(f"Unknown command: {token}\n")
+    print("Known commands:")
+    width = max(len(name) for name in _COMMANDS)
+    for name, description in sorted(_COMMANDS.items()):
+        print(f"  {name:<{width}}  {description}")
+    print(
+        "\nRun `agitrack --help` for the full list of options, `agitrack` on a terminal to pick a\n"
+        f"mode from a menu, or `agitrack -- {token}` to send the word to the backend as a prompt."
+    )
+    return 2
 
 
 # Every parsed option that, on its own, says what aGiTrack should DO. If none of them is set and
@@ -296,6 +337,12 @@ def _choose_mode() -> list[str] | None:
 def _dispatch(argv: list[str] | None = None) -> int:
     _make_console_output_lossy()
     command, argv = _split_command(list(sys.argv[1:] if argv is None else argv))
+    # A bare word in the command position that is NOT a command: say so and stop. Without this it
+    # fell through to the backend as a prompt, so `agitrack statsu` launched an entire interactive
+    # agent session — the typo became the task. Answered before argparse, before the config and
+    # before any repo work, because nothing about the rest of the command line can rescue it.
+    if command is None and argv and _looks_like_a_command(argv[0]):
+        return _unknown_command(argv[0])
     parser = argparse.ArgumentParser(
         # `prog` explicitly, or Python 3.14 on Windows derives it from sys.argv[0] and the usage
         # line becomes `usage: python.exe C:\Users\<name>\AppData\Local\Python\...\Scripts\agitrack`
@@ -425,7 +472,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         "--status",
         action="store_true",
         help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
-        "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+        "background, auto vs manual commit, worktree vs no-worktree), then exit. Also spelled "
+        "`agitrack status`.",
     )
     parser.add_argument(
         "--daemons",
@@ -731,16 +779,28 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # `agitrack -b stop`). Not meant for manual use.
         help=argparse.SUPPRESS,
     )
+    # Hand-wrapped, and rendered raw (below): the command list is a table, and argparse's
+    # default formatter reflows an epilog into one paragraph, which would run the two commands
+    # and their descriptions together.
     parser.epilog = (
-        "Commands: `agitrack stop` stops whatever aGiTrack is running for this repository, in "
-        "any mode (the background tracker, an interactive session, this repo's dashboard). Run "
-        "`agitrack` with no arguments on a terminal to pick a mode from a menu.\n\n"
-        "Unrecognized arguments are forwarded verbatim to the backend CLI "
-        f"({' / '.join(available_backends())}), e.g. `agitrack --backend opencode --port 12345`. Use "
-        "`--` to forward arguments that aGiTrack also defines or a bare prompt, e.g. "
-        '`agitrack -- --verbose "fix the bug"`. To see the backend CLI\'s own help, run '
+        "Commands:\n"
+        "  agitrack status   report whether aGiTrack is running for this repository, and\n"
+        "                    in which mode (same as -s / --status)\n"
+        "  agitrack stop     stop whatever aGiTrack is running for this repository, in any\n"
+        "                    mode (the background tracker, an interactive session, this\n"
+        "                    repo's dashboard)\n"
+        "\n"
+        "Any other bare word is reported as an unknown command rather than run as a prompt.\n"
+        "Run `agitrack` with no arguments on a terminal to pick a mode from a menu.\n"
+        "\n"
+        "Unrecognized arguments (options, not bare words) are forwarded verbatim to the\n"
+        f"backend CLI ({' / '.join(available_backends())}), e.g.\n"
+        "`agitrack --backend opencode --port 12345`. Use `--` to forward arguments that\n"
+        "aGiTrack also defines, or a bare prompt, e.g.\n"
+        '`agitrack -- --verbose "fix the bug"`. To see the backend CLI\'s own help, run\n'
         "`agitrack -- --help` (or invoke the backend directly)."
     )
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
     # parse_known_args so backend-specific flags pass through instead of erroring.
     args, backend_args = parser.parse_known_args(argv)
     # argparse leaves a single leading "--" separator in the remainder; drop it.
@@ -750,8 +810,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # CLIs are typed. `_split_command` only claims position 0 (so a prompt starting with the word
     # is safe), and everything else falls through to the backend as a prompt; a lone leftover
     # word that IS a command, with no `--` separator asking for it to be forwarded, is one.
-    if command is None and len(backend_args) == 1 and backend_args[0] in _COMMANDS and "--" not in argv:
+    if command is None and len(backend_args) == 1 and "--" not in argv and _looks_like_a_command(backend_args[0]):
+        if backend_args[0] not in _COMMANDS:
+            # `agitrack --repo <path> statsu`: the same typo as the one caught before parsing,
+            # only typed after the options. It cannot be a flag's value (argparse consumed
+            # those) and nothing asked for it to be forwarded, so it is a mistyped command.
+            return _unknown_command(backend_args[0])
         command, backend_args = backend_args[0], []
+    if command == "status":
+        # `agitrack status` is the bare-word spelling of `-s`/`--status`, and answered by the
+        # same code below: a command that reports and exits belongs next to `stop`, since
+        # someone who knows one will try the other.
+        command, args.status = None, True
     # `--repo` parses as None when absent so the two cases stay distinguishable (see its help);
     # from here on it is the plain path every other reader expects.
     repo_given = args.repo is not None

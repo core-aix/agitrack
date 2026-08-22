@@ -310,7 +310,7 @@ class RecoveryService:
         try:
             target = sha
             message = repo.commit_message("HEAD")
-            amended = apply_summary_to_message(message, summary, summary_metadata=metadata)
+            amended = apply_summary_to_message(message, summary, summary_metadata=metadata, repo_root=repo.repo)
             if amended != message and repo.rev_parse("HEAD") == repo.rev_parse(sha) and not repo.has_staged_changes():
                 repo.amend_commit(amended)
                 target = repo.rev_parse("HEAD")
