@@ -339,3 +339,64 @@ def test_a_reconstructed_backtrace_commit_is_redacted_but_the_dashboard_view_is_
 
     # The same builder with no repo named — the dashboard's call — leaves the text alone.
     assert "acme-billing" in _annotation([turn])
+
+
+# --- aGiTrack's own name, which is the author of these messages and load-bearing in them -------
+
+
+def test_agitrack_own_name_is_never_redacted_even_when_it_is_a_registered_repo(tmp_path):
+    # Anyone who WORKS on aGiTrack has a checkout of it registered, so in every OTHER repo on
+    # that machine "agitrack" looked like a distinctive foreign name — and was taken out of the
+    # two markers aGiTrack stamps on its own messages.
+    _known(tmp_path / "here", tmp_path / "agitrack")
+
+    assert "agitrack" not in [name.lower() for name in foreign_repo_names(tmp_path / "here")]
+
+    text = "<aGiTrack> ported the fix\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+    assert redact_foreign_repos(text, tmp_path / "here") == text
+    assert redact_foreign_repos("wrote .agitrack/config.json", tmp_path / "here") == "wrote .agitrack/config.json"
+
+
+def test_a_different_project_that_merely_starts_the_same_is_still_redacted(tmp_path):
+    # The exemption is the exact name, not a prefix: a neighbouring project is still a leak.
+    _known(tmp_path / "here", tmp_path / "agitrack", tmp_path / "agitrack-fork")
+
+    assert foreign_repo_names(tmp_path / "here") == ["agitrack-fork"]
+
+
+def test_a_turn_recorded_while_the_marker_was_masked_still_folds(tmp_path):
+    """The regression this exemption exists for, end to end.
+
+    Masking ``# aGiTrack Metadata`` did not merely look wrong: it is the sentinel the fold
+    builders key on, so a recorded turn stopped reading as a turn, ``build_auto_fold_message``
+    returned "" and the background tracker silently stopped committing. Turns recorded during
+    that window are still on the latent refs and must not be stranded there.
+    """
+    from agitrack.commits import build_auto_fold_message, build_manual_squash_trailer
+
+    masked = (
+        f"<{FOREIGN_REPO_MASK}> updated the slide deck\n\n"
+        f"# {FOREIGN_REPO_MASK} Metadata\n"
+        "commit_type: agent\n"
+        "backend: claude\n"
+    )
+
+    folded = build_auto_fold_message([masked], repo_root=tmp_path / "here")
+    assert folded.startswith("<aGiTrack> updated the slide deck")
+    assert "# aGiTrack Metadata" in folded
+
+    trailer = build_manual_squash_trailer(agitrack_session_id="s1", latent_bodies=[masked], repo_root=tmp_path / "here")
+    assert "# aGiTrack Metadata" in trailer
+
+
+def test_the_repair_leaves_a_genuine_redaction_in_the_prose_alone(tmp_path):
+    # Only the two structural forms come back. A bare mask in an interaction trace is a real
+    # other project, and unmasking it would undo the whole point of the redaction.
+    from agitrack.commits.message import restore_own_markers
+
+    body = f"<{FOREIGN_REPO_MASK}> x\n\n# {FOREIGN_REPO_MASK} Metadata\n\nported from {FOREIGN_REPO_MASK}\n"
+    repaired = restore_own_markers(body)
+
+    assert repaired.startswith("<aGiTrack> x")
+    assert "# aGiTrack Metadata" in repaired
+    assert f"ported from {FOREIGN_REPO_MASK}" in repaired
