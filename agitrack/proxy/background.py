@@ -1105,6 +1105,9 @@ class BackgroundRunner:
         # summary, not the raw prompt. Tracks the latent tip we're waiting on and since when.
         self._fold_wait_tip: str | None = None
         self._fold_wait_since: float | None = None
+        # The latent tip we have already complained about being unfoldable, so the warning below
+        # is said once per tip rather than every poll for as long as the tracker runs.
+        self._fold_unusable_tip: str | None = None
         # Worktree-settle tracking for the fold (see `_worktree_settled`): the latent tip being
         # waited on and since when, plus the last tree seen and when it last changed. A
         # `_settle_changed_at` of 0.0 means "no change ever observed", which reads as settled —
@@ -2275,7 +2278,20 @@ class BackgroundRunner:
         bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
         message = build_auto_fold_message(bodies, repo_root=self.repo.repo)
         if not message:
+            # Pending turns exist (checked above) yet none of them reads as a recorded turn, so
+            # there is nothing to fold and the branch simply stops advancing. That is how a
+            # corrupted metadata header once turned into "aGiTrack quietly stopped committing":
+            # every poll took this return, and no line anywhere said why. Say it — once per tip,
+            # so a stuck chain is a message rather than a silence.
+            if self._fold_unusable_tip != tip:
+                self._fold_unusable_tip = tip
+                self._print(
+                    f"{self._manual.pending_count()} recorded turn(s) could not be folded into a commit "
+                    "(their metadata is unreadable); the branch is not advancing. "
+                    "Please report this at https://github.com/core-aix/agitrack/issues."
+                )
             return
+        self._fold_unusable_tip = None
         try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())

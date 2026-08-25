@@ -7,7 +7,7 @@ from pathlib import Path
 from textwrap import wrap
 
 from agitrack import __version__
-from agitrack.commits.foreign import redact_foreign_repos
+from agitrack.commits.foreign import FOREIGN_REPO_MASK, redact_foreign_repos
 from agitrack.transcripts.capabilities import FIELDS as CAPABILITY_FIELDS
 
 
@@ -862,6 +862,28 @@ def build_user_commit_message(
     return _finish(lines, repo_root)
 
 
+def restore_own_markers(body: str) -> str:
+    """Put aGiTrack's own name back into a latent body that an over-eager redaction took it out of.
+
+    A repository named ``agitrack`` in the registry used to be redacted like any other foreign
+    project, which rewrote the two markers aGiTrack stamps on its OWN messages — the
+    ``<aGiTrack> `` subject prefix and the ``# aGiTrack Metadata`` header — into the mask. The
+    name is exempt now (:data:`agitrack.commits.foreign.OWN_NAME`), but the turns recorded while
+    it was not are still sitting on the latent refs, and to every reader that keys on the header
+    they look like commits holding no agent work at all: the fold builders below drop them, so
+    those turns would never reach a commit and their trace and tokens would be lost outright.
+
+    Deliberately narrow — only the two STRUCTURAL forms, anchored as aGiTrack writes them. A bare
+    ``[OTHER_REPO]`` in the prose of an interaction trace is a real redaction of a real other
+    project, and unmasking that would undo the very thing the redaction is for.
+    """
+    if FOREIGN_REPO_MASK not in body:
+        return body
+    return body.replace(f"# {FOREIGN_REPO_MASK} Metadata", METADATA_HEADER).replace(
+        f"<{FOREIGN_REPO_MASK}> ", AGITRACK_SUBJECT_PREFIX
+    )
+
+
 def build_manual_squash_trailer(
     *, agitrack_session_id: str, latent_bodies: list[str], repo_root: str | Path | None = None
 ) -> str:
@@ -890,7 +912,9 @@ def build_manual_squash_trailer(
     there are no pending turns."""
     # Chronological (oldest-first), like any squash merge; keep only real turn bodies.
     turn_blocks = [
-        text for text in ((body or "").strip() for body in latent_bodies) if text and METADATA_HEADER in text
+        text
+        for text in (restore_own_markers((body or "").strip()) for body in latent_bodies)
+        if text and METADATA_HEADER in text
     ]
     if not turn_blocks:
         return ""  # no AI work in this commit ⇒ no trailer, no attribution, no footprint
@@ -1003,7 +1027,11 @@ def build_auto_fold_message(latent_bodies: list[str], *, repo_root: str | Path |
     ``latent_bodies`` come from ``ManualCommitTracker.pending_bodies`` (summaries already applied),
     the durable source of truth, so the message is reproducible and carries the folded metadata the
     ``prepare-commit-msg`` hook's idempotency check looks for."""
-    bodies = [text for text in ((body or "").strip() for body in latent_bodies) if text and METADATA_HEADER in text]
+    bodies = [
+        text
+        for text in (restore_own_markers((body or "").strip()) for body in latent_bodies)
+        if text and METADATA_HEADER in text
+    ]
     if not bodies:
         return ""
     if len(bodies) == 1:

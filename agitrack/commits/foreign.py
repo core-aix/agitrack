@@ -13,7 +13,8 @@ word is what conversation actually uses.
 So every repository aGiTrack knows about EXCEPT the one being committed to is treated as a name
 to keep out. The registry (:mod:`agitrack.repos`) is the source: it is the user-wide list of
 projects aGiTrack has worked in, which is exactly the set of names a session on this machine is
-likely to mention.
+likely to mention. The one standing exception is aGiTrack's own name (:data:`OWN_NAME`), which
+is the message's author rather than another project — and is load-bearing in it.
 
 Two properties this deliberately does NOT have:
 
@@ -42,6 +43,26 @@ from pathlib import Path
 # both ugly and no longer greppable. Nothing splits on an underscore, for the same reason
 # "[REDACTED]" and "[PATH]" are single words.
 FOREIGN_REPO_MASK = "[OTHER_REPO]"
+
+# aGiTrack's own name, which is never "another project" no matter what the registry says.
+#
+# Anyone who WORKS on aGiTrack has a checkout of it registered, so in every other repository on
+# that machine "agitrack" looked like exactly the kind of distinctive foreign name this module
+# exists to remove — and it was removed, out of the two markers aGiTrack stamps on its own
+# messages: the ``<aGiTrack> `` subject prefix and the ``# aGiTrack Metadata`` header. That
+# header is not decoration; it is the sentinel every reader keys on. With it masked,
+# ``build_auto_fold_message`` saw no turns worth folding and returned "", so the background
+# tracker silently stopped committing — a redaction meant to tidy a commit message instead
+# switched off the tracking it was written into. (It also blanked ``.agitrack/`` out of paths.)
+#
+# So the exemption is unconditional rather than "unless the user has an agitrack checkout". The
+# word in these messages is aGiTrack naming ITSELF as their author, the message is already full
+# of ``agitrack_version`` and ``agitrack_session_id`` saying the same thing, and nothing is
+# leaked by admitting which tool wrote a commit it signed. Matched on the NAME, not the path, so
+# a directory called "agitrack" that is not the registry's own entry is covered too; a
+# DIFFERENT project whose name merely starts the same ("agitrack-fork") is not exempt, and the
+# markers can't collide with it anyway — the pattern matches whole names only.
+OWN_NAME = "agitrack"
 
 # Names too ordinary to redact. Each is a word a conversation uses for its own sake many times
 # per turn, so redacting it would damage far more text than it protects — and it would be
@@ -227,7 +248,7 @@ def foreign_repo_names(repo_root: str | Path) -> list[str]:
         if _is_related(path, current):
             continue
         name = (entry.name or path.name).strip()
-        if not name or name.lower() in own or not is_distinctive(name):
+        if not name or name.lower() == OWN_NAME or name.lower() in own or not is_distinctive(name):
             continue
         names.add(name)
     return sorted(names, key=lambda name: (-len(name), name.lower()))
