@@ -569,17 +569,35 @@ def test_commit_messages_include_current_agitrack_version_without_created_at():
     assert "created_at" not in message
 
 
-def test_commit_version_matches_installed_distribution():
-    # The version stamped into commit metadata must equal the aGiTrack the user has
-    # installed — agitrack.__version__ derives from the distribution metadata so the
-    # two cannot drift (pyproject.toml is the single version source).
-    from importlib.metadata import version
+def test_commit_metadata_stamps_the_running_version_not_stale_install_metadata():
+    """The version in a commit is the version of the aGiTrack that MADE it.
+
+    This asserted ``__version__ == importlib.metadata.version("agitrack")`` on the premise that
+    ``__version__`` derives from installed distribution metadata. It does not, and deliberately
+    not: :func:`agitrack._resolve_version` prefers the source checkout's ``pyproject.toml``
+    PRECISELY BECAUSE the two disagree — an editable install freezes its ``.dist-info`` at
+    install time, so from the moment a release bumps the version until someone reinstalls, the
+    metadata names a version older than the code that is running. (That is the bug the
+    preference was introduced for: commits stamped 0.0.4 while pyproject said 0.0.6.)
+
+    So the old assertion contradicted the design, and failed on exactly the everyday setup it
+    was meant to protect — a maintainer's own checkout, 0.6.20 running against 0.6.19 in
+    ``.dist-info`` — while saying nothing at all about commit messages when it did. What
+    actually matters is asserted instead: the message carries the RUNNING version, and never the
+    stale one."""
+    from importlib.metadata import PackageNotFoundError, version
 
     from agitrack import __version__
 
-    assert __version__ == version("agitrack")
     message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")
-    assert f"agitrack_version: {version('agitrack')}" in message
+    assert f"agitrack_version: {__version__}" in message
+
+    try:
+        installed = version("agitrack")
+    except PackageNotFoundError:  # a source tree that was never installed
+        installed = None
+    if installed is not None and installed != __version__:
+        assert f"agitrack_version: {installed}" not in message
 
 
 def test_source_version_falls_back_to_pyproject_when_metadata_missing():

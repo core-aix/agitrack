@@ -19,6 +19,21 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # No process this workflow starts may install an aGiTrack update for itself.
+  #
+  # On a source install, applying an update MERGES the checkout aGiTrack is running from — here,
+  # the job's own working tree. A release landing upstream mid-run then rewrites pyproject.toml
+  # underneath the already-imported agitrack.__version__, and the build fails on a version
+  # mismatch that has nothing to do with the commit under test. Every push to main triggers this
+  # workflow AND the release workflow, so that race is not hypothetical: it is the normal shape
+  # of a release, and it has produced red builds on Windows and on macOS.
+  #
+  # The suite sets this for itself too (tests/conftest.py::_never_really_self_update). It is
+  # repeated here so the guarantee does not depend on a fixture — it covers every step in every
+  # job, including any that runs aGiTrack outside pytest.
+  AGITRACK_NO_SELF_UPDATE: "1"
+
 jobs:
   check:
     # The POSIX OS axis that matters is macOS (BSD pty/termios) vs Linux (glibc). Run both

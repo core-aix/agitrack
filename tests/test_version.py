@@ -10,13 +10,26 @@ authoritative for itself, so its ``pyproject.toml`` is preferred over installed 
 from __future__ import annotations
 
 import agitrack
+from agitrack.update import selfupdate
 
 
 def test_source_version_matches_pyproject():
     # The running source tree's version is parsed from its own pyproject.toml.
     source = agitrack._source_version()
     assert source is not None and source.count(".") >= 2  # e.g. "0.0.6"
-    assert agitrack.__version__ == source  # what gets stamped into commits
+    # The message matters more than the assertion. `__version__` is read once at import while
+    # `source` is re-read now, so the ONLY way these differ is that pyproject.toml changed
+    # underneath the running suite — which in CI means a self-update merged the release commit
+    # into the job's own checkout. Bare, this failed as `assert '0.6.19' == '0.6.20'`, which
+    # reads like a packaging mistake in the commit under test and sent three separate
+    # investigations looking in the wrong place. Say what actually happened instead.
+    assert agitrack.__version__ == source, (  # what gets stamped into commits
+        f"agitrack.__version__ is {agitrack.__version__!r} but pyproject.toml now reads "
+        f"{source!r}. Nothing in a commit can cause that: the file changed while the suite was "
+        "running, so a self-update escaped the guards and merged this checkout mid-run. Check "
+        f"that {selfupdate.NO_SELF_UPDATE_ENV} is set for the whole run (conftest's "
+        "_never_really_self_update) and that self_update_enabled() still honours it."
+    )
 
 
 def test_resolve_version_prefers_source_over_installed(monkeypatch):
@@ -82,10 +95,25 @@ def test_the_suite_can_never_self_update_the_checkout_it_runs_from():
     own working tree. That merge pulled the release commit in mid-run, so ``pyproject.toml``
     advanced while the already-imported ``agitrack.__version__`` stayed put, and the test above
     failed with the two exactly one release apart (0.6.12/0.6.13, 0.6.13/0.6.14, 0.6.14/0.6.15 on
-    three consecutive Windows runs). Monkeypatching ``attempt_self_update`` cannot stop it: the
-    tracker doing the merging is a SUBPROCESS. What reaches a subprocess is the config dir, which
-    is inherited through ``AGITRACK_CONFIG_DIR`` — so it is the config that must say no.
+    three consecutive Windows runs, then 0.6.19/0.6.20 on macOS).
+
+    The macOS recurrence is the reason this asserts what it does. Two earlier guards were the
+    wrong shape: monkeypatching ``attempt_self_update`` cannot reach the SUBPROCESS doing the
+    merging, and ``check_for_updates: false`` in the isolated config stops only the tracker's own
+    periodic check — the restart watcher's ``self_update=True`` reaches the updater by another
+    route that never reads that key, and any config key is lost anyway the moment a test repoints
+    ``AGITRACK_CONFIG_DIR``. What survives both is the ENVIRONMENT, honoured at the one function
+    every install path goes through. So that is what is asserted here: not a particular caller
+    being polite, but the choke point saying no.
     """
+    import os
+
     from agitrack.config.settings import GlobalConfig
 
+    # Set for this process, and therefore inherited by every child a test can start.
+    assert os.environ.get(selfupdate.NO_SELF_UPDATE_ENV) == "1"
+    # …and actually honoured where it counts, whatever the config says.
+    assert selfupdate.self_update_suppressed_by_env() is True
+    assert selfupdate.self_update_enabled() is False
+    # The config guard remains, to keep spawned trackers from polling for updates all suite.
     assert GlobalConfig().check_for_updates is False

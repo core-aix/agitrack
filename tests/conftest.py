@@ -91,18 +91,14 @@ def _isolate_global_config(tmp_path_factory, monkeypatch):
     specific config still set ``AGITRACK_CONFIG_DIR`` themselves (that wins, as it
     runs after this fixture).
 
-    The config is written rather than left empty for one reason: ``check_for_updates`` must be
-    OFF. A test that starts a real background tracker starts a real update watcher with it
-    (``watch_for_update(..., self_update=True)``), and on a source checkout a self-update MERGES
-    the checkout aGiTrack is running from. In CI that is this job's own working tree: the merge
-    pulled the release commit in mid-run, so ``pyproject.toml`` advanced to the new version while
-    the already-imported ``agitrack.__version__`` stayed on the old one, and
-    ``test_source_version_matches_pyproject`` failed with the two exactly one release apart.
-    Windows only, because that job runs ~12 minutes and the POSIX ones finish inside the update
-    check's own throttle interval. ``_never_really_self_update`` was the first attempt at this and
-    cannot reach it: monkeypatch is in-process, and the tracker doing the merging is a SUBPROCESS.
-    The config dir is inherited through the environment, so switching it off here reaches every
-    process a test can start. Tests of the updater itself build their own GlobalConfig."""
+    The config is written rather than left empty so a spawned tracker does not spend the suite
+    polling for updates: ``check_for_updates`` stops its periodic check. It is NOT what keeps a
+    test from installing one — that key gates only the tracker's own check, it is lost the moment
+    a test repoints ``AGITRACK_CONFIG_DIR`` at a dir of its own, and a second caller (the restart
+    watcher) reaches the updater without consulting it at all. Stopping the install is
+    ``_never_really_self_update``'s job, through an environment variable that survives both
+    holes; see its docstring for the failure it prevents. Tests of the updater itself build their
+    own GlobalConfig."""
     config_dir = tmp_path_factory.mktemp("agitrack-config")
     (config_dir / "config.json").write_text('{"check_for_updates": false}\n', encoding="utf-8")
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(config_dir))
@@ -287,18 +283,37 @@ def _kill_leaked_daemons_at_the_end():
 
 @pytest.fixture(autouse=True)
 def _never_really_self_update(monkeypatch):
-    """No test may install an aGiTrack update for real.
+    """No test may install an aGiTrack update for real — in THIS process or any child.
 
     ``attempt_self_update`` is a genuine side effect: on a source install it fetches and
-    MERGES the checkout aGiTrack is running from. A test that started the daemon's watcher
-    thread did exactly that in CI — the merge pulled the release commit into the job's own
-    checkout mid-run, so ``pyproject.toml`` said 0.5.18 while the already-imported
-    ``agitrack.__version__`` still said 0.5.17, and the version test failed. The watcher
-    now opts in rather than defaulting on; this is the second line of defence, so no future
-    caller can reach the real updater from a test. Tests of the self-updater itself stub
-    ``Updater`` and call the module directly."""
+    MERGES the checkout aGiTrack is running from. In CI that checkout is the job's own working
+    tree, so a release landing upstream mid-run rewrites ``pyproject.toml`` underneath the
+    already-imported ``agitrack.__version__`` and ``test_source_version_matches_pyproject``
+    fails on two versions exactly one release apart — a red build that says nothing about the
+    commit under test.
+
+    It has now been closed three times, and the first two closures were the wrong SHAPE rather
+    than merely incomplete, which is why this fixture sets a variable as well:
+
+    * the ``monkeypatch`` below is in-process, and the daemon that does the merging is a
+      SUBPROCESS, so it never reached it;
+    * ``check_for_updates: false`` in the isolated config (see ``_isolate_global_config``)
+      stops the tracker's own periodic check — but NOT the restart watcher's
+      ``self_update=True`` call, which reaches ``attempt_self_update`` by a different route and
+      consults only ``self_update``. That is how the same failure came back on macOS one release
+      after the Windows fix, through a caller nobody had thought to guard. Any config key is
+      also lost the moment a test repoints ``AGITRACK_CONFIG_DIR`` at a dir of its own, which
+      plenty legitimately do.
+
+    So the load-bearing guard is the ENVIRONMENT variable: it is inherited by every child
+    process whatever config dir it settles on, and it is honoured at the one place every
+    install path passes through (:func:`agitrack.update.selfupdate.self_update_enabled`).
+    The monkeypatch stays as a second line of defence for in-process callers. Tests of the
+    self-updater itself unset the variable and drive the module against a stubbed ``Updater``.
+    """
     from agitrack.update import selfupdate
 
+    monkeypatch.setenv(selfupdate.NO_SELF_UPDATE_ENV, "1")
     monkeypatch.setattr(
         selfupdate, "attempt_self_update", lambda **kwargs: selfupdate.SelfUpdateRecord(), raising=False
     )

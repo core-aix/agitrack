@@ -12,6 +12,8 @@ import os
 import sys
 import types
 
+import pytest
+
 from agitrack.update import selfupdate
 from agitrack.update.updater import KIND_PACKAGE, KIND_SOURCE, METHOD_BREW_PYTHON, METHOD_MSI, METHOD_PIP
 
@@ -20,6 +22,18 @@ from agitrack.update.updater import KIND_PACKAGE, KIND_SOURCE, METHOD_BREW_PYTHO
 # updater's tests, so they bind the real function here at import time and drive it against
 # a stubbed Updater — the same pattern test_daemons.py uses for the process scan.
 _attempt_self_update = selfupdate.attempt_self_update
+
+
+@pytest.fixture(autouse=True)
+def _allow_the_updater_under_test_to_run(monkeypatch):
+    """Lift the suite-wide ``AGITRACK_NO_SELF_UPDATE`` kill-switch for this module only.
+
+    That variable is what stops any other test from installing a real update, and it is
+    honoured inside :func:`selfupdate.self_update_enabled` — so with it set these tests would
+    all short-circuit to "reporting only" and stop covering the thing they exist to cover.
+    Safe to lift precisely here: every test in this file drives a STUBBED ``Updater``, so
+    nothing reaches the network or the checkout."""
+    monkeypatch.delenv(selfupdate.NO_SELF_UPDATE_ENV, raising=False)
 
 
 def _updater(kind, method=METHOD_PIP):
@@ -455,3 +469,58 @@ def test_self_update_is_on_by_default_but_can_be_turned_off(tmp_path, monkeypatc
     assert record.state == selfupdate.STATE_MANUAL and record.needs_user is True
     assert record.latest == "1.1.0" and "turned off" in record.error
     assert "pip install --upgrade agitrack" in record.instructions
+
+
+def test_the_environment_kill_switch_stops_an_install_the_config_would_allow(tmp_path, monkeypatch):
+    """``AGITRACK_NO_SELF_UPDATE`` must beat a config that says installing is fine.
+
+    This is the guard the test suite itself leans on, and the reason it is an environment
+    variable rather than a config key: it has to reach a daemon SUBPROCESS that picks its own
+    config dir. A source install's ``apply()`` merges the checkout aGiTrack runs from, so in CI
+    an escape rewrites the job's own ``pyproject.toml`` mid-run — see
+    ``tests/test_version.py::test_the_suite_can_never_self_update_the_checkout_it_runs_from``.
+    """
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    applied: list[str] = []
+
+    class _Updater:
+        kind = KIND_SOURCE
+
+        def _install_method(self):
+            return METHOD_PIP
+
+        def check(self, **kwargs):
+            return types.SimpleNamespace(ok=True, available=True, current="1.0.0", latest="1.1.0", error="")
+
+        def apply(self):
+            applied.append("apply")  # merges the checkout — must never happen under the switch
+            return types.SimpleNamespace(ok=True, error="", message="")
+
+        def manual_update_instructions(self):
+            return "Run: pip install --upgrade agitrack"
+
+    monkeypatch.setattr("agitrack.update.updater.Updater", _Updater)
+    from agitrack.config.settings import GlobalConfig
+
+    assert GlobalConfig().self_update is True  # the config alone would install it
+    assert selfupdate.self_update_enabled() is True
+
+    monkeypatch.setenv(selfupdate.NO_SELF_UPDATE_ENV, "1")
+
+    assert selfupdate.self_update_enabled() is False
+    record = _attempt_self_update()
+
+    assert applied == []  # nothing was installed, and no checkout was merged
+    # Still REPORTED, so a dashboard can say an update exists — only installing is suppressed.
+    assert record.latest == "1.1.0"
+
+
+def test_the_kill_switch_reads_the_usual_truthy_spellings(monkeypatch):
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv(selfupdate.NO_SELF_UPDATE_ENV, value)
+        assert selfupdate.self_update_suppressed_by_env() is True, value
+    for value in ("", "0", "false", "no"):
+        monkeypatch.setenv(selfupdate.NO_SELF_UPDATE_ENV, value)
+        assert selfupdate.self_update_suppressed_by_env() is False, value
+    monkeypatch.delenv(selfupdate.NO_SELF_UPDATE_ENV, raising=False)
+    assert selfupdate.self_update_suppressed_by_env() is False

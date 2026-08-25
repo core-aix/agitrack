@@ -314,10 +314,51 @@ def attempt_self_update(*, debug=None, timeout: int | None = None, on_status=Non
         lock.release()
 
 
+# Environment kill-switch for unattended self-updates. Set it (``1``/``true``/``yes``) and no
+# aGiTrack process will install anything for itself, whatever the config says.
+#
+# It is an ENVIRONMENT variable rather than one more config key on purpose, because the thing it
+# has to reach is a SUBPROCESS. Installing is decided deep inside a daemon that some other
+# process started, and the two mechanisms that could say no both have a hole:
+# ``monkeypatch`` is in-process, so it never reaches the child; and a config key is read from
+# whatever ``AGITRACK_CONFIG_DIR`` points at, so anything that repoints that (a test wanting its
+# own config, a CI job, one slot of a parallel run) silently loses the setting. The environment
+# is inherited by every child no matter which config dir it ends up using, which makes this the
+# only switch that cannot be lost on the way down.
+#
+# The concrete damage it prevents: on a SOURCE install, applying an update MERGES the checkout
+# aGiTrack is running from. When that checkout is a CI job's own working tree, a release landing
+# upstream mid-run rewrites ``pyproject.toml`` underneath the already-imported
+# ``agitrack.__version__``, and the build fails on a version mismatch that has nothing to do with
+# the commit under test. That happened on three consecutive Windows runs, and again on macOS one
+# release later through a DIFFERENT caller — which is the sign that per-caller guards were the
+# wrong shape and this belongs at the one place every install path passes through.
+#
+# Useful beyond the suite: a packaged, containerised or centrally-managed install wants the same
+# guarantee, and telling it to set one variable is simpler than shipping a config file.
+NO_SELF_UPDATE_ENV = "AGITRACK_NO_SELF_UPDATE"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def self_update_suppressed_by_env() -> bool:
+    """Whether :data:`NO_SELF_UPDATE_ENV` is set to a truthy value in this process."""
+    try:
+        from agitrack.env import getenv_compat
+
+        return (getenv_compat("NO_SELF_UPDATE") or "").strip().lower() in _TRUTHY
+    except Exception:
+        return False  # reading the environment must never be what stops an update
+
+
 def self_update_enabled() -> bool:
     """Whether aGiTrack may install updates for itself — the global ``self_update``
     setting, on unless the user turned it off. Read fresh each attempt so flipping it
-    takes effect without restarting anything."""
+    takes effect without restarting anything.
+
+    :data:`NO_SELF_UPDATE_ENV` overrides it and wins over any config, because it is the only
+    form of "no" that survives being inherited by a subprocess under a different config dir."""
+    if self_update_suppressed_by_env():
+        return False
     try:
         from agitrack.config.settings import GlobalConfig
 
