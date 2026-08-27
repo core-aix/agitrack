@@ -100,8 +100,8 @@ def startup_notice(repo: Path) -> str | None:
     """Anything the user must do themselves for these hooks to work, or None.
 
     Only Codex has such a step (it requires a person to review a new hook before it runs), and
-    only when its hook is actually installed — see ``codex_settings.trust_reminder``, which
-    checks exactly that.
+    only when its hook is actually installed AND a Codex CLI exists on this machine — see
+    ``codex_settings.trust_reminder``, which checks exactly that.
 
     It used to take the tracked backend and answer None unless that was Codex. Now that hooks
     are armed for every installed backend, a repo tracked on Claude can carry Codex's hooks too

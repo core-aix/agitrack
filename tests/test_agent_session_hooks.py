@@ -142,6 +142,53 @@ def test_codex_now_gets_the_note_it_could_never_have(tmp_path):
     assert any("--claude-session-note" in c for c in commands)
 
 
+# --- the one step the user has to take themselves ---------------------------
+
+
+def test_the_trust_reminder_stays_quiet_for_someone_without_codex(tmp_path, monkeypatch):
+    """The hooks go in for EVERY backend, so a repo tracked on Claude carries Codex's hook too.
+    Printing its trust chore at a user who has no Codex is a task about a prompt they will never
+    see, in a tool they do not have."""
+    codex_settings.install_agent_autostart_hook(tmp_path)
+    monkeypatch.setattr(codex_settings, "project_is_trusted", lambda repo: False)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: False)
+
+    assert codex_settings.trust_reminder(tmp_path) is None
+    assert agent_hooks.startup_notice(tmp_path) is None
+
+
+def test_the_trust_reminder_opens_by_naming_who_it_is_for(tmp_path, monkeypatch):
+    """Installed is not the same as used: someone with Codex on the machine who drives Claude all
+    day should be able to stop reading at the first clause."""
+    codex_settings.install_agent_autostart_hook(tmp_path)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: name == "codex")
+
+    monkeypatch.setattr(codex_settings, "project_is_trusted", lambda repo: False)
+    untrusted = codex_settings.trust_reminder(tmp_path)
+    monkeypatch.setattr(codex_settings, "project_is_trusted", lambda repo: True)
+    reviewed = codex_settings.trust_reminder(tmp_path)
+
+    for message in (untrusted, reviewed):
+        assert message is not None
+        assert message.startswith("If you use the Codex backend")
+    assert "not trusted yet" in untrusted
+    assert "`/hooks`" in reviewed
+
+
+def test_a_lookup_that_blows_up_keeps_the_reminder(tmp_path, monkeypatch):
+    """The reminder is the one hook step aGiTrack cannot take for the user. A failed `which` must
+    not silently swallow it and leave a Codex user with a hook that never runs."""
+    codex_settings.install_agent_autostart_hook(tmp_path)
+    monkeypatch.setattr(codex_settings, "project_is_trusted", lambda repo: False)
+
+    def boom(name):
+        raise OSError("no PATH today")
+
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", boom)
+
+    assert codex_settings.trust_reminder(tmp_path) is not None
+
+
 # --- starting the tracker ---------------------------------------------------
 
 
