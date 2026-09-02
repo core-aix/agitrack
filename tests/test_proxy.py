@@ -8050,6 +8050,7 @@ def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
 
     t = [1000.0]
     monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda _seconds: None)
 
     # Backend keeps dying quickly: first 3 relaunch, the 4th gives up and exits.
     assert runner._relaunch_backend_or_exit() is True
@@ -8074,6 +8075,7 @@ def test_crash_loop_capture_surfaces_backend_output(monkeypatch):
 
     t = [1000.0]
     monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda _seconds: None)
     for _ in range(3):
         assert runner._relaunch_backend_or_exit() is True
     assert runner._relaunch_backend_or_exit() is False
@@ -8098,6 +8100,7 @@ def test_backend_exit_notice_shows_the_launched_command(monkeypatch):
 
     t = [1000.0]
     monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda _seconds: None)
     for _ in range(3):
         runner._relaunch_backend_or_exit()
     runner._relaunch_backend_or_exit()
@@ -8108,7 +8111,7 @@ def test_backend_exit_notice_shows_the_launched_command(monkeypatch):
     assert "no output before exiting" in notice  # explicit, not an empty section
 
 
-def test_busy_session_forks_instead_of_crash_looping():
+def test_busy_session_forks_instead_of_crash_looping(monkeypatch):
     # The claude session is held by a running background agent. aGiTrack should fork a
     # copy on the next spawn rather than relaunch into the same refusal (#114).
     import types
@@ -8123,6 +8126,7 @@ def test_busy_session_forks_instead_of_crash_looping():
     runner._debug = lambda *a, **k: None
     messages = []
     runner._restart_agent = lambda msg: messages.append(msg)
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda _seconds: None)
 
     # First death: fork once.
     assert runner._relaunch_backend_or_exit() is True
@@ -8150,6 +8154,28 @@ def test_claude_spawn_command_fork_appends_flag():
     assert "--fork-session" not in cmd_plain
 
 
+def test_relaunch_backend_backs_off_before_retrying(monkeypatch):
+    # A backend that exits instantly (e.g. a slow apiKeyHelper still fetching credentials)
+    # must not burn all 3 relaunch attempts before the credential fetch had a real chance to
+    # finish. No delay on the first retry (most exits are unrelated to auth and should
+    # resume immediately); increasing delay on the 2nd/3rd give a slow helper time to
+    # succeed instead of racing straight into the crash-loop guard.
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner._restart_agent = lambda msg: None
+    runner._finalize_on_backend_exit = lambda: None
+
+    t = [1000.0]
+    sleeps = []
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    for _ in range(3):
+        runner._relaunch_backend_or_exit()
+
+    assert sleeps == [1.5, 4.0]
+
+
 def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
     runner = make_runner()
     runner._debug = lambda *a, **k: None
@@ -8159,6 +8185,7 @@ def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
 
     t = [1000.0]
     monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.sleep", lambda _seconds: None)
     for _ in range(3):
         runner._relaunch_backend_or_exit()
     t[0] += 60.0  # a minute later the old exits no longer count
