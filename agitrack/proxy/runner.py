@@ -6235,9 +6235,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         now = time.monotonic()
         recent = [t for t in self._relaunch_times if now - t < _RELAUNCH_WINDOW_SECONDS]
         if len(recent) >= 3:
-            self._debug(
-                f"backend exited 3x within {_RELAUNCH_WINDOW_SECONDS:.0f}s; quitting instead of relaunching"
-            )
+            self._debug(f"backend exited 3x within {_RELAUNCH_WINDOW_SECONDS:.0f}s; quitting instead of relaunching")
             self._backend_exit_notice = self._format_backend_exit_notice()
             self._finalize_on_backend_exit()
             return False
