@@ -275,6 +275,16 @@ _MAX_HELD_REPLY_BYTES = 256
 # automatically rather than crash-looping and exiting (#114).
 _FORK_HINT_RE = re.compile(r"running as a background agent|--fork-session", re.IGNORECASE)
 
+# Crash-loop guard for a repeatedly-exiting backend (_relaunch_backend_or_exit). The window
+# must comfortably exceed the total backoff below plus spawn overhead, or the guard's own
+# bookkeeping trips before the backoff it is meant to accommodate finishes playing out.
+_RELAUNCH_WINDOW_SECONDS = 20.0
+# Delay before the 1st/2nd/3rd relaunch attempt. No delay on the first retry (most exits are
+# not auth-related — Esc from the session picker, a clean `/exit` — and should resume
+# instantly); increasing delay after, so a backend whose apiKeyHelper is momentarily slow
+# (1Password/biometric unlock) gets real wall-clock time to succeed before the guard gives up.
+_RELAUNCH_BACKOFF_SECONDS: tuple[float, ...] = (0.0, 1.5, 4.0)
+
 
 # Sentinel: the summarizer-model picker was dismissed (Esc), distinct from a real None choice
 # ("same as the session model"). Lets _choose_summarizer_model report "no change" unambiguously.
@@ -6223,15 +6233,25 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 return False
             return True
         now = time.monotonic()
-        recent = [t for t in self._relaunch_times if now - t < 12.0]
+        recent = [t for t in self._relaunch_times if now - t < _RELAUNCH_WINDOW_SECONDS]
         if len(recent) >= 3:
-            self._debug("backend exited 3x within 12s; quitting instead of relaunching")
+            self._debug(f"backend exited 3x within {_RELAUNCH_WINDOW_SECONDS:.0f}s; quitting instead of relaunching")
             self._backend_exit_notice = self._format_backend_exit_notice()
             self._finalize_on_backend_exit()
             return False
         recent.append(now)
         self._relaunch_times = recent
         self.child_pid = None  # already gone
+        # A backend that exits INSTANTLY (bad key, no network, apiKeyHelper still warming up
+        # 1Password/biometric auth) can burn all 3 attempts in a fraction of a second, giving a
+        # transient — but slightly slow — credential fetch no real chance to succeed on retry.
+        # Backing off before each relaunch trades a bit of latency in the genuine crash-loop
+        # case (which was going to fail anyway) for a real second and third chance here. Skip
+        # the wait on the very first retry: most exits (Esc from the session picker, a clean
+        # `/exit`) are not auth-related and should resume instantly.
+        delay = _RELAUNCH_BACKOFF_SECONDS[min(len(recent) - 1, len(_RELAUNCH_BACKOFF_SECONDS) - 1)]
+        if delay:
+            time.sleep(delay)
         try:
             # _restart_agent tears down the dead PTY, re-baselines (so existing
             # history is not re-committed) and respawns; _spawn resumes the same
