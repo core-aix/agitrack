@@ -250,6 +250,22 @@ def project_is_trusted(repo: Path) -> bool:
     return False
 
 
+def codex_is_installed() -> bool:
+    """Whether this machine has a Codex CLI at all — the gate on saying anything about it.
+
+    The hooks are installed for every backend, so a repo tracked on Claude carries Codex's hook
+    too, and its trust reminder used to print for a user who has never installed Codex: a chore
+    about a prompt they will never see, in a tool they do not have. Best-effort by design — if
+    the lookup itself fails, answering True keeps the reminder for a user who may well need it
+    rather than silently dropping the one step aGiTrack cannot take for them."""
+    try:
+        from agitrack.backends.setup import backend_installed
+
+        return bool(backend_installed("codex"))
+    except Exception:
+        return True
+
+
 def trust_reminder(repo: Path) -> str | None:
     """The one thing the user has to do themselves, or None when there is nothing to say.
 
@@ -257,17 +273,26 @@ def trust_reminder(repo: Path) -> str | None:
     ones silently — no warning, no output, the hook simply never fires. aGiTrack will not write
     that trust on the user's behalf: it is a security decision about running a command, and the
     whole point of the review is that a person makes it. So it says what to do once, and the
-    message names the specific thing that is missing rather than reciting both possibilities."""
+    message names the specific thing that is missing rather than reciting both possibilities.
+
+    Two conditions gate it, and both are about not handing someone a chore that is not theirs:
+    the hook has to be on disk (:func:`hook_is_installed`), and Codex has to be installed at all
+    (:func:`codex_is_installed`). Even then the reminder opens with "If you use the Codex
+    backend" — an installed Codex is not a used one, and a Claude user should be able to stop
+    reading at the first clause."""
     if not hook_is_installed(repo, AGENT_AUTOSTART_HOOK):
+        return None
+    if not codex_is_installed():
         return None
     if not project_is_trusted(repo):
         return (
-            "Codex reads a project's hooks only for a folder it trusts, and this one is not "
-            "trusted yet — answer 'yes' to Codex's trust prompt for this folder, then run "
-            "`/hooks` in Codex and trust aGiTrack's two session hooks. Until then, tracking "
-            "still starts on your next commit."
+            "If you use the Codex backend: Codex reads a project's hooks only for a folder it "
+            "trusts, and this one is not trusted yet — answer 'yes' to Codex's trust prompt for "
+            "this folder, then run `/hooks` in Codex and trust aGiTrack's two session hooks. "
+            "Until then, tracking still starts on your next commit."
         )
     return (
-        "Codex runs a new hook only after you review it: run `/hooks` in Codex once and trust "
-        "aGiTrack's two session hooks. Until then, tracking still starts on your next commit."
+        "If you use the Codex backend: Codex runs a new hook only after you review it — run "
+        "`/hooks` in Codex once and trust aGiTrack's two session hooks. Until then, tracking "
+        "still starts on your next commit."
     )
