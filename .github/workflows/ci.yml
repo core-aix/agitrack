@@ -279,3 +279,13 @@ jobs:
         run: npm ci
       - name: Compile + unit tests
         run: npm test
+
+      # Build the .vsix the way the release workflows publish it. `npm test` only compiles
+      # and runs the unit tests, so it cannot see the rule vsce enforces at package time:
+      # @types/vscode must not be newer than engines.vscode. A dependabot bump of
+      # @types/vscode alone therefore went green here while breaking `vsce publish` — and
+      # that step runs at the END of a release, after PyPI and the MSI have already shipped,
+      # so the extension silently misses the version. Packaging on every PR moves that
+      # failure back to the PR, where it costs nothing.
+      - name: Package (.vsix)
+        run: npm run package -- -o /tmp/agitrack-vscode.vsix

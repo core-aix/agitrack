@@ -65,3 +65,13 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "deps(vscode)"
+    ignore:
+      # @types/vscode is not an ordinary dependency — it IS the API surface the extension is
+      # compiled against, and vsce refuses to package when it is newer than engines.vscode
+      # (^1.93.0 here: the oldest editor aGiTrack supports). Raising it is a decision to drop
+      # older VS Code versions, not a version bump. It is therefore pinned to the engines floor
+      # exactly, and moved by hand when that floor moves. Left to dependabot it opens a PR that
+      # passes CI and then fails `vsce publish` at the tail of a release, after PyPI and the MSI
+      # have already gone out. The ci.yml `extension` job now packages the .vsix, so a
+      # hand-made mismatch fails on the PR — this rule keeps the bot from proposing one at all.
+      - dependency-name: "@types/vscode"
