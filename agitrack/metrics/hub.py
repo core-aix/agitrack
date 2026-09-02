@@ -33,7 +33,6 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -820,13 +819,17 @@ def hub_url() -> str:
 
 
 def _spawn_hub() -> subprocess.Popen[bytes] | None:
-    """Start the hub as a detached child, freeing whatever terminal asked for it."""
+    """Start the hub as a detached child, freeing whatever terminal asked for it.
+
+    Unlike the per-repo daemons the hub inherits the LAUNCHER's working directory, which is
+    whatever project (or folder of projects) the user typed the command in — so it needs the
+    same import isolation, and a working directory of its own when that one holds a stray
+    ``agitrack`` package (``proc.agitrack_invocation``)."""
+    from agitrack.proc import agitrack_invocation, isolated_env, safe_spawn_cwd
+
     # Built explicitly rather than from this process's argv: the hub takes no arguments beyond its
     # own flag, and inheriting the launcher's (say `--backtrace`) would start the wrong thing.
-    if getattr(sys, "frozen", False):
-        command = [sys.executable, "--hub-serve"]
-    else:
-        command = [sys.executable, "-m", "agitrack", "--hub-serve"]
+    command = [*agitrack_invocation(), "--hub-serve"]
     try:
         log_path().parent.mkdir(parents=True, exist_ok=True)
         handle = log_path().open("ab")
@@ -838,6 +841,8 @@ def _spawn_hub() -> subprocess.Popen[bytes] | None:
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=handle,
+            cwd=str(safe_spawn_cwd(Path.cwd())),
+            env=isolated_env(),
             **detach_kwargs(),
         )
     except OSError:

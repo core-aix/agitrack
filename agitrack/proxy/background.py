@@ -687,11 +687,17 @@ def spawn_background_daemon(repo: GitRepo, *, extra_args: list[str]) -> subproce
     (``detach_kwargs``) so it survives the launcher returning and the terminal closing, and
     is not hit by Ctrl-C in the launcher's terminal. Unlike the dashboard daemon there is NO
     owner-pid watchdog — a tracker must outlive whatever launched it (stop it with
-    ``agitrack -b stop``). stdout/stderr go to a log file so a startup failure is recoverable."""
+    ``agitrack -b stop``). stdout/stderr go to a log file so a startup failure is recoverable.
+
+    The child must load the INSTALLED aGiTrack, never an ``agitrack`` directory that happens to
+    sit in the repository being tracked — which is exactly what a repo holding the projects you
+    track (aGiTrack's own checkout among them) does hold. See ``proc.agitrack_invocation``: the
+    import isolation is the difference between a tracker and a traceback in ``background.log``
+    that nobody reads while the launcher says the daemon is live."""
+    from agitrack.proc import agitrack_invocation, isolated_env, safe_spawn_cwd
+
     cmd = [
-        sys.executable,
-        "-m",
-        "agitrack",
+        *agitrack_invocation(),
         "--repo",
         str(repo.repo),
         "--background",
@@ -706,8 +712,8 @@ def spawn_background_daemon(repo: GitRepo, *, extra_args: list[str]) -> subproce
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
-            cwd=str(repo.repo),
-            env=dict(os.environ),
+            cwd=str(safe_spawn_cwd(repo.repo)),
+            env=isolated_env(),
             **detach_kwargs(),
         )
     finally:

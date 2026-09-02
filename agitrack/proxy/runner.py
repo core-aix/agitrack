@@ -10694,8 +10694,10 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         session auto-resumes. Best-effort; never raises.
         """
         try:
-            args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
-            command = f"{shlex.quote(sys.executable)} -m agitrack {args}".rstrip()
+            from agitrack.proc import agitrack_invocation
+
+            args = " ".join(shlex.quote(arg) for arg in [*agitrack_invocation()[1:], *sys.argv[1:]])
+            command = f"{shlex.quote(sys.executable)} {args}".rstrip()
             host_prompt.reopen_in_new_terminal(command, str(self.base_repo.repo))
         except Exception as error:
             self._debug(f"reopen in new window failed: {error!r}")
