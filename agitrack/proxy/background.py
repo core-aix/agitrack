@@ -40,7 +40,7 @@ from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
-from agitrack.proxy.commit_engine import CommitEngine
+from agitrack.proxy.commit_engine import CommitEngine, turn_is_finished
 from agitrack.proxy.session import Session
 
 
@@ -2007,8 +2007,10 @@ class BackgroundRunner:
 
         # "Final message sent" gate (see docstring): SessionTurn.complete is False only for a turn
         # whose backend response has not finished. The trailing final-less turn survives to here only
-        # under the stop finalize; in every other path turns[-1] is already complete.
-        turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
+        # under the stop finalize; in every other path turns[-1] is already complete. An INTERRUPTED
+        # turn is finished too (`turn_is_finished`) — nothing more is coming, so the cover it owes
+        # must be taken now rather than waiting for a completion that never arrives.
+        turn_complete = bool(turns) and turn_is_finished(turns[-1])
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
         covered = self._agent_committed_own_work(turns) if turn_complete else []
         # …but NEVER in manual-commit mode: there the user decides when to commit, and aGiTrack
