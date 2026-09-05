@@ -2122,6 +2122,13 @@ def _open_dashboard_on_start(repo: GitRepo, config, *, scripted: bool = False) -
         # `starting_tracking`: this is `-b` or `-i`, which is the user saying "record this
         # repository from now on". The reconstruction is the inferred history of what happened
         # BEFORE, so it is never what to open here — asking for it has its own command.
+        #
+        # Said out loud first, because the call below can take a couple of seconds and is the last
+        # thing between the user and the mode they asked for: it starts the hub daemon if this is
+        # the first repository of the day, then gives an already-open dashboard tab its chance to
+        # take the navigation before a new one is opened. Silence there reads as aGiTrack hanging
+        # on startup for no reason; one line makes the same wait obviously purposeful.
+        print("Opening the aGiTrack dashboard in your browser…", flush=True)
         open_dashboard(repo.repo, quiet=True, starting_tracking=True)
     except Exception:
         pass  # a dashboard that will not open must never stop the mode the user asked for

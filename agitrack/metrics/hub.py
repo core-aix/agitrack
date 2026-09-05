@@ -290,9 +290,15 @@ class _Mounts:
 # tab when nothing does.
 _CLIENT_TTL_SECONDS = 90.0
 # How long a launcher waits for an open tab to pick up a navigation before giving up and opening
-# a browser itself. Long enough for a tab that was just raised to notice, come back up to speed
-# and ping, short enough not to be felt as a hang.
-_NAVIGATE_WAIT_SECONDS = 6.0
+# a browser itself. This is a HANG on the startup path — every `agitrack` on a repo pays it before
+# the TUI appears — so it is sized for the tab that CAN answer, not for the one that never will.
+# A page that becomes visible pings the hub immediately (`visibilitychange`/`focus`, see
+# `wireHubPresence`), not on its next 2-second tick, so a raise that worked is answered in well
+# under a second; the 2 seconds here are one whole ping interval of slack on top of that. Waiting
+# longer only lengthened the pause for the case that is hopeless anyway: a dashboard tab sitting
+# in the BACKGROUND of a window stays hidden when its application is raised, never pings, and the
+# launcher opens a new tab regardless — after, as measured, a silent six seconds every time.
+_NAVIGATE_WAIT_SECONDS = 2.0
 # How often `_await_dashboard` looks again while waiting for a tab to check in.
 _CLIENT_POLL_SECONDS = 0.25
 # How long to wait for the open tabs to re-register when the launcher STARTED the hub it is asking.
