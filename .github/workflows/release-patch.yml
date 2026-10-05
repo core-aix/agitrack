@@ -187,7 +187,7 @@ jobs:
         if: ${{ env.VSCE_TOKEN != '' }}
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: 22
 
       - name: Publish VSCode extension
         if: ${{ env.VSCE_TOKEN != '' }}
