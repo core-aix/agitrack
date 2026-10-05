@@ -2137,7 +2137,9 @@ def _open_dashboard_on_start(repo: GitRepo, config, *, scripted: bool = False) -
         # the first repository of the day, then gives an already-open dashboard tab its chance to
         # take the navigation before a new one is opened. Silence there reads as aGiTrack hanging
         # on startup for no reason; one line makes the same wait obviously purposeful.
-        print("Opening the aGiTrack dashboard in your browser…", flush=True)
+        # The leading newline keeps it a block of its own: a start-up notice (e.g. the Codex hook
+        # reminder) usually ends just above it.
+        print("\nOpening the aGiTrack dashboard in your browser…", flush=True)
         open_dashboard(repo.repo, quiet=True, starting_tracking=True)
     except Exception:
         pass  # a dashboard that will not open must never stop the mode the user asked for
