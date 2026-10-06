@@ -422,18 +422,20 @@ class CommitEngine:
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
+                # Every entry carries when its turn began, so the trace's age cap can place it.
+                at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     # A background wake-up is an EVENT, not something the user said.
                     role = TRACE_EVENT_ROLE if _is_background_event(turn.user_prompt) else "user"
-                    self.state.append_trace(role, turn.user_prompt)
+                    self.state.append_trace(role, turn.user_prompt, at=at)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
                     if followup.strip():
                         # Its own heading, but NOT a new turn — see append_trace(starts_turn).
-                        self.state.append_trace("user", followup, starts_turn=False)
+                        self.state.append_trace("user", followup, starts_turn=False, at=at)
                 for message in self._agent_messages_for(turn):
-                    self.state.append_trace("agent", message)
+                    self.state.append_trace("agent", message, at=at)
                 self._add_turn_usage(turn)
             # The subject describes what was ASKED FOR, so a synthetic wake-up label is not a
             # candidate: a commit whose turns were all background-driven falls back to
@@ -459,26 +461,29 @@ class CommitEngine:
             self.state.save()
 
             subject_prompts: list[str] = []
-            entries: list[tuple[str, str, bool]] = []
+            # (role, content, starts_turn, at): `at` is when the turn began, so the trace's age
+            # cap can place the entry (see message._limit_trace_age).
+            entries: list[tuple[str, str, bool, float | None]] = []
             for turn in turns:
+                at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     if _is_background_event(turn.user_prompt):
                         # An EVENT woke the agent; nobody asked for anything. It belongs in the
                         # trace (it explains a turn with no prompt) but never under the user's
                         # name, and never as the commit's subject.
-                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True))
+                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True, at))
                     else:
                         subject_prompts.append(turn.user_prompt)
-                        entries.append(("user", turn.user_prompt, True))
+                        entries.append(("user", turn.user_prompt, True, at))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
                     if not followup.strip():
                         continue
                     subject_prompts.append(followup)
-                    entries.append(("user", followup, False))
+                    entries.append(("user", followup, False, at))
                 for message in self._agent_messages_for(turn):
-                    entries.append(("agent", message, True))
+                    entries.append(("agent", message, True, at))
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. a follow-up note typed mid-turn) are still added to the
@@ -538,9 +543,9 @@ class CommitEngine:
                     insert_at = index + 1
                     break
             # Leftovers were typed while that turn was running, so they continue it too.
-            entries[insert_at:insert_at] = [("user", leftover, False) for leftover in leftovers]
-            for role, content, starts_turn in entries:
-                self.state.append_trace(role, content, starts_turn=starts_turn)
+            entries[insert_at:insert_at] = [("user", leftover, False, None) for leftover in leftovers]
+            for role, content, starts_turn, at in entries:
+                self.state.append_trace(role, content, starts_turn=starts_turn, at=at)
 
             cover_backend_head = False
             cover_with_staged = False
@@ -643,7 +648,7 @@ class CommitEngine:
         changed_paths = self._changed_paths(changed_paths_fn) if interrupted else None
         trace_text = render_interaction_trace(
             self.state.pending_trace(),
-            self.state.trace_turn_limit,
+            self.state.trace_max_age_hours,
             interrupted=interrupted,
             changed_paths=changed_paths,
             # The summarizer's SOLE input, so it is redacted before the LLM ever sees it: a
@@ -672,7 +677,7 @@ class CommitEngine:
             reasoning_effort=reasoning_effort,
             conversation_anchor=conversation_anchor,
             token_usage=self.state.pending_token_usage(),
-            trace_turn_limit=self.state.trace_turn_limit,
+            trace_max_age_hours=self.state.trace_max_age_hours,
             session_name=session_name,
             summary=summary_text,
             summary_metadata=summary_metadata,
@@ -811,6 +816,7 @@ class CommitEngine:
         commit_fn: Callable,
         on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
         note_in_flight_fn: Callable[[dict | None], None] | None = None,
+        at_commit: bool = False,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -829,6 +835,16 @@ class CommitEngine:
         (result, new_awaited)
             *result* is ``True`` (committed), ``False`` (consumed, no commit),
             or ``None`` (deferred / no result ready).
+
+        ``at_commit`` means a real ``git commit`` is being made RIGHT NOW (by the user or by the
+        agent itself) and this parse feeds its message. Every conversation up to that moment is
+        then recorded into it, whatever would otherwise make the engine wait: a turn still
+        running, async sub-agents still working, a run of trivial monitor ticks. Callers pass it
+        together with ``require_complete=False``; it additionally keeps a trailing turn that has
+        no reply yet, which a force commit otherwise trims, because the user asked for
+        everything said before the commit. A running turn is anchored on its user id like any
+        force capture, so the rest of it is recorded by a later commit, counting only its new
+        tokens.
         """
         parse_thread = session.agent_parse_thread
         if parse_thread and parse_thread.is_alive():
@@ -966,7 +982,7 @@ class CommitEngine:
         # Exception: a SOLE final-less turn under a force commit (require_complete=False,
         # the exit finalize) is kept, so exit still captures in-flight work; turns_after
         # re-exports it if the conversation later continues.
-        while len(all_turns) > 1 and not all_turns[-1].final_response:
+        while not at_commit and len(all_turns) > 1 and not all_turns[-1].final_response:
             dropped = all_turns.pop()
             debug_fn(
                 f"trimming unanswered trailing turn from commit "
@@ -1052,6 +1068,11 @@ class CommitEngine:
             # that actually carried a response; fall back to the last turn for a no-text
             # finished turn. Which of the turn's two ids anchors the mark is decided below.
             watermark = complete_turns[-1] if complete_turns else last_turn
+            if at_commit and last_turn is not None:
+                # A commit-time capture recorded EVERY turn, the running one included, so the
+                # mark goes on that turn — anchored on its user id below, with its tokens so far
+                # remembered — or the next commit would record it again in full.
+                watermark = last_turn
             # A turn captured MID-FLIGHT is anchored on its USER id — never on whatever
             # assistant id it happens to carry at this instant. A backend mints a NEW message
             # id for each assistant response within a turn, so the id a force capture (the

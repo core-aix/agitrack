@@ -344,7 +344,18 @@ def write_proxy_status(repo: GitRepo, *, commits: str, worktree: bool) -> None:
         path = proxy_status_path(repo)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"pid": os.getpid(), "mode": "interactive", "commits": commits, "worktree": bool(worktree)}),
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "mode": "interactive",
+                    "commits": commits,
+                    "worktree": bool(worktree),
+                    # This session answers the pre-commit flush request (see
+                    # `_interactive_session_answers_flush`). Older sessions did not, and asking
+                    # one would only make every commit wait out the timeout.
+                    "commit_flush": not worktree,
+                }
+            ),
             encoding="utf-8",
         )
     except OSError:
@@ -363,6 +374,16 @@ def clear_proxy_status(repo: GitRepo) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+def _interactive_session_answers_flush(repo: GitRepo) -> bool:
+    """Whether the live interactive session holding this repo will service a pre-commit flush
+    request: a no-worktree session (whose commits the fold hook covers) recent enough to say so."""
+    info = _read_proxy_status(repo)
+    if not info or not info.get("commit_flush"):
+        return False
+    pid = info.get("pid")
+    return isinstance(pid, int) and pid_alive(pid)
 
 
 def _read_proxy_status(repo: GitRepo) -> dict | None:
@@ -1008,9 +1029,10 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
             # made needs a FRESH fold trailer: if it's the BACKGROUND daemon, nudge it to record any
             # pending completed turns and re-render the trailer synchronously NOW, so this commit's
             # prepare-commit-msg hook folds the trace/metadata in instead of a trailer lagging the
-            # daemon's poll (the bug where a commit racing the poll folded nothing). An interactive
-            # TUI renders its own trailer as turns complete, so it needs no nudge.
-            if _live_background_pid(repo) is not None:
+            # daemon's poll (the bug where a commit racing the poll folded nothing). A no-worktree
+            # interactive session takes the same request: its trailer is otherwise only as fresh as
+            # the last turn it chose to record, and it holds turns back while sub-agents run.
+            if _live_background_pid(repo) is not None or _interactive_session_answers_flush(repo):
                 request_daemon_flush(repo)
             return 0
     except Exception:
@@ -1037,7 +1059,7 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # they are the most likely to re-edit it — protect its '#' headings from git's cleanup.
         repo.ensure_comment_char_preserves_headings()
         runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
-        runner._process_once()  # parse the repo's own backend session, record NEW pending turns
+        runner._process_once(require_complete=False, at_commit=True)  # this commit records everything said so far
         runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
     except Exception:
         return 0
@@ -1797,7 +1819,14 @@ class BackgroundRunner:
         if not nonce or nonce == self._last_flush_nonce:
             return
         try:
-            self._process_once()
+            # A commit is being made right now — by the user or by the agent itself — so it
+            # carries EVERY conversation up to this moment: finished turns, the turn still
+            # running, and turns the engine would otherwise hold back while async sub-agents or
+            # a monitor are still working. Waiting there is right for aGiTrack's own commits,
+            # but a commit made by someone else does not wait, and every one made during the
+            # wait used to land with no trace at all (seen live: seven hours of prompts behind a
+            # long-running sub-agent, none of them in any of that day's commits).
+            self._process_once(require_complete=False, at_commit=True)
             self._manual.render_trailer()
         except Exception as error:
             self._debug(f"flush failed: {error!r}")
@@ -1958,14 +1987,18 @@ class BackgroundRunner:
         self._install_change_autostart_hook()
         self._write_handshake()  # `-b status` and the dashboard read the tracked backend from here
 
-    def _process_once(self, *, require_complete: bool = True) -> bool:
+    def _process_once(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
         """Export the user's active backend session and record any newly completed turns as
         latent commits. Returns True when a turn was recorded this cycle.
 
         ``require_complete=False`` is the STOP finalize: it keeps a turn that never got a final
         response, so work in progress when the daemon is stopped is still captured. This mirrors
         the interactive proxy's exit finalize — without it, quitting mid-turn silently discarded
-        that turn's record in background mode but not in the TUI."""
+        that turn's record in background mode but not in the TUI.
+
+        ``at_commit`` is the pre-commit flush: a ``git commit`` is being made right now, so every
+        conversation up to this moment is recorded into it (see
+        ``CommitEngine.finish_parse_if_ready``)."""
         session_id = self._tracked_session_id()
         if session_id is None:
             self._debug("no human-driven session in this repo; nothing to export")
@@ -1998,6 +2031,7 @@ class BackgroundRunner:
             mirror_fn=lambda _sid: None,
             commit_fn=self._record_turns,
             note_in_flight_fn=self._note_in_flight,
+            at_commit=at_commit,
         )
         # The engine records the session's still-running background tasks onto the session it was
         # given. That object is thrown away each cycle, so carry the answer onto the runner — the

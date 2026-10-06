@@ -223,15 +223,34 @@ def test_current_conversation_watermark_still_uses_single_value(tmp_path):
     assert state.backend_message_id_for("A") is None  # current conversation recomputes
 
 
-def test_trace_turn_limit_defaults_and_reads_config(tmp_path):
+def test_trace_max_age_hours_defaults_and_reads_config(tmp_path):
     state = AgitrackState(tmp_path)
-    assert state.trace_turn_limit == 5
+    assert state.trace_max_age_hours == 24.0
 
     config = tmp_path / ".agitrack" / "config.json"
     config.parent.mkdir(parents=True)
-    config.write_text('{"trace_turn_limit": 3}\n', encoding="utf-8")
+    config.write_text('{"trace_max_age_hours": 6}\n', encoding="utf-8")
+    assert AgitrackState(tmp_path).trace_max_age_hours == 6.0
 
-    assert AgitrackState(tmp_path).trace_turn_limit == 3
+    # 0 or null keeps every turn since the last commit.
+    config.write_text('{"trace_max_age_hours": 0}\n', encoding="utf-8")
+    assert AgitrackState(tmp_path).trace_max_age_hours is None
+    config.write_text('{"trace_max_age_hours": null}\n', encoding="utf-8")
+    assert AgitrackState(tmp_path).trace_max_age_hours is None
+
+    # The retired count cap is no longer read: it dropped most of a busy span.
+    config.write_text('{"trace_turn_limit": 3}\n', encoding="utf-8")
+    assert AgitrackState(tmp_path).trace_max_age_hours == 24.0
+
+
+def test_append_trace_records_when_the_turn_began(tmp_path):
+    state = AgitrackState(tmp_path)
+    state.append_trace("user", "hello", at=1_790_000_000)
+    state.append_trace("user", "undated")
+    assert state.pending_trace() == [
+        {"role": "user", "content": "hello", "at": 1_790_000_000},
+        {"role": "user", "content": "undated"},
+    ]
 
 
 # --- issue #17: corrupt state must not brick startup; writes are atomic --------
@@ -272,7 +291,7 @@ def test_corrupt_config_json_falls_back_to_defaults(tmp_path):
 
     state = AgitrackState(tmp_path)  # must not raise
 
-    assert state.trace_turn_limit == 5  # default config
+    assert state.trace_max_age_hours == 24.0  # default config
 
 
 def test_save_is_atomic_and_leaves_no_temp_file(tmp_path):

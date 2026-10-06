@@ -766,7 +766,7 @@ Repository-local configuration can be stored in `.agitrack/config.json`:
 
 ```json
 {
-  "trace_turn_limit": 5,
+  "trace_max_age_hours": 24,
   "summarization_enabled": true,
   "summarization_model": null,
   "learning_backend": null,
@@ -774,7 +774,7 @@ Repository-local configuration can be stored in `.agitrack/config.json`:
 }
 ```
 
-`trace_turn_limit` controls the maximum number of recent user turns included in an agent commit body. The default is `5`.
+`trace_max_age_hours` bounds how far back an agent commit's interaction trace reaches: it keeps every turn since the previous commit that began within this many hours of the newest one (default `24`), however many there are, and notes how many older turns it left out. Set it to `0` or `null` to keep every turn since the previous commit. Turns prompted while aGiTrack was stopped are never included either way. (This replaces the old `trace_turn_limit`, a count of turns, which is no longer read.)
 
 `summarization_enabled` (default `true`) toggles the LLM summarization stream (see Summarization above). `summarization_model` sets the model the summarizer asks the backend to use; leave it unset (`null`) to use the backend's default model. Both keys can also be set user-wide in `~/.agitrack/config.json`; the repository-local value wins, and the `summarizer` command writes its changes here.
 

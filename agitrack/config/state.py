@@ -49,6 +49,11 @@ _EXCLUDE_LINES = (
 )
 
 
+# A commit's interaction trace keeps the turns that began within this many hours of its newest
+# one (`trace_max_age_hours` in .agitrack/config.json). See commits.message._limit_trace_age.
+DEFAULT_TRACE_MAX_AGE_HOURS = 24.0
+
+
 class AgitrackState:
     def __init__(self, repo: Path, *, default_backend: str | None = None) -> None:
         self.repo = repo
@@ -129,7 +134,7 @@ class AgitrackState:
 
     def _default_config(self) -> dict[str, Any]:
         return {
-            "trace_turn_limit": 5,
+            "trace_max_age_hours": DEFAULT_TRACE_MAX_AGE_HOURS,
             "summarization_model": None,
             "summarization_enabled": True,
             "full_agent_messages": False,
@@ -675,9 +680,16 @@ class AgitrackState:
         return list(self.data.get("pending_trace") or [])
 
     @property
-    def trace_turn_limit(self) -> int:
-        value = self.config.get("trace_turn_limit", 5)
-        return value if isinstance(value, int) and value > 0 else 5
+    def trace_max_age_hours(self) -> float | None:
+        """How far back, from its newest turn, a commit's interaction trace reaches (hours).
+        ``0`` or ``null`` keeps every turn since the last commit. The old ``trace_turn_limit``
+        (a count of turns) is no longer read: a count dropped most of a busy span."""
+        value = self.config.get("trace_max_age_hours", DEFAULT_TRACE_MAX_AGE_HOURS)
+        if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and value <= 0):
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return DEFAULT_TRACE_MAX_AGE_HOURS
 
     @property
     def full_agent_messages(self) -> bool:
@@ -752,7 +764,7 @@ class AgitrackState:
         self.config.update(merged)
         self._config_baseline = copy.deepcopy(merged)
 
-    def append_trace(self, role: str, content: str, *, starts_turn: bool = True) -> None:
+    def append_trace(self, role: str, content: str, *, starts_turn: bool = True, at: float | None = None) -> None:
         """Add one entry to the pending trace.
 
         ``starts_turn=False`` marks an entry that CONTINUES the turn before it rather than
@@ -764,6 +776,10 @@ class AgitrackState:
         item: dict[str, object] = {"role": role, "content": content}
         if not starts_turn:
             item["starts_turn"] = False
+        if at:
+            # When the turn this entry belongs to began (epoch seconds), so the trace's age cap
+            # can place it. See message._limit_trace_age.
+            item["at"] = at
         trace.append(item)
         self.data["pending_trace"] = trace
         self.save()

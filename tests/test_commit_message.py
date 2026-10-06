@@ -23,7 +23,7 @@ def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
         {"role": "user", "content": "ship it, key is sk-ant-api03-SECRETSECRETSECRETSECRET"},
         {"role": "agent", "content": "Shipped it."},
     ]
-    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+    rendered = render_interaction_trace(trace)
     assert rendered.startswith("## User")
     assert "## Agent\n\nShipped it." in rendered
     assert "SECRETSECRETSECRETSECRET" not in rendered  # masked
@@ -41,20 +41,6 @@ def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
     assert committed == rendered
 
 
-def test_render_interaction_trace_respects_turn_limit():
-    # A turn is an EXCHANGE: it takes the agent's reply to close one, so these are five turns
-    # rather than five messages. (Five bare user entries in a row are ONE turn — see
-    # test_messages_sent_back_to_back_are_one_turn_not_several.)
-    trace = []
-    for i in range(5):
-        trace.append({"role": "user", "content": f"turn {i}"})
-        trace.append({"role": "agent", "content": f"answer {i}"})
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
-    # Only the most recent 2 turns are kept (same limiting the commit applies).
-    assert "turn 4" in rendered and "turn 3" in rendered
-    assert "turn 0" not in rendered
-
-
 def test_a_background_event_is_never_rendered_as_a_user_message():
     # THE BUG: the harness wakes the agent when a task it backgrounded reports back, and the
     # parser labels that turn with a synthetic prompt. Recorded under the `user` role it became
@@ -67,7 +53,7 @@ def test_a_background_event_is_never_rendered_as_a_user_message():
         {"role": TRACE_EVENT_ROLE, "content": "(background task completed)"},
         {"role": "agent", "content": "Sweep finished: 62.5% accuracy."},
     ]
-    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+    rendered = render_interaction_trace(trace)
 
     assert rendered.count("## User") == 1  # the real prompt, and only it
     assert "## User\n\n(background task completed)" not in rendered
@@ -77,149 +63,117 @@ def test_a_background_event_is_never_rendered_as_a_user_message():
     assert "woken here by a background event (background task completed), not by a user" in note
 
 
-def test_a_background_event_starts_a_turn_for_the_trace_limit():
-    # A wake-up is bounded like anything else: it may evict an OLDER wake-up, which is the one
-    # thing a burst of them should cost. Without this a monitor ticking for an hour keeps every
-    # tick in the trace, since none of those turns is committed on its own.
+HOUR = 3600
+T0 = 1_790_000_000  # an arbitrary epoch-seconds origin for the stamped traces below
+
+
+def _turn(prompt, answer, hours_ago_from_newest, newest=T0 + 48 * HOUR, role="user"):
+    at = newest - hours_ago_from_newest * HOUR
+    return [{"role": role, "content": prompt, "at": at}, {"role": "agent", "content": answer, "at": at}]
+
+
+def test_the_trace_is_bounded_by_age_not_by_a_count_of_turns():
+    """THE BUG: the trace kept only the last 5 turns. A real commit had thirty-nine prompts
+    waiting for it (an async sub-agent held recording for seven hours) and would have kept five.
+    A busy span is not a reason to forget what was asked, so the bound is now how long ago a turn
+    began — counted back from the NEWEST turn — and any number of turns inside it are kept."""
     trace = []
-    for i in range(5):
-        trace.append({"role": TRACE_EVENT_ROLE, "content": "(background monitor update)"})
-        trace.append({"role": "agent", "content": f"tick {i}"})
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    for i in range(40):
+        trace += _turn(f"prompt {i}", f"answer {i}", hours_ago_from_newest=(39 - i) * 0.1)
 
-    assert "tick 4" in rendered and "tick 3" in rendered
-    assert "tick 0" not in rendered
+    rendered = render_interaction_trace(trace)
+
+    assert all(f"prompt {i}" in rendered for i in range(40))
+    assert "not shown here" not in rendered
 
 
-def test_background_wake_ups_never_evict_the_prompt_that_asked_for_the_work():
-    """THE BUG, measured on a real commit: the turn limit counted a background wake-up as a turn,
-    so five of them spent the whole budget of 5 and the session's opening instruction — "check
-    the dependabot PRs and merge if there are no issues" — was evicted from its own commit.
-
-    The wake-ups were timers the agent had queued while waiting on a slow CI job, and every one
-    of them was answered with a sentence saying it was still waiting. Nobody asked for those
-    turns; they cannot be what a trace of five turns is spent on. A turn is a user-agent PAIR."""
+def test_turns_older_than_the_window_are_dropped_whole_and_counted():
     trace = [
-        {"role": "user", "content": "the instruction that started the work"},
-        {"role": "agent", "content": "on it"},
+        *_turn("from two days ago", "old answer", hours_ago_from_newest=48),
+        *_turn("from yesterday morning", "older answer", hours_ago_from_newest=25),
+        *_turn("from this morning", "recent answer", hours_ago_from_newest=3),
+        *_turn("just now", "newest answer", hours_ago_from_newest=0),
     ]
-    for i in range(5):
-        trace.append({"role": TRACE_EVENT_ROLE, "content": "(background task completed)"})
-        trace.append({"role": "agent", "content": f"still waiting {i}"})
-    trace.append({"role": "user", "content": "a second instruction"})
-    trace.append({"role": "agent", "content": "done"})
 
-    rendered = render_interaction_trace(trace, trace_turn_limit=5)
+    rendered = render_interaction_trace(trace)  # default window: 24 hours
 
-    assert "the instruction that started the work" in rendered
-    assert "a second instruction" in rendered
-    assert "still waiting 0" in rendered  # seven turns, but only two of them are pairs
+    assert "from this morning" in rendered and "just now" in rendered
+    assert "from two days ago" not in rendered and "old answer" not in rendered
+    assert "from yesterday morning" not in rendered and "older answer" not in rendered
+    # The trace says it starts mid-conversation rather than passing for the whole story.
+    note = " ".join(line.lstrip("> ") for line in rendered.splitlines() if line.startswith(">"))
+    assert "2 earlier turns of this conversation began more than 24 hours before the latest one" in note
 
 
-def test_a_storm_of_wake_ups_is_trimmed_around_the_prompt_it_follows():
-    # Both budgets apply at once: the pair survives whole, and the wake-ups it drags behind it
-    # are cut to the most recent `trace_turn_limit` — bounded, without costing the prompt.
-    trace = [{"role": "user", "content": "start the long watch"}, {"role": "agent", "content": "watching"}]
-    for i in range(20):
-        trace.append({"role": TRACE_EVENT_ROLE, "content": "(background monitor update)"})
-        trace.append({"role": "agent", "content": f"tick {i}"})
+def test_the_window_is_configurable_and_can_be_switched_off():
+    trace = [*_turn("old", "a", hours_ago_from_newest=5), *_turn("new", "b", hours_ago_from_newest=0)]
 
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
-
-    assert "start the long watch" in rendered
-    assert "tick 19" in rendered and "tick 18" in rendered
-    assert "tick 17" not in rendered and "tick 0" not in rendered
+    assert "## User\n\nold" not in render_interaction_trace(trace, trace_max_age_hours=2)
+    assert "old" in render_interaction_trace(trace, trace_max_age_hours=None)
+    assert "old" in render_interaction_trace(trace, trace_max_age_hours=0)
 
 
-def test_a_wake_up_older_than_every_surviving_prompt_is_dropped_with_it():
-    # An event note reads as context for the exchange around it, so one left stranded above the
-    # oldest surviving prompt would explain a turn that is no longer in the trace.
+def test_an_entry_with_no_time_is_never_dropped():
+    # An older install's entry, or a prompt the proxy captured live, carries no stamp. It cannot
+    # be placed, and the cap exists to bound a trace, never to lose a message we cannot date.
     trace = [
-        {"role": TRACE_EVENT_ROLE, "content": "(background task completed)"},
-        {"role": "agent", "content": "ancient"},
+        {"role": "user", "content": "undated"},
+        {"role": "agent", "content": "undated answer"},
+        *_turn("ancient", "x", hours_ago_from_newest=100),
+        *_turn("current", "y", hours_ago_from_newest=0),
     ]
-    for i in range(4):
-        trace.append({"role": "user", "content": f"prompt {i}"})
-        trace.append({"role": "agent", "content": f"answer {i}"})
 
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    rendered = render_interaction_trace(trace)
 
+    assert "undated" in rendered and "current" in rendered
     assert "ancient" not in rendered
-    assert "prompt 3" in rendered and "prompt 2" in rendered
-    assert "prompt 1" not in rendered
 
 
-def test_a_message_queued_mid_turn_does_not_count_as_a_turn_of_its_own():
-    """THE BUG: the trace limiter counted every `## User` block as a turn, but a message the user
-    queues while the agent is working is not one — the agent is already answering the turn it
-    belongs to.
-
-    Measured on a real session: one turn carried ELEVEN queued messages, so a limit of 5 cut the
-    trace INSIDE that turn. Its opening prompt and first eight follow-ups were dropped, and
-    because that turn's work was committed here, the words that asked for it ended up in no
-    commit at all — the trace began mid-conversation with the ninth thing the user said."""
-    trace = [{"role": "user", "content": "the opening prompt"}]
-    for i in range(11):
-        trace.append({"role": "user", "content": f"queued {i}", "starts_turn": False})
-    trace.append({"role": "agent", "content": "one answer covering all of it"})
-    trace.append({"role": "user", "content": "a genuinely new turn"})
-    trace.append({"role": "agent", "content": "and its answer"})
-
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
-
-    # Two turns fit the limit, and each is kept WHOLE.
-    assert "the opening prompt" in rendered
-    assert all(f"queued {i}" in rendered for i in range(11))
-    assert "a genuinely new turn" in rendered
-
-
-def test_messages_sent_back_to_back_are_one_turn_not_several():
-    """A turn is an exchange, and it is the agent's REPLY that ends one.
-
-    The user can keep typing while the agent works — a correction, an afterthought, a second
-    question — and none of that is a new turn: no answer came between them. Treating each as one
-    let a handful of quick messages evict everything the trace was supposed to keep, and cut a
-    conversation off mid-way through what the user was saying.
-
-    This holds regardless of how the messages were recorded, which is the point of deriving the
-    boundary from the trace: the run collapses even without the `starts_turn` marker, so a
-    recording path that does not set it (or an entry written by an older install) still reads as
-    one turn."""
+def test_a_turn_is_kept_or_dropped_whole_with_its_queued_follow_ups():
+    # A turn is an EXCHANGE: messages sent while the agent worked, with no reply between them,
+    # belong to the turn they continue, so they go wherever that turn goes and are never left
+    # orphaned under a later turn's heading.
+    old_at, new_at = T0, T0 + 30 * HOUR
     trace = [
-        {"role": "user", "content": "first thought"},
-        {"role": "user", "content": "second thought"},
-        {"role": "user", "content": "third thought"},
-        {"role": "agent", "content": "one answer to all three"},
-        {"role": "user", "content": "a real follow-up turn"},
-        {"role": "agent", "content": "answered"},
+        {"role": "user", "content": "old opening", "at": old_at},
+        {"role": "user", "content": "old follow-up", "at": old_at, "starts_turn": False},
+        {"role": "agent", "content": "old answer", "at": old_at},
+        {"role": "user", "content": "new opening", "at": new_at},
+        {"role": "user", "content": "typed while it worked"},  # no stamp: still part of this turn
+        {"role": "agent", "content": "new answer", "at": new_at},
     ]
 
-    # Two turns, so a limit of 2 keeps everything...
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
-    assert all(t in rendered for t in ("first thought", "second thought", "third thought"))
-    assert "a real follow-up turn" in rendered
+    rendered = render_interaction_trace(trace)
 
-    # ...and a limit of 1 drops the first exchange WHOLE, never part of it.
-    rendered = render_interaction_trace(trace, trace_turn_limit=1)
-    assert not any(t in rendered for t in ("first thought", "second thought", "third thought"))
-    assert "a real follow-up turn" in rendered
+    assert "old opening" not in rendered and "old follow-up" not in rendered
+    assert "new opening" in rendered and "typed while it worked" in rendered
 
 
-def test_a_turn_that_is_over_the_limit_is_still_dropped_whole():
-    # The limit still bites — it just counts turns. Follow-ups ride with the turn they continue,
-    # so an evicted turn takes its own queued messages with it and never leaves them orphaned
-    # under a later turn's heading.
-    trace = []
-    for turn in range(4):
-        trace.append({"role": "user", "content": f"turn {turn}"})
-        trace.append({"role": "user", "content": f"turn {turn} followup", "starts_turn": False})
-        trace.append({"role": "agent", "content": f"answer {turn}"})
+def test_background_wake_ups_open_turns_and_age_out_like_any_other():
+    trace = [
+        *_turn("(background task completed)", "stale tick", hours_ago_from_newest=30, role=TRACE_EVENT_ROLE),
+        *_turn("the instruction", "on it", hours_ago_from_newest=1),
+        *_turn("(background monitor update)", "fresh tick", hours_ago_from_newest=0, role=TRACE_EVENT_ROLE),
+    ]
 
-    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    rendered = render_interaction_trace(trace)
 
-    assert "turn 3" in rendered and "turn 3 followup" in rendered
-    assert "turn 2" in rendered and "turn 2 followup" in rendered
-    assert "turn 1" not in rendered and "turn 1 followup" not in rendered
+    assert "stale tick" not in rendered
+    assert "the instruction" in rendered and "fresh tick" in rendered
+
+
+def test_millisecond_stamps_are_read_as_seconds():
+    newest = (T0 + 48 * HOUR) * 1000
+    trace = [
+        {"role": "user", "content": "old", "at": newest - 30 * HOUR * 1000},
+        {"role": "agent", "content": "a", "at": newest - 30 * HOUR * 1000},
+        {"role": "user", "content": "new", "at": newest},
+        {"role": "agent", "content": "b", "at": newest},
+    ]
+
+    rendered = render_interaction_trace(trace)
+
+    assert "## User\n\nold" not in rendered and "## User\n\nnew" in rendered
 
 
 def test_render_interaction_trace_drops_empty_role_entries():
@@ -231,7 +185,7 @@ def test_render_interaction_trace_drops_empty_role_entries():
         {"role": "user", "content": ""},
         {"role": "agent", "content": "done"},
     ]
-    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+    rendered = render_interaction_trace(trace)
     assert rendered.count("## User") == 1 and "Continue" in rendered
     assert rendered.count("## Agent") == 1
 
@@ -751,13 +705,16 @@ def test_commit_message_body_lines_are_wrapped_to_72():
     assert all(len(line) <= 72 for line in body_lines)
 
 
-def test_agent_commit_trace_is_limited_by_user_turns():
+def test_agent_commit_trace_is_limited_by_age():
+    # The commit message applies the same age window as the rendered trace (the summarizer's input).
+    newest = 1_790_000_000
     trace = []
     for index in range(7):
+        at = newest - (6 - index) * 6 * 3600  # one turn every six hours
         trace.extend(
             [
-                {"role": "user", "content": f"user {index}"},
-                {"role": "agent", "content": f"agent {index}"},
+                {"role": "user", "content": f"user {index}", "at": at},
+                {"role": "agent", "content": f"agent {index}", "at": at},
             ]
         )
 
@@ -768,12 +725,11 @@ def test_agent_commit_trace_is_limited_by_user_turns():
         backend_session_id="ses-1",
         agitrack_session_id="agit-1",
         model="provider/model",
-        trace_turn_limit=5,
+        trace_max_age_hours=24,
     )
 
-    assert "## User\n\nuser 0" not in message
-    assert "## User\n\nuser 1" not in message
-    assert "## User\n\nuser 2" in message
+    assert "## User\n\nuser 1" not in message  # 30 hours before the newest turn
+    assert "## User\n\nuser 2" in message  # exactly 24 hours: kept
     assert "## Agent\n\nagent 6" in message
 
 
@@ -1115,7 +1071,6 @@ def test_an_interrupted_turn_names_the_files_its_commit_actually_carries():
     """
     rendered = render_interaction_trace(
         _interrupted_trace(),
-        trace_turn_limit=10,
         interrupted=True,
         changed_paths=["f1.txt", "f2.txt", "f3.txt"],
     )
@@ -1129,9 +1084,7 @@ def test_an_interrupted_turn_names_the_files_its_commit_actually_carries():
 def test_a_long_change_list_is_counted_rather_than_dumped():
     paths = [f"f{i}.txt" for i in range(20)]
 
-    rendered = render_interaction_trace(
-        _interrupted_trace(), trace_turn_limit=10, interrupted=True, changed_paths=paths
-    )
+    rendered = render_interaction_trace(_interrupted_trace(), interrupted=True, changed_paths=paths)
 
     unwrapped = " ".join(rendered.replace("> ", "").split())
     assert "f11.txt" in unwrapped and "f12.txt" not in unwrapped  # 12 shown
@@ -1140,15 +1093,13 @@ def test_a_long_change_list_is_counted_rather_than_dumped():
 
 def test_the_change_list_is_only_for_interrupted_turns():
     """Every other commit keeps the trace as the summarizer's sole input, by design."""
-    rendered = render_interaction_trace(
-        _interrupted_trace(), trace_turn_limit=10, interrupted=False, changed_paths=["only_in_the_diff.txt"]
-    )
+    rendered = render_interaction_trace(_interrupted_trace(), interrupted=False, changed_paths=["only_in_the_diff.txt"])
 
     assert "only_in_the_diff.txt" not in rendered
 
 
 def test_an_interrupted_turn_with_no_readable_change_list_still_says_it_was_interrupted():
-    rendered = render_interaction_trace(_interrupted_trace(), trace_turn_limit=10, interrupted=True)
+    rendered = render_interaction_trace(_interrupted_trace(), interrupted=True)
 
     assert "NOT completed" in rendered
     assert "this commit itself" not in rendered

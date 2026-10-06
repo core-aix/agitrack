@@ -1348,6 +1348,40 @@ def test_background_commit_folds_fresh_turn_via_flush(tmp_path):
     assert "# aGiTrack Metadata" in msg  # the turn's trace/metadata folded into the commit
 
 
+def test_a_commit_carries_every_conversation_while_a_sub_agent_is_still_running(tmp_path):
+    """THE BUG, seen live in manual mode: an async sub-agent ran for seven hours, the daemon held
+    every turn back for all of it, and each commit made meanwhile — the agent's own included —
+    landed with no trace. 39 of 55 prompts that day reached no commit. A commit is the moment the
+    user (or agent) says "this is the work so far", so it records everything said up to it: the
+    question-only turns before, and the turn still running that is making the commit."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    turns = [
+        _turn("u1", "m1", "what algorithm did you use before?", "The v8 one.", 10),
+        _turn("u2", "m2", "why was v8 so good?", "Golden labels.", 10),
+        SessionTurn(
+            "u3", "m3", "yes you can do the authoring test", "", TokenUsage(total=7, output=7), "m", complete=False
+        ),
+    ]
+    backend.sessions["s1"] = ExportedSession("s1", "claude-opus-4-8", None, turns, live_subagent_ids=["a72c9956"])
+    backend.latest = "s1"
+
+    # The ordinary poll waits for the sub-agent and the running turn: nothing is recorded.
+    runner._process_once()
+    assert runner._manual.pending_count() == 0
+
+    # The agent commits its own work mid-turn; the pre-commit hook asks the daemon to flush.
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n-commit", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "authoring test")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    for prompt in ("what algorithm did you use before?", "why was v8 so good?", "yes you can do the authoring test"):
+        assert prompt in msg
+
+
 def test_precommit_sync_nudges_a_running_daemon_to_flush(tmp_path, monkeypatch):
     # When a LIVE background daemon holds the lock, precommit_sync no longer just bails: it asks the
     # daemon to flush so this commit folds a fresh trailer (it still records nothing itself — the

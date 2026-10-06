@@ -484,7 +484,7 @@ class AgitrackShell:
             # render it now, before clear_trace below.
             # Redacted before the summarizer sees it — see the same call in commit_engine.py.
             trace_text = render_interaction_trace(
-                self.state.pending_trace(), self.state.trace_turn_limit, repo_root=self.repo.repo
+                self.state.pending_trace(), self.state.trace_max_age_hours, repo_root=self.repo.repo
             )
             commit_summary = None
             summary_metadata = None
@@ -519,7 +519,7 @@ class AgitrackShell:
                     model=self.state.model,
                     reasoning_effort="on" if result.tokens.reasoning > 0 else None,
                     token_usage=self.state.pending_token_usage(),
-                    trace_turn_limit=self.state.trace_turn_limit,
+                    trace_max_age_hours=self.state.trace_max_age_hours,
                     summary=commit_summary,
                     summary_metadata=summary_metadata,
                     origin_event=origin_event,

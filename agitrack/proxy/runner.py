@@ -376,6 +376,13 @@ class RepoChangeHandler(FileSystemEventHandler):
             relative = os.path.relpath(src_path, self.repo_path)
         except ValueError:
             relative = src_path
+        if relative == os.path.join(".agitrack", "flush-request"):
+            # A `git commit` is waiting on us to record the conversation so far (see
+            # ProxyRunner._service_commit_flush_request). Not a worktree change, so only the git
+            # worker is woken — at once, rather than after its idle poll.
+            if self.wake is not None:
+                self.wake.set()
+            return
         if any(part in self.IGNORED_PARTS for part in relative.split(os.sep)):
             return
         self.changed.set()
@@ -6549,6 +6556,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # A foreground merge is being resolved; don't make normal commits meanwhile.
             self._maybe_complete_agent_merge()
             return
+        self._service_commit_flush_request()  # a `git commit` waiting for the conversation so far
         self._maybe_agent_commit()
         self._poll_base_advanced()
         self._service_manual_commit_mode()  # --manual-commits: react to a user/external commit
@@ -9172,12 +9180,11 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         repo = repo or self.repo
         state = state or self.state
         if self._manual_commits:
-            # Capture any agent turn that just finished (its parse may have completed while the
-            # user was opening this menu) as a latent commit BEFORE folding, so its metadata/
-            # trace are included rather than raced past. A turn still mid-parse is recorded on
-            # the next loop tick; a commit made mid-parse OUTSIDE aGiTrack can't be intercepted.
+            # Record EVERY conversation up to this moment as latent turns BEFORE folding, so this
+            # commit carries all of it: finished turns, the one still running, and turns held
+            # back while async sub-agents work (see `_record_conversation_for_commit`).
             try:
-                self._finish_agent_parse_if_ready(quiet=True)
+                self._record_conversation_for_commit()
             except Exception as error:
                 self._debug(f"manual pre-commit turn flush failed: {error!r}")
         if on_worktree:
@@ -10127,6 +10134,22 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             ["No, keep working", "Yes, terminate them and exit"],
         )
         return choice == "Yes, terminate them and exit"
+
+    def _record_conversation_for_commit(self) -> None:
+        """A commit is being made right now (by the user or by the agent itself): record every
+        conversation up to this moment so the commit's fold carries it. Joins the in-flight
+        parse, then takes a FRESH one, both finished with ``at_commit`` (see
+        ``CommitEngine.finish_parse_if_ready``)."""
+        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+            self.agent_parse_thread.join(timeout=20)
+        self._finish_agent_parse_if_ready(
+            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+        )
+        if self._start_agent_parse() and self.agent_parse_thread:
+            self.agent_parse_thread.join(timeout=20)
+        self._finish_agent_parse_if_ready(
+            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+        )
 
     def _commit_latest_turn_sync(self) -> None:
         # Synchronously (joining the parse worker) commit the latest completed
@@ -11369,6 +11392,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         prompt_untracked: bool | None = None,
         integrate: bool = True,
         require_complete: bool = True,
+        at_commit: bool = False,
     ) -> bool | None:
         if prompt_untracked is None:
             # Worktree sessions are isolated sandboxes, so agent commits there
@@ -11392,6 +11416,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # them as-is rather than raising a modal during teardown.
             on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
             note_in_flight_fn=self._note_in_flight,
+            at_commit=at_commit,
         )
         self._awaited_followups = new_awaited
         if committed is not None:

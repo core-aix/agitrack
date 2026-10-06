@@ -10,6 +10,8 @@ from agitrack import __version__
 from agitrack.commits.foreign import FOREIGN_REPO_MASK, redact_foreign_repos
 from agitrack.transcripts.capabilities import FIELDS as CAPABILITY_FIELDS
 
+from agitrack.config.state import DEFAULT_TRACE_MAX_AGE_HOURS
+
 
 def _system_info() -> str:
     """Host OS and version for the commit metadata. Tool availability differs across
@@ -279,7 +281,7 @@ def build_agent_commit_message(
     reasoning_effort: str | None = None,
     conversation_anchor: str | None = None,
     token_usage: dict[str, int | None] | None = None,
-    trace_turn_limit: int = 5,
+    trace_max_age_hours: float | None = DEFAULT_TRACE_MAX_AGE_HOURS,
     session_name: str | None = None,
     summary: str | None = None,
     summary_metadata: list[str] | None = None,
@@ -323,7 +325,7 @@ def build_agent_commit_message(
             reasoning_effort=reasoning_effort,
             conversation_anchor=conversation_anchor,
             token_usage=token_usage,
-            trace_turn_limit=trace_turn_limit,
+            trace_max_age_hours=trace_max_age_hours,
             session_name=session_name,
             summary_metadata=summary_metadata,
             covered_commits=covered_commits,
@@ -466,6 +468,7 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
 
 
 TRACE_EVENT_ROLE = "event"
+
 """Trace role for something that HAPPENED rather than something someone said.
 
 The harness wakes the agent when a task it backgrounded reports back, and the transcript
@@ -504,7 +507,7 @@ def _trace_role_lines(item: dict, repo_root: str | Path | None = None) -> list[s
 
 def render_interaction_trace(
     trace: list[dict],
-    trace_turn_limit: int,
+    trace_max_age_hours: float | None = DEFAULT_TRACE_MAX_AGE_HOURS,
     *,
     interrupted: bool = False,
     changed_paths: list[str] | None = None,
@@ -522,7 +525,9 @@ def render_interaction_trace(
     contains — because a cancelled turn's messages stop before its last edits (see
     ``_interrupted_changes_sentence``). Both are ignored unless the turn was interrupted."""
     lines: list[str] = list(_interrupted_note_lines(interrupted, changed_paths))
-    for item in _limit_trace_turns(trace, trace_turn_limit):
+    kept, omitted = _limit_trace_age(trace, trace_max_age_hours)
+    lines.extend(_omitted_turns_note_lines(omitted, trace_max_age_hours))
+    for item in kept:
         lines.extend(_trace_role_lines(item, repo_root))
     return "\n".join(lines).strip()
 
@@ -535,7 +540,7 @@ def _trace_and_metadata_lines(
     agitrack_session_id: str,
     model: str | None,
     token_usage: dict[str, int | None] | None,
-    trace_turn_limit: int,
+    trace_max_age_hours: float | None,
     backend_version: str | None = None,
     reasoning_effort: str | None = None,
     conversation_anchor: str | None = None,
@@ -565,7 +570,9 @@ def _trace_and_metadata_lines(
     # this commit's token counts span work already in history — the human-readable
     # counterpart to the ``covered_commits`` metadata line (issues #35/#58).
     lines.extend(_covered_commits_note_lines(covered_commits))
-    for item in _limit_trace_turns(trace, trace_turn_limit):
+    kept, omitted = _limit_trace_age(trace, trace_max_age_hours)
+    lines.extend(_omitted_turns_note_lines(omitted, trace_max_age_hours))
+    for item in kept:
         # Nest each message's own headings under its "## User"/"## Agent" role heading (so a
         # message's "# Title" can't outrank the role) and skip empty entries (see _trace_role_lines).
         lines.extend(_trace_role_lines(item, repo_root))
@@ -1107,46 +1114,38 @@ def _nest_headings_under_role(content: str) -> str:
     return "\n".join(lines)
 
 
-def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
-    """Keep the most recent ``turn_limit`` turns of ``trace``.
+def _limit_trace_age(trace: list[dict], max_age_hours: float | None) -> tuple[list[dict], int]:
+    """The turns of ``trace`` that began within ``max_age_hours`` of its NEWEST turn, and how
+    many older turns were left out.
 
-    A turn is an EXCHANGE — something said to the agent, and the agent answering it — so it is
-    the agent's reply that closes one and makes the next thing said a new turn. Consecutive
-    messages with no reply between them are one turn however many there are: the user can keep
-    typing while the agent works, and none of that is a new exchange.
+    The trace used to be cut to the last N turns (``trace_turn_limit``, 5). That is the wrong
+    unit: a commit covers everything said since the previous one, and a busy hour can easily
+    hold twenty exchanges, so a count cap silently dropped most of what the user asked for. Seen
+    on a real repository where an async sub-agent held recording for seven hours: thirty-nine
+    prompts waited for one commit that would have kept five. Time is the bound that matches what
+    a reader wants from a commit ("what happened in the run-up to this"), so the cap is an AGE,
+    measured from the newest turn rather than from now, so a commit made a while after its last
+    turn is not shortened by the wait.
 
-    Counting each `## User` block instead cut the trace INSIDE a turn. Measured on a real
-    session: one turn carried eleven messages sent while the agent worked, so a limit of 5 kept
-    the last three and dropped the opening prompt with eight follow-ups — and because that turn's
-    work was committed there, the words that asked for it survived in no commit at all.
+    A turn is an EXCHANGE — something said to the agent and the agent answering it — so it is
+    the agent's reply that closes one, and consecutive messages with no reply between them (the
+    user typing while the agent works, or an entry marked ``starts_turn=False``) belong to the
+    turn they continue. A turn is kept or dropped WHOLE, so a follow-up is never orphaned under
+    a later turn's heading. A background wake-up (:data:`TRACE_EVENT_ROLE`) opens a turn like a
+    prompt does.
 
-    PROMPTS AND WAKE-UPS ARE BUDGETED SEPARATELY, and this is the whole point of the function:
+    A turn is placed by the ``at`` stamp on the entry that opened it (epoch seconds, written by
+    the commit engine from the transcript). A turn with no stamp — an older install's entry, a
+    prompt captured live by the proxy, a backend that records no times — cannot be placed and is
+    KEPT: the cap exists to bound a trace, never to lose a message we cannot date. ``None`` or a
+    non-positive age disables the cap.
 
-        the unit of the limit is a user-agent PAIR. A turn nobody asked for — the harness woke
-        the agent with a background event (:data:`TRACE_EVENT_ROLE`) and it answered — is not a
-        pair, and can never push a prompt out of the trace.
-
-    Both kinds are still bounded, each to `turn_limit` of its own, because they run away for
-    different reasons and neither bound can do the other's job:
-
-      * Counting wake-ups as turns loses the prompt. A real commit here traced seven turns —
-        an opening instruction, five wake-ups from timers the agent had queued while waiting on
-        CI, and a second instruction. Five one-sentence replies saying "still waiting" spent the
-        entire budget of 5, so the instruction that motivated the commit was the one thing
-        evicted, while five notes about a stale timer were kept.
-      * Not counting them at all leaves the trace unbounded: a monitor that ticks for an hour
-        wakes the agent every few minutes, those turns are deferred rather than committed (they
-        change nothing), and the pending trace keeps growing. A wake-up may evict an OLDER
-        wake-up — that is the one thing a burst of them should cost.
-
-    A wake-up older than the oldest surviving prompt goes with it: an event note is context for
-    the exchange it sits in, and reading one stranded above the first prompt tells nobody
-    anything. `starts_turn=False`, recorded for a message known to have been queued into a turn
-    already under way, keeps such a message out of the count even where a reply happens to
-    precede it; it is absent on entries written by older installs, so its default preserves
-    their meaning."""
-    limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
-    starts: list[tuple[int, str]] = []
+    What is in the trace at all is decided upstream and is unchanged by this: the watermark
+    (only turns since the last commit) and the tracking gap (nothing prompted while aGiTrack was
+    stopped; see :mod:`agitrack.tracking_gap`)."""
+    if not isinstance(max_age_hours, (int, float)) or isinstance(max_age_hours, bool) or max_age_hours <= 0:
+        return trace, 0
+    starts: list[int] = []
     answered = True  # nothing is in flight yet, so the first thing said opens a turn
     for index, item in enumerate(trace):
         role = str(item.get("role", "")).strip().lower()
@@ -1154,27 +1153,44 @@ def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
             answered = True  # the agent replied: whatever is said next begins a new exchange
             continue
         if answered and item.get("starts_turn", True) is not False:
-            starts.append((index, role))
+            starts.append(index)
         answered = False
-    prompts = [index for index, role in starts if role == "user"]
-    events = [index for index, role in starts if role != "user"]
-    if len(prompts) <= limit and len(events) <= limit:
-        return trace
-    kept_prompts = prompts[-limit:]
-    kept_events = events[-limit:]
-    if kept_prompts:
-        # Never strand a wake-up above the oldest prompt still in the trace.
-        kept_events = [index for index in kept_events if index > kept_prompts[0]]
-    kept = set(kept_prompts) | set(kept_events)
-    opens = {index for index, _ in starts}
+    stamps = [_entry_time(trace[index]) for index in starts]
+    known = [stamp for stamp in stamps if stamp is not None]
+    if not known:
+        return trace, 0
+    cutoff = max(known) - float(max_age_hours) * 3600
+    dropped = {index for index, stamp in zip(starts, stamps) if stamp is not None and stamp < cutoff}
+    if not dropped:
+        return trace, 0
     limited: list[dict] = []
-    keeping = False  # entries ahead of the first turn belong to none of them
+    keeping = True
     for index, item in enumerate(trace):
-        if index in opens:
-            keeping = index in kept
+        if index in starts:
+            keeping = index not in dropped
         if keeping:
             limited.append(item)
-    return limited
+    return limited, len(dropped)
+
+
+def _entry_time(item: dict) -> float | None:
+    value = item.get("at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value / 1000 if value > 1e11 else value)  # tolerate millisecond stamps
+
+
+def _omitted_turns_note_lines(omitted: int, max_age_hours: float | None) -> list[str]:
+    """A note saying how many older turns the age cap left out, so a trace that starts
+    mid-conversation says so instead of reading as the whole story."""
+    if omitted <= 0 or not max_age_hours:
+        return []
+    hours = f"{max_age_hours:g}"
+    noun = "turn" if omitted == 1 else "turns"
+    return _note_block(
+        f"{omitted} earlier {noun} of this conversation began more than {hours} hours "
+        "before the latest one and are not shown here."
+    ) + [""]
 
 
 def mask_paths(text: str) -> str:

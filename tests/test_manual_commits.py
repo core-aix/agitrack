@@ -1368,13 +1368,16 @@ def test_manual_pending_bodies_fold_in_summary_note_when_available(tmp_path):
 def test_git_commit_menu_flushes_pending_turn_before_folding(tmp_path):
     # A turn that finished while the user opened the menu must be captured before the fold.
     runner, repo, state = _manual_runner(tmp_path)
-    flushed: list[bool] = []
-    runner._finish_agent_parse_if_ready = lambda quiet=False: flushed.append(quiet)
+    flushed: list[dict] = []
+    runner._finish_agent_parse_if_ready = lambda **kwargs: flushed.append(kwargs)
     (tmp_path / "a.txt").write_text("one\nuser\n", encoding="utf-8")
 
     runner._create_user_commit_popup(repo=repo, state=state, include_declined=True)
 
-    assert flushed == [True]  # the parse/record flush ran before committing
+    # The parse/record flush ran before committing, and as a commit-time capture: everything said
+    # up to now, not only turns that finished with no sub-agent still running.
+    assert flushed
+    assert all(call.get("at_commit") is True and call.get("require_complete") is False for call in flushed)
 
 
 def test_menu_commit_folds_summaries_and_dashboard_shows_newest_first(tmp_path):
@@ -2641,3 +2644,41 @@ def test_the_project_post_commit_hook_still_runs_on_a_folded_commit(tmp_path):
     assert "# aGiTrack Metadata" in _git(repo, "log", "-1", "--format=%B", "HEAD")
     assert repo.rev_parse("refs/agitrack/manual/s") == repo.rev_parse("HEAD")  # the fold still happened
     assert ran.exists()
+
+
+def test_an_interactive_session_answers_the_commit_flush_request(tmp_path):
+    """A `git commit` made while an interactive no-worktree session runs (very often the agent's
+    own) asks that session, through the same file handshake the background tracker answers, to
+    record every conversation so far before the fold hook reads the trailer."""
+    runner, repo, state = _manual_runner(tmp_path)
+    calls: list[str] = []
+    runner._record_conversation_for_commit = lambda: calls.append("recorded")
+    agit = repo.repo / ".agitrack"
+    agit.mkdir(exist_ok=True)
+
+    # A request left over from before the session started is noted, never answered.
+    (agit / "flush-request").write_text("old", encoding="utf-8")
+    runner._service_commit_flush_request()
+    assert calls == [] and not (agit / "flush-done").exists()
+
+    (agit / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_commit_flush_request()
+    assert calls == ["recorded"]
+    assert (agit / "flush-done").read_text(encoding="utf-8") == "n1"
+
+    runner._service_commit_flush_request()  # the same request is answered once
+    assert calls == ["recorded"]
+
+
+def test_the_commit_hook_only_asks_a_session_that_says_it_answers(tmp_path):
+    # An older interactive session never answers, so asking it would make every commit wait out
+    # the timeout. The session records that it answers in session.json; only then is it asked.
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    bg.write_proxy_status(repo, commits="manual", worktree=False)
+    assert bg._interactive_session_answers_flush(repo) is True
+    bg.write_proxy_status(repo, commits="auto", worktree=True)  # worktree commits are not folded
+    assert bg._interactive_session_answers_flush(repo) is False
+    bg.proxy_status_path(repo).write_text('{"pid": %d, "mode": "interactive"}' % os.getpid(), encoding="utf-8")
+    assert bg._interactive_session_answers_flush(repo) is False

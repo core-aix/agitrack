@@ -2401,3 +2401,68 @@ def test_the_latent_path_reports_its_own_changes_not_the_index(tmp_path):
     assert recorded, "the turn should have been recorded latently"
     unwrapped = " ".join(recorded[0].replace("> ", "").split())
     assert "it changes latent1.txt, latent2.txt." in unwrapped
+
+
+def _finish_at_commit(engine, session, commit_fn):
+    return engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+        at_commit=True,
+    )
+
+
+def test_a_commit_records_every_conversation_even_while_sub_agents_run(tmp_path):
+    """THE BUG, seen live: an async sub-agent ran for seven hours, the engine held every turn back
+    for all of it, and each commit made meanwhile — the user's and the agent's own — landed with no
+    trace at all. Waiting is right for aGiTrack's OWN commits; a commit someone else makes now does
+    not wait, so it has to carry everything said up to now."""
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-commit",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "run the comparison", "Launched it.", TokenUsage(total=9), None),
+            SessionTurn("u2", "a2", "how is it going?", "Halfway.", TokenUsage(total=5), None),
+        ],
+        live_subagent_ids=["a72c99562a5ca1e17"],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = _finish_at_commit(engine, session, commit_fn)
+
+    assert result is True
+    assert [t.user_prompt for t in commits[0]["turns"]] == ["run the comparison", "how is it going?"]
+    assert state.backend_message_id_for("ses-commit") == "a2"
+
+
+def test_a_commit_made_mid_turn_records_the_running_turn_too(tmp_path):
+    # The agent commits its own work while its turn is still running. Everything said up to that
+    # moment belongs in that commit — including the prompt that asked for the work, which a force
+    # commit would otherwise trim for having no reply yet. The turn is anchored on its USER id, so
+    # its remainder is recorded by a later commit.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-mid",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "first ask", "Done.", TokenUsage(total=3), None),
+            SessionTurn("u2", "a2", "use queue that test please", "", TokenUsage(total=7), None, complete=False),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = _finish_at_commit(engine, session, commit_fn)
+
+    assert result is True
+    assert [t.user_prompt for t in commits[0]["turns"]] == ["first ask", "use queue that test please"]
+    assert state.backend_message_id_for("ses-mid") == "u2"

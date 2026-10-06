@@ -12615,3 +12615,14 @@ def test_the_pause_pipe_never_swallows_a_keystroke(monkeypatch):
         os.close(saved_in)
         os.close(master)
         os.close(slave)
+
+
+def test_a_commit_flush_request_wakes_the_git_worker_without_marking_a_change():
+    # A `git commit` writes `.agitrack/flush-request` and waits a few seconds for the session to
+    # record the conversation so far. The idle worker sleeps up to 30s, so the request must wake it
+    # at once — but it is not a worktree edit, and must not hold the commit gate open as one.
+    from agitrack.proxy.runner import RepoChangeHandler
+
+    changed, wake = threading.Event(), threading.Event()
+    RepoChangeHandler("/repo", changed, wake).on_any_event(_Event("modified", "/repo/.agitrack/flush-request"))
+    assert wake.is_set() and not changed.is_set()
