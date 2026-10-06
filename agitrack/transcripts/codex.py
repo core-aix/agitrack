@@ -29,6 +29,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 from agitrack.transcripts import capabilities as caps
@@ -1307,6 +1308,8 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
             continue
         if resolved != root and not resolved.startswith(root + os.sep):
             continue
+        if paths.in_nested_repo(root, resolved):
+            continue  # a nested repository's session is that repository's to track
         session_id = _id_from_path(path)
         if not session_id:
             continue

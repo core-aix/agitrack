@@ -309,6 +309,23 @@ class CommitEngine:
             self._debug(f"tracking floor lookup failed: {error!r}")
             return None
 
+    def _redacted_turn_test(self) -> Callable[[SessionTurn], bool]:
+        """Whether a turn began inside a window removed with ``agitrack redact``."""
+        root = getattr(self.repo, "repo", None)
+        windows: list[tuple[float, float]] = []
+        if root is not None:
+            try:
+                from agitrack.redact import redacted_windows
+
+                windows = redacted_windows(Path(root))
+            except Exception as error:
+                self._debug(f"redaction windows lookup failed: {error!r}")
+        if not windows:
+            return lambda _turn: False
+        from agitrack.redact import in_windows
+
+        return lambda turn: in_windows(getattr(turn, "started_at", None), windows)
+
     def _skip_untracked_turns(self, turns: list[SessionTurn]) -> None:
         """Advance this conversation's watermark past turns from the untracked stretch, so they
         are not re-exported and re-dropped on every poll for the rest of the conversation's life.
@@ -398,6 +415,9 @@ class CommitEngine:
         if not turns:
             return False
         backend_commits = list(backend_commits or [])
+        # Turns from a window the user removed with `agitrack redact`: still counted (their
+        # tokens were spent and their edits are in the tree), but no word of them is written.
+        redacted = self._redacted_turn_test()
 
         if accumulate_trace_only_on_commit:
             # Actions / shell mode: do the staged check first, accumulate only
@@ -422,6 +442,9 @@ class CommitEngine:
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
+                if redacted(turn):
+                    self._add_turn_usage(turn)
+                    continue
                 # Every entry carries when its turn began, so the trace's age cap can place it.
                 at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
@@ -444,6 +467,7 @@ class CommitEngine:
             prompts = [
                 p
                 for turn in turns
+                if not redacted(turn)
                 for p in ([turn.user_prompt, *turn.queued_followups])
                 if p and not _is_background_event(p)
             ]
@@ -465,6 +489,8 @@ class CommitEngine:
             # cap can place the entry (see message._limit_trace_age).
             entries: list[tuple[str, str, bool, float | None]] = []
             for turn in turns:
+                if redacted(turn):
+                    continue
                 at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     if _is_background_event(turn.user_prompt):

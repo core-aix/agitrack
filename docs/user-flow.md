@@ -695,6 +695,35 @@ tracker that outlives the command cannot go on writing the conversation into com
 
 ---
 
+## 10b. Removing a recorded conversation (`agitrack redact`)
+
+`agitrack redact` takes interaction traces back out of history, for a conversation that should
+never have been recorded. It selects turns by commit (`--commit`) or by when they took place
+(`--since` / `--until`), and rewrites only commit messages: every rewritten commit keeps its files,
+author and dates, so the working tree, index and checkout do not change.
+
+```mermaid
+flowchart TD
+  cmd(["agitrack redact --commit REV / --since T --until T"]) --> sel{"Which turns?"}
+  sel -->|"--commit"| all[["Every turn recorded in that commit"]]
+  sel -->|"--since/--until"| win[["Every turn whose recorded span overlaps the window<br/>(a commit with no span: placed by its own date)"]]
+  all --> any{"Anything recorded to remove?"}
+  win --> any
+  any -->|No| remember[["Nothing in history. A window is still remembered,<br/>so its uncommitted turns never reach a commit message"]]
+  any -->|Yes| show[["List the commits (ids and dates only, never the text),<br/>the branches rewritten, and any remote or tag that keeps the original"]]
+  show --> dry{"--dry-run?"}
+  dry -->|Yes| done0(["Nothing changed"])
+  dry -->|No| ask{"Rewrite these commit messages? [y/N]<br/>(skipped with --yes; refused without a terminal)"}
+  ask -->|No| done0
+  ask -->|Yes| lock{"Who holds the repository?"}
+  lock -->|"Nobody"| rewrite
+  lock -->|"A background tracker"| pause[["Stop it (it records its final turn on the way out)"]] --> rewrite
+  lock -->|"An interactive session"| refuse(["Refused: quit the session first"])
+  rewrite[["Plan again under the lock, then rewrite: the trace becomes a note,<br/>aGiTrack's subject/summary of that turn too (unless --keep-summary),<br/>metadata kept plus trace_removed. Branches, pending latent turns,<br/>notes and the tracker watermark follow the new ids"]]
+  rewrite --> report[["Report: force-push needed for pushed branches; tags untouched;<br/>--purge expires the reflog and prunes the originals"]]
+  report --> restart(["A stopped background tracker is started again in the same commit mode"])
+```
+
 ## 11. Session sharing
 
 Sharing pushes a session's **redacted** backend transcript to `origin` on a custom ref

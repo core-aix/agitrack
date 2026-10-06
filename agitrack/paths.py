@@ -70,3 +70,27 @@ def contains_segments(path: str, segments: str) -> bool:
     haystack = _fold(path) if os.name == "nt" else slash(path)
     needle = segments.casefold() if os.name == "nt" else segments
     return needle in haystack
+
+
+def in_nested_repo(directory: str | os.PathLike, path: str | os.PathLike) -> bool:
+    """Whether *path* lies inside a git repository NESTED in the repository at *directory* — a
+    submodule, or a ``git init`` / clone in a subfolder.
+
+    Such a repository is tracked separately, so a session run there belongs to IT: listing it
+    among the parent's sessions (backtrace, bulk share) credited the parent with the nested
+    repo's whole conversation. Answered from the filesystem alone (a ``.git`` entry on the way up,
+    stopping short of *directory*), because it runs once per session in a listing. A *directory*
+    that is not itself a repository has no "nested" ones: every repo under it is just a repo, and
+    a backtrace over a plain folder keeps them all."""
+    root = os.path.realpath(os.fspath(directory))
+    if not os.path.exists(os.path.join(root, ".git")):
+        return False
+    current = os.path.realpath(os.fspath(path))
+    while current != root and current.startswith(root + os.sep):
+        if os.path.exists(os.path.join(current, ".git")):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return False

@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 
@@ -236,6 +237,8 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
             continue
         if dpath != directory and directory not in dpath.parents:
             continue
+        if paths.in_nested_repo(directory, dpath):
+            continue  # a nested repository's session is that repository's to track
         updated = session.get("updated") or session.get("created") or 0
         title = session.get("title")
         ref = SessionRef(id=str(sid), updated=_to_seconds(updated), label=title if isinstance(title, str) else None)

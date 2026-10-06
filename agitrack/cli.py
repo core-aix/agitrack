@@ -229,6 +229,7 @@ def _looks_like_a_long_path_failure(message: str) -> bool:
 _COMMANDS: dict[str, str] = {
     "status": "report whether aGiTrack is running for this repository, and in which mode",
     "stop": "stop whatever aGiTrack is running for this repository, in any mode",
+    "redact": "remove the interaction trace of chosen commits, or of a time window, from history",
 }
 
 
@@ -488,6 +489,50 @@ def _dispatch(argv: list[str] | None = None) -> int:
         "<path>` to list or stop only that repository's daemons; without it the reach is every "
         "repository you have. A non-interactive `--daemons stop` needs `--yes`, since there is "
         "no one there to answer the confirmation.",
+    )
+    redact = parser.add_argument_group(
+        "agitrack redact",
+        "Remove interaction traces that should never have been recorded (a password pasted into "
+        "the wrong window, a message meant for someone else). Rewrites the affected commit "
+        "MESSAGES only: files, the working tree and the index are untouched. Example: "
+        "`agitrack redact --commit abc1234` or `agitrack redact --since '2026-10-06 14:00' "
+        "--until '2026-10-06 15:30'`.",
+    )
+    redact.add_argument(
+        "--commit",
+        dest="redact_commits",
+        action="append",
+        metavar="REV",
+        help="with `redact`: remove every turn's trace from this commit (repeatable)",
+    )
+    redact.add_argument(
+        "--since",
+        dest="redact_since",
+        metavar="TIME",
+        help="with `redact`: start of the window (ISO date/time in local time, or e.g. 3h / 2d ago)",
+    )
+    redact.add_argument(
+        "--until",
+        dest="redact_until",
+        metavar="TIME",
+        help="with `redact`: end of the window (a bare date means the end of that day; default now)",
+    )
+    redact.add_argument(
+        "--keep-summary",
+        action="store_true",
+        help="with `redact`: keep aGiTrack's subject/summary of a redacted turn (by default it is "
+        "removed too, since it was written from the trace and often quotes the prompt)",
+    )
+    redact.add_argument(
+        "--purge",
+        action="store_true",
+        help="with `redact`: also expire the reflog and prune the original commits from this clone",
+    )
+    redact.add_argument(
+        "--dry-run",
+        dest="redact_dry_run",
+        action="store_true",
+        help="with `redact`: show what would be rewritten and change nothing",
     )
     parser.add_argument(
         "--yes",
@@ -889,6 +934,29 @@ def _dispatch(argv: list[str] | None = None) -> int:
         from agitrack.stop import stop_everything
 
         return stop_everything(stop_repo, assume_yes=args.yes)
+
+    if command == "redact":
+        # `agitrack redact`: take interaction traces back out of history (agitrack/redact.py).
+        try:
+            redact_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(_no_repo_message(Path(args.repo).expanduser(), error))
+            return 1
+        from agitrack import redact as redaction
+
+        return redaction.run(
+            redact_repo,
+            commits=args.redact_commits,
+            since=args.redact_since,
+            until=args.redact_until,
+            keep_summary=args.keep_summary,
+            purge=args.purge,
+            assume_yes=args.yes,
+            dry_run=args.redact_dry_run,
+        )
+    elif args.redact_commits or args.redact_since or args.redact_until:
+        print("`--commit`, `--since` and `--until` belong to `agitrack redact`; e.g. `agitrack redact --commit <sha>`.")
+        return 2
 
     # Bare `agitrack` on a terminal: ASK which mode, rather than silently starting the one that
     # happened to be the historical default. aGiTrack has several modes that look nothing alike

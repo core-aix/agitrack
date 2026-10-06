@@ -2466,3 +2466,31 @@ def test_a_commit_made_mid_turn_records_the_running_turn_too(tmp_path):
     assert result is True
     assert [t.user_prompt for t in commits[0]["turns"]] == ["first ask", "use queue that test please"]
     assert state.backend_message_id_for("ses-mid") == "u2"
+
+
+def test_a_turn_from_a_redacted_window_is_counted_but_never_written(tmp_path):
+    """`agitrack redact --since/--until` remembers its window, because the conversation in it
+    may not be committed yet: the next commit would otherwise write it straight back. The turn's
+    tokens still count (they were spent) and its edits still commit; no word of it is written."""
+    from agitrack import redact
+
+    redact.remember_window(tmp_path, 1_790_000_000, 1_790_003_600)
+    engine, repo, state = _engine(tmp_path)
+    repo.repo = tmp_path  # where the engine looks for the remembered windows
+    hidden = _turn("my password is hunter2", "noted", total=7, output=3)
+    hidden.started_at = 1_790_000_100
+    kept = _turn("add the tests", "added", total=5, output=2)
+    kept.started_at = 1_790_009_000
+
+    engine.commit_turns(
+        turns=[hidden, kept],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+
+    assert repo.message is not None
+    assert "hunter2" not in repo.message
+    assert "add the tests" in repo.message
+    assert "tokens_since_last_commit_output: 5" in repo.message  # both turns' tokens

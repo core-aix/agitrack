@@ -351,7 +351,7 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, Path]]:
         for ref in _refs_in_project_dir(project_dir):
             path = project_dir / f"{ref.id}.jsonl"
             cwd = _first_cwd(path)
-            if cwd is not None and _within(directory, cwd):
+            if cwd is not None and _within(directory, cwd) and not paths.in_nested_repo(directory, cwd):
                 out.append((ref, path))
     out.sort(key=lambda item: item[0].updated, reverse=True)
     return out

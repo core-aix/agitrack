@@ -180,6 +180,27 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | The proxy's `_manual_record` survives a pruned latent object too — the re-anchor lived ONLY in the tracker, so the daemon coped and interactive `-m` raised on every turn for the rest of the session | `test_the_proxys_own_manual_copy_also_survives_a_pruned_latent_object` | real-git |
 | The tail trim of `prune_abandoned_refs` is actually exercised: a trailing turn that left the code exactly as HEAD has it is dropped, and the turn that wrote code is kept. (The previous test recorded a "conversation-only" turn that `gate()` silently refused, so the chain never grew a tail and its `len <= before` assertion held no matter what.) | `test_a_trailing_turn_that_left_the_code_as_head_has_it_is_trimmed`, `test_the_trim_keeps_the_turn_that_actually_wrote_code`, `test_a_turn_that_only_talked_never_reaches_the_chain_at_all` | real-git |
 
+## 6d. Removing a recorded conversation (`agitrack redact`, `tests/test_redact.py`)
+| Flow | Test | Kind |
+| --- | --- | --- |
+| `--commit` removes that commit's traces; trees, the working tree and the descendants' content are unchanged; the aGiTrack subject/summary goes with the trace; metadata stays | `test_a_commit_is_redacted_and_everything_but_its_messages_is_left_as_it_was` | real git |
+| `--since/--until` removes only the turns inside the window, even within one folded manual-mode commit, and never the user's own subject | `test_a_window_redacts_only_the_turns_inside_it_even_within_one_folded_commit` | real git |
+| Every local branch holding the commit is rewritten; a redacted commit's summary note is dropped and other notes follow the new ids | `test_every_local_branch_holding_the_commit_is_rewritten_and_a_summary_note_is_dropped` | real git |
+| Pending latent turns (`refs/agitrack/manual/*`) are rewritten too | `test_pending_latent_turns_are_rewritten_too` | real git |
+| A window is remembered: a turn from it committed later is counted but never written | `test_a_window_is_remembered_for_turns_that_are_not_committed_yet`, `test_a_turn_from_a_redacted_window_is_counted_but_never_written` | real git / mock |
+| Idempotent, `--dry-run` changes nothing, no selection is refused, a quoted metadata block is not a turn | `test_running_it_twice_changes_nothing_the_second_time`, `test_a_dry_run_changes_nothing`, `test_nothing_is_rewritten_without_a_selection`, `test_a_metadata_block_quoted_inside_a_trace_is_not_mistaken_for_a_turn` | real git |
+| A running background tracker is stopped, history rewritten, and the tracker restarted in the same mode; the next turn commits normally | verified live (two real trackers, real OpenCode turns); not yet automated | live |
+
+## 6e. Repositories nested inside a tracked one (`tests/test_nested_repos.py`)
+| Flow | Test | Kind |
+| --- | --- | --- |
+| A nested repo (submodule or independent subfolder repo) is never offered for staging in the parent | `test_a_nested_repo_is_never_offered_for_staging_in_the_parent` | real git |
+| Edits inside a nested repo are not a change of the parent (`has_changes`, `has_tracked_changes`) | `test_work_inside_a_nested_repo_is_not_a_change_to_the_parent` | real git |
+| The parent's snapshot and latent gate ignore nested repos, even after they commit | `test_the_parents_snapshot_ignores_nested_repos_even_after_they_commit`, `test_the_parents_latent_gate_records_nothing_for_nested_work` | real git |
+| Each nested repo resolves to its own root, lock and hooks dir | `test_each_repository_resolves_to_its_own_root_and_hooks` | real git |
+| A nested repo's agent sessions are not listed as the parent's (backtrace / bulk share) | `test_a_session_run_in_a_nested_repo_is_not_the_parents`, `test_claude_backtrace_listing_leaves_the_nested_repos_sessions_to_it` | real git |
+| Two trackers (parent + nested) each commit only their own turn and files | verified live with real OpenCode turns; not yet automated | live |
+
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
 |---|---|---|
