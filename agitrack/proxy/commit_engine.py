@@ -214,6 +214,16 @@ def _is_dialog_keystroke(turn) -> bool:
     return True
 
 
+def _export(backend, repo_path, session_id: str, collect_edits: bool):
+    """``backend.export_session``, with each turn's edits when asked for and supported."""
+    if collect_edits:
+        try:
+            return backend.export_session(repo_path, session_id, collect_edits=True)
+        except TypeError:
+            pass  # a backend (or test double) that cannot recover edits: export without them
+    return backend.export_session(repo_path, session_id)
+
+
 def turn_is_finished(turn) -> bool:
     """Whether *turn* can still receive more messages from the backend.
 
@@ -279,8 +289,11 @@ class CommitEngine:
         *,
         debug_fn: _DebugFn | None = None,
         full_agent_messages: bool | None = None,
+        collect_edits: bool = False,
     ) -> None:
         self.repo = repo
+        # Export each turn WITH the files it edited, which routing needs (agitrack.routing).
+        self._collect_edits = collect_edits
         self.state = state
         self._debug = debug_fn or (lambda *a, **kw: None)
         # Per-run override for the "include all agent messages" behaviour (e.g. the
@@ -843,6 +856,7 @@ class CommitEngine:
         on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
         note_in_flight_fn: Callable[[dict | None], None] | None = None,
         at_commit: bool = False,
+        turn_filter: Callable[[SessionTurn], bool] | None = None,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -871,6 +885,11 @@ class CommitEngine:
         everything said before the commit. A running turn is anchored on its user id like any
         force capture, so the rest of it is recorded by a later commit, counting only its new
         tokens.
+
+        ``turn_filter`` keeps only the turns that belong to THIS repository (see
+        :mod:`agitrack.routing`): a conversation may have edited several repositories, and each
+        records the turns that touched it. A run of turns that all belong elsewhere and have all
+        finished is stepped past, so it is not re-exported and re-dropped on every poll.
         """
         parse_thread = session.agent_parse_thread
         if parse_thread and parse_thread.is_alive():
@@ -939,6 +958,28 @@ class CommitEngine:
                 f"session_id={new_session_id}"
             )
             self._skip_untracked_turns(untracked_turns)
+
+        if turn_filter is not None and all_turns:
+            kept = [turn for turn in all_turns if turn_filter(turn)]
+            if not kept:
+                # Step past them, but never past the conversation's LAST turn: it can still
+                # continue (a backend may close each step of a running turn, so it can look
+                # finished between two edits), and a turn that wrote only elsewhere so far may
+                # write here next. Only a turn some later turn has followed is over for sure.
+                settled = all_turns[:-1]
+                if settled and all(turn_is_finished(turn) for turn in settled):
+                    debug_fn(
+                        f"stepping past {len(settled)} turn(s) that belong to other repositories "
+                        f"session_id={new_session_id}"
+                    )
+                    self._skip_untracked_turns(settled)
+                return False, awaited_followups
+            if len(kept) != len(all_turns):
+                debug_fn(
+                    f"routing: {len(all_turns) - len(kept)} turn(s) belong to other repositories "
+                    f"session_id={new_session_id}"
+                )
+            all_turns = kept
 
         # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
         # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
@@ -1239,7 +1280,7 @@ class CommitEngine:
                 # single global one), so switching between conversations never replays or
                 # double-counts a conversation's already-committed turns.
                 last_message_id = state.backend_message_id_for(session_id)
-                exported = backend.export_session(repo.repo, session_id) if session_id else None
+                exported = _export(backend, repo.repo, session_id, self._collect_edits) if session_id else None
                 turn_count = len(exported.turns) if exported else 0
                 final_count = len([t for t in exported.turns if t.final_response]) if exported else 0
                 debug_fn(

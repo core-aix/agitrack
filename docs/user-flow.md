@@ -724,6 +724,23 @@ flowchart TD
   report --> restart(["A stopped background tracker is started again in the same commit mode"])
 ```
 
+## 10c. Which repository a turn is recorded in
+
+A conversation can edit several repositories (its own, one nested inside it, a sibling
+checkout). Each turn's trace is recorded in the repositories it edited.
+
+```mermaid
+flowchart TD
+  turn(["A finished turn, with the files it edited"]) --> dest{"Which git repositories hold those files?<br/>(the nearest repository: a nested repo, not its parent)"}
+  dest -->|"None (it only talked, or edited scratch files)"| home[["Recorded where the conversation started"]]
+  dest -->|"Includes the repository it started in"| both[["Recorded where it started"]]
+  dest -->|"Only other repositories"| tracked{"Is every one of them tracked by aGiTrack<br/>(a tracker running, or auto-start armed)?"}
+  tracked -->|No| home
+  tracked -->|Yes| away[["Left to those repositories"]]
+  both --> others
+  away --> others[["Every other repository it edited records it too: its tracker reads<br/>conversations started elsewhere (every 10 s, and when a commit is made)<br/>and keeps the turns that edited it, prompted after it started routing"]]
+```
+
 ## 11. Session sharing
 
 Sharing pushes a session's **redacted** backend transcript to `origin` on a custom ref

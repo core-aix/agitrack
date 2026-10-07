@@ -6558,6 +6558,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             return
         self._service_commit_flush_request()  # a `git commit` waiting for the conversation so far
         self._maybe_agent_commit()
+        self._record_elsewhere()
         self._poll_base_advanced()
         self._service_manual_commit_mode()  # --manual-commits: react to a user/external commit
         self._warn_if_base_edited()
@@ -10135,6 +10136,47 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         )
         return choice == "Yes, terminate them and exit"
 
+    @property
+    def _routes_turns(self) -> bool:
+        """Whether this session's turns are routed between repositories (agitrack.routing).
+        Only without a worktree: a worktree session's agent is confined to its worktree, and a
+        turn routed away from it would have nowhere to be recorded while this session holds the
+        repository."""
+        return not self._use_worktrees
+
+    def _home_turn_filter(self):
+        if not self._routes_turns:
+            return None
+        from agitrack import routing
+
+        root = str(self.base_repo.repo)
+        return routing.Router(root).home_filter(root)
+
+    def _record_elsewhere(self, *, at_commit: bool = False) -> bool:
+        """Record turns of conversations started in OTHER folders that edited this repository
+        (agitrack.routing), the same way a background tracker does. Every ten seconds on the git
+        worker, and at once when a commit is being made."""
+        if not self._routes_turns:
+            return False
+        now = time.monotonic()
+        if not at_commit and now - getattr(self, "_elsewhere_checked_at", 0.0) < 10.0:
+            return False
+        self._elsewhere_checked_at = now
+        from agitrack import routing
+
+        try:
+            return routing.record_elsewhere(
+                self.base_repo,
+                self.state,
+                commit_fn=self._create_agent_commit_from_turns_popup,
+                debug_fn=self._debug,
+                require_complete=not at_commit,
+                at_commit=at_commit,
+            )
+        except Exception as error:
+            self._debug(f"recording other folders' conversations failed: {error!r}")
+            return False
+
     def _record_conversation_for_commit(self) -> None:
         """A commit is being made right now (by the user or by the agent itself): record every
         conversation up to this moment so the commit's fold carries it. Joins the in-flight
@@ -10150,6 +10192,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         self._finish_agent_parse_if_ready(
             quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
         )
+        self._record_elsewhere(at_commit=True)
 
     def _commit_latest_turn_sync(self) -> None:
         # Synchronously (joining the parse worker) commit the latest completed
@@ -11376,7 +11419,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # the user switched sessions, and resolving `self.backend` / `self.repo`
         # at that point would hit the WRONG session. CommitEngine.start_parse
         # captures the owning session explicitly and writes results back to it.
-        return CommitEngine(self.repo, self.state, debug_fn=self._debug).start_parse(
+        # Without a worktree the agent edits wherever it likes, so each turn is read with the
+        # files it edited and routed to the repositories it changed (agitrack.routing).
+        return CommitEngine(self.repo, self.state, debug_fn=self._debug, collect_edits=self._routes_turns).start_parse(
             session=self.active,
             discover_session_id_fn=self._discover_spawned_session,
             debug_fn=self._debug,
@@ -11417,6 +11462,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
             note_in_flight_fn=self._note_in_flight,
             at_commit=at_commit,
+            turn_filter=self._home_turn_filter(),
         )
         self._awaited_followups = new_awaited
         if committed is not None:

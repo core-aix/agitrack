@@ -71,7 +71,7 @@ def _backend_or_skip(name, tmp_path):
 
 def _patches_for(directory, path="calc.py"):
     """Every reconstructed patch line the backtrace holds for ``path`` in ``directory``."""
-    claude._LAST_EXPORT = None  # the exporter memoizes per file identity; each build must re-read
+    claude._EXPORTS.clear()  # the exporter memoizes per file identity; each build must re-read
     view = bt.build_backtrace(directory)
     lines: list[str] = []
     for edits in view.file_edits.values():
@@ -137,7 +137,7 @@ def test_the_recorded_harness_version_matches_the_installed_cli(backend_name, tm
     )
     assert result.exit_code == 0, f"{backend_name} run failed: {result!r}"
 
-    claude._LAST_EXPORT = None
+    claude._EXPORTS.clear()
     view = bt.build_backtrace(tmp_path)
     recorded = {
         line.split(": ", 1)[1].strip()

@@ -201,6 +201,16 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | A nested repo's agent sessions are not listed as the parent's (backtrace / bulk share) | `test_a_session_run_in_a_nested_repo_is_not_the_parents`, `test_claude_backtrace_listing_leaves_the_nested_repos_sessions_to_it` | real git |
 | Two trackers (parent + nested) each commit only their own turn and files | verified live with real OpenCode turns; not yet automated | live |
 
+## 6f. One conversation editing several repositories (`tests/test_routing.py`)
+| Flow | Test | Kind |
+| --- | --- | --- |
+| A file belongs to the NEAREST repository (a nested repo, not its parent); a path outside any repo is no destination | `test_a_file_belongs_to_the_nearest_repository` | real git |
+| Home keeps its own edits, talk, scratch edits and turns for untracked destinations; drops a turn that edited only tracked repositories elsewhere; a running turn is not placed yet | `test_home_keeps_its_own_work_talk_and_anything_it_cannot_hand_over`, `test_a_running_turn_is_not_placed_until_it_finishes` | real git |
+| A repository takes exactly the turns from elsewhere that edited it, never history from before routing began, relative paths resolved against the conversation's folder | `test_a_repository_takes_exactly_the_turns_that_edited_it_from_elsewhere` | real git |
+| One Claude conversation started in a parent, editing the parent and a nested repo: each tracker records only its share, under its own watermark, and the nested repo does not start tracking that conversation as its own | `test_one_conversation_is_split_between_the_parent_and_the_nested_repo` | real git + real transcript |
+| A sibling checkout finds a conversation started elsewhere that names its path | `test_a_sibling_repository_takes_the_turns_that_edited_it` | real git + real transcript |
+| Live: parent + nested repo, a tracker each, one turn writing a file in each: both commits carry the turn and only their own file, on Claude, Codex and OpenCode | verified live; not automated (needs real backends) | live |
+
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
 |---|---|---|

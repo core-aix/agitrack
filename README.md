@@ -586,9 +586,11 @@ agitrack redact --commit abc1234 --dry-run                        # show what wo
 - **A running background tracker is restarted for you**: it is stopped while history is rewritten and comes back in the same commit mode. An interactive session has to be quit first.
 - **What it cannot reach**: a remote that already has the commits (force-push the rewritten branch, and know that the original text stays in the remote's history, pull requests and other clones until then), tags, and this clone's reflog (add `--purge` to expire it and prune the originals now). The command lists all of these before it asks for confirmation; `--yes` skips the question.
 
-### Repositories inside a repository
+### Repositories inside a repository, and conversations that edit several
 
-A git repository nested inside a tracked one (a submodule, or a separate repository cloned or `git init`-ed into a subfolder) is tracked **separately**: run aGiTrack inside it (`cd sub && agitrack -b`) and its turns are committed there, with their own trace, lock and hooks. The parent never stages a nested repository, never counts edits inside one as a change of its own, and does not list a nested repository's agent sessions as its own in the backtrace. A submodule pointer that has moved is still an ordinary change of the parent, for you to commit when you choose.
+A git repository nested inside a tracked one (a submodule, or a separate repository cloned or `git init`-ed into a subfolder) is tracked **separately**: run aGiTrack inside it (`cd sub && agitrack -b`) and its work is committed there, with its own trace, lock and hooks. The parent never stages a nested repository, never counts edits inside one as a change of its own, and does not list a nested repository's agent sessions as its own in the backtrace. A submodule pointer that has moved is still an ordinary change of the parent, for you to commit when you choose.
+
+An agent is not limited to the folder you start it in, so **each turn's trace goes to the repositories it actually edited**. A conversation started in a parent folder that edits both the parent and a nested repository (or a sibling checkout) shows up in both repositories' commits, each with the files that changed there. A repository's tracker records its own conversations' turns, plus the turns of conversations started elsewhere that edited files inside it. A turn that changed nothing in its own repository is left to the repositories it did change, but only when aGiTrack tracks all of them; otherwise it stays where it started, so no trace is lost. Turns from before a repository started taking part are never claimed. This works the same with Claude, Codex and OpenCode.
 
 ### Repository dashboard
 

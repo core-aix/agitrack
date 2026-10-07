@@ -51,6 +51,7 @@ from pathlib import Path
 from agitrack.commits.message import AGITRACK_SUBJECT_PREFIX, TRACE_HEADER
 from agitrack.fileio import atomic_write_text, read_json_object
 from agitrack.git import GitRepo, RepoLock
+from agitrack.proc import console_isolation_kwargs
 
 # The metadata line a redacted block gains. Its presence is also how a second run recognises a
 # turn that is already redacted.
@@ -356,8 +357,34 @@ def _contains_any(repo: GitRepo, ref: str, targets: dict[str, str]) -> bool:
     return any(sha in reachable for sha in targets)
 
 
+def _cat_commit(repo: GitRepo, sha: str) -> str:
+    """A commit object's exact text. Read as BYTES: the text pipe would translate line endings
+    on Windows, and the object is written back byte for byte (see :func:`_write_commit`)."""
+    raw = subprocess.run(
+        ["git", "-C", str(repo.repo), "cat-file", "commit", sha],
+        capture_output=True,
+        check=True,
+        **console_isolation_kwargs(),
+    ).stdout
+    return raw.decode("utf-8", errors="surrogateescape")
+
+
+def _write_commit(repo: GitRepo, text: str) -> str:
+    """Store *text* as a commit object and return its id. Written as BYTES: through a text pipe
+    Windows turns every ``\n`` into ``\r\n``, and git rejects the object ("badTreeSha1:
+    invalid 'tree' line format") — which is exactly how Windows CI failed."""
+    out = subprocess.run(
+        ["git", "-C", str(repo.repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+        input=text.encode("utf-8", errors="surrogateescape"),
+        capture_output=True,
+        check=True,
+        **console_isolation_kwargs(detach_stdin=False),
+    ).stdout
+    return out.decode("ascii").strip()
+
+
 def _raw_message(repo: GitRepo, sha: str) -> str:
-    raw = _git(repo, "cat-file", "commit", sha)
+    raw = _cat_commit(repo, sha)
     return raw.split("\n\n", 1)[1] if "\n\n" in raw else ""
 
 
@@ -400,9 +427,9 @@ def apply_redaction(repo: GitRepo, plan: Plan, *, keep_summary: bool = False) ->
         new_parents = [mapping.get(parent, parent) for parent in parents]
         if sha not in plan.targets and new_parents == parents:
             continue
-        raw = _git(repo, "cat-file", "commit", sha)
+        raw = _cat_commit(repo, sha)
         obj = _rewritten_object(raw, new_parents, plan.targets.get(sha))
-        mapping[sha] = _git(repo, "hash-object", "-t", "commit", "-w", "--stdin", input_text=obj).strip()
+        mapping[sha] = _write_commit(repo, obj)
     for ref, old in tips.items():
         new = mapping.get(old)
         if new:

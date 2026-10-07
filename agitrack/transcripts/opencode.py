@@ -1366,3 +1366,34 @@ def session_model(session_id: str) -> str | None:
     if not model_id:
         return None
     return f"{provider}/{model_id}" if provider else str(model_id)
+
+
+def recent_sessions(since: float) -> list[tuple[SessionRef, str]]:
+    """Every top-level OpenCode conversation, in ANY directory, updated since ``since``: ``(ref,
+    recorded directory)``. Read from OpenCode's database, read-only and never blocking (the same
+    rules as :func:`session_last_activity`), because ``opencode session list`` only lists the
+    project of the folder it runs in: run from a nested repository it does not see a conversation
+    started in the parent, which is exactly the one routing has to find (agitrack.routing)."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return []
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            rows = connection.execute(
+                "SELECT id, directory, time_updated, title FROM session "
+                "WHERE parent_id IS NULL AND time_updated > ? ORDER BY time_updated DESC LIMIT ?",
+                (int(since * 1000), _ACTIVITY_ROW_LIMIT),
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception:
+        return []  # wrong schema, locked, corrupt, no sqlite3: no signal
+    out: list[tuple[SessionRef, str]] = []
+    for sid, directory, updated, title in rows:
+        if not sid or not isinstance(directory, str):
+            continue
+        out.append((SessionRef(id=str(sid), updated=_to_seconds(updated), label=title or None), directory))
+    return out

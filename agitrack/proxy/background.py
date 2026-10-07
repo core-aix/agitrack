@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from agitrack import __version__, tracking_gap
+from agitrack import __version__, routing, tracking_gap
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
@@ -1999,12 +1999,19 @@ class BackgroundRunner:
         ``at_commit`` is the pre-commit flush: a ``git commit`` is being made right now, so every
         conversation up to this moment is recorded into it (see
         ``CommitEngine.finish_parse_if_ready``)."""
+        home = self._process_home(require_complete=require_complete, at_commit=at_commit)
+        elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
+        return home or elsewhere
+
+    def _process_home(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
+        """The conversation started in this repository: every turn except those that edited
+        only OTHER tracked repositories (which record them themselves, see agitrack.routing)."""
         session_id = self._tracked_session_id()
         if session_id is None:
             self._debug("no human-driven session in this repo; nothing to export")
             return False
         session = self._bare_session()
-        engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
+        engine = CommitEngine(self.repo, self.state, debug_fn=self._debug, collect_edits=True)
         # Follow an in-backend session switch (the user starting or resuming a conversation)
         # while ignoring programmatic ones. The per-conversation watermark keeps each
         # conversation's turns counted exactly once.
@@ -2032,12 +2039,34 @@ class BackgroundRunner:
             commit_fn=self._record_turns,
             note_in_flight_fn=self._note_in_flight,
             at_commit=at_commit,
+            turn_filter=routing.Router(str(self.repo.repo)).home_filter(str(self.repo.repo)),
         )
         # The engine records the session's still-running background tasks onto the session it was
         # given. That object is thrown away each cycle, so carry the answer onto the runner — the
         # fold's settle rule needs it (see `_worktree_settled`).
         self._live_background_tasks = list(getattr(session, "live_background_task_ids", None) or [])
         return bool(committed)
+
+    # How often the conversations started OUTSIDE this repository are checked for turns that
+    # edited it. A commit being made checks at once (`at_commit`), whatever the clock says.
+    _ELSEWHERE_EVERY_SECONDS = 10.0
+
+    def _process_elsewhere(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
+        """Record the turns of conversations started in ANOTHER folder (a parent directory, a
+        sibling checkout, anywhere) that edited files in this repository (agitrack.routing)."""
+        now = time.monotonic()
+        if not at_commit and require_complete:
+            if now - getattr(self, "_elsewhere_checked_at", 0.0) < self._ELSEWHERE_EVERY_SECONDS:
+                return False
+        self._elsewhere_checked_at = now
+        return routing.record_elsewhere(
+            self.repo,
+            self.state,
+            commit_fn=self._record_turns,
+            debug_fn=self._debug,
+            require_complete=require_complete,
+            at_commit=at_commit,
+        )
 
     def _note_in_flight(self, facts: dict | None) -> None:
         """Remember (or clear) the running turn's facts. The pre-commit flush re-renders the

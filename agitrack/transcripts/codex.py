@@ -1838,3 +1838,23 @@ def looks_like_event_blob(text: str) -> bool:
     if not isinstance(row, dict):
         return False
     return row.get("type") in ("session_meta", "event_msg", "response_item", "turn_context", "world_state")
+
+
+def recent_sessions(since: float) -> list[tuple[SessionRef, str, Path]]:
+    """Every human-driven Codex conversation, in ANY directory, written to since ``since``:
+    ``(ref, recorded cwd, rollout path)``. Sub-agent threads and headless ``codex exec`` runs
+    are left out, as in :func:`list_sessions`."""
+    out: list[tuple[SessionRef, str, Path]] = []
+    for path in _rollout_files():  # newest mtime first
+        updated = _mtime(path)
+        if updated <= since:
+            break
+        header = _read_header(path)
+        if _is_agent_thread(header) or str(header.get("source") or "") == "exec":
+            continue
+        session_id = _id_from_path(path)
+        cwd = header.get("cwd")
+        if not session_id or not isinstance(cwd, str) or not cwd:
+            continue
+        out.append((SessionRef(id=session_id, updated=updated), cwd, path))
+    return out

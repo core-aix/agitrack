@@ -327,3 +327,16 @@ def runner_factory():
 
 # Re-export so callers can do: from conftest import make_runner
 make_runner = _make_runner
+
+
+@pytest.fixture(autouse=True)
+def _never_read_the_developers_conversations(request, monkeypatch):
+    """A tracker also reads conversations started in OTHER folders that may have edited its
+    repository (agitrack.routing.candidates) — which, unstubbed, means scanning the developer's
+    real ~/.claude, ~/.codex and OpenCode store from inside a test. Off by default; a routing
+    test opts in with ``@pytest.mark.routing`` and points the backends at its own fixtures."""
+    if request.node.get_closest_marker("routing"):
+        return
+    from agitrack import routing
+
+    monkeypatch.setattr(routing, "candidates", lambda *a, **k: [])

@@ -94,6 +94,7 @@ markers = [
     # the backend installed and authenticated, cost real tokens, and take seconds each.
     # Run with `pytest -m live` (each skips itself when its binary is absent).
     "live: calls a real backend CLI; excluded by default, run with `-m live`",
+    "routing: reads agent conversations across folders (agitrack.routing); stubbed out unless a test opts in",
 ]
 
 [tool.coverage.run]
