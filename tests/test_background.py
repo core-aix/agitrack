@@ -2845,3 +2845,78 @@ def test_a_commit_waits_for_a_tracker_that_has_started_its_flush(tmp_path):
 
     # A tracker that never picks the request up still lets the commit go after the first wait.
     assert background.request_daemon_flush(repo, timeout=0.2) is False
+
+
+def test_a_restarted_tracker_does_not_answer_the_previous_commits_flush_request(tmp_path):
+    """A request left on disk by a commit that finished before this tracker started must not be
+    answered: an answer is a FORCED capture, and answering the stale one after every restart
+    committed whatever turn was running, half done. On aGiTrack's own source checkout, where every
+    commit counts as an update and restarts the tracker, that looped (one turn, many commits)."""
+    import os
+    import time
+
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    agit = tmp_path / ".agitrack"
+    agit.mkdir(exist_ok=True)
+
+    # Answered already by the tracker that was running before.
+    (agit / "flush-request").write_text("n-answered", encoding="utf-8")
+    (agit / "flush-done").write_text("n-answered", encoding="utf-8")
+    assert background._already_answered_flush_nonce(repo) == "n-answered"
+
+    # Never answered, but older than any hook would still wait: its commit has gone ahead.
+    (agit / "flush-request").write_text("n-old", encoding="utf-8")
+    old = time.time() - 60
+    os.utime(agit / "flush-request", (old, old))
+    assert background._already_answered_flush_nonce(repo) == "n-old"
+
+    # Written moments ago and unanswered: a commit may be waiting on it across the restart.
+    (agit / "flush-request").write_text("n-fresh", encoding="utf-8")
+    assert background._already_answered_flush_nonce(repo) is None
+
+    # And the tracker really starts from it: nothing is forced at startup.
+    (agit / "flush-request").write_text("n-answered", encoding="utf-8")
+    (agit / "flush-done").write_text("n-answered", encoding="utf-8")
+    runner, _repo, _state, backend = _runner(tmp_path, manual=False)
+    forced: list[dict] = []
+    runner._process_once = lambda **kwargs: forced.append(kwargs) or False
+    runner._service_flush_requests()
+    assert forced == []
+
+
+def test_the_trackers_own_fold_commit_does_not_ask_the_tracker_to_flush(tmp_path):
+    """Its pre-commit hook would file a flush request the tracker answered right after the commit,
+    forcing a capture of the turn running at that moment."""
+    from agitrack.proxy.background import OWN_COMMIT_ENV
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+    seen: list = []
+    real_commit = repo.commit
+    repo.commit = lambda message, **kwargs: seen.append(kwargs.get("env")) or real_commit(message, **kwargs)
+
+    runner._auto_fold_pending()
+
+    assert seen == [OWN_COMMIT_ENV]
+
+
+def test_a_turn_polled_again_before_it_moved_on_owes_nothing(tmp_path):
+    """The rest of a turn captured mid-flight is owed only once it has spent tokens beyond the
+    capture. Recording it before it moved on wrote the same turn into history twice, the second
+    copy an empty block."""
+    from agitrack.proxy.commit_engine import continues_partial_capture
+
+    state = AgitrackState(tmp_path, default_backend="claude")
+    captured = TokenUsage(total=7, output=7)
+    state.set_partial_turn_usage("s1", "u1", captured.to_dict())
+
+    unchanged = SessionTurn("u1", "m1", "do x", "", TokenUsage(total=7, output=7), "m", complete=False)
+    assert continues_partial_capture(state, [unchanged], "s1") is False
+
+    moved_on = SessionTurn("u1", "m2", "do x", "done", TokenUsage(total=10, output=10), "m")
+    assert continues_partial_capture(state, [moved_on], "s1") is True
