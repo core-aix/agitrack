@@ -318,7 +318,31 @@ def flush_started_path(repo_root: Path) -> Path:
 FLUSH_WORKING_WAIT_SECONDS = 60.0
 
 
-def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
+def _already_answered_flush_nonce(repo: GitRepo) -> str | None:
+    """The flush request on disk when a tracker starts, if no commit can still be waiting on it:
+    it was answered already, or it is older than the hook's first wait (a hook that heard nothing
+    for that long has gone ahead with its commit). None when there is no request, or when it is
+    fresh enough that a commit may be waiting on it right now, across this tracker's restart."""
+    try:
+        path = _flush_request_path(repo)
+        nonce = path.read_text(encoding="utf-8").strip()
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    if not nonce:
+        return None
+    try:
+        answered = _flush_done_path(repo).read_text(encoding="utf-8").strip() == nonce
+    except OSError:
+        answered = False
+    return nonce if answered or age > _FLUSH_FIRST_WAIT_SECONDS else None
+
+
+# How long a commit's pre-commit hook waits for a tracker to pick its flush request up.
+_FLUSH_FIRST_WAIT_SECONDS = 5.0
+
+
+def request_daemon_flush(repo: GitRepo, *, timeout: float = _FLUSH_FIRST_WAIT_SECONDS) -> bool:
     """Ask the running background daemon to record any pending COMPLETED turns and (re)render the
     fold trailer RIGHT NOW, then wait (bounded) for it to acknowledge.
 
@@ -1200,8 +1224,13 @@ class BackgroundRunner:
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
         self._summary_threads: dict[str, threading.Thread] = {}
         # Nonce of the last pre-commit flush request we serviced, so a repeated request (or a stale
-        # request file across a restart) is handled at most once.
-        self._last_flush_nonce: str | None = None
+        # request file across a restart) is handled at most once. A request already on disk when
+        # this tracker starts belongs to a commit that has finished (or been answered) unless it
+        # was written moments ago: starting from None made every restart answer the previous
+        # commit's request, and an answer is a FORCED capture, so each restart committed whatever
+        # turn was running, half done. On a repository whose own commits count as an update (a
+        # source checkout of aGiTrack itself) that looped: commit, restart, capture, commit.
+        self._last_flush_nonce: str | None = _already_answered_flush_nonce(self.repo)
         # PERSISTENT tracking watermark: the HEAD up to which this daemon has accounted for AI work.
         # When a turn completes with a clean tree and HEAD has advanced past it, the new untracked
         # commits are the agent's own work (the agent/user committed it) and get COVERED with that
