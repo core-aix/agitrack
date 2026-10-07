@@ -1004,6 +1004,31 @@ class CommitEngine:
             )
             self._skip_untracked_turns(untracked_turns)
 
+        # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
+        # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
+        # otherwise the fold hook has no pending turn to fold and the commit lands with no
+        # metadata at all. Computed here, the one place that already holds both the export and
+        # the watermark, so every mode gets the same answer from the same evidence. Asked BEFORE
+        # the turn filter: a filter that keeps nothing returns early, and the previous answer (a
+        # turn running) would then outlive that turn and hold the background auto-fold back.
+        if note_in_flight_fn is not None:
+            running = all_turns[-1] if all_turns and not turn_is_finished(all_turns[-1]) else None
+            facts = None
+            if running is not None:
+                try:
+                    backend_name = self.state.backend
+                except Exception:
+                    backend_name = "unknown"  # no backend configured (tests / partial state)
+                facts = {
+                    "backend": backend_name,
+                    "backend_session_id": new_session_id,
+                    "model": exported_session.model or self.state.model,
+                    # A turn begun inside a window removed with `agitrack redact` is still
+                    # attributed, but its words are not written (as in `commit_turns`).
+                    "prompt": None if self._redacted_turn_test()(running) else running.user_prompt,
+                }
+            note_in_flight_fn(facts)
+
         if turn_filter is not None and all_turns:
             kept = [turn for turn in all_turns if turn_filter(turn)]
             if not kept:
@@ -1025,29 +1050,6 @@ class CommitEngine:
                     f"session_id={new_session_id}"
                 )
             all_turns = kept
-
-        # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
-        # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
-        # otherwise the fold hook has no pending turn to fold and the commit lands with no
-        # metadata at all. Computed here, the one place that already holds both the export and
-        # the watermark, so every mode gets the same answer from the same evidence.
-        if note_in_flight_fn is not None:
-            running = all_turns[-1] if all_turns and not turn_is_finished(all_turns[-1]) else None
-            facts = None
-            if running is not None:
-                try:
-                    backend_name = self.state.backend
-                except Exception:
-                    backend_name = "unknown"  # no backend configured (tests / partial state)
-                facts = {
-                    "backend": backend_name,
-                    "backend_session_id": new_session_id,
-                    "model": exported_session.model or self.state.model,
-                    # A turn begun inside a window removed with `agitrack redact` is still
-                    # attributed, but its words are not written (as in `commit_turns`).
-                    "prompt": None if self._redacted_turn_test()(running) else running.user_prompt,
-                }
-            note_in_flight_fn(facts)
 
         # Awaited-followup logic: a prompt queued while the agent was busy
         # belongs in the same commit as the turn it triggered.

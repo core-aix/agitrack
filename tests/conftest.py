@@ -340,3 +340,14 @@ def _never_read_the_developers_conversations(request, monkeypatch):
     from agitrack import routing
 
     monkeypatch.setattr(routing, "candidates", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _forget_the_claude_store_scan():
+    """`claude.recent_sessions` remembers the store between calls (it is asked every few
+    seconds, see its docstring); each test starts from a store it has never seen."""
+    from agitrack.transcripts import claude
+
+    claude._DIR_LISTINGS.clear()
+    claude._LAST_WRITTEN.clear()
+    claude._SWEPT_AT = float("-inf")

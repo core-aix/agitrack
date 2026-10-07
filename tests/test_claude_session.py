@@ -2037,3 +2037,55 @@ def test_overlong_project_dir_does_not_raise(tmp_path, monkeypatch):
     # Never created on disk: the point is that merely LOOKING at it must not raise.
     assert claude_transcripts._refs_in_project_dir(deep) == []
     assert claude_transcripts.list_sessions(deep) == []
+
+
+def test_the_store_scan_checks_cheaply_before_reading_anything(tmp_path, monkeypatch):
+    """Every tracker asks for recently written conversations every few seconds, over a store
+    holding every conversation this machine ever had. Between full sweeps, a folder nobody
+    added a transcript to is not re-listed and a quiet transcript is not stat'ed; a new
+    transcript is seen at once; a quiet one written to again is seen by the next full sweep
+    (or a commit's `full=True`)."""
+    import os
+    import time
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    project = tmp_path / "projects" / "-work-app"
+    project.mkdir(parents=True)
+
+    def write(name: str, mtime: float) -> Path:
+        path = project / f"{name}.jsonl"
+        path.write_text(
+            json.dumps({"type": "user", "cwd": "/work/app", "message": {"role": "user", "content": "hi"}}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(path, (mtime, mtime))
+        return path
+
+    now = time.time()
+    quiet = write("quiet", now - 7200)
+    write("busy", now - 5)
+    since = now - 3600
+    ids = lambda **k: sorted(ref.id for ref, _cwd, _path in claude_session.recent_sessions(since, **k))  # noqa: E731
+    assert ids() == ["busy"]  # the first call is a full sweep
+
+    stats: list[str] = []
+    real_stat = Path.stat
+
+    def counting_stat(self, *a, **k):
+        if self.suffix == ".jsonl":
+            stats.append(self.name)
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+    os.utime(project, (now - 1000, now - 1000))  # pin the folder's mtime: nothing added since
+    claude_session._DIR_LISTINGS.clear()
+    assert ids(full=True) == ["busy"]
+    stats.clear()
+    os.utime(quiet, (now, now))  # the quiet conversation is written to again
+    os.utime(project, (now - 1000, now - 1000))
+    assert ids() == ["busy"]  # not between sweeps: only the busy one is looked at
+    assert stats == ["busy.jsonl"]
+    assert ids(full=True) == ["busy", "quiet"]  # a full sweep (or a commit) finds it
+
+    write("fresh", now)  # a NEW conversation changes the folder, so it is seen at once
+    assert ids() == ["busy", "fresh", "quiet"]

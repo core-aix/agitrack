@@ -302,3 +302,32 @@ def test_a_commit_rereads_a_conversation_that_looks_unchanged(layout, tmp_path, 
     assert not tracker._process_elsewhere(require_complete=False)  # an ordinary poll skips it
     assert tracker._process_once(require_complete=False, at_commit=True)
     assert "fix the nested library" in _pending(tracker)
+
+
+def test_a_turn_from_elsewhere_still_running_in_this_repository_is_reported(layout, tmp_path, monkeypatch):
+    """Its edits are already in this tree while it runs, and the auto-fold commits the whole tree,
+    so the tracker must hear that it is running (it waits for it as for its own turn). A running
+    turn that has edited only somewhere else, or a finished one, is not reported."""
+    from agitrack.transcripts.types import ExportedSession
+
+    parent, inner, sibling, _scratch = layout
+    repo, state = GitRepo(inner), AgitrackState(inner, default_backend="claude")
+    seen: list[bool] = []
+
+    def run(turn: SessionTurn) -> bool:
+        candidate = routing.Candidate("claude", "s-elsewhere", str(parent), None, time.time())
+        monkeypatch.setattr(routing, "candidates", lambda root, since, full=False: [candidate])
+        monkeypatch.setattr(routing, "export_candidate", lambda c: ExportedSession("s-elsewhere", "m", None, [turn]))
+        routing.record_elsewhere(
+            repo, state, commit_fn=lambda **_k: None, debug_fn=lambda _m: None, note_running_fn=seen.append
+        )
+        return seen[-1]
+
+    routing.routing_floor(state)
+    running_here = _turn("edit the nested library", inner / "lib.py")
+    running_here.complete = False
+    assert run(running_here) is True
+    running_elsewhere = _turn("edit the sibling", sibling / "x.py")
+    running_elsewhere.complete = False
+    assert run(running_elsewhere) is False
+    assert run(_turn("edit the nested library", inner / "lib.py")) is False  # finished

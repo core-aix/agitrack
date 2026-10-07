@@ -20,13 +20,7 @@ import time
 
 import pyte
 
-try:
-    from watchdog.events import FileSystemEvent, FileSystemEventHandler
-    from watchdog.observers import Observer
-except ImportError:  # pragma: no cover - exercised only without optional dependency
-    FileSystemEvent = None  # type: ignore[misc, assignment]
-    FileSystemEventHandler = object  # type: ignore[misc, assignment]
-    Observer = None  # type: ignore[misc, assignment]
+from agitrack.proxy.watch import Observer, RepoChangeHandler
 
 from agitrack.commits import AgitrackActions, UserCommitAborted
 from agitrack.console import stdin_is_interactive, stdout_is_interactive
@@ -338,56 +332,6 @@ def _short_session(session_id: str | None) -> str:
     if not session_id:
         return "(none)"
     return session_id[:8]
-
-
-class RepoChangeHandler(FileSystemEventHandler):
-    IGNORED_PARTS = {".agitrack", ".git", ".pytest_cache", ".venv", "__pycache__"}
-
-    # Event types that mean "somebody READ a file", not "the worktree changed". watchdog's
-    # inotify backend reports IN_OPEN and IN_CLOSE_NOWRITE as these; macOS FSEvents reports
-    # only real modifications, which is why this was a Linux-only failure.
-    #
-    # Counting a read as a change is catastrophic here, not merely noisy: `_last_change_at` is
-    # reset on every one, so `worktree_settled` (now - _last_change_at >= FILE_STABLE_SECONDS)
-    # never becomes true, the commit gate never opens, and aGiTrack stops committing entirely
-    # while looking perfectly healthy. Measured on a real repo with NOTHING being written:
-    # 1536 opened + 1536 closed_no_write events in 25s — about 123 phantom "changes" a second,
-    # from ordinary reads of files like .gitignore and AGENTS.md.
-    #
-    # `closed` (IN_CLOSE_WRITE) is deliberately NOT in this set: it follows an actual write.
-    READ_ONLY_EVENT_TYPES = {"opened", "closed_no_write"}
-
-    def __init__(self, repo_path, changed: threading.Event, wake: "threading.Event | None" = None) -> None:
-        self.repo_path = repo_path
-        self.changed = changed
-        # The git worker sleeps on `wake`; setting it lets a real worktree write
-        # wake the worker at once instead of waiting for its poll timeout.
-        self.wake = wake
-
-    def on_any_event(self, event: FileSystemEvent) -> None:
-        # Reads are not changes. Checked by event_type STRING rather than by class so this
-        # works across watchdog versions (older ones simply never emit these types).
-        if getattr(event, "event_type", "") in self.READ_ONLY_EVENT_TYPES:
-            return
-        # watchdog reports src_path as str or bytes depending on how the watch was
-        # set up; normalise to str so the IGNORED_PARTS check is uniform.
-        src_path = os.fsdecode(event.src_path)
-        try:
-            relative = os.path.relpath(src_path, self.repo_path)
-        except ValueError:
-            relative = src_path
-        if relative == os.path.join(".agitrack", "flush-request"):
-            # A `git commit` is waiting on us to record the conversation so far (see
-            # ProxyRunner._service_commit_flush_request). Not a worktree change, so only the git
-            # worker is woken — at once, rather than after its idle poll.
-            if self.wake is not None:
-                self.wake.set()
-            return
-        if any(part in self.IGNORED_PARTS for part in relative.split(os.sep)):
-            return
-        self.changed.set()
-        if self.wake is not None:
-            self.wake.set()
 
 
 class _ModalRequest:
@@ -10200,10 +10144,19 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 debug_fn=self._debug,
                 require_complete=not at_commit,
                 at_commit=at_commit,
+                note_running_fn=self._note_running_elsewhere,
             )
         except Exception as error:
             self._debug(f"recording other folders' conversations failed: {error!r}")
             return False
+
+    def _note_running_elsewhere(self, running: bool) -> None:
+        """Whether a conversation started in another folder is mid-turn with edits in this
+        repository (see ``routing.record_elsewhere``); the no-worktree auto-fold waits for it."""
+        if not running:
+            self._elsewhere_running_since = None
+        elif getattr(self, "_elsewhere_running_since", None) is None:
+            self._elsewhere_running_since = time.monotonic()
 
     def _record_conversation_for_commit(self) -> None:
         """A commit is being made right now (by the user or by the agent itself): record every

@@ -563,6 +563,14 @@ class ManualCommitsMixin(RunnerHost):
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
 
+    # As `BackgroundRunner._IN_FLIGHT_FOLD_HOLD_SECONDS`: a turn killed mid-flight never ends.
+    _ELSEWHERE_FOLD_HOLD_SECONDS = 30 * 60
+
+    def _turn_running_elsewhere(self) -> bool:
+        """A conversation started in another folder is mid-turn with edits in this tree."""
+        since = getattr(self, "_elsewhere_running_since", None)
+        return since is not None and time.monotonic() - since < self._ELSEWHERE_FOLD_HOLD_SECONDS
+
     def _auto_fold_latent_pending(self, *, force: bool = False) -> None:
         """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
         the branch advances per turn (like normal auto mode) but the interaction trace/metadata
@@ -584,6 +592,12 @@ class ManualCommitsMixin(RunnerHost):
             if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
                 return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
         except Exception:
+            return
+        # The fold commits the WHOLE tree, so while the next turn is running it would fold that
+        # turn's half-finished edits under the previous turn's trace (the background tracker
+        # makes the same check, `BackgroundRunner._turn_still_running`). Fold once it is idle,
+        # and once no conversation from another folder is mid-turn in this tree either.
+        if not force and (self.agent_in_flight or self._turn_running_elsewhere()):
             return
         # Hold the fold briefly while this turn's summary is still in flight: the summary lands
         # as a note on the (never-HEAD) latent commit, which _manual_pending_bodies folds into the

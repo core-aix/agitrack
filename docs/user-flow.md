@@ -286,6 +286,9 @@ backend (a `/resume` or a new conversation, tested on both backends): aGiTrack f
 session and counts each conversation's turns exactly once, and sub-agent tokens are folded into the
 launching turn. `agitrack -b stop` records any final turn (folding it in auto mode) and removes its
 per-run fold hooks (the persistent auto-track `pre-commit` hook stays, so a later commit still tracks).
+Re-running `agitrack -b` over a running tracker (to load an update, or to switch commit mode)
+records the turns that have finished but leaves a turn still running to the new tracker, which
+records it when it ends, so a restart never splits one prompt into two commits.
 
 **Jump to:** [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) · [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
@@ -720,7 +723,7 @@ flowchart TD
   ask -->|No| done0
   ask -->|Yes| lock{"Who holds the repository?"}
   lock -->|"Nobody"| rewrite
-  lock -->|"A background tracker"| pause[["Stop it (it records its final turn on the way out)"]] --> rewrite
+  lock -->|"A background tracker"| pause[["Stop it (it records its finished turns on the way out;<br/>a turn still running is left to the restarted tracker)"]] --> rewrite
   lock -->|"An interactive session"| refuse(["Refused: quit the session first"])
   rewrite[["Plan again under the lock, then rewrite: the trace becomes a note,<br/>aGiTrack's subject/summary of that turn too (unless --keep-summary),<br/>metadata kept plus trace_removed. Branches, pending latent turns,<br/>notes and the tracker watermark follow the new ids"]]
   rewrite --> report[["Report: force-push needed for pushed branches; tags untouched;<br/>--purge expires the reflog and prunes the originals"]]

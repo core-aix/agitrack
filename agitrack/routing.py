@@ -236,15 +236,17 @@ def _related(cwd: str, root: str) -> bool:
     return paths.under(root, real) or paths.under(real, root)
 
 
-def candidates(root: str, *, since: float, exclude_cwd: str | None = None) -> list[Candidate]:
+def candidates(root: str, *, since: float, exclude_cwd: str | None = None, full: bool = False) -> list[Candidate]:
     """Conversations started outside this repository, active since ``since``, that may have
-    edited it. Cheap filters only; whether a turn really did is decided by :class:`Router`."""
+    edited it. Cheap filters only; whether a turn really did is decided by :class:`Router`.
+    ``full``: look at every conversation now rather than trusting what was quiet a moment ago
+    (a commit is being made, so nothing may be missed)."""
     root = _real(root)
     found: list[Candidate] = []
     try:
         from agitrack.transcripts import claude
 
-        for ref, cwd, path in claude.recent_sessions(since):
+        for ref, cwd, path in claude.recent_sessions(since, full=full):
             if _real(cwd) != root and (_related(cwd, root) or _mentions(path, root)):
                 found.append(Candidate("claude", ref.id, cwd, path, ref.updated))
     except Exception:
@@ -319,12 +321,17 @@ def record_elsewhere(
     debug_fn: Callable[[str], None],
     require_complete: bool = True,
     at_commit: bool = False,
+    note_running_fn: Callable[[bool], None] | None = None,
 ) -> bool:
     """Record, in ``repo``, the turns of conversations started in ANOTHER folder that edited
     it. Each conversation is read with its edits recovered and run through the ordinary commit
     pipeline under its OWN watermark, keeping only the turns that touched this repository.
     Shared by the background tracker and the interactive session, so both route the same way.
-    Returns whether anything was recorded."""
+    Returns whether anything was recorded.
+
+    ``note_running_fn`` is told whether one of those conversations is IN THE MIDDLE of a turn
+    that has already edited this repository: its edits are in the tree, and an auto-fold
+    commits the whole tree, so it waits for that turn to end as it does for the local one."""
     from agitrack.backends.proxy_agents import make_proxy_agent
     from agitrack.proxy.commit_engine import CommitEngine
     from agitrack.proxy.session import Session
@@ -333,7 +340,8 @@ def record_elsewhere(
     floor = routing_floor(state)
     router = Router(root)
     recorded = False
-    for candidate in candidates(root, since=max(floor, time.time() - RECENT_SECONDS)):
+    running_here = False
+    for candidate in candidates(root, since=max(floor, time.time() - RECENT_SECONDS), full=at_commit):
         # A conversation unchanged since this repository last went through it has nothing new
         # to offer, and reading it again can cost a CLI call (OpenCode exports by subprocess).
         seen_key = (root, candidate.backend, candidate.session_id)
@@ -344,6 +352,9 @@ def record_elsewhere(
         exported = export_candidate(candidate)
         if exported is None or not exported.turns:
             continue
+        last = exported.turns[-1]
+        if not _finished(last) and router.foreign_filter(candidate.cwd, floor=floor)(last):
+            running_here = True
         # Session sets its per-session fields dynamically, so it is used untyped here (as the
         # background runner's _bare_session does).
         session: Any = Session.bare()
@@ -391,6 +402,8 @@ def record_elsewhere(
             # Only once nothing in it is still running: a running turn is placed when it ends,
             # and that end is itself a change, so the conversation is read again then.
             _PROCESSED[seen_key] = candidate.updated
+    if note_running_fn is not None:
+        note_running_fn(running_here)
     return recorded
 
 
