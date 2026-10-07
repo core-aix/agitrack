@@ -2494,3 +2494,38 @@ def test_a_turn_from_a_redacted_window_is_counted_but_never_written(tmp_path):
     assert "hunter2" not in repo.message
     assert "add the tests" in repo.message
     assert "tokens_since_last_commit_output: 5" in repo.message  # both turns' tokens
+
+
+def test_the_in_flight_record_never_quotes_a_turn_from_a_redacted_window(tmp_path):
+    """A commit the agent makes mid-turn is attributed from the running turn, prompt included.
+    A turn begun inside a window removed with `agitrack redact` keeps its attribution, but its
+    prompt must not be written, exactly as `commit_turns` treats a finished one."""
+    from agitrack import redact
+
+    redact.remember_window(tmp_path, 1_790_000_000, 1_790_003_600)
+    running = SessionTurn("u1", "a1", "my password is hunter2", "", TokenUsage(total=3, output=1), None)
+    running.complete = False
+    running.started_at = 1_790_000_100
+    session = Session.bare()
+    exported = ExportedSession("ses-r", "m", None, [running])
+    engine, _state, _commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    engine.repo.repo = tmp_path  # where the engine looks for the remembered windows
+    noted: list = []
+
+    engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: True,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+        note_in_flight_fn=noted.append,
+    )
+
+    assert noted and noted[-1] is not None
+    assert noted[-1]["prompt"] is None
+    assert noted[-1]["backend_session_id"] == "ses-r"

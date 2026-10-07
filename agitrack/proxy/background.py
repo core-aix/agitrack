@@ -306,6 +306,18 @@ def _flush_done_path(repo: GitRepo) -> Path:
     return repo.repo / ".agitrack" / "flush-done"
 
 
+def flush_started_path(repo_root: Path) -> Path:
+    return repo_root / ".agitrack" / "flush-started"
+
+
+# How long a commit waits for a tracker that has STARTED answering its flush request. The first
+# `timeout` only covers a tracker that never picks the request up (wedged, or too old to know the
+# handshake); one that has picked it up is recording right now, and a commit that went ahead
+# anyway folded a stale trailer: a long conversation's export, or another folder's OpenCode
+# conversation exported by CLI, can take longer than the first wait.
+FLUSH_WORKING_WAIT_SECONDS = 60.0
+
+
 def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
     """Ask the running background daemon to record any pending COMPLETED turns and (re)render the
     fold trailer RIGHT NOW, then wait (bounded) for it to acknowledge.
@@ -321,13 +333,22 @@ def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
         _flush_request_path(repo).write_text(nonce, encoding="utf-8")
     except OSError:
         return False
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    extended = False
     while time.monotonic() < deadline:
         try:
             if _flush_done_path(repo).read_text(encoding="utf-8").strip() == nonce:
                 return True
         except OSError:
             pass
+        if not extended:
+            try:
+                if flush_started_path(repo.repo).read_text(encoding="utf-8").strip() == nonce:
+                    extended = True
+                    deadline = started + max(timeout, FLUSH_WORKING_WAIT_SECONDS)
+            except OSError:
+                pass
         time.sleep(0.05)
     return False
 
@@ -1042,7 +1063,10 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
             # daemon's poll (the bug where a commit racing the poll folded nothing). A no-worktree
             # interactive session takes the same request: its trailer is otherwise only as fresh as
             # the last turn it chose to record, and it holds turns back while sub-agents run.
-            if _live_background_pid(repo) is not None or _interactive_session_answers_flush(repo):
+            # Not for a commit the interactive session is making itself (Ctrl-G git-commit): it has
+            # recorded and folded everything already, and is holding the lock a flush would wait on.
+            folded = os.environ.get("AGITRACK_COMMIT_FOLDED") == "1"
+            if not folded and (_live_background_pid(repo) is not None or _interactive_session_answers_flush(repo)):
                 request_daemon_flush(repo)
             return 0
     except Exception:
@@ -1828,6 +1852,10 @@ class BackgroundRunner:
             return
         if not nonce or nonce == self._last_flush_nonce:
             return
+        try:
+            flush_started_path(self.repo.repo).write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
         try:
             # A commit is being made right now — by the user or by the agent itself — so it
             # carries EVERY conversation up to this moment: finished turns, the turn still

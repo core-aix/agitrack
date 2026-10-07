@@ -204,3 +204,32 @@ def test_a_metadata_block_quoted_inside_a_trace_is_not_mistaken_for_a_turn():
 
     assert count == 1
     assert SECRET not in new and "Here is the format" not in new
+
+
+def test_a_commit_no_branch_contains_is_reported_not_claimed_as_removed(tmp_path, capsys):
+    repo = _init_repo(tmp_path)
+    orphan = _commit(
+        repo, _agent_body(f"the password is {SECRET}", "Ok.", started=T0, ended=T0 + 60), file="b.txt", content="b\n"
+    )
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")  # the commit is now on no branch at all
+
+    code = redact.run(repo, commits=[orphan], since=None, until=None, assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "No branch contains " + orphan[:10] in out
+    assert "Removed the interaction trace" not in out
+
+
+def test_a_commit_on_a_detached_head_is_rewritten(tmp_path, capsys):
+    repo = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "--detach")
+    leaky = _commit(
+        repo, _agent_body(f"the password is {SECRET}", "Ok.", started=T0, ended=T0 + 60), file="b.txt", content="b\n"
+    )
+
+    assert redact.run(repo, commits=[leaky], since=None, until=None, assume_yes=True) == 0
+
+    assert SECRET not in _full_log(repo)
+    assert _git(repo, "rev-parse", "HEAD").strip() != leaky
+    assert "across 1 commit(s)" in capsys.readouterr().out

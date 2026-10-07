@@ -2812,3 +2812,36 @@ def test_a_turn_that_records_nothing_leaves_no_prompts_behind(tmp_path):
     runner._process_once()  # tree unchanged: nothing to record
     assert runner._manual.pending_count() == 0
     assert state.pending_trace() == []
+
+
+def test_a_commit_waits_for_a_tracker_that_has_started_its_flush(tmp_path):
+    """The first wait only covers a tracker that never picks the request up. One that has (it
+    wrote `flush-started`) is recording right now, and a commit that went ahead anyway folded a
+    stale trailer, so the hook keeps waiting for its answer."""
+    import threading
+    import time
+
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".agitrack").mkdir(exist_ok=True)
+
+    def slow_tracker():
+        while True:
+            try:
+                nonce = (tmp_path / ".agitrack" / "flush-request").read_text(encoding="utf-8").strip()
+            except OSError:
+                nonce = ""
+            if nonce:
+                break
+        background.flush_started_path(tmp_path).write_text(nonce, encoding="utf-8")
+        time.sleep(0.6)  # longer than the hook's first wait below
+        (tmp_path / ".agitrack" / "flush-done").write_text(nonce, encoding="utf-8")
+
+    worker = threading.Thread(target=slow_tracker)
+    worker.start()
+    assert background.request_daemon_flush(repo, timeout=0.2) is True
+    worker.join()
+
+    # A tracker that never picks the request up still lets the commit go after the first wait.
+    assert background.request_daemon_flush(repo, timeout=0.2) is False

@@ -469,6 +469,12 @@ class ManualCommitsMixin(RunnerHost):
             return
         self._answered_flush_nonce = nonce
         try:
+            # Tells the waiting hook this session is on it, so it waits for the answer rather than
+            # timing out (see `background.FLUSH_WORKING_WAIT_SECONDS`).
+            (agit_dir / "flush-started").write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
+        try:
             self._record_conversation_for_commit()
             self._render_manual_trailer()
         except Exception as error:

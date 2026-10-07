@@ -2712,3 +2712,64 @@ def test_a_turn_whose_edits_were_discarded_is_still_dropped(tmp_path):
     restarted = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
     restarted.setup()
     assert restarted.pending_count() == 0
+
+
+def test_git_commit_menu_holds_the_pipeline_until_the_ref_is_reset(tmp_path):
+    """No turn may be recorded between the fold and the ref reset. The git worker records turns
+    too, and one it recorded DURING the commit (the pre-commit hook used to ask it to) was skipped
+    by the fold hook, since the message already carried the folded header, and then dropped by the
+    ref reset. A turn finished while the message dialog was open must still be folded in."""
+    import threading
+
+    runner, repo, state = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nuser\n", encoding="utf-8")
+
+    def dialog(*_a, **_k):
+        # A turn the agent finished while the user was typing the message.
+        (tmp_path / "b.txt").write_text("agent\n", encoding="utf-8")
+        runner._manual_gate()
+        runner._manual_record(_agent_body("finished while typing", 7))
+        return "my message"
+
+    runner._prompt_popup = dialog
+    seen: dict = {}
+    real_commit = repo.commit
+
+    def commit(message, **kwargs):
+        probe: list[bool] = []
+        worker = threading.Thread(target=lambda: probe.append(runner._pipeline_lock.acquire(blocking=False)))
+        worker.start()
+        worker.join()
+        seen["worker_got_lock"] = probe[0]
+        if probe[0]:
+            runner._pipeline_lock.release()
+        seen["env"] = kwargs.get("env")
+        return real_commit(message, **kwargs)
+
+    repo.commit = commit
+    assert runner._create_user_commit_popup(repo=repo, state=state, include_declined=True) is True
+
+    assert seen["worker_got_lock"] is False
+    assert seen["env"] == {"AGITRACK_COMMIT_FOLDED": "1"}
+    assert "finished while typing" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_precommit_sync_does_not_ask_for_a_flush_on_a_commit_already_folded(tmp_path, monkeypatch):
+    from agitrack.git import RepoLock
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    lock = RepoLock(tmp_path / ".agitrack" / "lock")
+    assert lock.acquire()  # the interactive session holds it
+    asked: list[int] = []
+    monkeypatch.setattr(background, "_interactive_session_answers_flush", lambda _repo: True)
+    monkeypatch.setattr(background, "request_daemon_flush", lambda _repo, **_k: asked.append(1) or True)
+    try:
+        monkeypatch.setenv("AGITRACK_COMMIT_FOLDED", "1")
+        assert background.precommit_sync(repo) == 0
+        assert asked == []
+        monkeypatch.delenv("AGITRACK_COMMIT_FOLDED")
+        background.precommit_sync(repo)
+        assert asked == [1]
+    finally:
+        lock.release()

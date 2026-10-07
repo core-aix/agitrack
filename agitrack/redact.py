@@ -289,6 +289,9 @@ class Plan:
     tags: list[str] = field(default_factory=list)  # tags still holding an original (not rewritten)
     remotes: list[str] = field(default_factory=list)  # remote branches that already have one
     window: tuple[float, float] | None = None
+    # Selected commits no branch (nor a detached HEAD, nor a pending-turn ref) reaches: there is
+    # nothing that would carry a rewritten copy, so they are reported rather than "removed".
+    unreachable: list[str] = field(default_factory=list)
 
 
 def _git(repo: GitRepo, *args: str, input_text: str | None = None, check: bool = True) -> str:
@@ -297,7 +300,15 @@ def _git(repo: GitRepo, *args: str, input_text: str | None = None, check: bool =
 
 def _candidate_refs(repo: GitRepo) -> list[str]:
     out = _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/agitrack/manual")
-    return [line for line in out.splitlines() if line]
+    refs = [line for line in out.splitlines() if line]
+    if _detached(repo):
+        refs.append("HEAD")  # a commit checked out on no branch is still history the user has
+    return refs
+
+
+def _detached(repo: GitRepo) -> bool:
+    has_head = bool(_git(repo, "rev-parse", "--verify", "--quiet", "HEAD", check=False).strip())
+    return has_head and not _git(repo, "symbolic-ref", "-q", "HEAD", check=False).strip()
 
 
 def plan_redaction(
@@ -309,6 +320,7 @@ def plan_redaction(
 ) -> Plan:
     refs = _candidate_refs(repo)
     targets: dict[str, str] = {}
+    counts: dict[str, int] = {}
     turns = 0
     if commits:
         for rev in commits:
@@ -319,6 +331,7 @@ def plan_redaction(
             new, count = redact_message(message, window=None, committed_at=None, keep_summary=keep_summary)
             if count:
                 targets[sha] = new
+                counts[sha] = count
                 turns += count
     if window is not None and refs:
         log = _git(repo, "log", "--format=%H%x00%ct%x01", *refs)
@@ -337,11 +350,23 @@ def plan_redaction(
             )
             if count:
                 targets[sha] = new
+                counts[sha] = count
                 turns += count
     plan = Plan(targets=targets, turns=turns, refs=[], window=window)
     if not targets:
         return plan
-    plan.refs = [ref for ref in refs if _contains_any(repo, ref, targets)]
+    reachable: set[str] = set()
+    for ref in refs:
+        history = _reachable_from(repo, ref)
+        if any(sha in history for sha in targets):
+            plan.refs.append(ref)
+            reachable |= history
+    plan.unreachable = [sha for sha in targets if sha not in reachable]
+    for sha in plan.unreachable:
+        del targets[sha]
+        plan.turns -= counts.get(sha, 0)
+    if not targets:
+        return plan
     for kind, pattern in (("tags", "refs/tags"), ("remotes", "refs/remotes")):
         held: set[str] = set()
         for sha in list(targets)[:200]:
@@ -351,10 +376,8 @@ def plan_redaction(
     return plan
 
 
-def _contains_any(repo: GitRepo, ref: str, targets: dict[str, str]) -> bool:
-    out = _git(repo, "rev-list", ref, check=False)
-    reachable = set(out.split())
-    return any(sha in reachable for sha in targets)
+def _reachable_from(repo: GitRepo, ref: str) -> set[str]:
+    return set(_git(repo, "rev-list", ref, check=False).split())
 
 
 def _cat_commit(repo: GitRepo, sha: str) -> str:
@@ -436,7 +459,7 @@ def apply_redaction(repo: GitRepo, plan: Plan, *, keep_summary: bool = False) ->
             _git(repo, "update-ref", "-m", "agitrack redact", ref, new, old)
     head = _git(repo, "rev-parse", "HEAD", check=False).strip()
     detached = not _git(repo, "symbolic-ref", "-q", "HEAD", check=False).strip()
-    if detached and head in mapping:
+    if detached and "HEAD" not in tips and head in mapping:
         _git(repo, "update-ref", "--no-deref", "-m", "agitrack redact", "HEAD", mapping[head], head)
     _carry_notes(repo, mapping, plan, keep_summary=keep_summary)
     _remap_state(repo, mapping)
@@ -542,6 +565,15 @@ def run(
         print(f"aGiTrack: {error}")
         return 1
 
+    if plan.unreachable:
+        print(
+            "No branch contains "
+            + ", ".join(sha[:10] for sha in plan.unreachable)
+            + ", so there is nothing to rewrite it on: only a commit some branch (or a checked-out "
+            "HEAD) reaches can be rewritten. A remote or another clone that has it keeps it."
+        )
+        if not plan.targets:
+            return 1
     if not plan.targets:
         print("No recorded interaction trace matches; nothing in history to remove.")
         if window is not None and not dry_run:
@@ -589,8 +621,8 @@ def run(
 
 def _report(repo: GitRepo, plan: Plan, mapping: dict[str, str], *, purge: bool) -> None:
     print(
-        f"\nRemoved the interaction trace of {plan.turns} turn(s) across {len(plan.targets)} commit(s); "
-        f"{len(mapping)} commit(s) rewritten."
+        f"\nRemoved the interaction trace of {plan.turns} turn(s) across "
+        f"{sum(1 for sha in plan.targets if sha in mapping)} commit(s); {len(mapping)} commit(s) rewritten."
     )
     if plan.remotes:
         print(
@@ -621,6 +653,8 @@ def _describe(repo: GitRepo, plan: Plan) -> None:
     if len(shown) > 20:
         print(f"  ... and {len(shown) - 20} more")
     names = [ref.removeprefix("refs/heads/") for ref in plan.refs if ref.startswith("refs/heads/")]
+    if "HEAD" in plan.refs:
+        names.append("(detached HEAD)")
     pending = [ref for ref in plan.refs if ref.startswith("refs/agitrack/manual/")]
     print(
         f"Branches rewritten: {', '.join(names) or '(none)'}"

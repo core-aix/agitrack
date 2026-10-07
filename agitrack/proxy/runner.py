@@ -9180,23 +9180,6 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         on_worktree = repo is None
         repo = repo or self.repo
         state = state or self.state
-        if self._manual_commits:
-            # Record EVERY conversation up to this moment as latent turns BEFORE folding, so this
-            # commit carries all of it: finished turns, the one still running, and turns held
-            # back while async sub-agents work (see `_record_conversation_for_commit`).
-            # Under the pipeline lock: the git worker records conversations too, and the
-            # tracked-conversation fields `_record_elsewhere` saves and restores around another
-            # folder's conversation must not interleave with a commit of this one.
-            locked = threading.current_thread() is threading.main_thread()
-            if locked:
-                self._acquire_pipeline_lock_from_main()
-            try:
-                self._record_conversation_for_commit()
-            except Exception as error:
-                self._debug(f"manual pre-commit turn flush failed: {error!r}")
-            finally:
-                if locked:
-                    self._pipeline_lock.release()
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
@@ -9225,6 +9208,34 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 return False
             message = result
             prompt = "Commit message is required — enter one, or press Esc to continue without committing:"
+        # Manual mode: from here to the ref reset below, nothing else may record a turn. The git
+        # worker records conversations too, so a turn it recorded while this commit was being made
+        # (the pre-commit hook used to ASK it to) was skipped by the fold hook, which sees the
+        # header already folded below, and then dropped by the ref reset: its trace reached no
+        # commit. Held from the main thread only (an RLock, so a caller already holding it is fine).
+        locked = self._manual_commits and threading.current_thread() is threading.main_thread()
+        if locked:
+            self._acquire_pipeline_lock_from_main()
+        try:
+            return self._finish_user_commit(repo, state, message)
+        finally:
+            if locked:
+                self._pipeline_lock.release()
+
+    def _finish_user_commit(self, repo: GitRepo, state: AgitrackState, message: str) -> bool:
+        commit_env: dict[str, str] | None = None
+        if self._manual_commits:
+            # Record EVERY conversation up to this moment as latent turns BEFORE folding, so this
+            # commit carries all of it: finished turns, the one still running, and turns held
+            # back while async sub-agents work (see `_record_conversation_for_commit`). After the
+            # message dialog, not before it: the dialog can stay open for minutes.
+            try:
+                self._record_conversation_for_commit()
+            except Exception as error:
+                self._debug(f"manual pre-commit turn flush failed: {error!r}")
+            # Already recorded and folded here, so the pre-commit hook must not ask this session to
+            # flush: it would wait on the lock held above until its timeout.
+            commit_env = {"AGITRACK_COMMIT_FOLDED": "1"}
         if self._manual_commits:
             # Manual-commit mode: fold the pending latent turns' tracking into this one
             # commit inline, so it's fully tracked whether or not the prepare-commit-msg
@@ -9248,7 +9259,10 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 message=message, agitrack_session_id=state.session_id, repo_root=getattr(repo, "repo", None)
             )
         try:
-            repo.commit(commit_message)
+            if commit_env:
+                repo.commit(commit_message, env=commit_env)
+            else:
+                repo.commit(commit_message)
         except Exception as error:
             # A failed commit (a repo pre-commit hook rejecting it, a git config/identity problem,
             # a racing change) must NOT crash aGiTrack — it used to propagate as an uncaught

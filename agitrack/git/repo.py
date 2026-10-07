@@ -381,8 +381,8 @@ class GitRepo:
             return True
         raise GitError(process.stderr.strip() or "Unable to inspect changes")
 
-    def commit(self, message: str) -> str:
-        self._run(["git", "commit", "-F", "-"], input_text=message)
+    def commit(self, message: str, *, env: dict[str, str] | None = None) -> str:
+        self._run(["git", "commit", "-F", "-"], input_text=message, env=env)
         return self.short_sha("HEAD")
 
     def amend_commit(self, message: str) -> str:

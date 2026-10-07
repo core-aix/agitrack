@@ -1027,7 +1027,9 @@ class CommitEngine:
                     "backend": backend_name,
                     "backend_session_id": new_session_id,
                     "model": exported_session.model or self.state.model,
-                    "prompt": running.user_prompt,
+                    # A turn begun inside a window removed with `agitrack redact` is still
+                    # attributed, but its words are not written (as in `commit_turns`).
+                    "prompt": None if self._redacted_turn_test()(running) else running.user_prompt,
                 }
             note_in_flight_fn(facts)
 

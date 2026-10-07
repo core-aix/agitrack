@@ -524,8 +524,10 @@ tree holds them — the base repo and/or this session's worktree.
 > `git-commit` is the one command used for **both** a plain user commit and a commit that includes
 > the agent's tracked work. It stages your changes, then folds every pending latent turn's trace +
 > metadata into the message so the result is a **single** commit carrying your edits *and* the full
-> agent tracking; the latent ref is then reset. (An external `git commit` you run yourself gets the
-> same folding via the `prepare-commit-msg` hook.) See
+> agent tracking; the latent ref is then reset. The conversation is recorded AFTER you type the
+> message (so a turn that finished while the dialog was open is included), and from there to the
+> reset nothing else can record a turn, so none is lost between the fold and the reset. (An external
+> `git commit` you run yourself gets the same folding via the `prepare-commit-msg` hook.) See
 > [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m).
 
 ```mermaid
@@ -709,6 +711,7 @@ flowchart TD
   sel -->|"--since/--until"| win[["Every turn whose recorded span overlaps the window<br/>(a commit with no span: placed by its own date)"]]
   all --> any{"Anything recorded to remove?"}
   win --> any
+  any -->|"Only commits no branch contains"| orphan(["Named and left alone (nothing would carry a rewritten copy); exit 1"])
   any -->|No| remember[["Nothing in history. A window is still remembered,<br/>so its uncommitted turns never reach a commit message"]]
   any -->|Yes| show[["List the commits (ids and dates only, never the text),<br/>the branches rewritten, and any remote or tag that keeps the original"]]
   show --> dry{"--dry-run?"}
