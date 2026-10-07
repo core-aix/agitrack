@@ -2770,3 +2770,45 @@ def test_a_daemon_is_registered_before_it_finishes_starting(tmp_path, monkeypatc
     assert seen[0] == "register:background", f"registered too late: {seen}"
     assert "hooks" in seen  # ...and the slow startup work really did come after it
     assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")
+
+
+def test_the_rest_of_a_turn_captured_mid_flight_is_recorded_when_it_ends(tmp_path):
+    """The agent commits its own work while its turn is still running. That commit carries the
+    turn as it stood (commit-time capture). When the turn then ends, the tree is clean and the
+    commit already holds an aGiTrack block, so neither "the tree changed" nor "an untracked commit
+    is owed" said to record the rest, and the final reply and remaining tokens were dropped
+    (found in a live pre-release run). The remainder is owed, and counts only its new tokens."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    running = SessionTurn(
+        "u1", "m1", "build the thing", "", TokenUsage(total=7, output=7), "claude-opus-4-8", complete=False
+    )
+    backend.set_session("s1", [running])
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()  # the agent's `git commit` fires the pre-commit flush
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    assert "build the thing" in _git(repo, "log", "-1", "--format=%B")
+
+    done = SessionTurn("u1", "m2", "build the thing", "Built it.", TokenUsage(total=10, output=10), "claude-opus-4-8")
+    backend.set_session("s1", [done])
+    runner._process_once()
+
+    recorded = "\n".join(runner._manual.pending_bodies())
+    assert "Built it." in recorded
+    assert "tokens_since_last_commit_output: 3" in recorded  # 10 spent, 7 already in the commit
+
+
+def test_a_turn_that_records_nothing_leaves_no_prompts_behind(tmp_path):
+    """A turn the recording gate turns away (nothing changed) must not leave its entries in the
+    pending trace: the next attempt reads them as leftover prompts, and when that attempt is
+    another conversation's they land in its commit as stray `## User` blocks (found in a live
+    pre-release run: one OpenCode session's prompt inside the next session's commit)."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "just a question", "an answer", 5)])
+    runner._process_once()  # tree unchanged: nothing to record
+    assert runner._manual.pending_count() == 0
+    assert state.pending_trace() == []

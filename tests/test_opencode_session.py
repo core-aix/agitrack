@@ -812,3 +812,28 @@ def test_repo_activity_is_silent_rather_than_wrong_when_the_store_is_unreadable(
     connection.close()
 
     assert repo_activity(tmp_path / "repo") is None
+
+
+def test_a_turn_between_two_steps_is_not_finished():
+    """OpenCode closes each step with ``finish: "tool-calls"`` and starts the next one as a new
+    message. A poll landing between two steps must not read the turn as finished: it was
+    recorded there and its watermark set on a message the turn moved past, so the reply and the
+    rest of its tokens were never recorded (found live)."""
+    user = {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "do it"}]}
+    step = {
+        "info": {"role": "assistant", "id": "a1", "parentID": "u1", "finish": "tool-calls"},
+        "parts": [{"type": "text", "text": "Creating it."}, {"type": "tool", "tool": "apply_patch"}],
+    }
+    between = parse_exported_session({"info": {"id": "s"}, "messages": [user, step]})
+    assert between.turns[0].complete is False
+
+    streaming = {"info": {"role": "assistant", "id": "a2", "parentID": "u1"}, "parts": []}
+    assert parse_exported_session({"info": {"id": "s"}, "messages": [user, step, streaming]}).turns[0].complete is False
+
+    final = {
+        "info": {"role": "assistant", "id": "a2", "parentID": "u1", "finish": "stop"},
+        "parts": [{"type": "text", "text": "Done."}],
+    }
+    done = parse_exported_session({"info": {"id": "s"}, "messages": [user, step, final]})
+    assert done.turns[0].complete is True
+    assert done.turns[0].final_response == "Done."

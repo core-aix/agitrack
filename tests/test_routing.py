@@ -270,3 +270,35 @@ def test_a_sibling_repository_takes_the_turns_that_edited_it(layout, tmp_path, m
     recorded = _pending(sibling_tracker)
     assert "port the helper to the sibling" in recorded
     assert "tidy the parent" not in recorded
+
+
+def test_an_armed_hook_is_not_a_tracker(layout, monkeypatch):
+    """A repository whose auto-start hook is armed but whose tracker is not running cannot be
+    handed a turn: the tracker it starts later claims only turns prompted after it first routes,
+    so the turn would be recorded nowhere."""
+    parent, inner, _sibling, _scratch = layout
+    from agitrack.proxy import background
+
+    monkeypatch.setattr(background, "running_mode_for", lambda root: {"running": False, "armed": True, "kind": "armed"})
+    assert routing.is_tracked(str(inner)) is False
+    assert routing.Router(str(parent)).home_filter(str(parent))(_turn("only the nested repo", inner / "b.txt"))
+
+
+@pytest.mark.routing
+def test_a_commit_rereads_a_conversation_that_looks_unchanged(layout, tmp_path, monkeypatch):
+    """A conversation whose recording was deferred (sub-agents still running, which write their
+    own files) looks unchanged, but a commit must still read it."""
+    parent, inner, _sibling, _scratch = layout
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    claude._EXPORTS.clear()
+    claude._HEAD_CACHE.clear()
+    path = _write_claude_session(
+        config, parent, "33333333-3333-3333-3333-333333333333", [("fix the nested library", inner / "lib.py")]
+    )
+    monkeypatch.setattr(routing, "is_tracked", lambda root: True)
+    tracker = _tracker(inner, tmp_path)
+    routing._PROCESSED[(str(inner), "claude", "33333333-3333-3333-3333-333333333333")] = path.stat().st_mtime
+    assert not tracker._process_elsewhere(require_complete=False)  # an ordinary poll skips it
+    assert tracker._process_once(require_complete=False, at_commit=True)
+    assert "fix the nested library" in _pending(tracker)

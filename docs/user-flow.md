@@ -734,7 +734,7 @@ flowchart TD
   turn(["A finished turn, with the files it edited"]) --> dest{"Which git repositories hold those files?<br/>(the nearest repository: a nested repo, not its parent)"}
   dest -->|"None (it only talked, or edited scratch files)"| home[["Recorded where the conversation started"]]
   dest -->|"Includes the repository it started in"| both[["Recorded where it started"]]
-  dest -->|"Only other repositories"| tracked{"Is every one of them tracked by aGiTrack<br/>(a tracker running, or auto-start armed)?"}
+  dest -->|"Only other repositories"| tracked{"Is every one of them tracked by aGiTrack<br/>(a tracker running there right now)?"}
   tracked -->|No| home
   tracked -->|Yes| away[["Left to those repositories"]]
   both --> others

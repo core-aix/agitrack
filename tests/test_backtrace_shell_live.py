@@ -42,7 +42,9 @@ _PARSER = {"claude": claude, "codex": codex, "opencode": opencode}
 # small model reliably does the first and stops — which fails as "the sed edit was not
 # recovered" and reads like a bug in the recovery. None = the CLI's own default (OpenCode fronts
 # arbitrary providers, so no id is valid everywhere).
-_MODELS = {"claude": "claude-sonnet-5", "codex": "gpt-5.4-mini", "opencode": None}
+# Codex also None: which ids an account may use changes (a ChatGPT login was refused a model
+# the API still lists), and only the CLI's own default is always one it accepts.
+_MODELS = {"claude": "claude-sonnet-5", "codex": None, "opencode": None}
 
 _PROMPT = """Use ONLY your shell/terminal tool for every step. Do NOT use any file-editing tool
 (no Edit, Write, MultiEdit, apply_patch, str_replace).

@@ -141,3 +141,23 @@ def test_claude_backtrace_listing_leaves_the_nested_repos_sessions_to_it(parent,
 
     assert parent_sessions == {"11111111-1111-1111-1111-111111111111"}
     assert inner_sessions == {"22222222-2222-2222-2222-222222222222"}
+
+
+def test_a_nested_repo_with_no_commit_yet_does_not_break_the_snapshot(tmp_path):
+    """`git add -A` refuses the whole add when a subfolder is a fresh `git init` with no
+    commit; the snapshot (and so every latent gate) used to raise until it got one."""
+    root = _repo(tmp_path / "parent")
+    (root / "fresh").mkdir()
+    _git(root / "fresh", "init", "-q")
+    (root / "fresh" / "x.txt").write_text("x\n", encoding="utf-8")
+    repo = GitRepo(root)
+    head = repo.comparable_tree("HEAD")
+    assert repo.snapshot_worktree_tree() == head
+    (root / "f.txt").write_text("parent edit\n", encoding="utf-8")
+    assert repo.snapshot_worktree_tree() != head
+
+
+def test_a_session_worktree_is_the_repository_not_a_nested_one(parent):
+    _git(parent, "worktree", "add", "-q", str(parent / ".agitrack" / "worktrees" / "s1"), "-b", "agitrack/s1")
+    assert paths.in_nested_repo(parent, parent / ".agitrack" / "worktrees" / "s1") is False
+    assert paths.in_nested_repo(parent, parent / ".agitrack" / "worktrees" / "s1" / "src") is False

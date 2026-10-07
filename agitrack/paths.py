@@ -86,6 +86,10 @@ def in_nested_repo(directory: str | os.PathLike, path: str | os.PathLike) -> boo
     if not os.path.exists(os.path.join(root, ".git")):
         return False
     current = os.path.realpath(os.fspath(path))
+    if current == os.path.join(root, ".agitrack") or current.startswith(os.path.join(root, ".agitrack") + os.sep):
+        # aGiTrack's own session worktrees (``.agitrack/worktrees/<name>``) carry a ``.git``
+        # file too, but they ARE this repository: their sessions are its sessions.
+        return False
     while current != root and current.startswith(root + os.sep):
         if os.path.exists(os.path.join(current, ".git")):
             return True

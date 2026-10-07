@@ -224,6 +224,23 @@ def _export(backend, repo_path, session_id: str, collect_edits: bool):
     return backend.export_session(repo_path, session_id)
 
 
+def continues_partial_capture(state, turns, session_id: str | None) -> bool:
+    """Whether *turns* include the rest of a turn a commit captured while it was still running.
+
+    A commit made mid-turn (`at_commit`, the agent committing its own work) records the turn as
+    it stood and anchors the watermark on its user id, so the turn comes back once it ends with
+    its final reply and the rest of its tokens. By then the tree is usually clean (that commit
+    holds the work) and the commit already carries an aGiTrack block, so neither "the tree
+    changed" nor "an untracked commit is owed" says to record it, and the remainder was dropped.
+    It is owed all the same."""
+    record = state.partial_turn_usage() if state is not None else None
+    if not record or not record.get("user_id"):
+        return False
+    if session_id and record.get("session_id") and record.get("session_id") != session_id:
+        return False
+    return any(getattr(turn, "user_message_id", None) == record.get("user_id") for turn in turns)
+
+
 def turn_is_finished(turn) -> bool:
     """Whether *turn* can still receive more messages from the backend.
 
@@ -321,6 +338,10 @@ class CommitEngine:
         except Exception as error:
             self._debug(f"tracking floor lookup failed: {error!r}")
             return None
+
+    def _restore_pending_trace(self, items: list[dict]) -> None:
+        self.state.data["pending_trace"] = list(items)
+        self.state.save()
 
     def _redacted_turn_test(self) -> Callable[[SessionTurn], bool]:
         """Whether a turn began inside a window removed with ``agitrack redact``."""
@@ -431,6 +452,7 @@ class CommitEngine:
         # Turns from a window the user removed with `agitrack redact`: still counted (their
         # tokens were spent and their edits are in the tree), but no word of them is written.
         redacted = self._redacted_turn_test()
+        pending_before: list[dict] = []
 
         if accumulate_trace_only_on_commit:
             # Actions / shell mode: do the staged check first, accumulate only
@@ -489,10 +511,13 @@ class CommitEngine:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
             # entries that hadn't yet landed as a turn (e.g. a queued prompt from
             # before this parse cycle).
+            # Put back exactly as found when this attempt commits nothing: the entries written
+            # below belong to THESE turns, and left behind they read as leftover prompts to the
+            # next attempt, which may be another conversation's (a session switch carried one
+            # conversation's prompt into the next one's commit).
+            pending_before = self.state.pending_trace()
             pending_users: list[str] = [
-                content
-                for item in self.state.pending_trace()
-                if item.get("role") == "user" and (content := item.get("content"))
+                content for item in pending_before if item.get("role") == "user" and (content := item.get("content"))
             ]
             self.state.data["pending_trace"] = []
             self.state.save()
@@ -595,6 +620,7 @@ class CommitEngine:
                 # actually changed since the latent tip, so a no-op turn records nothing —
                 # and, per bug #14, tokens are still accumulated only once past this gate.
                 if manual_gate_fn is not None and not manual_gate_fn():
+                    self._restore_pending_trace(pending_before)
                     return False
             else:
                 # Hook: proxy mode puts the session on a fresh turn branch here.
@@ -606,6 +632,7 @@ class CommitEngine:
 
                 if not self.repo.has_staged_changes():
                     if not self._head_is_coverable(backend_commits):
+                        self._restore_pending_trace(pending_before)
                         return False
                     cover_backend_head = True
                 elif self._head_is_coverable(backend_commits):
@@ -743,6 +770,8 @@ class CommitEngine:
             # tree turned out unchanged after the gate).
             commit_sha = manual_record_fn(message)
             if commit_sha is None:
+                if not accumulate_trace_only_on_commit:
+                    self._restore_pending_trace(pending_before)
                 return False
         elif cover_backend_head or cover_with_staged:
             # The backend committed its own work (#35). Its commits keep their

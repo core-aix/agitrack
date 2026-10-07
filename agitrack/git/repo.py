@@ -448,7 +448,11 @@ class GitRepo:
             # just what happens to be staged in the user's real index. check=False so an
             # unborn branch (no HEAD yet) simply starts from an empty index.
             self._run(["git", "read-tree", "HEAD"], env=env, check=False)
-            self._run(["git", "add", "-A"], env=env)
+            if self._run(["git", "add", "-A"], env=env, check=False).returncode != 0:
+                # A nested repository with no commit yet (a fresh `git init` in a subfolder)
+                # makes git refuse the whole add. It is not this repository's content anyway, so
+                # add everything else and let the nested-repo pass below drop what remains.
+                self._run(["git", "add", "-A", "--ignore-errors"], env=env, check=False)
             self._leave_nested_repos_at_head(env)
             # Drop the agent scaffolding dirs from the snapshot whether they were tracked
             # or freshly added (``--ignore-unmatch`` so absent ones are a no-op). Done as a

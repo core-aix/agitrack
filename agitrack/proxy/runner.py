@@ -48,7 +48,7 @@ from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
-from agitrack.proxy.commit_engine import CommitEngine, turn_is_finished
+from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
@@ -9184,10 +9184,19 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # Record EVERY conversation up to this moment as latent turns BEFORE folding, so this
             # commit carries all of it: finished turns, the one still running, and turns held
             # back while async sub-agents work (see `_record_conversation_for_commit`).
+            # Under the pipeline lock: the git worker records conversations too, and the
+            # tracked-conversation fields `_record_elsewhere` saves and restores around another
+            # folder's conversation must not interleave with a commit of this one.
+            locked = threading.current_thread() is threading.main_thread()
+            if locked:
+                self._acquire_pipeline_lock_from_main()
             try:
                 self._record_conversation_for_commit()
             except Exception as error:
                 self._debug(f"manual pre-commit turn flush failed: {error!r}")
+            finally:
+                if locked:
+                    self._pipeline_lock.release()
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
@@ -9414,6 +9423,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                     use_latent = False
             except Exception as error:
                 self._debug(f"clean-tree cover check failed: {error!r}")
+        # The rest of a turn a commit captured mid-flight is owed a record even on a clean tree
+        # (see continues_partial_capture); `_manual_gate` reads this.
+        self._manual_owed_continuation = continues_partial_capture(self.state, turns, backend_session_id)
         committed = CommitEngine(
             self.repo,
             self.state,

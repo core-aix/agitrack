@@ -40,7 +40,7 @@ from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
-from agitrack.proxy.commit_engine import CommitEngine, turn_is_finished
+from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
 from agitrack.proxy.session import Session
 
 
@@ -608,8 +608,13 @@ def repo_status(repo: GitRepo) -> int:
     def _commit_mode(handshake_mode: object) -> str:
         return "manual-commit" if isinstance(handshake_mode, str) and "manual" in handshake_mode else "auto-commit"
 
+    # Whether the running mode confines the agent at all. Only an interactive WORKTREE session
+    # launches the agent inside a sandbox; in background mode the user starts the agent and in a
+    # no-worktree session it edits this checkout directly, so "only its own worktree" was false.
+    unconfined_mode: str | None = None
     bg_pid = _live_background_pid(repo)
     if bg_pid is not None:
+        unconfined_mode = "background mode starts no agent itself, so none is sandboxed"
         info = _read_handshake(repo) or {}
         print(
             f"aGiTrack is running on {_abbreviated_repo(repo)} in BACKGROUND mode (PID {bg_pid}): "
@@ -621,6 +626,8 @@ def repo_status(repo: GitRepo) -> int:
         if proxy is not None and isinstance(proxy_pid, int) and pid_alive(proxy_pid):
             commits = "manual-commit" if proxy.get("commits") == "manual" else "auto-commit"
             worktree = "worktree" if proxy.get("worktree") else "no worktree"
+            if not proxy.get("worktree"):
+                unconfined_mode = "with no worktree the agent edits this checkout directly"
             print(
                 f"aGiTrack is running on {_abbreviated_repo(repo)} in INTERACTIVE mode "
                 f"(PID {proxy_pid}): {commits}, {worktree}."
@@ -638,7 +645,10 @@ def repo_status(repo: GitRepo) -> int:
     # looked like enforcement was the agent choosing to comply.
     from agitrack.proxy import sandbox
 
-    print(sandbox.status_line())
+    if unconfined_mode:
+        print(f"Confinement: not used in this mode ({unconfined_mode}).")
+    else:
+        print(sandbox.status_line())
     reminder = update_reminder_line(repo.repo)
     if reminder:
         print(reminder)
@@ -2164,7 +2174,10 @@ class BackgroundRunner:
         # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
         # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
         # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
-        self._manual.owed_record = bool(in_flight_covered)
+        # ...and so is the rest of a turn a commit captured while it was still running.
+        self._manual.owed_record = bool(in_flight_covered) or continues_partial_capture(
+            self.state, turns, backend_session_id
+        )
         result = engine.commit_turns(
             turns=turns,
             backend=backend,

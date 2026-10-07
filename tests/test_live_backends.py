@@ -36,9 +36,19 @@ pytestmark = pytest.mark.live
 # smoke test at all — exactly the backend whose CLI contract nobody has verified yet.
 _BACKENDS = headless_backends()
 
+
 # Cheapest tier per backend, so a smoke test never bills a frontier model. None = the CLI's own
 # default (OpenCode fronts arbitrary providers, so there is no id that is valid everywhere).
-_SMOKE_MODELS = {"claude": "claude-haiku-4-5-20251001", "codex": "gpt-5.4-mini", "opencode": None}
+def _codex_smoke_model() -> str | None:
+    """The smallest model Codex itself offers THIS account (its own roster), not a fixed id:
+    which ids an account may use changes, and a hardcoded mini tier was refused outright for a
+    ChatGPT login. None (the CLI's default) when the roster names no small tier."""
+    from agitrack.summaries.model_select import list_available_models, smallest_model
+
+    return smallest_model("codex", list_available_models("codex"))
+
+
+_SMOKE_MODELS = {"claude": "claude-haiku-4-5-20251001", "codex": _codex_smoke_model(), "opencode": None}
 
 
 def _backend_or_skip(name, tmp_path):

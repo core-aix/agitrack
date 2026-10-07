@@ -326,7 +326,9 @@ class ManualCommitsMixin(RunnerHost):
         # agent committed its own work mid-turn: that commit carries an in-flight block only, so
         # the turn's trace and tokens are still owed, and declining here loses them outright.
         # Record with the tree as it stands — the latent commit is metadata, not a diff.
-        self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
+        self._manual_allow_unchanged = bool(self._uncovered_backend_commits()) or bool(
+            getattr(self, "_manual_owed_continuation", False)
+        )
         return self._manual_allow_unchanged
 
     def _manual_changed_paths(self) -> list[str]:

@@ -50,11 +50,20 @@ def _real(path: str | os.PathLike) -> str:
 
 
 _ROOT_CACHE: dict[str, str | None] = {}
+# A tracker runs for days, and an agent can `git init` or clone into a folder it already looked
+# up; a cached answer is therefore only trusted for a minute.
+_ROOT_CACHE_SECONDS = 60.0
+_root_cache_born = 0.0
 
 
 def repo_root_of(path: str) -> str | None:
     """The git repository a (possibly deleted) file lives in, or None outside any repository.
     The NEAREST one: a file in ``parent/sub/x`` belongs to ``sub`` when ``sub`` is a repository."""
+    global _root_cache_born
+    now = time.monotonic()
+    if now - _root_cache_born > _ROOT_CACHE_SECONDS:
+        _ROOT_CACHE.clear()
+        _root_cache_born = now
     directory = os.path.dirname(_real(path))
     walked: list[str] = []
     found: str | None = None
@@ -96,9 +105,11 @@ def destinations(turn: SessionTurn, cwd: str | None) -> set[str]:
 
 
 def is_tracked(root: str) -> bool:
-    """Whether something will record this repository's share of a conversation started
-    elsewhere: a background tracker running there, an interactive session there that routes
-    turns (no worktree), or an auto-start hook that will start a tracker on its next commit.
+    """Whether something IS recording this repository's share of a conversation started
+    elsewhere: a background tracker running there, or an interactive session there that routes
+    turns (no worktree). An armed auto-start hook does NOT count: the tracker it starts later
+    claims only turns prompted after it first routes, so a turn handed over to it before then
+    would be recorded nowhere.
     A worktree session does not count: its agent is confined to the worktree, and it reads no
     other folder's conversations."""
     from agitrack.proxy import background
@@ -113,7 +124,7 @@ def is_tracked(root: str) -> bool:
         except (OSError, ValueError):
             return False
         return bool(status.get("commit_flush"))  # written only by a no-worktree session
-    return bool(mode.get("running") or mode.get("armed"))
+    return bool(mode.get("running"))
 
 
 def _finished(turn: SessionTurn) -> bool:
@@ -326,7 +337,9 @@ def record_elsewhere(
         # A conversation unchanged since this repository last went through it has nothing new
         # to offer, and reading it again can cost a CLI call (OpenCode exports by subprocess).
         seen_key = (root, candidate.backend, candidate.session_id)
-        if candidate.updated and _PROCESSED.get(seen_key) == candidate.updated:
+        # A commit is never skipped this way: a conversation whose recording was deferred (its
+        # sub-agents still running, which write to their own files) looks unchanged here.
+        if not at_commit and candidate.updated and _PROCESSED.get(seen_key) == candidate.updated:
             continue
         exported = export_candidate(candidate)
         if exported is None or not exported.turns:
@@ -374,7 +387,7 @@ def record_elsewhere(
         if committed:
             debug_fn(f"recorded turns from a {candidate.backend} conversation started in {candidate.cwd}")
             recorded = True
-        if not any(not _finished(turn) for turn in exported.turns):
+        if not getattr(exported, "live_subagent_ids", None) and not any(not _finished(turn) for turn in exported.turns):
             # Only once nothing in it is still running: a running turn is placed when it ends,
             # and that end is itself a change, so the conversation is read again then.
             _PROCESSED[seen_key] = candidate.updated

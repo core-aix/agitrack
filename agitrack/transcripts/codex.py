@@ -1858,3 +1858,26 @@ def recent_sessions(since: float) -> list[tuple[SessionRef, str, Path]]:
             continue
         out.append((SessionRef(id=session_id, updated=updated), cwd, path))
     return out
+
+
+_TOP_LEVEL_MODEL_RE = re.compile(r"""^\s*model\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
+
+
+def configured_model() -> str | None:
+    """The default model in ``$CODEX_HOME/config.toml`` (its top-level ``model = "..."``).
+
+    What a run that pins no model actually runs under. Needed because a bare run is
+    ``--ephemeral`` (no session file) and Codex's event stream names no model, so without it
+    such a run recorded none. Only the TOP-LEVEL key counts: the same key inside a
+    ``[profiles.x]`` table belongs to a profile, not to the default."""
+    try:
+        text = (_codex_home() / "config.toml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            return None  # the first table ends the top level
+        match = _TOP_LEVEL_MODEL_RE.match(line)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None

@@ -179,6 +179,9 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | …but never after a re-anchor past a `git gc --prune`d tip, where HEAD is a fallback parent rather than evidence nothing happened | `test_a_pruned_latent_object_does_not_kill_all_future_tracking` | real-git |
 | The proxy's `_manual_record` survives a pruned latent object too — the re-anchor lived ONLY in the tracker, so the daemon coped and interactive `-m` raised on every turn for the rest of the session | `test_the_proxys_own_manual_copy_also_survives_a_pruned_latent_object` | real-git |
 | The tail trim of `prune_abandoned_refs` is actually exercised: a trailing turn that left the code exactly as HEAD has it is dropped, and the turn that wrote code is kept. (The previous test recorded a "conversation-only" turn that `gate()` silently refused, so the chain never grew a tail and its `len <= before` assertion held no matter what.) | `test_a_trailing_turn_that_left_the_code_as_head_has_it_is_trimmed`, `test_the_trim_keeps_the_turn_that_actually_wrote_code`, `test_a_turn_that_only_talked_never_reaches_the_chain_at_all` | real-git |
+| The agent commits its own work mid-turn and then replies: the rest of the turn (reply + remaining tokens, delta only) is recorded on the clean tree, survives a tracker restart, and folds into the next user commit; a turn whose edits were discarded is still dropped | `test_the_rest_of_a_turn_captured_mid_flight_is_recorded_when_it_ends`, `test_a_record_owed_on_a_clean_tree_survives_a_restart`, `test_a_turn_whose_edits_were_discarded_is_still_dropped` | real-git; verified live on OpenCode (tokens exact vs OpenCode's totals) |
+| A turn that records nothing leaves no pending-trace entries behind (they leaked into the next conversation's commit as stray `## User` blocks) | `test_a_turn_that_records_nothing_leaves_no_prompts_behind` | real-git; verified live |
+| OpenCode: a poll between two steps of a turn (`finish: "tool-calls"`) does not read the turn as finished | `tests/test_opencode_session.py::test_a_turn_between_two_steps_is_not_finished` | parser |
 
 ## 6d. Removing a recorded conversation (`agitrack redact`, `tests/test_redact.py`)
 | Flow | Test | Kind |
@@ -198,6 +201,7 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | Edits inside a nested repo are not a change of the parent (`has_changes`, `has_tracked_changes`) | `test_work_inside_a_nested_repo_is_not_a_change_to_the_parent` | real git |
 | The parent's snapshot and latent gate ignore nested repos, even after they commit | `test_the_parents_snapshot_ignores_nested_repos_even_after_they_commit`, `test_the_parents_latent_gate_records_nothing_for_nested_work` | real git |
 | Each nested repo resolves to its own root, lock and hooks dir | `test_each_repository_resolves_to_its_own_root_and_hooks` | real git |
+| A nested repo with no commit yet does not break the parent's snapshot; aGiTrack's own session worktrees are not "nested repos" | `test_a_nested_repo_with_no_commit_yet_does_not_break_the_snapshot`, `test_a_session_worktree_is_the_repository_not_a_nested_one` | real git |
 | A nested repo's agent sessions are not listed as the parent's (backtrace / bulk share) | `test_a_session_run_in_a_nested_repo_is_not_the_parents`, `test_claude_backtrace_listing_leaves_the_nested_repos_sessions_to_it` | real git |
 | Two trackers (parent + nested) each commit only their own turn and files | verified live with real OpenCode turns; not yet automated | live |
 
@@ -209,6 +213,7 @@ the agent's own commit carrying only an in-flight block with no cover ever arriv
 | A repository takes exactly the turns from elsewhere that edited it, never history from before routing began, relative paths resolved against the conversation's folder | `test_a_repository_takes_exactly_the_turns_that_edited_it_from_elsewhere` | real git |
 | One Claude conversation started in a parent, editing the parent and a nested repo: each tracker records only its share, under its own watermark, and the nested repo does not start tracking that conversation as its own | `test_one_conversation_is_split_between_the_parent_and_the_nested_repo` | real git + real transcript |
 | A sibling checkout finds a conversation started elsewhere that names its path | `test_a_sibling_repository_takes_the_turns_that_edited_it` | real git + real transcript |
+| An armed (not running) destination is not "tracked", so the turn stays home; a commit re-reads a conversation that looks unchanged | `test_an_armed_hook_is_not_a_tracker`, `test_a_commit_rereads_a_conversation_that_looks_unchanged` | real git + real transcript |
 | Live: parent + nested repo, a tracker each, one turn writing a file in each: both commits carry the turn and only their own file, on Claude, Codex and OpenCode | verified live; not automated (needs real backends) | live |
 
 ## 7. Switching sessions

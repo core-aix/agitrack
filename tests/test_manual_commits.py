@@ -2682,3 +2682,33 @@ def test_the_commit_hook_only_asks_a_session_that_says_it_answers(tmp_path):
     assert bg._interactive_session_answers_flush(repo) is False
     bg.proxy_status_path(repo).write_text('{"pid": %d, "mode": "interactive"}' % os.getpid(), encoding="utf-8")
     assert bg._interactive_session_answers_flush(repo) is False
+
+
+def test_a_record_owed_on_a_clean_tree_survives_a_restart(tmp_path):
+    """The rest of a turn whose work the agent already committed is recorded on a CLEAN tree.
+    The "nothing uncommitted means the chain is stale" rule threw it away on the next tracker
+    start, so the turn's reply and remaining tokens reached no commit (found live)."""
+    tracker, repo = _tracker(tmp_path)
+    tracker.owed_record = True
+    _record(tracker, "the rest of a turn", 111)
+    tracker.owed_record = False
+    assert tracker.pending_count() == 1
+
+    restarted = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    restarted.setup()
+    assert restarted.pending_count() == 1
+    tracker.service()  # a HEAD poll on the clean tree keeps it as well
+    assert tracker.pending_count() == 1
+
+
+def test_a_turn_whose_edits_were_discarded_is_still_dropped(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    (tmp_path / "new.txt").write_text("agent edit\n", encoding="utf-8")
+    _record(tracker, "an edit", 5)
+    tracker.owed_record = True
+    _record(tracker, "the rest of that turn", 3)
+    tracker.owed_record = False  # owed-shaped, on top of the edit
+    (tmp_path / "new.txt").unlink()  # the user throws the edit away: the tree is clean again
+    restarted = ManualCommitTracker(repo, repo, AgitrackState(tmp_path, default_backend="claude"))
+    restarted.setup()
+    assert restarted.pending_count() == 0

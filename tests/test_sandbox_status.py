@@ -70,3 +70,26 @@ def test_status_reports_the_confinement_mode(tmp_path, monkeypatch, capsys):
     repo_status(GitRepo.discover(root))
 
     assert "Confinement:" in capsys.readouterr().out
+
+
+def test_status_does_not_claim_confinement_for_a_background_tracker(tmp_path, monkeypatch, capsys):
+    """A background tracker starts no agent, so nothing is sandboxed: the line used to say the
+    agent "can only write its own worktree" there anyway."""
+    import subprocess
+
+    from agitrack.git import GitRepo
+    from agitrack.proxy import background
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    root = tmp_path / "proj"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    monkeypatch.setattr(background, "_live_background_pid", lambda repo: 4242)
+
+    background.repo_status(GitRepo.discover(root))
+
+    out = capsys.readouterr().out
+    assert "Confinement: not used in this mode" in out
+    assert "only write its own worktree" not in out
