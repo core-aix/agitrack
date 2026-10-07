@@ -1295,6 +1295,7 @@ class BackgroundRunner:
         # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
         # before that turn ends — the pre-commit flush re-exports first, so this is current.
         self._in_flight: dict | None = None
+        self._in_flight_since: float | None = None  # monotonic time the running turn was first seen
         self._manual = ManualCommitTracker(
             self.repo, self.base_repo, self.state, debug=self._debug, in_flight_fn=lambda: self._in_flight
         )
@@ -2148,6 +2149,10 @@ class BackgroundRunner:
         a change as well keeps attribution working even if that nudge never lands (a removed
         pre-commit hook, a ``core.hooksPath`` that skips it)."""
         changed = self._in_flight != facts
+        if facts is None:
+            self._in_flight_since = None
+        elif self._in_flight is None or self._in_flight_since is None:
+            self._in_flight_since = time.monotonic()
         self._in_flight = facts
         if changed:
             self._manual.render_trailer()
@@ -2456,6 +2461,8 @@ class BackgroundRunner:
             return
         if self._manual.pending_count() == 0:
             return
+        if not force and self._turn_still_running():
+            return  # the edits in the tree belong to the running turn: fold when it ends
         if not force and not self._worktree_settled(tip):
             return  # something is still writing — retry next cycle
         # Let the LLM summary land first so the commit is summarized (subject + lead paragraph),
@@ -2528,6 +2535,21 @@ class BackgroundRunner:
         if self._settle_tree is not None and tree != self._settle_tree:
             self._settle_changed_at = time.monotonic()
         self._settle_tree = tree
+
+    # How long a running turn holds the auto-fold back. A turn that is genuinely working ends long
+    # before this; one whose agent was killed mid-turn never records an end, and must not stop this
+    # repository being committed for good.
+    _IN_FLIGHT_FOLD_HOLD_SECONDS = 30 * 60
+
+    def _turn_still_running(self) -> bool:
+        """Whether the agent is in the middle of a turn right now. The fold commits EVERYTHING in
+        the tree, and while a turn runs that includes its half-finished edits: they were committed
+        under the PREVIOUS turn's trace whenever the agent paused long enough for the tree to look
+        settled (8 s, e.g. while a test suite ran). The interactive session only auto-commits once
+        the agent is idle; this is the same rule."""
+        if self._in_flight is None or self._in_flight_since is None:
+            return False
+        return time.monotonic() - self._in_flight_since < self._IN_FLIGHT_FOLD_HOLD_SECONDS
 
     def _worktree_settled(self, tip: str) -> bool:
         """True when the working tree has stopped changing, so the fold captures a coherent
