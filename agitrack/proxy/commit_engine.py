@@ -232,13 +232,29 @@ def continues_partial_capture(state, turns, session_id: str | None) -> bool:
     its final reply and the rest of its tokens. By then the tree is usually clean (that commit
     holds the work) and the commit already carries an aGiTrack block, so neither "the tree
     changed" nor "an untracked commit is owed" says to record it, and the remainder was dropped.
-    It is owed all the same."""
+    It is owed all the same.
+
+    Only once the turn has MOVED ON, though: spent tokens beyond what the capture counted (any
+    new reply, tool step or sub-agent costs some). A turn polled again before it did anything new
+    owes nothing, and recording it then wrote the same turn into history a second time, as an
+    empty block beside the first (seen live, after a capture made mid-turn)."""
     record = state.partial_turn_usage() if state is not None else None
     if not record or not record.get("user_id"):
         return False
     if session_id and record.get("session_id") and record.get("session_id") != session_id:
         return False
-    return any(getattr(turn, "user_message_id", None) == record.get("user_id") for turn in turns)
+    counted = record.get("usage") or {}
+    for turn in turns:
+        if getattr(turn, "user_message_id", None) != record.get("user_id"):
+            continue
+        tokens = getattr(turn, "tokens", None)
+        now = tokens.to_dict() if tokens is not None else {}
+        return any(
+            isinstance(value, int) and value > int(counted.get(key) or 0)
+            for key, value in now.items()
+            if key != "context"  # the context size is a level, not a count spent
+        )
+    return False
 
 
 def turn_is_finished(turn) -> bool:
