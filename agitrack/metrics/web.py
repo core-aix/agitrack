@@ -2374,14 +2374,15 @@ function partsHtml(parts){
     const out = (p.tokens&&p.tokens.output) ? ` · ${kfmt(p.tokens.output)} out` : "";
     const mdl = p.model ? ` · ${esc(p.model)}` : "";
     const commits = (LIVE && p.commits) ? p.commits.filter(s => /^[0-9a-fA-F]{4,64}$/.test(s)) : [];
-    const diffs = commits.map(s => {
-      const id = "pdiff-"+(++_partDiffSeq);
-      return `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${id}">file diff of ${esc(s.slice(0,8))}</button>`+
-        `<div class="dmsg diff" id="${id}" hidden></div>`;
-    }).join("");
+    // Buttons in the header row, their boxes BELOW it: the row lays out side by side, and a box
+    // inside it was squeezed into a narrow column next to its button.
+    const ids = commits.map(() => "pdiff-"+(++_partDiffSeq));
+    const buttons = commits.map((s, k) =>
+      `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
+    const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
       `${esc(p.subject||"(no subject)")}<span class="pmeta">${mdl}${out}</span></summary>`+
-      (diffs ? `<div class="dhead">${diffs}</div>` : "")+
+      (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
   const note = LIVE ? " The squash keeps one combined diff (<b>show file diff</b> above); a part's own change is only shown where it names a commit of its own." : "";
