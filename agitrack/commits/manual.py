@@ -383,7 +383,10 @@ class ManualCommitTracker:
             if not tip:
                 return False
             snapshot = worktree_tree if worktree_tree is not None else self.repo.snapshot_worktree_tree()
-            clean = snapshot == self.repo.comparable_tree("HEAD")
+            head_tree = self.repo.comparable_tree("HEAD")
+            clean = snapshot == head_tree
+            if clean and not self.repo.is_ancestor(tip, head) and records_owed_trace(self.repo, tip, head_tree):
+                return False  # the rest of a turn whose work is already committed: still owed
             if clean or self.repo.is_ancestor(tip, head):
                 self.repo.update_ref(self.ref(), head)
                 return True
@@ -450,6 +453,24 @@ class ManualCommitTracker:
         self.render_trailer()
 
 
+def records_owed_trace(repo: GitRepo, sha: str, head_tree: str) -> bool:
+    """Whether the latent commit *sha* records a turn whose WORK is already committed: the rest
+    of a turn a commit captured mid-flight, or a turn whose code the agent committed itself.
+
+    Such a record is taken on a clean tree, so the "nothing uncommitted means the chain is
+    stale" rule discarded it on the next tracker start or HEAD move, and the turn's reply and
+    remaining tokens reached no commit (found live). It is recognised by shape: it adds no code
+    over its parent, and its tree is what HEAD holds now. A turn whose edits were later
+    discarded fails the second half, its tree being one HEAD never got."""
+    try:
+        if repo.comparable_tree(sha) != head_tree:
+            return False
+        parents = repo.parents(sha)
+        return bool(parents) and repo.comparable_tree(parents[0]) == head_tree
+    except Exception:
+        return False
+
+
 def prune_abandoned_refs(
     repo: GitRepo,
     own_ref: str,
@@ -507,6 +528,8 @@ def prune_abandoned_refs(
             tip = repo.ref_sha(ref)
             if not tip or repo.is_ancestor(tip, head):
                 continue  # already folded/committed: reset_stale_ref's ordinary case
+            if working_tree_is_clean and records_owed_trace(repo, tip, head_tree):
+                continue  # owed a commit's trace, not stale (see records_owed_trace)
             if working_tree_is_clean:
                 # No uncommitted code anywhere, so nothing this session recorded still explains
                 # work about to be committed.
@@ -516,7 +539,12 @@ def prune_abandoned_refs(
                 continue
             # Trim the conversation-only tail: trailing turns that recorded no code beyond HEAD.
             pruned = tip
-            while pruned and pruned != head and repo.comparable_tree(pruned) == head_tree:
+            while (
+                pruned
+                and pruned != head
+                and repo.comparable_tree(pruned) == head_tree
+                and not records_owed_trace(repo, pruned, head_tree)
+            ):
                 parents = repo.parents(pruned)
                 pruned = parents[0] if parents else head
             if pruned != tip:

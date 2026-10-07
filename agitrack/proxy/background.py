@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from agitrack import __version__, tracking_gap
+from agitrack import __version__, routing, tracking_gap
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
@@ -40,7 +40,7 @@ from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
-from agitrack.proxy.commit_engine import CommitEngine, turn_is_finished
+from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
 from agitrack.proxy.session import Session
 
 
@@ -306,6 +306,18 @@ def _flush_done_path(repo: GitRepo) -> Path:
     return repo.repo / ".agitrack" / "flush-done"
 
 
+def flush_started_path(repo_root: Path) -> Path:
+    return repo_root / ".agitrack" / "flush-started"
+
+
+# How long a commit waits for a tracker that has STARTED answering its flush request. The first
+# `timeout` only covers a tracker that never picks the request up (wedged, or too old to know the
+# handshake); one that has picked it up is recording right now, and a commit that went ahead
+# anyway folded a stale trailer: a long conversation's export, or another folder's OpenCode
+# conversation exported by CLI, can take longer than the first wait.
+FLUSH_WORKING_WAIT_SECONDS = 60.0
+
+
 def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
     """Ask the running background daemon to record any pending COMPLETED turns and (re)render the
     fold trailer RIGHT NOW, then wait (bounded) for it to acknowledge.
@@ -321,13 +333,22 @@ def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
         _flush_request_path(repo).write_text(nonce, encoding="utf-8")
     except OSError:
         return False
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    extended = False
     while time.monotonic() < deadline:
         try:
             if _flush_done_path(repo).read_text(encoding="utf-8").strip() == nonce:
                 return True
         except OSError:
             pass
+        if not extended:
+            try:
+                if flush_started_path(repo.repo).read_text(encoding="utf-8").strip() == nonce:
+                    extended = True
+                    deadline = started + max(timeout, FLUSH_WORKING_WAIT_SECONDS)
+            except OSError:
+                pass
         time.sleep(0.05)
     return False
 
@@ -344,7 +365,18 @@ def write_proxy_status(repo: GitRepo, *, commits: str, worktree: bool) -> None:
         path = proxy_status_path(repo)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"pid": os.getpid(), "mode": "interactive", "commits": commits, "worktree": bool(worktree)}),
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "mode": "interactive",
+                    "commits": commits,
+                    "worktree": bool(worktree),
+                    # This session answers the pre-commit flush request (see
+                    # `_interactive_session_answers_flush`). Older sessions did not, and asking
+                    # one would only make every commit wait out the timeout.
+                    "commit_flush": not worktree,
+                }
+            ),
             encoding="utf-8",
         )
     except OSError:
@@ -363,6 +395,16 @@ def clear_proxy_status(repo: GitRepo) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+def _interactive_session_answers_flush(repo: GitRepo) -> bool:
+    """Whether the live interactive session holding this repo will service a pre-commit flush
+    request: a no-worktree session (whose commits the fold hook covers) recent enough to say so."""
+    info = _read_proxy_status(repo)
+    if not info or not info.get("commit_flush"):
+        return False
+    pid = info.get("pid")
+    return isinstance(pid, int) and pid_alive(pid)
 
 
 def _read_proxy_status(repo: GitRepo) -> dict | None:
@@ -587,8 +629,13 @@ def repo_status(repo: GitRepo) -> int:
     def _commit_mode(handshake_mode: object) -> str:
         return "manual-commit" if isinstance(handshake_mode, str) and "manual" in handshake_mode else "auto-commit"
 
+    # Whether the running mode confines the agent at all. Only an interactive WORKTREE session
+    # launches the agent inside a sandbox; in background mode the user starts the agent and in a
+    # no-worktree session it edits this checkout directly, so "only its own worktree" was false.
+    unconfined_mode: str | None = None
     bg_pid = _live_background_pid(repo)
     if bg_pid is not None:
+        unconfined_mode = "background mode starts no agent itself, so none is sandboxed"
         info = _read_handshake(repo) or {}
         print(
             f"aGiTrack is running on {_abbreviated_repo(repo)} in BACKGROUND mode (PID {bg_pid}): "
@@ -600,6 +647,8 @@ def repo_status(repo: GitRepo) -> int:
         if proxy is not None and isinstance(proxy_pid, int) and pid_alive(proxy_pid):
             commits = "manual-commit" if proxy.get("commits") == "manual" else "auto-commit"
             worktree = "worktree" if proxy.get("worktree") else "no worktree"
+            if not proxy.get("worktree"):
+                unconfined_mode = "with no worktree the agent edits this checkout directly"
             print(
                 f"aGiTrack is running on {_abbreviated_repo(repo)} in INTERACTIVE mode "
                 f"(PID {proxy_pid}): {commits}, {worktree}."
@@ -617,7 +666,10 @@ def repo_status(repo: GitRepo) -> int:
     # looked like enforcement was the agent choosing to comply.
     from agitrack.proxy import sandbox
 
-    print(sandbox.status_line())
+    if unconfined_mode:
+        print(f"Confinement: not used in this mode ({unconfined_mode}).")
+    else:
+        print(sandbox.status_line())
     reminder = update_reminder_line(repo.repo)
     if reminder:
         print(reminder)
@@ -1008,9 +1060,13 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
             # made needs a FRESH fold trailer: if it's the BACKGROUND daemon, nudge it to record any
             # pending completed turns and re-render the trailer synchronously NOW, so this commit's
             # prepare-commit-msg hook folds the trace/metadata in instead of a trailer lagging the
-            # daemon's poll (the bug where a commit racing the poll folded nothing). An interactive
-            # TUI renders its own trailer as turns complete, so it needs no nudge.
-            if _live_background_pid(repo) is not None:
+            # daemon's poll (the bug where a commit racing the poll folded nothing). A no-worktree
+            # interactive session takes the same request: its trailer is otherwise only as fresh as
+            # the last turn it chose to record, and it holds turns back while sub-agents run.
+            # Not for a commit the interactive session is making itself (Ctrl-G git-commit): it has
+            # recorded and folded everything already, and is holding the lock a flush would wait on.
+            folded = os.environ.get("AGITRACK_COMMIT_FOLDED") == "1"
+            if not folded and (_live_background_pid(repo) is not None or _interactive_session_answers_flush(repo)):
                 request_daemon_flush(repo)
             return 0
     except Exception:
@@ -1037,7 +1093,7 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # they are the most likely to re-edit it — protect its '#' headings from git's cleanup.
         repo.ensure_comment_char_preserves_headings()
         runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
-        runner._process_once()  # parse the repo's own backend session, record NEW pending turns
+        runner._process_once(require_complete=False, at_commit=True)  # this commit records everything said so far
         runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
     except Exception:
         return 0
@@ -1797,7 +1853,18 @@ class BackgroundRunner:
         if not nonce or nonce == self._last_flush_nonce:
             return
         try:
-            self._process_once()
+            flush_started_path(self.repo.repo).write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            # A commit is being made right now — by the user or by the agent itself — so it
+            # carries EVERY conversation up to this moment: finished turns, the turn still
+            # running, and turns the engine would otherwise hold back while async sub-agents or
+            # a monitor are still working. Waiting there is right for aGiTrack's own commits,
+            # but a commit made by someone else does not wait, and every one made during the
+            # wait used to land with no trace at all (seen live: seven hours of prompts behind a
+            # long-running sub-agent, none of them in any of that day's commits).
+            self._process_once(require_complete=False, at_commit=True)
             self._manual.render_trailer()
         except Exception as error:
             self._debug(f"flush failed: {error!r}")
@@ -1958,20 +2025,31 @@ class BackgroundRunner:
         self._install_change_autostart_hook()
         self._write_handshake()  # `-b status` and the dashboard read the tracked backend from here
 
-    def _process_once(self, *, require_complete: bool = True) -> bool:
+    def _process_once(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
         """Export the user's active backend session and record any newly completed turns as
         latent commits. Returns True when a turn was recorded this cycle.
 
         ``require_complete=False`` is the STOP finalize: it keeps a turn that never got a final
         response, so work in progress when the daemon is stopped is still captured. This mirrors
         the interactive proxy's exit finalize — without it, quitting mid-turn silently discarded
-        that turn's record in background mode but not in the TUI."""
+        that turn's record in background mode but not in the TUI.
+
+        ``at_commit`` is the pre-commit flush: a ``git commit`` is being made right now, so every
+        conversation up to this moment is recorded into it (see
+        ``CommitEngine.finish_parse_if_ready``)."""
+        home = self._process_home(require_complete=require_complete, at_commit=at_commit)
+        elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
+        return home or elsewhere
+
+    def _process_home(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
+        """The conversation started in this repository: every turn except those that edited
+        only OTHER tracked repositories (which record them themselves, see agitrack.routing)."""
         session_id = self._tracked_session_id()
         if session_id is None:
             self._debug("no human-driven session in this repo; nothing to export")
             return False
         session = self._bare_session()
-        engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
+        engine = CommitEngine(self.repo, self.state, debug_fn=self._debug, collect_edits=True)
         # Follow an in-backend session switch (the user starting or resuming a conversation)
         # while ignoring programmatic ones. The per-conversation watermark keeps each
         # conversation's turns counted exactly once.
@@ -1998,12 +2076,35 @@ class BackgroundRunner:
             mirror_fn=lambda _sid: None,
             commit_fn=self._record_turns,
             note_in_flight_fn=self._note_in_flight,
+            at_commit=at_commit,
+            turn_filter=routing.Router(str(self.repo.repo)).home_filter(str(self.repo.repo)),
         )
         # The engine records the session's still-running background tasks onto the session it was
         # given. That object is thrown away each cycle, so carry the answer onto the runner — the
         # fold's settle rule needs it (see `_worktree_settled`).
         self._live_background_tasks = list(getattr(session, "live_background_task_ids", None) or [])
         return bool(committed)
+
+    # How often the conversations started OUTSIDE this repository are checked for turns that
+    # edited it. A commit being made checks at once (`at_commit`), whatever the clock says.
+    _ELSEWHERE_EVERY_SECONDS = 10.0
+
+    def _process_elsewhere(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
+        """Record the turns of conversations started in ANOTHER folder (a parent directory, a
+        sibling checkout, anywhere) that edited files in this repository (agitrack.routing)."""
+        now = time.monotonic()
+        if not at_commit and require_complete:
+            if now - getattr(self, "_elsewhere_checked_at", 0.0) < self._ELSEWHERE_EVERY_SECONDS:
+                return False
+        self._elsewhere_checked_at = now
+        return routing.record_elsewhere(
+            self.repo,
+            self.state,
+            commit_fn=self._record_turns,
+            debug_fn=self._debug,
+            require_complete=require_complete,
+            at_commit=at_commit,
+        )
 
     def _note_in_flight(self, facts: dict | None) -> None:
         """Remember (or clear) the running turn's facts. The pre-commit flush re-renders the
@@ -2101,7 +2202,10 @@ class BackgroundRunner:
         # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
         # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
         # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
-        self._manual.owed_record = bool(in_flight_covered)
+        # ...and so is the rest of a turn a commit captured while it was still running.
+        self._manual.owed_record = bool(in_flight_covered) or continues_partial_capture(
+            self.state, turns, backend_session_id
+        )
         result = engine.commit_turns(
             turns=turns,
             backend=backend,

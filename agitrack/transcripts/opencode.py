@@ -10,6 +10,7 @@ import threading
 import time
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 
@@ -236,6 +237,8 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
             continue
         if dpath != directory and directory not in dpath.parents:
             continue
+        if paths.in_nested_repo(directory, dpath):
+            continue  # a nested repository's session is that repository's to track
         updated = session.get("updated") or session.get("created") or 0
         title = session.get("title")
         ref = SessionRef(id=str(sid), updated=_to_seconds(updated), label=title if isinstance(title, str) else None)
@@ -860,7 +863,14 @@ def _build_turn(
     # agent commit made mid-turn got no in-flight attribution at all, and the background tracker
     # would commit a "turn" that was still being written. Claude computes the same thing as
     # ``complete=not in_flight`` (transcripts/claude.py).
-    complete = bool(_as_dict(final_info).get("finish"))
+    #
+    # Read off the LAST assistant message, and not every reason is terminal: OpenCode closes each
+    # STEP of a turn with ``finish: "tool-calls"`` and then starts the next step as a new message.
+    # Counting that as finished made a poll between two steps record the turn and set the
+    # watermark on a message the turn then moved past, so its reply and remaining tokens were
+    # never recorded (found live: an agent that committed its own work and then replied).
+    last_finish = _as_dict((last_assistant or {}).get("info")).get("finish")
+    complete = bool(last_finish) and str(last_finish).lower().replace("_", "-") not in _STEP_FINISHES
     used = capabilities.collect(tool_names=tool_names, skills=skills, subagents=subagents, mcp_servers=mcp_servers)
     for name in used.skills:
         if name not in roster:
@@ -1020,6 +1030,10 @@ def _parts_text(parts: object) -> str:
                 continue
             texts.append(text)
     return "".join(texts).strip()
+
+
+# Finish reasons that end a STEP of a turn, after which OpenCode runs the tools and continues.
+_STEP_FINISHES = frozenset({"tool-calls"})
 
 
 def _final_response(parts: object, *, finish: object = None) -> str:
@@ -1363,3 +1377,34 @@ def session_model(session_id: str) -> str | None:
     if not model_id:
         return None
     return f"{provider}/{model_id}" if provider else str(model_id)
+
+
+def recent_sessions(since: float) -> list[tuple[SessionRef, str]]:
+    """Every top-level OpenCode conversation, in ANY directory, updated since ``since``: ``(ref,
+    recorded directory)``. Read from OpenCode's database, read-only and never blocking (the same
+    rules as :func:`session_last_activity`), because ``opencode session list`` only lists the
+    project of the folder it runs in: run from a nested repository it does not see a conversation
+    started in the parent, which is exactly the one routing has to find (agitrack.routing)."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return []
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            rows = connection.execute(
+                "SELECT id, directory, time_updated, title FROM session "
+                "WHERE parent_id IS NULL AND time_updated > ? ORDER BY time_updated DESC LIMIT ?",
+                (int(since * 1000), _ACTIVITY_ROW_LIMIT),
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception:
+        return []  # wrong schema, locked, corrupt, no sqlite3: no signal
+    out: list[tuple[SessionRef, str]] = []
+    for sid, directory, updated, title in rows:
+        if not sid or not isinstance(directory, str):
+            continue
+        out.append((SessionRef(id=str(sid), updated=_to_seconds(updated), label=title or None), directory))
+    return out

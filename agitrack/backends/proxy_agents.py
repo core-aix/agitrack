@@ -312,7 +312,7 @@ class ProxyAgent(Protocol):
         with the worktree directory name (the session's name). Includes ones whose
         worktree has since been removed, so named sessions stay resumable."""
 
-    def export_session(self, repo: Path, session_id: str) -> ExportedSession | None: ...
+    def export_session(self, repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None: ...
 
     def is_event_blob(self, content: str) -> bool:
         """Whether a trace entry is a raw backend event dump that should be
@@ -424,8 +424,8 @@ class OpenCodeProxyAgent:
     def list_worktree_sessions(self, worktrees_root: Path) -> list[tuple[str, SessionRef]]:
         return opencode_session.list_worktree_sessions(worktrees_root)
 
-    def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
-        return opencode_session.export_session(repo, session_id)
+    def export_session(self, repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
+        return opencode_session.export_session(repo, session_id, collect_edits=collect_edits)
 
     def is_event_blob(self, content: str) -> bool:
         return opencode_session.looks_like_event_blob(content)
@@ -538,8 +538,8 @@ class ClaudeProxyAgent:
     def list_worktree_sessions(self, worktrees_root: Path) -> list[tuple[str, SessionRef]]:
         return claude_session.list_worktree_sessions(worktrees_root)
 
-    def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
-        return claude_session.export_session(repo, session_id)
+    def export_session(self, repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
+        return claude_session.export_session(repo, session_id, collect_edits=collect_edits)
 
     def is_event_blob(self, content: str) -> bool:
         return False
@@ -653,8 +653,8 @@ class CodexProxyAgent:
     def list_worktree_sessions(self, worktrees_root: Path) -> list[tuple[str, SessionRef]]:
         return codex_session.list_worktree_sessions(worktrees_root)
 
-    def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
-        return codex_session.export_session(repo, session_id)
+    def export_session(self, repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
+        return codex_session.export_session(repo, session_id, collect_edits=collect_edits)
 
     def is_event_blob(self, content: str) -> bool:
         return codex_session.looks_like_event_blob(content)

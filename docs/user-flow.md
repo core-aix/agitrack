@@ -524,8 +524,10 @@ tree holds them — the base repo and/or this session's worktree.
 > `git-commit` is the one command used for **both** a plain user commit and a commit that includes
 > the agent's tracked work. It stages your changes, then folds every pending latent turn's trace +
 > metadata into the message so the result is a **single** commit carrying your edits *and* the full
-> agent tracking; the latent ref is then reset. (An external `git commit` you run yourself gets the
-> same folding via the `prepare-commit-msg` hook.) See
+> agent tracking; the latent ref is then reset. The conversation is recorded AFTER you type the
+> message (so a turn that finished while the dialog was open is included), and from there to the
+> reset nothing else can record a turn, so none is lost between the fold and the reset. (An external
+> `git commit` you run yourself gets the same folding via the `prepare-commit-msg` hook.) See
 > [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m).
 
 ```mermaid
@@ -694,6 +696,53 @@ tracker that outlives the command cannot go on writing the conversation into com
 [Exit and terminal close](#10-exit-and-terminal-close)
 
 ---
+
+## 10b. Removing a recorded conversation (`agitrack redact`)
+
+`agitrack redact` takes interaction traces back out of history, for a conversation that should
+never have been recorded. It selects turns by commit (`--commit`) or by when they took place
+(`--since` / `--until`), and rewrites only commit messages: every rewritten commit keeps its files,
+author and dates, so the working tree, index and checkout do not change.
+
+```mermaid
+flowchart TD
+  cmd(["agitrack redact --commit REV / --since T --until T"]) --> sel{"Which turns?"}
+  sel -->|"--commit"| all[["Every turn recorded in that commit"]]
+  sel -->|"--since/--until"| win[["Every turn whose recorded span overlaps the window<br/>(a commit with no span: placed by its own date)"]]
+  all --> any{"Anything recorded to remove?"}
+  win --> any
+  any -->|"Only commits no branch contains"| orphan(["Named and left alone (nothing would carry a rewritten copy); exit 1"])
+  any -->|No| remember[["Nothing in history. A window is still remembered,<br/>so its uncommitted turns never reach a commit message"]]
+  any -->|Yes| show[["List the commits (ids and dates only, never the text),<br/>the branches rewritten, and any remote or tag that keeps the original"]]
+  show --> dry{"--dry-run?"}
+  dry -->|Yes| done0(["Nothing changed"])
+  dry -->|No| ask{"Rewrite these commit messages? [y/N]<br/>(skipped with --yes; refused without a terminal)"}
+  ask -->|No| done0
+  ask -->|Yes| lock{"Who holds the repository?"}
+  lock -->|"Nobody"| rewrite
+  lock -->|"A background tracker"| pause[["Stop it (it records its final turn on the way out)"]] --> rewrite
+  lock -->|"An interactive session"| refuse(["Refused: quit the session first"])
+  rewrite[["Plan again under the lock, then rewrite: the trace becomes a note,<br/>aGiTrack's subject/summary of that turn too (unless --keep-summary),<br/>metadata kept plus trace_removed. Branches, pending latent turns,<br/>notes and the tracker watermark follow the new ids"]]
+  rewrite --> report[["Report: force-push needed for pushed branches; tags untouched;<br/>--purge expires the reflog and prunes the originals"]]
+  report --> restart(["A stopped background tracker is started again in the same commit mode"])
+```
+
+## 10c. Which repository a turn is recorded in
+
+A conversation can edit several repositories (its own, one nested inside it, a sibling
+checkout). Each turn's trace is recorded in the repositories it edited.
+
+```mermaid
+flowchart TD
+  turn(["A finished turn, with the files it edited"]) --> dest{"Which git repositories hold those files?<br/>(the nearest repository: a nested repo, not its parent)"}
+  dest -->|"None (it only talked, or edited scratch files)"| home[["Recorded where the conversation started"]]
+  dest -->|"Includes the repository it started in"| both[["Recorded where it started"]]
+  dest -->|"Only other repositories"| tracked{"Is every one of them tracked by aGiTrack<br/>(a tracker running there right now)?"}
+  tracked -->|No| home
+  tracked -->|Yes| away[["Left to those repositories"]]
+  both --> others
+  away --> others[["Every other repository it edited records it too: its tracker reads<br/>conversations started elsewhere (every 10 s, and when a commit is made)<br/>and keeps the turns that edited it, prompted after it started routing"]]
+```
 
 ## 11. Session sharing
 

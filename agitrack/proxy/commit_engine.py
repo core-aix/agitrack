@@ -214,6 +214,33 @@ def _is_dialog_keystroke(turn) -> bool:
     return True
 
 
+def _export(backend, repo_path, session_id: str, collect_edits: bool):
+    """``backend.export_session``, with each turn's edits when asked for and supported."""
+    if collect_edits:
+        try:
+            return backend.export_session(repo_path, session_id, collect_edits=True)
+        except TypeError:
+            pass  # a backend (or test double) that cannot recover edits: export without them
+    return backend.export_session(repo_path, session_id)
+
+
+def continues_partial_capture(state, turns, session_id: str | None) -> bool:
+    """Whether *turns* include the rest of a turn a commit captured while it was still running.
+
+    A commit made mid-turn (`at_commit`, the agent committing its own work) records the turn as
+    it stood and anchors the watermark on its user id, so the turn comes back once it ends with
+    its final reply and the rest of its tokens. By then the tree is usually clean (that commit
+    holds the work) and the commit already carries an aGiTrack block, so neither "the tree
+    changed" nor "an untracked commit is owed" says to record it, and the remainder was dropped.
+    It is owed all the same."""
+    record = state.partial_turn_usage() if state is not None else None
+    if not record or not record.get("user_id"):
+        return False
+    if session_id and record.get("session_id") and record.get("session_id") != session_id:
+        return False
+    return any(getattr(turn, "user_message_id", None) == record.get("user_id") for turn in turns)
+
+
 def turn_is_finished(turn) -> bool:
     """Whether *turn* can still receive more messages from the backend.
 
@@ -279,8 +306,11 @@ class CommitEngine:
         *,
         debug_fn: _DebugFn | None = None,
         full_agent_messages: bool | None = None,
+        collect_edits: bool = False,
     ) -> None:
         self.repo = repo
+        # Export each turn WITH the files it edited, which routing needs (agitrack.routing).
+        self._collect_edits = collect_edits
         self.state = state
         self._debug = debug_fn or (lambda *a, **kw: None)
         # Per-run override for the "include all agent messages" behaviour (e.g. the
@@ -308,6 +338,27 @@ class CommitEngine:
         except Exception as error:
             self._debug(f"tracking floor lookup failed: {error!r}")
             return None
+
+    def _restore_pending_trace(self, items: list[dict]) -> None:
+        self.state.data["pending_trace"] = list(items)
+        self.state.save()
+
+    def _redacted_turn_test(self) -> Callable[[SessionTurn], bool]:
+        """Whether a turn began inside a window removed with ``agitrack redact``."""
+        root = getattr(self.repo, "repo", None)
+        windows: list[tuple[float, float]] = []
+        if root is not None:
+            try:
+                from agitrack.redact import redacted_windows
+
+                windows = redacted_windows(Path(root))
+            except Exception as error:
+                self._debug(f"redaction windows lookup failed: {error!r}")
+        if not windows:
+            return lambda _turn: False
+        from agitrack.redact import in_windows
+
+        return lambda turn: in_windows(getattr(turn, "started_at", None), windows)
 
     def _skip_untracked_turns(self, turns: list[SessionTurn]) -> None:
         """Advance this conversation's watermark past turns from the untracked stretch, so they
@@ -398,6 +449,10 @@ class CommitEngine:
         if not turns:
             return False
         backend_commits = list(backend_commits or [])
+        # Turns from a window the user removed with `agitrack redact`: still counted (their
+        # tokens were spent and their edits are in the tree), but no word of them is written.
+        redacted = self._redacted_turn_test()
+        pending_before: list[dict] = []
 
         if accumulate_trace_only_on_commit:
             # Actions / shell mode: do the staged check first, accumulate only
@@ -422,18 +477,23 @@ class CommitEngine:
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
+                if redacted(turn):
+                    self._add_turn_usage(turn)
+                    continue
+                # Every entry carries when its turn began, so the trace's age cap can place it.
+                at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     # A background wake-up is an EVENT, not something the user said.
                     role = TRACE_EVENT_ROLE if _is_background_event(turn.user_prompt) else "user"
-                    self.state.append_trace(role, turn.user_prompt)
+                    self.state.append_trace(role, turn.user_prompt, at=at)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
                     if followup.strip():
                         # Its own heading, but NOT a new turn — see append_trace(starts_turn).
-                        self.state.append_trace("user", followup, starts_turn=False)
+                        self.state.append_trace("user", followup, starts_turn=False, at=at)
                 for message in self._agent_messages_for(turn):
-                    self.state.append_trace("agent", message)
+                    self.state.append_trace("agent", message, at=at)
                 self._add_turn_usage(turn)
             # The subject describes what was ASKED FOR, so a synthetic wake-up label is not a
             # candidate: a commit whose turns were all background-driven falls back to
@@ -442,6 +502,7 @@ class CommitEngine:
             prompts = [
                 p
                 for turn in turns
+                if not redacted(turn)
                 for p in ([turn.user_prompt, *turn.queued_followups])
                 if p and not _is_background_event(p)
             ]
@@ -450,35 +511,43 @@ class CommitEngine:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
             # entries that hadn't yet landed as a turn (e.g. a queued prompt from
             # before this parse cycle).
+            # Put back exactly as found when this attempt commits nothing: the entries written
+            # below belong to THESE turns, and left behind they read as leftover prompts to the
+            # next attempt, which may be another conversation's (a session switch carried one
+            # conversation's prompt into the next one's commit).
+            pending_before = self.state.pending_trace()
             pending_users: list[str] = [
-                content
-                for item in self.state.pending_trace()
-                if item.get("role") == "user" and (content := item.get("content"))
+                content for item in pending_before if item.get("role") == "user" and (content := item.get("content"))
             ]
             self.state.data["pending_trace"] = []
             self.state.save()
 
             subject_prompts: list[str] = []
-            entries: list[tuple[str, str, bool]] = []
+            # (role, content, starts_turn, at): `at` is when the turn began, so the trace's age
+            # cap can place the entry (see message._limit_trace_age).
+            entries: list[tuple[str, str, bool, float | None]] = []
             for turn in turns:
+                if redacted(turn):
+                    continue
+                at = getattr(turn, "started_at", None)
                 if turn.user_prompt and not _is_dialog_keystroke(turn):
                     if _is_background_event(turn.user_prompt):
                         # An EVENT woke the agent; nobody asked for anything. It belongs in the
                         # trace (it explains a turn with no prompt) but never under the user's
                         # name, and never as the commit's subject.
-                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True))
+                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True, at))
                     else:
                         subject_prompts.append(turn.user_prompt)
-                        entries.append(("user", turn.user_prompt, True))
+                        entries.append(("user", turn.user_prompt, True, at))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
                     if not followup.strip():
                         continue
                     subject_prompts.append(followup)
-                    entries.append(("user", followup, False))
+                    entries.append(("user", followup, False, at))
                 for message in self._agent_messages_for(turn):
-                    entries.append(("agent", message, True))
+                    entries.append(("agent", message, True, at))
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. a follow-up note typed mid-turn) are still added to the
@@ -538,9 +607,9 @@ class CommitEngine:
                     insert_at = index + 1
                     break
             # Leftovers were typed while that turn was running, so they continue it too.
-            entries[insert_at:insert_at] = [("user", leftover, False) for leftover in leftovers]
-            for role, content, starts_turn in entries:
-                self.state.append_trace(role, content, starts_turn=starts_turn)
+            entries[insert_at:insert_at] = [("user", leftover, False, None) for leftover in leftovers]
+            for role, content, starts_turn, at in entries:
+                self.state.append_trace(role, content, starts_turn=starts_turn, at=at)
 
             cover_backend_head = False
             cover_with_staged = False
@@ -551,6 +620,7 @@ class CommitEngine:
                 # actually changed since the latent tip, so a no-op turn records nothing —
                 # and, per bug #14, tokens are still accumulated only once past this gate.
                 if manual_gate_fn is not None and not manual_gate_fn():
+                    self._restore_pending_trace(pending_before)
                     return False
             else:
                 # Hook: proxy mode puts the session on a fresh turn branch here.
@@ -562,6 +632,7 @@ class CommitEngine:
 
                 if not self.repo.has_staged_changes():
                     if not self._head_is_coverable(backend_commits):
+                        self._restore_pending_trace(pending_before)
                         return False
                     cover_backend_head = True
                 elif self._head_is_coverable(backend_commits):
@@ -643,7 +714,7 @@ class CommitEngine:
         changed_paths = self._changed_paths(changed_paths_fn) if interrupted else None
         trace_text = render_interaction_trace(
             self.state.pending_trace(),
-            self.state.trace_turn_limit,
+            self.state.trace_max_age_hours,
             interrupted=interrupted,
             changed_paths=changed_paths,
             # The summarizer's SOLE input, so it is redacted before the LLM ever sees it: a
@@ -672,7 +743,7 @@ class CommitEngine:
             reasoning_effort=reasoning_effort,
             conversation_anchor=conversation_anchor,
             token_usage=self.state.pending_token_usage(),
-            trace_turn_limit=self.state.trace_turn_limit,
+            trace_max_age_hours=self.state.trace_max_age_hours,
             session_name=session_name,
             summary=summary_text,
             summary_metadata=summary_metadata,
@@ -699,6 +770,8 @@ class CommitEngine:
             # tree turned out unchanged after the gate).
             commit_sha = manual_record_fn(message)
             if commit_sha is None:
+                if not accumulate_trace_only_on_commit:
+                    self._restore_pending_trace(pending_before)
                 return False
         elif cover_backend_head or cover_with_staged:
             # The backend committed its own work (#35). Its commits keep their
@@ -811,6 +884,8 @@ class CommitEngine:
         commit_fn: Callable,
         on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
         note_in_flight_fn: Callable[[dict | None], None] | None = None,
+        at_commit: bool = False,
+        turn_filter: Callable[[SessionTurn], bool] | None = None,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -829,6 +904,21 @@ class CommitEngine:
         (result, new_awaited)
             *result* is ``True`` (committed), ``False`` (consumed, no commit),
             or ``None`` (deferred / no result ready).
+
+        ``at_commit`` means a real ``git commit`` is being made RIGHT NOW (by the user or by the
+        agent itself) and this parse feeds its message. Every conversation up to that moment is
+        then recorded into it, whatever would otherwise make the engine wait: a turn still
+        running, async sub-agents still working, a run of trivial monitor ticks. Callers pass it
+        together with ``require_complete=False``; it additionally keeps a trailing turn that has
+        no reply yet, which a force commit otherwise trims, because the user asked for
+        everything said before the commit. A running turn is anchored on its user id like any
+        force capture, so the rest of it is recorded by a later commit, counting only its new
+        tokens.
+
+        ``turn_filter`` keeps only the turns that belong to THIS repository (see
+        :mod:`agitrack.routing`): a conversation may have edited several repositories, and each
+        records the turns that touched it. A run of turns that all belong elsewhere and have all
+        finished is stepped past, so it is not re-exported and re-dropped on every poll.
         """
         parse_thread = session.agent_parse_thread
         if parse_thread and parse_thread.is_alive():
@@ -898,6 +988,28 @@ class CommitEngine:
             )
             self._skip_untracked_turns(untracked_turns)
 
+        if turn_filter is not None and all_turns:
+            kept = [turn for turn in all_turns if turn_filter(turn)]
+            if not kept:
+                # Step past them, but never past the conversation's LAST turn: it can still
+                # continue (a backend may close each step of a running turn, so it can look
+                # finished between two edits), and a turn that wrote only elsewhere so far may
+                # write here next. Only a turn some later turn has followed is over for sure.
+                settled = all_turns[:-1]
+                if settled and all(turn_is_finished(turn) for turn in settled):
+                    debug_fn(
+                        f"stepping past {len(settled)} turn(s) that belong to other repositories "
+                        f"session_id={new_session_id}"
+                    )
+                    self._skip_untracked_turns(settled)
+                return False, awaited_followups
+            if len(kept) != len(all_turns):
+                debug_fn(
+                    f"routing: {len(all_turns) - len(kept)} turn(s) belong to other repositories "
+                    f"session_id={new_session_id}"
+                )
+            all_turns = kept
+
         # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
         # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
         # otherwise the fold hook has no pending turn to fold and the commit lands with no
@@ -915,7 +1027,9 @@ class CommitEngine:
                     "backend": backend_name,
                     "backend_session_id": new_session_id,
                     "model": exported_session.model or self.state.model,
-                    "prompt": running.user_prompt,
+                    # A turn begun inside a window removed with `agitrack redact` is still
+                    # attributed, but its words are not written (as in `commit_turns`).
+                    "prompt": None if self._redacted_turn_test()(running) else running.user_prompt,
                 }
             note_in_flight_fn(facts)
 
@@ -966,7 +1080,7 @@ class CommitEngine:
         # Exception: a SOLE final-less turn under a force commit (require_complete=False,
         # the exit finalize) is kept, so exit still captures in-flight work; turns_after
         # re-exports it if the conversation later continues.
-        while len(all_turns) > 1 and not all_turns[-1].final_response:
+        while not at_commit and len(all_turns) > 1 and not all_turns[-1].final_response:
             dropped = all_turns.pop()
             debug_fn(
                 f"trimming unanswered trailing turn from commit "
@@ -1052,6 +1166,11 @@ class CommitEngine:
             # that actually carried a response; fall back to the last turn for a no-text
             # finished turn. Which of the turn's two ids anchors the mark is decided below.
             watermark = complete_turns[-1] if complete_turns else last_turn
+            if at_commit and last_turn is not None:
+                # A commit-time capture recorded EVERY turn, the running one included, so the
+                # mark goes on that turn — anchored on its user id below, with its tokens so far
+                # remembered — or the next commit would record it again in full.
+                watermark = last_turn
             # A turn captured MID-FLIGHT is anchored on its USER id — never on whatever
             # assistant id it happens to carry at this instant. A backend mints a NEW message
             # id for each assistant response within a turn, so the id a force capture (the
@@ -1192,7 +1311,7 @@ class CommitEngine:
                 # single global one), so switching between conversations never replays or
                 # double-counts a conversation's already-committed turns.
                 last_message_id = state.backend_message_id_for(session_id)
-                exported = backend.export_session(repo.repo, session_id) if session_id else None
+                exported = _export(backend, repo.repo, session_id, self._collect_edits) if session_id else None
                 turn_count = len(exported.turns) if exported else 0
                 final_count = len([t for t in exported.turns if t.final_response]) if exported else 0
                 debug_fn(

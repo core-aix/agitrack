@@ -29,6 +29,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.fileio import safe_is_dir
 from agitrack.transcripts import capabilities as caps
@@ -1307,6 +1308,8 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
             continue
         if resolved != root and not resolved.startswith(root + os.sep):
             continue
+        if paths.in_nested_repo(root, resolved):
+            continue  # a nested repository's session is that repository's to track
         session_id = _id_from_path(path)
         if not session_id:
             continue
@@ -1835,3 +1838,46 @@ def looks_like_event_blob(text: str) -> bool:
     if not isinstance(row, dict):
         return False
     return row.get("type") in ("session_meta", "event_msg", "response_item", "turn_context", "world_state")
+
+
+def recent_sessions(since: float) -> list[tuple[SessionRef, str, Path]]:
+    """Every human-driven Codex conversation, in ANY directory, written to since ``since``:
+    ``(ref, recorded cwd, rollout path)``. Sub-agent threads and headless ``codex exec`` runs
+    are left out, as in :func:`list_sessions`."""
+    out: list[tuple[SessionRef, str, Path]] = []
+    for path in _rollout_files():  # newest mtime first
+        updated = _mtime(path)
+        if updated <= since:
+            break
+        header = _read_header(path)
+        if _is_agent_thread(header) or str(header.get("source") or "") == "exec":
+            continue
+        session_id = _id_from_path(path)
+        cwd = header.get("cwd")
+        if not session_id or not isinstance(cwd, str) or not cwd:
+            continue
+        out.append((SessionRef(id=session_id, updated=updated), cwd, path))
+    return out
+
+
+_TOP_LEVEL_MODEL_RE = re.compile(r"""^\s*model\s*=\s*["']([^"']+)["']\s*(?:#.*)?$""")
+
+
+def configured_model() -> str | None:
+    """The default model in ``$CODEX_HOME/config.toml`` (its top-level ``model = "..."``).
+
+    What a run that pins no model actually runs under. Needed because a bare run is
+    ``--ephemeral`` (no session file) and Codex's event stream names no model, so without it
+    such a run recorded none. Only the TOP-LEVEL key counts: the same key inside a
+    ``[profiles.x]`` table belongs to a profile, not to the default."""
+    try:
+        text = (_codex_home() / "config.toml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            return None  # the first table ends the top level
+        match = _TOP_LEVEL_MODEL_RE.match(line)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None

@@ -185,6 +185,12 @@ class CodexBackend:
             from agitrack.transcripts.codex import session_model
 
             resolved_model = session_model(parsed_session_id or session_id or "")
+        if not resolved_model:
+            # A bare run is ephemeral (no session file to ask), so fall back to the default
+            # the user's config names: that is what a run pinning no model ran under.
+            from agitrack.transcripts.codex import configured_model
+
+            resolved_model = configured_model()
 
         # A FAILED run with nothing to say reports WHY. Codex puts the reason ("The 'gpt-x' model
         # is not supported when using Codex with a ChatGPT account", a 429, an expired login) only

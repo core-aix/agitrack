@@ -1851,7 +1851,7 @@ def test_an_unchanged_transcript_is_not_re_read(tmp_path, monkeypatch):
             },
         ],
     )
-    claude._LAST_EXPORT = None
+    claude._EXPORTS.clear()
     parses = []
     real_parse = claude.parse_rows
     monkeypatch.setattr(claude, "parse_rows", lambda *a, **k: (parses.append(1), real_parse(*a, **k))[1])
@@ -1893,13 +1893,13 @@ def test_the_export_memo_lets_a_big_session_go_when_nobody_comes_back(tmp_path):
 
     path = tmp_path / "sess.jsonl"
     _write_rows(path, [{"type": "user", "uuid": "u1", "parentUuid": None, "message": {"role": "user", "content": "x"}}])
-    claude._LAST_EXPORT = None
+    claude._EXPORTS.clear()
     claude.export_session_at(path)
-    assert claude._LAST_EXPORT is not None
-    stored_key, stored, _at = claude._LAST_EXPORT
-    claude._LAST_EXPORT = (stored_key, stored, time.monotonic() - claude._EXPORT_MEMO_SECONDS - 1)
+    assert str(path) in claude._EXPORTS
+    stored_key, stored, _at = claude._EXPORTS[str(path)]
+    claude._EXPORTS[str(path)] = (stored_key, stored, time.monotonic() - claude._EXPORT_MEMO_SECONDS - 1)
     claude.export_session_at(path)  # expired: re-read, and the stale entry replaced
-    assert claude._LAST_EXPORT[2] > time.monotonic() - 5
+    assert claude._EXPORTS[str(path)][2] > time.monotonic() - 5
 
 
 def test_forget_session_in_drops_a_worktrees_copy_of_a_moved_conversation(monkeypatch, tmp_path):

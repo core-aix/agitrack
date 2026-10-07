@@ -22,6 +22,7 @@ same script works on Windows too.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -308,7 +309,9 @@ def hooks_dir_for_path(directory: Path) -> Path | None:
         if common.is_file():
             target = Path(common.read_text(encoding="utf-8", errors="replace").strip())
             git_dir = target if target.is_absolute() else git_dir / target
-        return git_dir / "hooks"
+        # Normalised: a submodule's `gitdir: ../.git/modules/<name>` would otherwise come back
+        # as `<sub>/../.git/...`, correct but unequal to the same directory spelled plainly.
+        return Path(os.path.normpath(git_dir / "hooks"))
     except OSError:
         return None
 

@@ -148,8 +148,9 @@ To skip the menu, name the mode on the command line:
 | `agitrack --backtrace` | reconstruct past agent sessions |
 | `agitrack status` | report what aGiTrack is running here (same as `-s`) |
 | `agitrack stop` | stop whatever aGiTrack is running here, in any mode |
+| `agitrack redact` | remove recorded interaction traces from history (see [Removing a recorded conversation](#removing-a-recorded-conversation-agitrack-redact)) |
 
-`status` and `stop` are aGiTrack's only bare-word commands; any other bare word is reported as an unknown command (with the known ones listed) instead of being run. To send a single word to the agent as a prompt, put it after `--`: `agitrack -- refactor`.
+`status`, `stop` and `redact` are aGiTrack's only bare-word commands; any other bare word is reported as an unknown command (with the known ones listed) instead of being run. To send a single word to the agent as a prompt, put it after `--`: `agitrack -- refactor`.
 
 **`agitrack stop` is the one way to stop.** Whatever is holding the repository, it stops it: the background tracker, an interactive session, and this repository's dashboard. You do not have to remember which mode you started.
 
@@ -568,6 +569,29 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 - Commits are created only when staged changes exist.
 - If the backend commits on its own (e.g. the agent runs `git commit` itself, or a hook does), aGiTrack never rewrites those commits — their hashes stay exactly what the agent may already have reported in PR or issue comments. Instead, once the turn finishes, aGiTrack adds a *cover commit* on top carrying the interaction trace and metadata: a merge-shaped commit in the GitHub PR merge style, whose tree is the backend head's tree and whose parents are the turn's start and the backend's head, so `git log --first-parent` reads turn-by-turn while the backend's own commits remain reachable via the second parent. The `covered_commits` metadata line records the hashes of the backend-made commits the cover accounts for; when aGiTrack also has uncommitted changes to commit, its own (regular) commit carries that line instead.
 
+### Removing a recorded conversation (`agitrack redact`)
+
+A commit message is where aGiTrack writes a conversation down, and it is published as soon as the branch is pushed. If you typed something into the agent that should never be in history (a password pasted into the wrong window, a message meant for someone else, a customer's details), take it back out:
+
+```bash
+agitrack redact --commit abc1234                                  # every turn recorded in this commit (repeatable)
+agitrack redact --since "2026-10-06 14:00" --until "2026-10-06 15:30"  # every turn that took place in this window
+agitrack redact --since 3h                                        # the last three hours
+agitrack redact --commit abc1234 --dry-run                        # show what would change, change nothing
+```
+
+- **Only commit messages change.** The affected commits are rewritten with the same files, author, committer and dates, so your working tree, index and checkout are untouched. Commits after a rewritten one get new ids, as with any history rewrite. Every local branch holding the commit is updated (and a detached HEAD sitting on it), along with the turns aGiTrack has recorded but not yet folded into a commit. A commit that no branch contains any more is named and left alone, since nothing would carry a rewritten copy.
+- **A turn's trace is replaced by a one-line note.** The aGiTrack subject and summary of that turn are replaced too, because they were written from the conversation and often quote your prompt (`--keep-summary` keeps them). Your own commit subjects are never touched. The metadata (tokens, model, times) stays, gaining a `trace_removed:` line, so the dashboard's numbers do not change.
+- **A window is precise inside a commit.** With `--since`/`--until`, a commit that folds several turns (manual-commit mode) keeps the turns outside the window. The window is also remembered, so a turn from it that has not been committed yet never reaches a commit message later.
+- **A running background tracker is restarted for you**: it is stopped while history is rewritten and comes back in the same commit mode. An interactive session has to be quit first.
+- **What it cannot reach**: a remote that already has the commits (force-push the rewritten branch, and know that the original text stays in the remote's history, pull requests and other clones until then), tags, and this clone's reflog (add `--purge` to expire it and prune the originals now). The command lists all of these before it asks for confirmation; `--yes` skips the question.
+
+### Repositories inside a repository, and conversations that edit several
+
+A git repository nested inside a tracked one (a submodule, or a separate repository cloned or `git init`-ed into a subfolder) is tracked **separately**: run aGiTrack inside it (`cd sub && agitrack -b`) and its work is committed there, with its own trace, lock and hooks. The parent never stages a nested repository, never counts edits inside one as a change of its own, and does not list a nested repository's agent sessions as its own in the backtrace. A submodule pointer that has moved is still an ordinary change of the parent, for you to commit when you choose.
+
+An agent is not limited to the folder you start it in, so **each turn's trace goes to the repositories it actually edited**. A conversation started in a parent folder that edits both the parent and a nested repository (or a sibling checkout) shows up in both repositories' commits, each with the files that changed there. A repository's tracker records its own conversations' turns, plus the turns of conversations started elsewhere that edited files inside it. A turn that changed nothing in its own repository is left to the repositories it did change, but only when aGiTrack tracks all of them; otherwise it stays where it started, so no trace is lost. Turns from before a repository started taking part are never claimed. This works the same with Claude, Codex and OpenCode.
+
 ### Repository dashboard
 
 The [Dashboard](#dashboard) section above covers how to run it (`-d`, and `-d text` for a one-shot plain-text report); this is the full breakdown of **what it computes and how each commit is classified** — all from the aGiTrack metadata in commit messages, so the numbers are identical on every clone.
@@ -766,7 +790,7 @@ Repository-local configuration can be stored in `.agitrack/config.json`:
 
 ```json
 {
-  "trace_turn_limit": 5,
+  "trace_max_age_hours": 24,
   "summarization_enabled": true,
   "summarization_model": null,
   "learning_backend": null,
@@ -774,7 +798,7 @@ Repository-local configuration can be stored in `.agitrack/config.json`:
 }
 ```
 
-`trace_turn_limit` controls the maximum number of recent user turns included in an agent commit body. The default is `5`.
+`trace_max_age_hours` bounds how far back an agent commit's interaction trace reaches: it keeps every turn since the previous commit that began within this many hours of the newest one (default `24`), however many there are, and notes how many older turns it left out. Set it to `0` or `null` to keep every turn since the previous commit. Turns prompted while aGiTrack was stopped are never included either way. (This replaces the old `trace_turn_limit`, a count of turns, which is no longer read.)
 
 `summarization_enabled` (default `true`) toggles the LLM summarization stream (see Summarization above). `summarization_model` sets the model the summarizer asks the backend to use; leave it unset (`null`) to use the backend's default model. Both keys can also be set user-wide in `~/.agitrack/config.json`; the repository-local value wins, and the `summarizer` command writes its changes here.
 

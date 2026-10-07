@@ -896,7 +896,7 @@ def _message(source: _Source, session_id: str, turn: SessionTurn) -> str:
     # keep names out of what gets PUBLISHED, and blanking them here would only take information
     # away from the one person already entitled to it. `--backtrace commit`, which does write real
     # commits, redacts (metrics/backtrace_commit.py).
-    body = render_interaction_trace(trace, trace_turn_limit=len(trace) + 1)
+    body = render_interaction_trace(trace, trace_max_age_hours=None)
 
     lines = [_subject(turn), ""]
     if body:

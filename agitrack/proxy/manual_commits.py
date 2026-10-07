@@ -326,7 +326,9 @@ class ManualCommitsMixin(RunnerHost):
         # agent committed its own work mid-turn: that commit carries an in-flight block only, so
         # the turn's trace and tokens are still owed, and declining here loses them outright.
         # Record with the tree as it stands — the latent commit is metadata, not a diff.
-        self._manual_allow_unchanged = bool(self._uncovered_backend_commits())
+        self._manual_allow_unchanged = bool(self._uncovered_backend_commits()) or bool(
+            getattr(self, "_manual_owed_continuation", False)
+        )
         return self._manual_allow_unchanged
 
     def _manual_changed_paths(self) -> list[str]:
@@ -443,6 +445,44 @@ class ManualCommitsMixin(RunnerHost):
         except Exception as error:
             self._debug(f"manual ref reset failed: {error!r}")
         return False
+
+    def _service_commit_flush_request(self) -> None:
+        """Answer a pre-commit flush request (``background.request_daemon_flush``), the same
+        handshake the background tracker answers: a ``git commit`` — the user's, or one the agent
+        runs itself — is waiting for this session to record the conversation so far and re-render
+        the fold trailer, so the commit carries every turn up to this moment. Runs on the git
+        worker, which the file watcher wakes the moment the request is written.
+
+        A request already sitting there when the session starts belongs to a commit that has long
+        since finished (it waited at most a few seconds), so it is noted and never answered."""
+        if not self._latent_tracking:
+            return
+        agit_dir = self.base_repo.repo / ".agitrack"
+        try:
+            nonce = (agit_dir / "flush-request").read_text(encoding="utf-8").strip()
+        except OSError:
+            nonce = ""
+        if not hasattr(self, "_answered_flush_nonce"):
+            self._answered_flush_nonce = nonce
+            return
+        if not nonce or nonce == self._answered_flush_nonce:
+            return
+        self._answered_flush_nonce = nonce
+        try:
+            # Tells the waiting hook this session is on it, so it waits for the answer rather than
+            # timing out (see `background.FLUSH_WORKING_WAIT_SECONDS`).
+            (agit_dir / "flush-started").write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            self._record_conversation_for_commit()
+            self._render_manual_trailer()
+        except Exception as error:
+            self._debug(f"commit flush failed: {error!r}")
+        try:
+            (agit_dir / "flush-done").write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
 
     def _service_manual_commit_mode(self) -> None:
         """Per-loop upkeep for manual-commit mode (throttled). With the hooks installed, react

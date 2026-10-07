@@ -971,3 +971,17 @@ def test_recorded_cwd_reads_the_header_without_parsing_the_whole_file(codex_home
 
     assert codex.recorded_cwd(path) == "/somewhere/repo"
     assert codex.recorded_cwd(codex_home / "nope.jsonl") is None
+
+
+def test_configured_model_reads_only_the_top_level_default(tmp_path, monkeypatch):
+    from agitrack.transcripts import codex as codex_transcripts
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert codex_transcripts.configured_model() is None
+    (tmp_path / "config.toml").write_text(
+        'model = "gpt-6-astra"  # default\nmodel_reasoning_effort = "high"\n\n[profiles.fast]\nmodel = "x"\n',
+        encoding="utf-8",
+    )
+    assert codex_transcripts.configured_model() == "gpt-6-astra"
+    (tmp_path / "config.toml").write_text('[profiles.fast]\nmodel = "x"\n', encoding="utf-8")
+    assert codex_transcripts.configured_model() is None

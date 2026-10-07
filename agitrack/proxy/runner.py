@@ -48,7 +48,7 @@ from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
-from agitrack.proxy.commit_engine import CommitEngine, turn_is_finished
+from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
@@ -376,6 +376,13 @@ class RepoChangeHandler(FileSystemEventHandler):
             relative = os.path.relpath(src_path, self.repo_path)
         except ValueError:
             relative = src_path
+        if relative == os.path.join(".agitrack", "flush-request"):
+            # A `git commit` is waiting on us to record the conversation so far (see
+            # ProxyRunner._service_commit_flush_request). Not a worktree change, so only the git
+            # worker is woken — at once, rather than after its idle poll.
+            if self.wake is not None:
+                self.wake.set()
+            return
         if any(part in self.IGNORED_PARTS for part in relative.split(os.sep)):
             return
         self.changed.set()
@@ -6549,7 +6556,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # A foreground merge is being resolved; don't make normal commits meanwhile.
             self._maybe_complete_agent_merge()
             return
+        self._service_commit_flush_request()  # a `git commit` waiting for the conversation so far
         self._maybe_agent_commit()
+        self._record_elsewhere()
         self._poll_base_advanced()
         self._service_manual_commit_mode()  # --manual-commits: react to a user/external commit
         self._warn_if_base_edited()
@@ -9171,15 +9180,6 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         on_worktree = repo is None
         repo = repo or self.repo
         state = state or self.state
-        if self._manual_commits:
-            # Capture any agent turn that just finished (its parse may have completed while the
-            # user was opening this menu) as a latent commit BEFORE folding, so its metadata/
-            # trace are included rather than raced past. A turn still mid-parse is recorded on
-            # the next loop tick; a commit made mid-parse OUTSIDE aGiTrack can't be intercepted.
-            try:
-                self._finish_agent_parse_if_ready(quiet=True)
-            except Exception as error:
-                self._debug(f"manual pre-commit turn flush failed: {error!r}")
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
@@ -9208,6 +9208,34 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 return False
             message = result
             prompt = "Commit message is required — enter one, or press Esc to continue without committing:"
+        # Manual mode: from here to the ref reset below, nothing else may record a turn. The git
+        # worker records conversations too, so a turn it recorded while this commit was being made
+        # (the pre-commit hook used to ASK it to) was skipped by the fold hook, which sees the
+        # header already folded below, and then dropped by the ref reset: its trace reached no
+        # commit. Held from the main thread only (an RLock, so a caller already holding it is fine).
+        locked = self._manual_commits and threading.current_thread() is threading.main_thread()
+        if locked:
+            self._acquire_pipeline_lock_from_main()
+        try:
+            return self._finish_user_commit(repo, state, message)
+        finally:
+            if locked:
+                self._pipeline_lock.release()
+
+    def _finish_user_commit(self, repo: GitRepo, state: AgitrackState, message: str) -> bool:
+        commit_env: dict[str, str] | None = None
+        if self._manual_commits:
+            # Record EVERY conversation up to this moment as latent turns BEFORE folding, so this
+            # commit carries all of it: finished turns, the one still running, and turns held
+            # back while async sub-agents work (see `_record_conversation_for_commit`). After the
+            # message dialog, not before it: the dialog can stay open for minutes.
+            try:
+                self._record_conversation_for_commit()
+            except Exception as error:
+                self._debug(f"manual pre-commit turn flush failed: {error!r}")
+            # Already recorded and folded here, so the pre-commit hook must not ask this session to
+            # flush: it would wait on the lock held above until its timeout.
+            commit_env = {"AGITRACK_COMMIT_FOLDED": "1"}
         if self._manual_commits:
             # Manual-commit mode: fold the pending latent turns' tracking into this one
             # commit inline, so it's fully tracked whether or not the prepare-commit-msg
@@ -9231,7 +9259,10 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 message=message, agitrack_session_id=state.session_id, repo_root=getattr(repo, "repo", None)
             )
         try:
-            repo.commit(commit_message)
+            if commit_env:
+                repo.commit(commit_message, env=commit_env)
+            else:
+                repo.commit(commit_message)
         except Exception as error:
             # A failed commit (a repo pre-commit hook rejecting it, a git config/identity problem,
             # a racing change) must NOT crash aGiTrack — it used to propagate as an uncaught
@@ -9406,6 +9437,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                     use_latent = False
             except Exception as error:
                 self._debug(f"clean-tree cover check failed: {error!r}")
+        # The rest of a turn a commit captured mid-flight is owed a record even on a clean tree
+        # (see continues_partial_capture); `_manual_gate` reads this.
+        self._manual_owed_continuation = continues_partial_capture(self.state, turns, backend_session_id)
         committed = CommitEngine(
             self.repo,
             self.state,
@@ -10127,6 +10161,64 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             ["No, keep working", "Yes, terminate them and exit"],
         )
         return choice == "Yes, terminate them and exit"
+
+    @property
+    def _routes_turns(self) -> bool:
+        """Whether this session's turns are routed between repositories (agitrack.routing).
+        Only without a worktree: a worktree session's agent is confined to its worktree, and a
+        turn routed away from it would have nowhere to be recorded while this session holds the
+        repository."""
+        return not self._use_worktrees
+
+    def _home_turn_filter(self):
+        if not self._routes_turns:
+            return None
+        from agitrack import routing
+
+        root = str(self.base_repo.repo)
+        return routing.Router(root).home_filter(root)
+
+    def _record_elsewhere(self, *, at_commit: bool = False) -> bool:
+        """Record turns of conversations started in OTHER folders that edited this repository
+        (agitrack.routing), the same way a background tracker does. Every ten seconds on the git
+        worker, and at once when a commit is being made."""
+        if not self._routes_turns:
+            return False
+        now = time.monotonic()
+        if not at_commit and now - getattr(self, "_elsewhere_checked_at", 0.0) < 10.0:
+            return False
+        self._elsewhere_checked_at = now
+        from agitrack import routing
+
+        try:
+            return routing.record_elsewhere(
+                self.base_repo,
+                self.state,
+                commit_fn=self._create_agent_commit_from_turns_popup,
+                debug_fn=self._debug,
+                require_complete=not at_commit,
+                at_commit=at_commit,
+            )
+        except Exception as error:
+            self._debug(f"recording other folders' conversations failed: {error!r}")
+            return False
+
+    def _record_conversation_for_commit(self) -> None:
+        """A commit is being made right now (by the user or by the agent itself): record every
+        conversation up to this moment so the commit's fold carries it. Joins the in-flight
+        parse, then takes a FRESH one, both finished with ``at_commit`` (see
+        ``CommitEngine.finish_parse_if_ready``)."""
+        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+            self.agent_parse_thread.join(timeout=20)
+        self._finish_agent_parse_if_ready(
+            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+        )
+        if self._start_agent_parse() and self.agent_parse_thread:
+            self.agent_parse_thread.join(timeout=20)
+        self._finish_agent_parse_if_ready(
+            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+        )
+        self._record_elsewhere(at_commit=True)
 
     def _commit_latest_turn_sync(self) -> None:
         # Synchronously (joining the parse worker) commit the latest completed
@@ -11353,7 +11445,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # the user switched sessions, and resolving `self.backend` / `self.repo`
         # at that point would hit the WRONG session. CommitEngine.start_parse
         # captures the owning session explicitly and writes results back to it.
-        return CommitEngine(self.repo, self.state, debug_fn=self._debug).start_parse(
+        # Without a worktree the agent edits wherever it likes, so each turn is read with the
+        # files it edited and routed to the repositories it changed (agitrack.routing).
+        return CommitEngine(self.repo, self.state, debug_fn=self._debug, collect_edits=self._routes_turns).start_parse(
             session=self.active,
             discover_session_id_fn=self._discover_spawned_session,
             debug_fn=self._debug,
@@ -11369,6 +11463,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         prompt_untracked: bool | None = None,
         integrate: bool = True,
         require_complete: bool = True,
+        at_commit: bool = False,
     ) -> bool | None:
         if prompt_untracked is None:
             # Worktree sessions are isolated sandboxes, so agent commits there
@@ -11392,6 +11487,8 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # them as-is rather than raising a modal during teardown.
             on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
             note_in_flight_fn=self._note_in_flight,
+            at_commit=at_commit,
+            turn_filter=self._home_turn_filter(),
         )
         self._awaited_followups = new_awaited
         if committed is not None:

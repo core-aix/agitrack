@@ -219,10 +219,23 @@ class GitRepo:
         return self._run(["git", "status"]).stdout
 
     def has_changes(self) -> bool:
-        return bool(self.status_short().strip())
+        """Whether THIS repository's working tree differs from HEAD.
+
+        Repositories nested inside it are theirs to track, not ours (see :meth:`untracked_files`):
+        edits inside a submodule (``--ignore-submodules=dirty``; a moved submodule pointer still
+        counts) and an untracked nested repo are not changes to this one. Without that, an agent
+        working in a nested repo kept the parent permanently "dirty"."""
+        output = self._run(["git", "status", "--short", "--ignore-submodules=dirty"]).stdout
+        lines = [line for line in output.splitlines() if line.strip()]
+        if any(not line.startswith("??") for line in lines):
+            return True
+        # Only untracked entries: real files, or nested repositories (which do not count).
+        return bool(lines) and bool(self.untracked_files())
 
     def has_tracked_changes(self) -> bool:
-        return self._diff_has_changes(["git", "diff", "--quiet"]) or self.has_staged_changes()
+        return (
+            self._diff_has_changes(["git", "diff", "--quiet", "--ignore-submodules=dirty"]) or self.has_staged_changes()
+        )
 
     def diff_head(self) -> str:
         # Content of all tracked changes (staged + unstaged) relative to HEAD.
@@ -283,8 +296,29 @@ class GitRepo:
             self._run(["git", "add", "--", *paths])
 
     def untracked_files(self) -> list[str]:
+        """Untracked files that belong to THIS repository.
+
+        A git repository nested inside this one — ``git init`` in a subfolder, or a clone dropped
+        into one — is a separate repository with its own history, and aGiTrack tracks it
+        separately (run aGiTrack there). Without ``--directory``, git lists such a repo as ONE
+        entry ending in ``/`` and never its files, which is the only way a directory appears in
+        this listing, so those entries are dropped. Staging one would commit the nested repo into
+        this one as an embedded gitlink (git's "adding embedded git repository" warning), which is
+        exactly what an automatic commit did before this filter."""
         output = self._run(["git", "ls-files", "--others", "--exclude-standard"]).stdout
-        return [line for line in output.splitlines() if line and not _is_scaffolding(line)]
+        return [line for line in output.splitlines() if line and not line.endswith("/") and not _is_scaffolding(line)]
+
+    def nested_repo_paths(self) -> list[str]:
+        """Repo-relative paths (no trailing slash) of git repositories inside this one: its
+        submodules / gitlinks, and untracked nested repos. Each is tracked separately."""
+        nested = [
+            line.split("\t", 1)[1]
+            for line in self._run(["git", "ls-files", "--stage"], check=False).stdout.splitlines()
+            if line.startswith("160000 ") and "\t" in line
+        ]
+        output = self._run(["git", "ls-files", "--others", "--exclude-standard"], check=False).stdout
+        nested += [line.rstrip("/") for line in output.splitlines() if line.endswith("/")]
+        return nested
 
     def untracked_entries(self) -> list[str]:
         """Untracked paths with WHOLLY-untracked directories collapsed to a single ``dir/``
@@ -347,8 +381,8 @@ class GitRepo:
             return True
         raise GitError(process.stderr.strip() or "Unable to inspect changes")
 
-    def commit(self, message: str) -> str:
-        self._run(["git", "commit", "-F", "-"], input_text=message)
+    def commit(self, message: str, *, env: dict[str, str] | None = None) -> str:
+        self._run(["git", "commit", "-F", "-"], input_text=message, env=env)
         return self.short_sha("HEAD")
 
     def amend_commit(self, message: str) -> str:
@@ -414,7 +448,12 @@ class GitRepo:
             # just what happens to be staged in the user's real index. check=False so an
             # unborn branch (no HEAD yet) simply starts from an empty index.
             self._run(["git", "read-tree", "HEAD"], env=env, check=False)
-            self._run(["git", "add", "-A"], env=env)
+            if self._run(["git", "add", "-A"], env=env, check=False).returncode != 0:
+                # A nested repository with no commit yet (a fresh `git init` in a subfolder)
+                # makes git refuse the whole add. It is not this repository's content anyway, so
+                # add everything else and let the nested-repo pass below drop what remains.
+                self._run(["git", "add", "-A", "--ignore-errors"], env=env, check=False)
+            self._leave_nested_repos_at_head(env)
             # Drop the agent scaffolding dirs from the snapshot whether they were tracked
             # or freshly added (``--ignore-unmatch`` so absent ones are a no-op). Done as a
             # separate step rather than an ``:(exclude)`` pathspec, which errors when the
@@ -425,6 +464,28 @@ class GitRepo:
                 check=False,
             )
             return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def _leave_nested_repos_at_head(self, env: dict[str, str]) -> None:
+        """In a snapshot's throwaway index, undo what ``add -A`` did to NESTED repositories: drop
+        an untracked nested repo it added as a gitlink, and put a moved submodule pointer back to
+        HEAD's. Work inside a nested repo belongs to that repo's own tracking; counting it here
+        made an untouched parent look changed forever (the added gitlink is never in HEAD) and
+        recorded a commit inside a submodule as this repository's turn."""
+        raw = self._run(["git", "diff-index", "--cached", "--no-renames", "HEAD"], env=env, check=False)
+        if raw.returncode != 0:
+            return  # unborn branch: nothing to compare against, nothing nested yet either
+        for line in raw.stdout.splitlines():
+            meta, _, path = line.partition("\t")
+            fields = meta.lstrip(":").split()
+            if len(fields) < 5 or "160000" not in (fields[0], fields[1]) or not path:
+                continue
+            old_mode, new_mode, old_sha, status = fields[0], fields[1], fields[2], fields[4]
+            if status == "A" and new_mode == "160000":
+                # `rm --cached` refuses a gitlink staged moments ago ("staged content different
+                # from both the file and the HEAD"); this index is ours alone, so force it.
+                self._run(["git", "update-index", "--force-remove", "--", path], env=env, check=False)
+            elif old_mode == "160000" and new_mode == "160000":
+                self._run(["git", "update-index", "--cacheinfo", f"160000,{old_sha},{path}"], env=env, check=False)
 
     def comparable_tree(self, rev: str = "HEAD") -> str:
         """The tree of *rev* with the agent scaffolding dirs stripped, so it is directly

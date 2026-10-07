@@ -351,7 +351,7 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, Path]]:
         for ref in _refs_in_project_dir(project_dir):
             path = project_dir / f"{ref.id}.jsonl"
             cwd = _first_cwd(path)
-            if cwd is not None and _within(directory, cwd):
+            if cwd is not None and _within(directory, cwd) and not paths.in_nested_repo(directory, cwd):
                 out.append((ref, path))
     out.sort(key=lambda item: item[0].updated, reverse=True)
     return out
@@ -957,13 +957,16 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     return export_session_at(_session_path(repo, session_id), collect_edits=collect_edits)
 
 
-# The last export, keyed by the file's identity. A long session's transcript is large (this
-# repo's own is ~150 MB) and re-reading it costs a fifth of a second EVERY time, which the
-# user waits out with their prompt held ("checking existing git changes..."). An append-only
-# JSONL that has not grown or been touched since the last read cannot have changed, so the
-# previous result stands. One entry only, and dropped after a couple of minutes: this exists
-# to serve the same file twice in a row, not to hold a 150 MB session in memory all day.
-_LAST_EXPORT: tuple[tuple, "ExportedSession | None", float] | None = None
+# Recent exports, one per FILE, keyed by the file's identity. A long session's transcript is
+# large (this repo's own is ~150 MB) and re-reading it costs a fifth of a second EVERY time,
+# which the user waits out with their prompt held ("checking existing git changes..."). An
+# append-only JSONL that has not grown or been touched since the last read cannot have
+# changed, so the previous result stands. A few files, not one: a tracker now reads its own
+# conversation AND the ones started elsewhere that edited it (agitrack.routing) every cycle,
+# and a single slot made them evict each other. Each entry is dropped after a couple of
+# minutes: this exists to serve the same file again soon, not to hold sessions all day.
+_EXPORTS: dict[str, tuple[tuple, "ExportedSession | None", float]] = {}
+_EXPORT_SLOTS = 4
 _EXPORT_MEMO_SECONDS = 120.0
 
 
@@ -977,7 +980,6 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
     :func:`_edits_from_message`); it is off for ordinary exports.
 
     Repeated calls for an UNCHANGED file (same size and mtime) reuse the previous result."""
-    global _LAST_EXPORT
     if not path.is_file():
         return None
     try:
@@ -985,12 +987,12 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
         key = (str(path), stamp.st_size, stamp.st_mtime_ns, collect_edits)
     except OSError:
         key = None
-    if _LAST_EXPORT is not None:
-        cached_key, cached, stored_at = _LAST_EXPORT
-        if time.monotonic() - stored_at > _EXPORT_MEMO_SECONDS:
-            _LAST_EXPORT = None  # let a big session go rather than hold it for a caller who left
-        elif key is not None and cached_key == key:
-            return cached
+    now = time.monotonic()
+    for stale in [name for name, (_k, _e, at) in _EXPORTS.items() if now - at > _EXPORT_MEMO_SECONDS]:
+        del _EXPORTS[stale]  # let a big session go rather than hold it for a caller who left
+    entry = _EXPORTS.get(str(path))
+    if entry is not None and key is not None and entry[0] == key:
+        return entry[1]
     rows: list[dict] = []
     try:
         # errors="replace", NEVER strict: a transcript is appended to by the backend while we
@@ -1020,7 +1022,10 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
         collect_edits=collect_edits,
     )
     if key is not None:
-        _LAST_EXPORT = (key, exported, time.monotonic())
+        _EXPORTS.pop(str(path), None)
+        _EXPORTS[str(path)] = (key, exported, time.monotonic())
+        while len(_EXPORTS) > _EXPORT_SLOTS:
+            del _EXPORTS[next(iter(_EXPORTS))]  # oldest stored first
     return exported
 
 
@@ -2281,3 +2286,45 @@ def _as_dict(value: object) -> dict:
 
 def _int(value: object) -> int:
     return value if isinstance(value, int) else 0
+
+
+def recent_sessions(since: float) -> list[tuple[SessionRef, str, Path]]:
+    """Every human-driven Claude conversation, in ANY directory, written to since ``since``:
+    ``(ref, recorded cwd, transcript path)``. One ``stat`` per transcript, plus a bounded head
+    read for the few that are recent. Feeds routing (:mod:`agitrack.routing`): a conversation
+    started in one folder routinely edits another repository, and that repository's tracker has
+    to find it."""
+    root = _projects_root()
+    if not safe_is_dir(root):
+        return []
+    out: list[tuple[SessionRef, str, Path]] = []
+    try:
+        project_dirs = list(root.iterdir())
+    except OSError:
+        return []
+    for project_dir in project_dirs:
+        if not safe_is_dir(project_dir):
+            continue
+        for path in project_dir.glob("*.jsonl"):
+            try:
+                updated = path.stat().st_mtime
+            except OSError:
+                continue
+            if updated <= since:
+                continue
+            head = _HEAD_CACHE.get(str(path))
+            if head is None:
+                # A transcript's first rows (and so its cwd and whether it is programmatic) never
+                # change once written, so each file's head is read once per process.
+                _, programmatic = _scan_session_head(path)
+                head = (_first_cwd(path), programmatic)
+                if head[0]:  # a brand-new transcript may not have recorded its cwd yet
+                    _HEAD_CACHE[str(path)] = head
+            cwd, programmatic = head
+            if programmatic or not cwd:
+                continue
+            out.append((SessionRef(id=path.stem, updated=updated), cwd, path))
+    return out
+
+
+_HEAD_CACHE: dict[str, tuple[str | None, bool]] = {}

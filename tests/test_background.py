@@ -1348,6 +1348,40 @@ def test_background_commit_folds_fresh_turn_via_flush(tmp_path):
     assert "# aGiTrack Metadata" in msg  # the turn's trace/metadata folded into the commit
 
 
+def test_a_commit_carries_every_conversation_while_a_sub_agent_is_still_running(tmp_path):
+    """THE BUG, seen live in manual mode: an async sub-agent ran for seven hours, the daemon held
+    every turn back for all of it, and each commit made meanwhile — the agent's own included —
+    landed with no trace. 39 of 55 prompts that day reached no commit. A commit is the moment the
+    user (or agent) says "this is the work so far", so it records everything said up to it: the
+    question-only turns before, and the turn still running that is making the commit."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    turns = [
+        _turn("u1", "m1", "what algorithm did you use before?", "The v8 one.", 10),
+        _turn("u2", "m2", "why was v8 so good?", "Golden labels.", 10),
+        SessionTurn(
+            "u3", "m3", "yes you can do the authoring test", "", TokenUsage(total=7, output=7), "m", complete=False
+        ),
+    ]
+    backend.sessions["s1"] = ExportedSession("s1", "claude-opus-4-8", None, turns, live_subagent_ids=["a72c9956"])
+    backend.latest = "s1"
+
+    # The ordinary poll waits for the sub-agent and the running turn: nothing is recorded.
+    runner._process_once()
+    assert runner._manual.pending_count() == 0
+
+    # The agent commits its own work mid-turn; the pre-commit hook asks the daemon to flush.
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n-commit", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "authoring test")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    for prompt in ("what algorithm did you use before?", "why was v8 so good?", "yes you can do the authoring test"):
+        assert prompt in msg
+
+
 def test_precommit_sync_nudges_a_running_daemon_to_flush(tmp_path, monkeypatch):
     # When a LIVE background daemon holds the lock, precommit_sync no longer just bails: it asks the
     # daemon to flush so this commit folds a fresh trailer (it still records nothing itself — the
@@ -2736,3 +2770,78 @@ def test_a_daemon_is_registered_before_it_finishes_starting(tmp_path, monkeypatc
     assert seen[0] == "register:background", f"registered too late: {seen}"
     assert "hooks" in seen  # ...and the slow startup work really did come after it
     assert git_hooks.is_autotrack_hook(repo.hooks_dir() / "pre-commit")
+
+
+def test_the_rest_of_a_turn_captured_mid_flight_is_recorded_when_it_ends(tmp_path):
+    """The agent commits its own work while its turn is still running. That commit carries the
+    turn as it stood (commit-time capture). When the turn then ends, the tree is clean and the
+    commit already holds an aGiTrack block, so neither "the tree changed" nor "an untracked commit
+    is owed" said to record the rest, and the final reply and remaining tokens were dropped
+    (found in a live pre-release run). The remainder is owed, and counts only its new tokens."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    running = SessionTurn(
+        "u1", "m1", "build the thing", "", TokenUsage(total=7, output=7), "claude-opus-4-8", complete=False
+    )
+    backend.set_session("s1", [running])
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()  # the agent's `git commit` fires the pre-commit flush
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    assert "build the thing" in _git(repo, "log", "-1", "--format=%B")
+
+    done = SessionTurn("u1", "m2", "build the thing", "Built it.", TokenUsage(total=10, output=10), "claude-opus-4-8")
+    backend.set_session("s1", [done])
+    runner._process_once()
+
+    recorded = "\n".join(runner._manual.pending_bodies())
+    assert "Built it." in recorded
+    assert "tokens_since_last_commit_output: 3" in recorded  # 10 spent, 7 already in the commit
+
+
+def test_a_turn_that_records_nothing_leaves_no_prompts_behind(tmp_path):
+    """A turn the recording gate turns away (nothing changed) must not leave its entries in the
+    pending trace: the next attempt reads them as leftover prompts, and when that attempt is
+    another conversation's they land in its commit as stray `## User` blocks (found in a live
+    pre-release run: one OpenCode session's prompt inside the next session's commit)."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "just a question", "an answer", 5)])
+    runner._process_once()  # tree unchanged: nothing to record
+    assert runner._manual.pending_count() == 0
+    assert state.pending_trace() == []
+
+
+def test_a_commit_waits_for_a_tracker_that_has_started_its_flush(tmp_path):
+    """The first wait only covers a tracker that never picks the request up. One that has (it
+    wrote `flush-started`) is recording right now, and a commit that went ahead anyway folded a
+    stale trailer, so the hook keeps waiting for its answer."""
+    import threading
+    import time
+
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".agitrack").mkdir(exist_ok=True)
+
+    def slow_tracker():
+        while True:
+            try:
+                nonce = (tmp_path / ".agitrack" / "flush-request").read_text(encoding="utf-8").strip()
+            except OSError:
+                nonce = ""
+            if nonce:
+                break
+        background.flush_started_path(tmp_path).write_text(nonce, encoding="utf-8")
+        time.sleep(0.6)  # longer than the hook's first wait below
+        (tmp_path / ".agitrack" / "flush-done").write_text(nonce, encoding="utf-8")
+
+    worker = threading.Thread(target=slow_tracker)
+    worker.start()
+    assert background.request_daemon_flush(repo, timeout=0.2) is True
+    worker.join()
+
+    # A tracker that never picks the request up still lets the commit go after the first wait.
+    assert background.request_daemon_flush(repo, timeout=0.2) is False
