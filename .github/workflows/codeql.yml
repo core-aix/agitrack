@@ -49,7 +49,7 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          language: ${{ matrix.language }}
+          languages: ${{ matrix.language }}
           config-file: ./.github/codeql/codeql-config.yml
           # security-extended adds the lower-severity security queries to the default set. The
           # noise cost is acceptable for a codebase that shells out to git and serves HTTP.

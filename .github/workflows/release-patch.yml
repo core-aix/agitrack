@@ -190,12 +190,27 @@ jobs:
           node-version: 22
 
       - name: Publish VSCode extension
+        id: vscode
         if: ${{ env.VSCE_TOKEN != '' }}
+        # Never fatal: PyPI and the GitHub Release are already out by now, and failing this
+        # job skipped the MSI build that needs it (v0.6.23: an expired Marketplace token
+        # left the release with no MSI). The step still shows as failed, and the step below
+        # says how to finish the job.
+        continue-on-error: true
         working-directory: editors/vscode
         run: |
           npm install --no-audit --no-fund
           npm run compile
           npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_TOKEN"
+
+      - name: Say how to publish the extension by hand
+        if: ${{ steps.vscode.outcome == 'failure' }}
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          msg="The VSCode extension was NOT published for v${VERSION} (an expired VSCE_TOKEN is the usual cause). Renew the token, then run the 'Release assets' workflow with version ${VERSION} and only the extension selected."
+          echo "::warning::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
   # Build the standalone Windows MSI and attach it to the release the job above just
   # created. This MUST live in the same workflow run as the release: the release is created
@@ -205,63 +220,10 @@ jobs:
   # merged to main, so checking out main yields the bumped source and `gh release upload`
   # has a release to attach to.
   build-msi:
-    name: Build + attach Windows MSI
     needs: release
-    runs-on: windows-latest
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: main
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Install runtime + build deps
-        run: uv sync --group build
-
-      - name: Resolve MSI name
-        id: msi
-        shell: pwsh
-        run: |
-          $ver = "${{ needs.release.outputs.version }}"
-          echo "MSI_NAME=agitrack-$ver-windows-x64.msi" >> $env:GITHUB_OUTPUT
-
-      - name: Build with PyInstaller
-        run: uv run pyinstaller installer/agitrack.spec -y
-
-      - name: Smoke-test bundled EXE
-        run: dist\agitrack\agitrack.exe --version
-
-      - name: Install WiX v5
-        # WiX v5 is required for the <Files> harvest element in agitrack.wxs (v4 lacks it).
-        run: dotnet tool install --global wix --version 5.0.2
-
-      - name: Add WiX UI extension
-        # Pin the UI extension to the SAME version as the wix tool. Unpinned, `wix
-        # extension add` pulls the latest (a newer major), which the toolset can't load —
-        # `wix build` then fails with WIX0144 "extension could not be found".
-        run: wix extension add --global WixToolset.UI.wixext/5.0.2
-
-      - name: Build MSI
-        # -arch x64: the PyInstaller bundle is 64-bit, so the MSI must be too (else
-        # ProgramFiles64Folder doesn't resolve and files install to the wrong place).
-        run: |
-          wix build `
-            installer\agitrack.wxs `
-            -arch x64 `
-            -d Version=${{ needs.release.outputs.version }} `
-            -d SourceDir=${{ github.workspace }}\dist\agitrack `
-            -ext WixToolset.UI.wixext `
-            -o dist\${{ steps.msi.outputs.MSI_NAME }}
-
-      - name: Attach MSI to the release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "v${{ needs.release.outputs.version }}" "dist/${{ steps.msi.outputs.MSI_NAME }}" --clobber
+    uses: ./.github/workflows/release-msi.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+      ref: main
