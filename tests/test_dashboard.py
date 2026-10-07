@@ -2414,8 +2414,12 @@ def _render_detail(entry: dict, tmp_path) -> str:
     stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
     script = tmp_path / "detail.js"
     script.write_text(
-        "const SOURCE = " + json.dumps(source) + ";\n"
-        + "const ENTRY = " + json.dumps(entry) + ";\n"
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + "const ENTRY = "
+        + json.dumps(entry)
+        + ";\n"
         + stub
         + "global.requestAnimationFrame = f => f();\n"
         + "const box = Object.assign(stubEl(), {hidden: true});\n"
