@@ -2920,3 +2920,30 @@ def test_a_turn_polled_again_before_it_moved_on_owes_nothing(tmp_path):
 
     moved_on = SessionTurn("u1", "m2", "do x", "done", TokenUsage(total=10, output=10), "m")
     assert continues_partial_capture(state, [moved_on], "s1") is True
+
+
+def test_the_auto_fold_waits_while_a_turn_is_still_running(tmp_path):
+    """The fold commits everything in the tree, and while a turn runs that includes its
+    half-finished edits: they were committed under the PREVIOUS turn's trace the moment the agent
+    paused long enough for the tree to look settled. A turn whose agent died mid-turn holds it back
+    for a bounded time only."""
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()  # a finished turn, pending
+    runner._worktree_settled = lambda tip: True
+    (tmp_path / "b.txt").write_text("half-finished work of the next turn\n", encoding="utf-8")
+
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "next"})
+    runner._auto_fold_pending()
+    assert len(_git(repo, "log", "--format=%H").split()) == 1  # nothing committed mid-turn
+
+    runner._in_flight_since = time.monotonic() - runner._IN_FLIGHT_FOLD_HOLD_SECONDS - 1
+    runner._auto_fold_pending()  # a turn that never ends does not hold the repo forever
+    assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+    runner._note_in_flight(None)
+    assert runner._turn_still_running() is False
