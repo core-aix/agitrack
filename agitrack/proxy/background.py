@@ -318,6 +318,13 @@ def flush_started_path(repo_root: Path) -> Path:
 FLUSH_WORKING_WAIT_SECONDS = 60.0
 
 
+# Set on a commit whose maker has already recorded and folded everything (the tracker's own
+# auto-fold, an interactive Ctrl-G commit or auto-fold), so the pre-commit hook does not ask
+# that same maker to flush. The maker cannot answer during its own commit, and answering after
+# it forced a capture of whatever turn was running.
+OWN_COMMIT_ENV = {"AGITRACK_COMMIT_FOLDED": "1"}
+
+
 def _already_answered_flush_nonce(repo: GitRepo) -> str | None:
     """The flush request on disk when a tracker starts, if no commit can still be waiting on it:
     it was answered already, or it is older than the hook's first wait (a hook that heard nothing
@@ -2482,7 +2489,10 @@ class BackgroundRunner:
                 return
             # The message already carries the folded metadata, so the prepare-commit-msg hook's
             # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
-            self.repo.commit(message)
+            # It is OUR commit, made from what we just recorded: its pre-commit hook must not ask
+            # us to flush. We answered that request once the commit was done, and an answer is a
+            # forced capture, so it recorded whatever turn was running at that moment half done.
+            self.repo.commit(message, env=OWN_COMMIT_ENV)
             self._manual.reset_stale_ref()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._set_tracked_head(self.repo.rev_parse("HEAD"))  # our own fold commit is accounted for

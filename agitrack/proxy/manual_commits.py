@@ -613,7 +613,11 @@ class ManualCommitsMixin(RunnerHost):
                 return
             # The message already carries the folded metadata, so the prepare-commit-msg hook's
             # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
-            sha = self.repo.commit(message)
+            # Our own commit: the pre-commit hook must not ask this session to flush (see
+            # `background.OWN_COMMIT_ENV`).
+            from agitrack.proxy.background import OWN_COMMIT_ENV
+
+            sha = self.repo.commit(message, env=OWN_COMMIT_ENV)
             self._reset_stale_manual_ref()
             self._manual_last_head = self.repo.rev_parse("HEAD")
             self._render_manual_trailer()

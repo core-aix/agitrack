@@ -9235,7 +9235,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 self._debug(f"manual pre-commit turn flush failed: {error!r}")
             # Already recorded and folded here, so the pre-commit hook must not ask this session to
             # flush: it would wait on the lock held above until its timeout.
-            commit_env = {"AGITRACK_COMMIT_FOLDED": "1"}
+            from agitrack.proxy.background import OWN_COMMIT_ENV
+
+            commit_env = dict(OWN_COMMIT_ENV)
         if self._manual_commits:
             # Manual-commit mode: fold the pending latent turns' tracking into this one
             # commit inline, so it's fully tracked whether or not the prepare-commit-msg
