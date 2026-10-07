@@ -1199,6 +1199,10 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         metadata=filterable_metadata(metadata),
         model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
+        # The commits the agent made itself during this turn: the only REAL commits a squashed
+        # part can name (a squash keeps one combined diff, and its bullets carry no ids), so the
+        # log can offer their diffs. Display only: coverage is counted from top-level commits.
+        covered_commits=(metadata.get("covered_commits") or "").split(),
         # The metadata block identifies the original commit this constituent was
         # parsed from: if the same commit is captured in more than one squash, the
         # block is byte-identical, which lets us count its tokens only once.
