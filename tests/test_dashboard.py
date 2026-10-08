@@ -2399,8 +2399,9 @@ def test_a_squashed_part_carries_the_commits_it_names_for_their_diffs(tmp_path):
     assert [p.get("commits") for p in fold["parts"] if p.get("commits")] == [["abc1234", "def5678"]]
 
 
-def _render_detail(entry: dict, tmp_path) -> str:
+def _render_detail(entry: dict, tmp_path, tz: str | None = None) -> str:
     """The detail the dashboard script draws when this log entry is opened."""
+    import os
     import shutil
     import subprocess
 
@@ -2430,9 +2431,59 @@ def _render_detail(entry: dict, tmp_path) -> str:
         + "console.log(box.innerHTML);\n",
         encoding="utf-8",
     )
-    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300)
+    env = {**os.environ, "TZ": tz} if tz else None
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
+
+
+def test_a_squashed_part_carries_when_its_turn_happened(tmp_path):
+    """Each squashed part carries the moment its turn ended (else began) for the date on its
+    row, and None when it recorded neither, so the row leaves the date out."""
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> ended turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "agent_started_at: 2026-10-08T10:00:00Z\nagent_ended_at: 2026-10-08T10:05:00Z\n\n"
+        "<aGiTrack> started turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "agent_started_at: 2026-10-08T11:00:00Z\n\n"
+        "<aGiTrack> undated turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    fold = next(c for c in data["commits"] if c["subject"] == "my commit")
+    when = {p["subject"]: p["ts"] for p in fold["parts"]}
+    from datetime import datetime
+
+    def epoch(iso):
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    assert when["<aGiTrack> ended turn"] == epoch("2026-10-08T10:05:00Z")  # the end
+    assert when["<aGiTrack> started turn"] == epoch("2026-10-08T11:00:00Z")  # no end: the start
+    assert when["<aGiTrack> undated turn"] is None
+
+
+def test_a_squashed_part_shows_its_date_on_the_right_only_when_it_has_one(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    ts = 1791453900
+    entry = {
+        "sha": "a" * 40,
+        "subject": "my commit",
+        "message": "my commit",
+        "parts": [
+            {"subject": "dated turn", "kind": "agent", "message": "x", "parts": [], "ts": ts, "model": "m1"},
+            {"subject": "undated turn", "kind": "agent", "message": "y", "parts": [], "ts": None},
+        ],
+    }
+    out = _render_detail(entry, tmp_path, tz="Asia/Tokyo")
+    local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST
+    dated, undated = out.split("undated turn", 1)
+    # On the right, under the part's model and tokens.
+    assert dated.index('class="psubj"') < dated.index('class="pmeta"') < dated.index('class="when"')
+    assert f">{local}</span>" in dated
+    assert 'class="when"' not in undated  # no recorded time: no date at all
 
 
 def test_a_squash_commit_offers_its_combined_diff_and_a_part_its_own_commits(tmp_path):

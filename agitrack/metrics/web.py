@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, apply_numstat_for, build_dashboard
+from agitrack.metrics.collect import CommitStat, Dashboard, _iso_epoch, apply_numstat_for, build_dashboard
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
@@ -371,6 +371,8 @@ def _part_payload(part: CommitStat) -> dict:
         "tokens": part.tokens,
         "started": part.started_at,
         "ended": part.ended_at,
+        # When the part's turn ended (else began), for the date on its row; None leaves it out.
+        "ts": _iso_epoch(part.ended_at) or _iso_epoch(part.started_at),
         # A nested squash's own message likewise drops its (separately-listed) constituents.
         "message": _main_message(part),
         # Commits the part names itself (its `covered_commits`): the only per-part diffs a squash
@@ -1400,7 +1402,10 @@ __UI_COMMIT_CSS__
 .dmsg.md a{color:var(--phosphor)}
 .entry .detail .phead{color:var(--ops);font-size:12px;margin:12px 0 6px}
 .part{border:1px solid var(--line);margin:5px 0;background:var(--panel-2)}
-.part>summary{cursor:pointer;padding:6px 10px;font-size:12.5px;color:var(--fg);list-style:none}
+.part>summary{cursor:pointer;padding:6px 10px;font-size:12.5px;color:var(--fg);list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px}
+.part>summary .psubj{flex:1 1 12em;min-width:0}
+.part .pright{display:flex;flex-direction:column;align-items:flex-end;gap:3px;margin-left:auto}
+.part .when{color:var(--fg-dim);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .part>summary::-webkit-details-marker{display:none}
 .part>summary::before{content:"▸ ";color:var(--ops)}
 .part[open]>summary::before{content:"▾ "}
@@ -2391,8 +2396,12 @@ function partsHtml(parts){
   // itself (its covered_commits), which are real commits with real diffs.
   const items = parts.map(p => {
     const pcls = AI_KINDS.has(p.kind) ? "ai" : (p.kind==="user" ? "user" : "nt");
-    const out = (p.tokens&&p.tokens.output) ? ` · ${kfmt(p.tokens.output)} out` : "";
-    const mdl = p.model ? ` · ${esc(p.model)}` : "";
+    const facts = [p.model ? esc(p.model) : "", (p.tokens&&p.tokens.output) ? `${kfmt(p.tokens.output)} out` : ""].filter(Boolean).join(" · ");
+    // On the right, like a log row: the part's model and tokens, its date/time below them
+    // (only when the part recorded one).
+    const w = commitWhen(p.ts);
+    const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
+    const right = (facts || whenTag) ? `<span class="pright">${facts ? `<span class="pmeta">${facts}</span>` : ""}${whenTag}</span>` : "";
     const commits = (LIVE && p.commits) ? p.commits.filter(s => /^[0-9a-fA-F]{4,64}$/.test(s)) : [];
     // Buttons in the header row, their boxes BELOW it: the row lays out side by side, and a box
     // inside it was squeezed into a narrow column next to its button.
@@ -2401,7 +2410,7 @@ function partsHtml(parts){
       `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
     const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
-      `${esc(p.subject||"(no subject)")}<span class="pmeta">${mdl}${out}</span></summary>`+
+      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>${right}</summary>`+
       (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
