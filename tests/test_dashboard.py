@@ -2437,6 +2437,40 @@ def _render_detail(entry: dict, tmp_path, tz: str | None = None) -> str:
     return result.stdout
 
 
+def test_a_fold_does_not_list_the_commit_itself_among_its_parts(tmp_path):
+    """A user's commit that folded agent turns opens with its own message and the user block
+    attributing it. The parser reads that block as a first part, which listed the commit as
+    a squashed "user" commit of itself, with the same subject and text shown just above."""
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\nwhat I changed\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> first turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 20\n\n"
+        "<aGiTrack> second turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 30\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    fold = next(c for c in data["commits"] if c["subject"] == "my commit")
+    assert [p["subject"] for p in fold["parts"]] == ["<aGiTrack> second turn", "<aGiTrack> first turn"]
+    assert fold["message"].startswith("my commit")  # the commit's own text is still shown, once
+
+
+def test_a_squashed_user_commit_that_is_not_the_lead_is_still_listed(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "Squash PR (#1)\n\n"
+        "* someone's own commit\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "* <aGiTrack> a turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 20\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    squash = next(c for c in data["commits"] if c["subject"].startswith("Squash PR"))
+    assert [p["subject"] for p in squash["parts"]] == ["<aGiTrack> a turn", "someone's own commit"]
+
+
 def test_a_squashed_part_carries_when_its_turn_happened(tmp_path):
     """Each squashed part carries the moment its turn ended (else began) for the date on its
     row, and None when it recorded neither, so the row leaves the date out."""

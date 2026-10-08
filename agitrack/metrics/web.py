@@ -344,8 +344,25 @@ def _display_parts(stat: CommitStat) -> list[dict]:
     """A squash's constituents serialized for the expandable log view, ordered
     **newest-first** to match the newest-first commit log. This reorder is DISPLAY-ONLY: the
     raw commit message keeps its constituents in chronological (oldest-first) order, like any
-    squash merge — only the dashboard shows the latest one at the top."""
-    return [_part_payload(part) for part in reversed(stat.constituents)]
+    squash merge — only the dashboard shows the latest one at the top.
+
+    A FOLD (a user's commit that absorbed agent turns) opens with the commit's OWN message and
+    the ``commit_type: user`` block attributing it, which the parser reads as a first
+    constituent like any other block. That "part" is the commit itself: the same subject and
+    text the detail view already shows above the list, so it is left out of the list."""
+    parts = list(stat.constituents)
+    if parts and _is_own_lead(parts[0], stat):
+        parts = parts[1:]
+    return [_part_payload(part) for part in reversed(parts)]
+
+
+def _is_own_lead(part: CommitStat, stat: CommitStat) -> bool:
+    """Whether ``part`` is the commit's own message with its user attribution block (the lead
+    of a fold), rather than a commit that was squashed into it."""
+    if part.kind != "user" or any(part.tokens.values()):
+        return False
+    head = part.message.partition(METADATA_HEADER)[0].strip()
+    return head == _main_message(stat)
 
 
 def _main_message(stat: CommitStat) -> str:
