@@ -81,9 +81,12 @@ def smallest_model(backend_name: str, models: list[str]) -> str | None:
 
 
 def _list_opencode_models() -> list[str]:
+    from agitrack.backends.opencode_settings import internal_call_env
+
     try:
         result = subprocess.run(
             resolve_subprocess_command(["opencode", "models"]),
+            env=internal_call_env(),  # aGiTrack's own call: no auto-start plugin
             **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

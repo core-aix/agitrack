@@ -301,3 +301,72 @@ def test_a_repo_that_never_had_them_does_not_come_back_with_them(tmp_path):
 
     assert agent_hooks.installed_autostart_backends(tmp_path) == []
     assert not (tmp_path / ".claude").exists()
+
+
+def _run_plugin(tmp_path: Path, env: dict) -> bool:
+    """Load the real plugin source under node with its command swapped for `touch`, call it the
+    way OpenCode does, and report whether it started anything."""
+    import shutil
+
+    import pytest
+
+    if shutil.which("node") is None or not Path("/usr/bin/touch").exists():
+        pytest.skip("needs node and a POSIX touch")
+    marker = tmp_path / "fired"
+    marker.unlink(missing_ok=True)
+    plugin = tmp_path / "plugin.mjs"
+    plugin.write_text(opencode_settings._plugin_source(["/usr/bin/touch", str(marker)]), encoding="utf-8")
+    script = (
+        f"const m = await import({json.dumps(plugin.as_uri())});"
+        f"await m.AgitrackAutostart({{ directory: {json.dumps(str(tmp_path))} }});"
+        "await new Promise((r) => setTimeout(r, 300));"
+    )
+    subprocess.run(["node", "--input-type=module", "-e", script], env=env, check=True, timeout=30)
+    return marker.exists()
+
+
+def test_the_opencode_plugin_ignores_agitracks_own_opencode_commands(tmp_path):
+    """OpenCode loads a project's plugins for EVERY command run in it, not only when a person
+    opens a session. aGiTrack's own `opencode export` / `session list` calls (several per poll
+    while an OpenCode turn runs) each started a Python process that the running tracker then
+    refused, and the call a tracker replacement made before its successor held the lock started
+    a SECOND tracker (seen live: "could not take this repo's single-writer lock")."""
+    import os
+
+    plain = {k: v for k, v in os.environ.items() if k != opencode_settings.INTERNAL_CALL_ENV}
+    assert _run_plugin(tmp_path, plain) is True  # a person opening a session: start a tracker
+    assert _run_plugin(tmp_path, opencode_settings.internal_call_env(plain)) is False
+
+
+def test_every_opencode_command_agitrack_runs_carries_the_internal_mark(tmp_path, monkeypatch):
+    """The plugin can only tell aGiTrack's calls apart if each one is marked."""
+    import os
+
+    from agitrack.backends.opencode import OpenCodeBackend
+    from agitrack.transcripts import opencode as transcripts
+
+    seen: list[dict] = []
+
+    def fake_run(*args, **kwargs):
+        seen.append(dict(kwargs.get("env") or os.environ))
+        text = kwargs.get("text") or kwargs.get("encoding")
+        return subprocess.CompletedProcess(args, 0, stdout="[]" if text else b"[]", stderr="")
+
+    monkeypatch.setattr(transcripts.subprocess, "run", fake_run)
+    transcripts._opencode_session_list(tmp_path, 5)
+    transcripts._run_opencode_subprocess(tmp_path, ["opencode", "export", "x"])
+
+    class _Popen:
+        def __init__(self, *args, **kwargs):
+            seen.append(dict(kwargs.get("env") or os.environ))
+            raise OSError("stop here")
+
+    import agitrack.backends.opencode as backend_module
+
+    monkeypatch.setattr(backend_module.subprocess, "Popen", _Popen)
+    try:
+        OpenCodeBackend(tmp_path).run("hi", model=None, session_id=None)
+    except Exception:
+        pass
+    assert len(seen) == 3
+    assert all(env.get(opencode_settings.INTERNAL_CALL_ENV) == "1" for env in seen)

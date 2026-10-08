@@ -2301,8 +2301,9 @@ def recent_sessions(since: float, *, full: bool = False) -> list[tuple[SessionRe
     Asked every few seconds by every tracker, over a store that holds every conversation ever
     had on this machine (tens of thousands of transcripts), so it checks cheaply what can have
     changed before reading anything. A project folder is re-listed only when its own mtime moved
-    (a conversation was created or removed there), and only transcripts written to within the
-    window are stat'ed. A conversation that went quiet and is then written to again is picked
+    (a conversation was created or removed there; on Windows, every pass, since NTFS does not
+    reliably move it), and only transcripts that are new or were written to within the window
+    are stat'ed. A conversation that went quiet and is then written to again is picked
     up by the next FULL sweep, which runs at most ``_FULL_SWEEP_SECONDS`` apart, or at once
     with ``full=True`` (a commit being made)."""
     global _SWEPT_AT
@@ -2325,8 +2326,9 @@ def recent_sessions(since: float, *, full: bool = False) -> list[tuple[SessionRe
         except OSError:
             continue
         cached = _DIR_LISTINGS.get(entry.path)
-        relisted = cached is None or cached[0] != listed_at
-        if cached is None or relisted:
+        # NTFS does not reliably move a folder's mtime when a file is created in it, so on
+        # Windows the folder is re-listed every pass (names only, no per-file stat).
+        if cached is None or cached[0] != listed_at or _FOLDER_MTIME_UNRELIABLE:
             paths = list(Path(entry.path).glob("*.jsonl"))
             _DIR_LISTINGS[entry.path] = (listed_at, paths)
         else:
@@ -2334,7 +2336,7 @@ def recent_sessions(since: float, *, full: bool = False) -> list[tuple[SessionRe
         for path in paths:
             key = str(path)
             known = _LAST_WRITTEN.get(key)
-            if not full and not relisted and known is not None and known <= since:
+            if not full and known is not None and known <= since:
                 continue  # quiet when last looked at: the next full sweep looks again
             try:
                 updated = path.stat().st_mtime
@@ -2366,6 +2368,8 @@ _DIR_LISTINGS: dict[str, tuple[int, list[Path]]] = {}
 _LAST_WRITTEN: dict[str, float] = {}
 _SWEPT_AT = float("-inf")
 _FULL_SWEEP_SECONDS = 60.0
+# NTFS does not reliably move a folder's mtime when a file is created in it.
+_FOLDER_MTIME_UNRELIABLE = os.name == "nt"
 
 
 _HEAD_CACHE: dict[str, tuple[str | None, bool]] = {}

@@ -2087,5 +2087,14 @@ def test_the_store_scan_checks_cheaply_before_reading_anything(tmp_path, monkeyp
     assert stats == ["busy.jsonl"]
     assert ids(full=True) == ["busy", "quiet"]  # a full sweep (or a commit) finds it
 
-    write("fresh", now)  # a NEW conversation changes the folder, so it is seen at once
+    write("fresh", now)  # a NEW conversation is seen at once
     assert ids() == ["busy", "fresh", "quiet"]
+
+    # ...even where creating a file does not move the folder's mtime (NTFS): pinned here, so a
+    # POSIX run reproduces what Windows CI caught.
+    os.utime(project, (now - 1000, now - 1000))
+    claude_session.recent_sessions(since)  # caches the pinned folder stamp
+    write("newer", now)
+    os.utime(project, (now - 1000, now - 1000))
+    monkeypatch.setattr(claude_session, "_FOLDER_MTIME_UNRELIABLE", True)
+    assert "newer" in ids()

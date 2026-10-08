@@ -35,6 +35,24 @@ PLUGIN_RELPATH = Path(".opencode") / "plugin" / "agitrack-autostart.js"
 MARKER = "@agitrack-managed"
 
 
+# Set on every `opencode` command aGiTrack itself runs (an export, a session listing, a headless
+# summary). OpenCode loads a project's plugins for ANY command run in it, not only when a person
+# opens a session, so without this mark each of those calls (several per poll while an OpenCode
+# turn runs) started a Python process just to be refused by the tracker already running, and the
+# call a tracker REPLACEMENT made, in the moment before its successor held the lock, started a
+# second tracker beside the one being launched.
+INTERNAL_CALL_ENV = "AGITRACK_INTERNAL_CALL"
+
+
+def internal_call_env(base: "dict[str, str] | None" = None) -> dict[str, str]:
+    """``base`` (default: this process's environment) marked as aGiTrack's own call."""
+    import os
+
+    env = dict(os.environ if base is None else base)
+    env[INTERNAL_CALL_ENV] = "1"
+    return env
+
+
 def _plugin_source(command: list[str]) -> str:
     """The plugin, with aGiTrack's own invocation baked in.
 
@@ -51,7 +69,9 @@ def _plugin_source(command: list[str]) -> str:
 
     It spawns in the project directory, where an ``agitrack`` folder may well sit (a repository
     that holds your projects, aGiTrack's own checkout among them), so ``PYTHONSAFEPATH`` is
-    passed the way every other aGiTrack child gets it — see ``proc.isolated_env``."""
+    passed the way every other aGiTrack child gets it — see ``proc.isolated_env``.
+
+    It does nothing for a command aGiTrack itself ran (``INTERNAL_CALL_ENV``)."""
     return f"""// {MARKER} — written and removed by aGiTrack; do not edit.
 // Starts aGiTrack's background tracker when an OpenCode session opens in this project, which is
 // what the SessionStart hooks do for Claude Code and Codex. See
@@ -61,6 +81,8 @@ import {{ spawn }} from "node:child_process"
 const COMMAND = {json.dumps(command)}
 
 export const AgitrackAutostart = async ({{ directory, worktree }}) => {{
+  // aGiTrack's own calls (an export, a session listing) are not a person opening a session.
+  if (process.env.{INTERNAL_CALL_ENV} === "1") return {{}}
   try {{
     const child = spawn(COMMAND[0], COMMAND.slice(1), {{
       cwd: worktree || directory || process.cwd(),
