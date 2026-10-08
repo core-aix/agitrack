@@ -1333,7 +1333,9 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry.ops::before{border-color:var(--ops);box-shadow:0 0 8px rgba(103,184,214,.4)}
 .entry.nontracked::before{border-color:var(--amber)}
 .entry .sha{color:var(--amber);font-size:12.5px}
-.entry .when{color:var(--fg-dim);font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.entry .emeta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:auto}
+.entry .erow{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;justify-content:flex-end}
+.entry .when{color:var(--fg-dim);font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
 /* overflow-wrap:anywhere so a subject with no spaces (a shell command, a long flag,
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
@@ -2325,10 +2327,14 @@ function renderLog(){
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
+    // The right-hand column: lines, tokens and model on top, and under them when the commit
+    // was made, so the date sits with the commit's other facts rather than in front of its subject.
     const w = commitWhen(c.ts);
+    const facts = `${lc}${tokenBrief(c.tokens)}${m}`;
     const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
-    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${whenTag}${badge}${pend}${trk}${anom}${squash}`+
-      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
+    const meta = (facts || whenTag) ? `<span class="emeta">${facts ? `<span class="erow">${facts}</span>` : ""}${whenTag}</span>` : "";
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
+      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${meta}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;

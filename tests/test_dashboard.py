@@ -2496,6 +2496,8 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     local = datetime.fromtimestamp(ts, ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
     utc = datetime.fromtimestamp(ts, ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M")
-    assert '<span class="when"' in result.stdout
+    row = result.stdout
+    # On the right, UNDER the commit's other facts (lines, tokens, model), not before its subject.
+    assert row.index('class="ksub"') < row.index('class="emeta"') < row.index('class="when"')
     assert f">{local}</span>" in result.stdout  # the reader's local time on the row
     assert f"({utc} UTC)" in result.stdout  # and the same moment in UTC on hover
