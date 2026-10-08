@@ -275,20 +275,42 @@ def replace_running_tracker(repo: GitRepo, *, owner_pid: int | None) -> bool:
     pid = _live_background_pid(repo)
     if pid is None or (owner_pid is not None and pid != owner_pid):
         return False
-    if not _terminate_and_wait(pid):
+    if not _terminate_and_wait(pid, replacing=repo):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; run `agitrack -b stop` and try again.")
         return False
     print(f"Restarting the aGiTrack background tracker (was PID {pid}).")
     return True
 
 
-def _terminate_and_wait(pid: int, *, timeout: float = 10.0) -> bool:
+def _replacing_path(repo: GitRepo) -> Path:
+    return repo.repo / ".agitrack" / "tracker-replacing"
+
+
+def _terminate_and_wait(pid: int, *, timeout: float = 10.0, replacing: GitRepo | None = None) -> bool:
     """SIGTERM ``pid`` and wait (bounded) for its clean shutdown — the tracker records any
-    final turn and removes its hooks on the way out. True once the process is gone."""
+    final turn and removes its hooks on the way out. True once the process is gone.
+
+    ``replacing``: another tracker takes over right after (a rerun of ``agitrack -b``, a mode
+    switch, ``agitrack redact``). The old one is told so, through a file naming its pid, and
+    then leaves a turn that is still RUNNING to its successor instead of committing it half
+    done: the successor resumes it from the persisted watermark, exactly as after an update
+    restart. A plain stop still captures everything, since nothing tracks after it."""
+    marker = _replacing_path(replacing) if replacing is not None else None
+    if marker is not None:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(str(pid), encoding="utf-8")
+        except OSError:
+            marker = None
     terminate_pid(pid)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and pid_alive(pid):
         time.sleep(0.1)
+    if marker is not None:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
     return not pid_alive(pid)
 
 
@@ -318,7 +340,38 @@ def flush_started_path(repo_root: Path) -> Path:
 FLUSH_WORKING_WAIT_SECONDS = 60.0
 
 
-def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
+# Set on a commit whose maker has already recorded and folded everything (the tracker's own
+# auto-fold, an interactive Ctrl-G commit or auto-fold), so the pre-commit hook does not ask
+# that same maker to flush. The maker cannot answer during its own commit, and answering after
+# it forced a capture of whatever turn was running.
+OWN_COMMIT_ENV = {"AGITRACK_COMMIT_FOLDED": "1"}
+
+
+def _already_answered_flush_nonce(repo: GitRepo) -> str | None:
+    """The flush request on disk when a tracker starts, if no commit can still be waiting on it:
+    it was answered already, or it is older than the hook's first wait (a hook that heard nothing
+    for that long has gone ahead with its commit). None when there is no request, or when it is
+    fresh enough that a commit may be waiting on it right now, across this tracker's restart."""
+    try:
+        path = _flush_request_path(repo)
+        nonce = path.read_text(encoding="utf-8").strip()
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    if not nonce:
+        return None
+    try:
+        answered = _flush_done_path(repo).read_text(encoding="utf-8").strip() == nonce
+    except OSError:
+        answered = False
+    return nonce if answered or age > _FLUSH_FIRST_WAIT_SECONDS else None
+
+
+# How long a commit's pre-commit hook waits for a tracker to pick its flush request up.
+_FLUSH_FIRST_WAIT_SECONDS = 5.0
+
+
+def request_daemon_flush(repo: GitRepo, *, timeout: float = _FLUSH_FIRST_WAIT_SECONDS) -> bool:
     """Ask the running background daemon to record any pending COMPLETED turns and (re)render the
     fold trailer RIGHT NOW, then wait (bounded) for it to acknowledge.
 
@@ -805,7 +858,7 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
         return 0
     if running is not None:
         info = _read_handshake(repo) or {}
-        if not _terminate_and_wait(running):
+        if not _terminate_and_wait(running, replacing=repo):
             print(
                 f"\naGiTrack background tracker (PID {running}) did not stop in time; "
                 "run `agitrack -b stop` and try again."
@@ -1192,6 +1245,13 @@ class BackgroundRunner:
         self._settle_since = 0.0
         self._settle_tree: str | None = None
         self._settle_changed_at = 0.0
+        # The quick check in front of that snapshot: a filesystem watch on the working tree.
+        # Snapshotting is several git processes, and it used to run on every 3 s poll of an idle
+        # repository; now it runs only once something under the tree changed (and, as a safety
+        # net for a watch that misses events, every `_TREE_RECHECK_SECONDS`).
+        self._tree_changed = threading.Event()
+        self._tree_observer: Any = None
+        self._tree_checked_at = 0.0
         # Tool-use ids of background tasks the agent started that are still running, refreshed
         # from each export. While any is live the settle wait is not capped (see below).
         self._live_background_tasks: list[str] = []
@@ -1200,8 +1260,13 @@ class BackgroundRunner:
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
         self._summary_threads: dict[str, threading.Thread] = {}
         # Nonce of the last pre-commit flush request we serviced, so a repeated request (or a stale
-        # request file across a restart) is handled at most once.
-        self._last_flush_nonce: str | None = None
+        # request file across a restart) is handled at most once. A request already on disk when
+        # this tracker starts belongs to a commit that has finished (or been answered) unless it
+        # was written moments ago: starting from None made every restart answer the previous
+        # commit's request, and an answer is a FORCED capture, so each restart committed whatever
+        # turn was running, half done. On a repository whose own commits count as an update (a
+        # source checkout of aGiTrack itself) that looped: commit, restart, capture, commit.
+        self._last_flush_nonce: str | None = _already_answered_flush_nonce(self.repo)
         # PERSISTENT tracking watermark: the HEAD up to which this daemon has accounted for AI work.
         # When a turn completes with a clean tree and HEAD has advanced past it, the new untracked
         # commits are the agent's own work (the agent/user committed it) and get COVERED with that
@@ -1259,6 +1324,9 @@ class BackgroundRunner:
         # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
         # before that turn ends — the pre-commit flush re-exports first, so this is current.
         self._in_flight: dict | None = None
+        self._in_flight_since: float | None = None  # monotonic time the running turn was first seen
+        # Same, for a turn of a conversation started in ANOTHER folder that is editing this one.
+        self._elsewhere_running_since: float | None = None
         self._manual = ManualCommitTracker(
             self.repo, self.base_repo, self.state, debug=self._debug, in_flight_fn=lambda: self._in_flight
         )
@@ -1478,9 +1546,13 @@ class BackgroundRunner:
         # commit into, and every git call would just raise its way through the handler below,
         # slowly, on the way out.
         if not restarting and not self._repo_is_gone():
+            # Being REPLACED (see `_terminate_and_wait`): a successor keeps tracking, so a turn
+            # still running is its to record when the turn ends. Finished turns are still
+            # recorded and folded here, as before.
+            replaced = self._being_replaced()
             try:
-                self._process_once(require_complete=False)
-                if not self._manual_commits:
+                self._process_once(require_complete=replaced)
+                if not self._manual_commits and not (replaced and self._turn_still_running()):
                     self._auto_fold_pending(force=True)
             except Exception as error:
                 self._debug(f"final process failed: {error!r}")
@@ -1498,6 +1570,13 @@ class BackgroundRunner:
         self._print(
             "background tracker restarting on the updated aGiTrack." if restarting else "background tracker stopped."
         )
+
+    def _being_replaced(self) -> bool:
+        """Whether this stop is a replacement: another tracker starts right after it."""
+        try:
+            return _replacing_path(self.repo).read_text(encoding="utf-8").strip() == str(os.getpid())
+        except OSError:
+            return False
 
     def _release_lock(self) -> None:
         """Give up the repo's single-writer lock, so a successor can take it. Best-effort:
@@ -1808,6 +1887,16 @@ class BackgroundRunner:
         return True
 
     def _loop(self) -> None:
+        from agitrack.proxy import watch
+
+        self._tree_observer = watch.start_watching(self.repo.repo, self._tree_changed)
+        try:
+            self._poll_until_stopped()
+        finally:
+            watch.stop_watching(self._tree_observer)
+            self._tree_observer = None
+
+    def _poll_until_stopped(self) -> None:
         while not self._stop.is_set():
             if self._repo_is_gone():
                 # Not `_explicit_stop`: this is the tracker deciding, and the distinction matters
@@ -1820,8 +1909,10 @@ class BackgroundRunner:
             try:
                 self._sample_worktree()  # the daemon's stand-in for the TUI's file watcher
                 self._process_once()  # records latently, or covers commits the agent made itself
-                self._manual.service()
-                if not self._manual_commits:
+                refs_quiet = self._refs_unchanged()
+                if not refs_quiet:
+                    self._manual.service()
+                if not self._manual_commits and not (refs_quiet and self._nothing_to_fold):
                     self._auto_fold_pending()
                 self._maybe_check_update()
             except Exception as error:  # never let one bad cycle kill the tracker
@@ -1846,10 +1937,24 @@ class BackgroundRunner:
         the waiting hook can proceed. Runs on the daemon's own loop thread — the single writer — so
         it never races the poll. At pre-commit time the working tree still holds the about-to-be-
         committed changes, so a just-finished turn records cleanly and folds into THAT commit."""
+        # Asked ten times a second between polls, so a stat answers "nothing new" first. Read
+        # anyway once a second: on a filesystem with coarse timestamps two requests written
+        # within one tick can stat the same, and the hook waits five seconds for an answer.
+        path = _flush_request_path(self.repo)
         try:
-            nonce = _flush_request_path(self.repo).read_text(encoding="utf-8").strip()
+            info = path.stat()
         except OSError:
             return
+        stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        now = time.monotonic()
+        if stamp == self._flush_request_stamp and now - self._flush_request_read_at < 1.0:
+            return
+        try:
+            nonce = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        self._flush_request_stamp = stamp
+        self._flush_request_read_at = now
         if not nonce or nonce == self._last_flush_nonce:
             return
         try:
@@ -1864,6 +1969,7 @@ class BackgroundRunner:
             # but a commit made by someone else does not wait, and every one made during the
             # wait used to land with no trace at all (seen live: seven hours of prompts behind a
             # long-running sub-agent, none of them in any of that day's commits).
+            self._followed_at = float("-inf")  # a commit asks which agent is driven, now
             self._process_once(require_complete=False, at_commit=True)
             self._manual.render_trailer()
         except Exception as error:
@@ -1975,6 +2081,12 @@ class BackgroundRunner:
                 activity[name] = float(when)
         return activity
 
+    _flush_request_stamp: tuple | None = None
+    _flush_request_read_at = float("-inf")
+
+    _FOLLOW_EVERY_SECONDS = 15.0
+    _followed_at = float("-inf")
+
     def _follow_the_driven_backend(self) -> None:
         """Point this tracker at the backend the person is actually using, when that is not the
         one it is currently on.
@@ -1988,6 +2100,14 @@ class BackgroundRunner:
         going to look at another store would drop its trace and tokens on the floor."""
         if self._in_flight is not None:
             return
+        # Asking every installed backend's store is the costliest part of an idle poll (Codex
+        # walks its rollout folders, OpenCode resolves every session's directory), and moving
+        # to another agent is a deliberate act, so it is asked every `_FOLLOW_EVERY_SECONDS`,
+        # not every poll. A commit asks at once (`_service_flush_requests` clears the clock).
+        now = time.monotonic()
+        if now - self._followed_at < self._FOLLOW_EVERY_SECONDS:
+            return
+        self._followed_at = now
         activity = self._backend_activity()
         if not activity:
             return  # nothing recorded anywhere — stay put and let the normal poll run
@@ -2104,7 +2224,16 @@ class BackgroundRunner:
             debug_fn=self._debug,
             require_complete=require_complete,
             at_commit=at_commit,
+            note_running_fn=self._note_running_elsewhere,
         )
+
+    def _note_running_elsewhere(self, running: bool) -> None:
+        """Whether a conversation started in another folder is mid-turn with edits in this
+        repository (see ``routing.record_elsewhere``); the auto-fold waits for it too."""
+        if not running:
+            self._elsewhere_running_since = None
+        elif self._elsewhere_running_since is None:
+            self._elsewhere_running_since = time.monotonic()
 
     def _note_in_flight(self, facts: dict | None) -> None:
         """Remember (or clear) the running turn's facts. The pre-commit flush re-renders the
@@ -2112,6 +2241,10 @@ class BackgroundRunner:
         a change as well keeps attribution working even if that nudge never lands (a removed
         pre-commit hook, a ``core.hooksPath`` that skips it)."""
         changed = self._in_flight != facts
+        if facts is None:
+            self._in_flight_since = None
+        elif self._in_flight is None or self._in_flight_since is None:
+            self._in_flight_since = time.monotonic()
         self._in_flight = facts
         if changed:
             self._manual.render_trailer()
@@ -2409,16 +2542,25 @@ class BackgroundRunner:
         ``_auto_fold_latent_pending(force=True)`` on exit."""
         ref = self._manual.ref()
         tip = self.repo.ref_sha(ref)
+        # No latent turn waiting: nothing to fold until a ref moves (see `_refs_unchanged`).
+        self._nothing_to_fold = not tip
         if not tip:
             return
+        # Cheap checks first: this runs on every poll while turns are pending, which a running
+        # turn can make half an hour, and each tree snapshot is several git processes.
+        if self._manual.pending_count() == 0:
+            self._nothing_to_fold = True
+            return
+        if not force and self._turn_still_running():
+            return  # the edits in the tree belong to the running turn: fold when it ends
         try:
             # Clean working tree vs HEAD ⇒ the agent (or user) already committed its work, and the
             # prepare-commit-msg fold hook folded the tracking into THAT commit — nothing to do.
-            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
+            # The poll's own sample is reused while the watch says nothing has changed since.
+            tree = self._settle_tree if not force and self._tree_unchanged() else None
+            if (tree or self.repo.snapshot_worktree_tree()) == self.repo.comparable_tree("HEAD"):
                 return
         except Exception:
-            return
-        if self._manual.pending_count() == 0:
             return
         if not force and not self._worktree_settled(tip):
             return  # something is still writing — retry next cycle
@@ -2453,7 +2595,10 @@ class BackgroundRunner:
                 return
             # The message already carries the folded metadata, so the prepare-commit-msg hook's
             # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
-            self.repo.commit(message)
+            # It is OUR commit, made from what we just recorded: its pre-commit hook must not ask
+            # us to flush. We answered that request once the commit was done, and an answer is a
+            # forced capture, so it recorded whatever turn was running at that moment half done.
+            self.repo.commit(message, env=OWN_COMMIT_ENV)
             self._manual.reset_stale_ref()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._set_tracked_head(self.repo.rev_parse("HEAD"))  # our own fold commit is accounted for
@@ -2481,14 +2626,93 @@ class BackgroundRunner:
         before committing is near zero. Measuring only from the first fold attempt would instead
         add a full quiet period to every commit. The snapshot is the same one the fold and the
         cover check already take each cycle, so this costs nothing extra in practice."""
+        if self._tree_unchanged():
+            return  # nothing under the tree changed since the last snapshot: it is the same tree
+        self._tree_changed.clear()  # before the snapshot, so a write during it is seen next time
         try:
             tree = self.repo.snapshot_worktree_tree()
         except Exception as error:
             self._debug(f"settle sample failed: {error!r}")
             return
+        self._tree_checked_at = time.monotonic()
         if self._settle_tree is not None and tree != self._settle_tree:
             self._settle_changed_at = time.monotonic()
         self._settle_tree = tree
+
+    # Whether the last fold attempt found no latent turn to fold; while no ref has moved since
+    # (`_refs_unchanged`), that is still the answer and the poll does not ask git again.
+    _nothing_to_fold = False
+    _refs_stamp: tuple | None = None
+    _refs_checked_at = float("-inf")
+
+    def _refs_unchanged(self) -> bool:
+        """Whether no ref this poll reads can have moved since the previous poll: HEAD, the
+        branch it names, ``packed-refs``, the latent refs and the post-commit signal file, judged
+        by a ``stat`` of each (git rewrites a ref by replacing its file). Answering "the same"
+        lets an idle poll skip the two ``git rev-parse`` calls it would otherwise make every
+        3 s. Never trusted for longer than ``_TREE_RECHECK_SECONDS``, and only for an ordinary
+        ``.git`` directory: anything else (a linked worktree, a submodule) always asks git."""
+        git_dir = self.repo.repo / ".git"
+        stamp: list = []
+        try:
+            if not git_dir.is_dir():
+                return False
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            paths = [git_dir / "HEAD", git_dir / "packed-refs", self.repo.repo / ".agitrack" / "manual-commit-signal"]
+            if head.startswith("ref: "):
+                paths.append(git_dir / head[5:])
+            latent = git_dir / "refs" / "agitrack" / "manual"
+            if latent.is_dir():
+                paths.extend(sorted(latent.iterdir()))
+            for path in paths:
+                try:
+                    info = path.stat()
+                    stamp.append((str(path), info.st_mtime_ns, info.st_ino, info.st_size))
+                except OSError:
+                    stamp.append((str(path), None))
+        except OSError:
+            return False
+        now = time.monotonic()
+        quiet = tuple(stamp) == self._refs_stamp and now - self._refs_checked_at < self._TREE_RECHECK_SECONDS
+        if not quiet:
+            self._refs_stamp = tuple(stamp)
+            self._refs_checked_at = now
+        return quiet
+
+    # How often the tree is snapshotted although the watch reported nothing: a safety net for a
+    # watch that drops events (an overflowing inotify queue, a network filesystem).
+    _TREE_RECHECK_SECONDS = 60.0
+
+    def _tree_unchanged(self) -> bool:
+        """Whether the last snapshot (``_settle_tree``) still describes the working tree: a
+        watch is running, it has reported no change since, and the safety re-check is not due."""
+        return (
+            self._tree_observer is not None
+            and self._settle_tree is not None
+            and not self._tree_changed.is_set()
+            and time.monotonic() - self._tree_checked_at < self._TREE_RECHECK_SECONDS
+        )
+
+    # How long a running turn holds the auto-fold back. A turn that is genuinely working ends long
+    # before this; one whose agent was killed mid-turn never records an end, and must not stop this
+    # repository being committed for good.
+    _IN_FLIGHT_FOLD_HOLD_SECONDS = 30 * 60
+
+    def _turn_still_running(self) -> bool:
+        """Whether the agent is in the middle of a turn right now. The fold commits EVERYTHING in
+        the tree, and while a turn runs that includes its half-finished edits: they were committed
+        under the PREVIOUS turn's trace whenever the agent paused long enough for the tree to look
+        settled (8 s, e.g. while a test suite ran). The interactive session only auto-commits once
+        the agent is idle; this is the same rule. A turn of a conversation started in another
+        folder that has edited this tree counts as well."""
+        now = time.monotonic()
+        started = self._in_flight_since
+        if self._in_flight is not None and started is not None:
+            if now - started < self._IN_FLIGHT_FOLD_HOLD_SECONDS:
+                return True
+        # A conversation started in another folder whose running turn has edited this tree.
+        since = self._elsewhere_running_since
+        return since is not None and now - since < self._IN_FLIGHT_FOLD_HOLD_SECONDS
 
     def _worktree_settled(self, tip: str) -> bool:
         """True when the working tree has stopped changing, so the fold captures a coherent

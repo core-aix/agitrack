@@ -963,8 +963,9 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
 # append-only JSONL that has not grown or been touched since the last read cannot have
 # changed, so the previous result stands. A few files, not one: a tracker now reads its own
 # conversation AND the ones started elsewhere that edited it (agitrack.routing) every cycle,
-# and a single slot made them evict each other. Each entry is dropped after a couple of
-# minutes: this exists to serve the same file again soon, not to hold sessions all day.
+# and a single slot made them evict each other. Each entry is dropped a couple of minutes
+# after it was last ASKED for: this exists to serve the same file again soon, not to hold
+# sessions nobody is reading.
 _EXPORTS: dict[str, tuple[tuple, "ExportedSession | None", float]] = {}
 _EXPORT_SLOTS = 4
 _EXPORT_MEMO_SECONDS = 120.0
@@ -992,6 +993,9 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
         del _EXPORTS[stale]  # let a big session go rather than hold it for a caller who left
     entry = _EXPORTS.get(str(path))
     if entry is not None and key is not None and entry[0] == key:
+        # Kept while it is being asked for: a tracker polls its own conversation every few
+        # seconds, and expiring it by age alone re-read an unchanged session every two minutes.
+        _EXPORTS[str(path)] = (key, entry[1], now)
         return entry[1]
     rows: list[dict] = []
     try:
@@ -2288,43 +2292,84 @@ def _int(value: object) -> int:
     return value if isinstance(value, int) else 0
 
 
-def recent_sessions(since: float) -> list[tuple[SessionRef, str, Path]]:
+def recent_sessions(since: float, *, full: bool = False) -> list[tuple[SessionRef, str, Path]]:
     """Every human-driven Claude conversation, in ANY directory, written to since ``since``:
-    ``(ref, recorded cwd, transcript path)``. One ``stat`` per transcript, plus a bounded head
-    read for the few that are recent. Feeds routing (:mod:`agitrack.routing`): a conversation
-    started in one folder routinely edits another repository, and that repository's tracker has
-    to find it."""
+    ``(ref, recorded cwd, transcript path)``. Feeds routing (:mod:`agitrack.routing`): a
+    conversation started in one folder routinely edits another repository, and that repository's
+    tracker has to find it.
+
+    Asked every few seconds by every tracker, over a store that holds every conversation ever
+    had on this machine (tens of thousands of transcripts), so it checks cheaply what can have
+    changed before reading anything. A project folder is re-listed only when its own mtime moved
+    (a conversation was created or removed there; on Windows, every pass, since NTFS does not
+    reliably move it), and only transcripts that are new or were written to within the window
+    are stat'ed. A conversation that went quiet and is then written to again is picked
+    up by the next FULL sweep, which runs at most ``_FULL_SWEEP_SECONDS`` apart, or at once
+    with ``full=True`` (a commit being made)."""
+    global _SWEPT_AT
     root = _projects_root()
     if not safe_is_dir(root):
         return []
+    now = time.monotonic()
+    if now - _SWEPT_AT >= _FULL_SWEEP_SECONDS:
+        full = True
     out: list[tuple[SessionRef, str, Path]] = []
     try:
-        project_dirs = list(root.iterdir())
+        project_dirs = list(os.scandir(root))
     except OSError:
         return []
-    for project_dir in project_dirs:
-        if not safe_is_dir(project_dir):
+    for entry in project_dirs:
+        try:
+            if not entry.is_dir():
+                continue
+            listed_at = entry.stat().st_mtime_ns
+        except OSError:
             continue
-        for path in project_dir.glob("*.jsonl"):
+        cached = _DIR_LISTINGS.get(entry.path)
+        # NTFS does not reliably move a folder's mtime when a file is created in it, so on
+        # Windows the folder is re-listed every pass (names only, no per-file stat).
+        if cached is None or cached[0] != listed_at or _FOLDER_MTIME_UNRELIABLE:
+            paths = list(Path(entry.path).glob("*.jsonl"))
+            _DIR_LISTINGS[entry.path] = (listed_at, paths)
+        else:
+            paths = cached[1]
+        for path in paths:
+            key = str(path)
+            known = _LAST_WRITTEN.get(key)
+            if not full and known is not None and known <= since:
+                continue  # quiet when last looked at: the next full sweep looks again
             try:
                 updated = path.stat().st_mtime
             except OSError:
                 continue
+            _LAST_WRITTEN[key] = updated
             if updated <= since:
                 continue
-            head = _HEAD_CACHE.get(str(path))
+            head = _HEAD_CACHE.get(key)
             if head is None:
                 # A transcript's first rows (and so its cwd and whether it is programmatic) never
                 # change once written, so each file's head is read once per process.
                 _, programmatic = _scan_session_head(path)
                 head = (_first_cwd(path), programmatic)
                 if head[0]:  # a brand-new transcript may not have recorded its cwd yet
-                    _HEAD_CACHE[str(path)] = head
+                    _HEAD_CACHE[key] = head
             cwd, programmatic = head
             if programmatic or not cwd:
                 continue
             out.append((SessionRef(id=path.stem, updated=updated), cwd, path))
+    if full:
+        _SWEPT_AT = now
     return out
+
+
+# `recent_sessions`'s memory of the store: each project folder's transcripts keyed on that
+# folder's mtime, when each transcript was last written, and when everything was last stat'ed.
+_DIR_LISTINGS: dict[str, tuple[int, list[Path]]] = {}
+_LAST_WRITTEN: dict[str, float] = {}
+_SWEPT_AT = float("-inf")
+_FULL_SWEEP_SECONDS = 60.0
+# NTFS does not reliably move a folder's mtime when a file is created in it.
+_FOLDER_MTIME_UNRELIABLE = os.name == "nt"
 
 
 _HEAD_CACHE: dict[str, tuple[str | None, bool]] = {}

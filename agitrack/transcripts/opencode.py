@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from agitrack.backends.opencode_settings import INTERNAL_CALL_ENV, internal_call_env
 from agitrack.env import getenv_compat
 import signal
 import subprocess
@@ -76,6 +77,7 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
                 ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)]
             ),
             cwd=cwd,
+            env=internal_call_env(),  # not a person opening a session: no auto-start plugin
             **UTF8_TEXT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -594,6 +596,7 @@ def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
         result = subprocess.run(
             resolve_subprocess_command(args),  # resolve opencode(.cmd) on Windows (#118)
             cwd=repo,
+            env=internal_call_env(),  # not a person opening a session: no auto-start plugin
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=_OPENCODE_CALL_TIMEOUT,
@@ -618,6 +621,7 @@ def _run_opencode_posix_pty(repo: Path, args: list[str]) -> tuple[str, int]:
         # aGiTrack's own Python code from the fork point as a duplicate process.
         try:
             os.chdir(repo)
+            os.environ[INTERNAL_CALL_ENV] = "1"  # not a person opening a session (the plugin)
             os.execvp(args[0], args)
         except BaseException:
             os._exit(127)

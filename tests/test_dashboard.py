@@ -2380,3 +2380,74 @@ def test_the_export_bakes_every_diff_a_story_chapter_points_at(tmp_path):
     # Deduped, and every one of them: a chapter whose commit has no baked diff opens onto an
     # error, which is the same failure in a different place.
     assert _story_shas(state) == ["a" * 40, "b" * 40, "c" * 40]
+
+
+def test_a_squashed_part_carries_the_commits_it_names_for_their_diffs(tmp_path):
+    """A squash keeps ONE combined diff, so a part's own change is recorded nowhere, except in
+    the commits it names itself (`covered_commits`): those are real commits, and the log offers
+    their diffs."""
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> first turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "covered_commits: abc1234 def5678\ntokens_since_last_commit_output: 20\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    fold = next(c for c in data["commits"] if c["subject"] == "my commit")
+    assert [p.get("commits") for p in fold["parts"] if p.get("commits")] == [["abc1234", "def5678"]]
+
+
+def _render_detail(entry: dict, tmp_path) -> str:
+    """The detail the dashboard script draws when this log entry is opened."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from tests.test_story import _DOM_STUB
+
+    page = render_html(_demo_repo(tmp_path / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = tmp_path / "detail.js"
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + "const ENTRY = "
+        + json.dumps(entry)
+        + ";\n"
+        + stub
+        + "global.requestAnimationFrame = f => f();\n"
+        + "const box = Object.assign(stubEl(), {hidden: true});\n"
+        + "const base = document.getElementById;\n"
+        + "document.getElementById = id => (id === 'detail-0' ? box : base(id));\n"
+        + "global.ENTRY = ENTRY;\n"
+        + "new Function(SOURCE + '\\n;LOG_ENTRIES = [ENTRY]; toggleDetail(0);')();\n"
+        + "console.log(box.innerHTML);\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_a_squash_commit_offers_its_combined_diff_and_a_part_its_own_commits(tmp_path):
+    """There used to be no way to see what a squashed commit changed: the commit's own diff
+    button was withheld from every squash, and its parts had none either."""
+    entry = {
+        "sha": "a" * 40,
+        "subject": "my commit",
+        "message": "my commit",
+        "parts": [
+            {"subject": "first turn", "kind": "agent", "message": "x", "parts": [], "commits": ["abc1234"]},
+            {"subject": "second turn", "kind": "agent", "message": "y", "parts": [], "commits": []},
+        ],
+    }
+    out = _render_detail(entry, tmp_path)
+    assert 'data-diff="0"' in out  # the squash commit's own (combined) diff
+    assert 'data-psha="abc1234"' in out  # the part that names a commit of its own
+    assert out.count("data-psha=") == 1  # and only that one

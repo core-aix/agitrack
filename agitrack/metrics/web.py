@@ -373,6 +373,9 @@ def _part_payload(part: CommitStat) -> dict:
         "ended": part.ended_at,
         # A nested squash's own message likewise drops its (separately-listed) constituents.
         "message": _main_message(part),
+        # Commits the part names itself (its `covered_commits`): the only per-part diffs a squash
+        # can still show, since the squash holds one combined diff.
+        "commits": list(part.covered_commits),
         "parts": _display_parts(part),  # nested squashes also expand newest-first
     }
 
@@ -2358,20 +2361,49 @@ function renderLog(){
   if(gi) gi.onkeydown = e => { if(e.key==="Enter" && gi.value!=="") goPage(+gi.value||cur); };
 }
 
+let _partDiffSeq = 0;
 function partsHtml(parts){
   // Squash constituents as a nested, expandable tree (native <details>, so the
   // nesting works for multiple rounds of squashing with no extra JS).
   if(!parts || !parts.length) return "";
+  // A squash keeps ONE combined diff (the commit's own "show file diff" above): a part's own
+  // change is not recorded anywhere. The exception is a part that names commits the agent made
+  // itself (its covered_commits), which are real commits with real diffs.
   const items = parts.map(p => {
     const pcls = AI_KINDS.has(p.kind) ? "ai" : (p.kind==="user" ? "user" : "nt");
     const out = (p.tokens&&p.tokens.output) ? ` · ${kfmt(p.tokens.output)} out` : "";
     const mdl = p.model ? ` · ${esc(p.model)}` : "";
+    const commits = (LIVE && p.commits) ? p.commits.filter(s => /^[0-9a-fA-F]{4,64}$/.test(s)) : [];
+    // Buttons in the header row, their boxes BELOW it: the row lays out side by side, and a box
+    // inside it was squeezed into a narrow column next to its button.
+    const ids = commits.map(() => "pdiff-"+(++_partDiffSeq));
+    const buttons = commits.map((s, k) =>
+      `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
+    const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
       `${esc(p.subject||"(no subject)")}<span class="pmeta">${mdl}${out}</span></summary>`+
+      (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
+  const note = LIVE ? " The squash keeps one combined diff (<b>show file diff</b> above); a part's own change is only shown where it names a commit of its own." : "";
   return `<div class="phead">squashed from ${parts.length} original commit${parts.length>1?"s":""} `+
-    `— tokens &amp; models counted from these:</div>${items}`;
+    `— tokens &amp; models counted from these.${note}</div>${items}`;
+}
+// A squashed part's own commit (one it names in covered_commits), toggled open under the part.
+async function togglePartDiff(btn){
+  const box = $(btn.dataset.pbox), sha = btn.dataset.psha;
+  if(!box || !sha) return;
+  if(!box.hidden){ box.hidden = true; return; }
+  box.hidden = false;
+  if(_diffCache[sha] !== undefined){ box.innerHTML = _diffCache[sha]; return; }
+  box.innerHTML = SPIN;
+  try{
+    const r = await fetch("diff?sha="+encodeURIComponent(sha), {cache:"no-store"});
+    const d = r.ok ? await r.json() : {error:"server error"};
+    const html = d.error ? '<div class="diffempty">'+esc(d.error)+'</div>' : diffHtml(d.diff, d.truncated);
+    _diffCache[sha] = html;
+    box.innerHTML = html;
+  }catch(e){ box.innerHTML = '<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'; }
 }
 function toggleDetail(i){
   const c = LOG_ENTRIES[i], detail = $("detail-"+i);
@@ -2384,9 +2416,10 @@ function toggleDetail(i){
   requestAnimationFrame(() => {
     if(detail.hidden) return;
     // Local file diff (served from the clone by /diff) is the primary, GitHub-free action;
-    // the GitHub link is kept as an optional extra when a remote is configured. A squash has
-    // no single diff worth showing here (its parts expand separately), so skip the button then.
-    const diffBtn = (LIVE && c.sha && !(c.parts&&c.parts.length))
+    // the GitHub link is kept as an optional extra when a remote is configured. A squash gets
+    // it too: it is a real commit whose diff is the combined change of every part below it,
+    // and leaving it out left no way at all to see what a squashed commit changed.
+    const diffBtn = (LIVE && c.sha)
       ? `<button class="diffbtn" data-diff="${i}">show file diff</button>` : "";
     const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
     const span = (c.started||c.ended)
@@ -2981,6 +3014,7 @@ async function init(){
   // left alone.
   $("commitlog").addEventListener("click", e => {
     const dbtn = e.target.closest(".diffbtn");
+    if(dbtn && dbtn.dataset.psha){ e.preventDefault(); togglePartDiff(dbtn); return; }
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const entry = e.target.closest(".entry");

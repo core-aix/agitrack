@@ -898,7 +898,7 @@ This is the definition of "done" for a change — it mirrors CI exactly (`.githu
 
 ### Releases
 
-Every merge to `main` cuts a release automatically (`.github/workflows/release-patch.yml`): it bumps the version in `pyproject.toml`, syncs the VSCode extension to match, publishes to PyPI and the Marketplace, and creates a GitHub Release.
+Every merge to `main` cuts a release automatically (`.github/workflows/release-patch.yml`): it bumps the version in `pyproject.toml`, syncs the VSCode extension to match, publishes to PyPI and the Marketplace, and creates a GitHub Release. If a run stops after the release is made (for example an expired Marketplace token), finish it with `gh workflow run release-assets.yml -f version=<version>`, which builds the Windows MSI and publishes the extension from the release's own tag.
 
 The bump level is taken from the **merge commit / squash-PR title**:
 

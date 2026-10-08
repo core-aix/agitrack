@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.backends.opencode_settings import internal_call_env
 from agitrack.proc import (  # _IS_WINDOWS: see proc.py
     _IS_WINDOWS,
     UTF8_TEXT,
@@ -111,6 +112,9 @@ class OpenCodeBackend:
         process = subprocess.Popen(
             resolve_subprocess_command(command),  # find/launch opencode(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
+            # aGiTrack's own run (a summary, a lesson, shell mode): the project's auto-start
+            # plugin must not take it for a person opening a session.
+            env=internal_call_env(),
             **UTF8_TEXT,
             # DEVNULL, never None. `None` means "inherit", and on POSIX `to_stdin` is False, so
             # the opencode child inherited whatever aGiTrack's own stdin was. Under `--ui-bridge`

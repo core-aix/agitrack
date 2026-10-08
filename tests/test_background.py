@@ -6,6 +6,7 @@ as the proxy, so token/turn accounting is identical."""
 from __future__ import annotations
 
 import json
+from typing import Any
 import os
 import shutil
 import stat
@@ -2845,3 +2846,322 @@ def test_a_commit_waits_for_a_tracker_that_has_started_its_flush(tmp_path):
 
     # A tracker that never picks the request up still lets the commit go after the first wait.
     assert background.request_daemon_flush(repo, timeout=0.2) is False
+
+
+def test_a_restarted_tracker_does_not_answer_the_previous_commits_flush_request(tmp_path):
+    """A request left on disk by a commit that finished before this tracker started must not be
+    answered: an answer is a FORCED capture, and answering the stale one after every restart
+    committed whatever turn was running, half done. On aGiTrack's own source checkout, where every
+    commit counts as an update and restarts the tracker, that looped (one turn, many commits)."""
+    import os
+    import time
+
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    agit = tmp_path / ".agitrack"
+    agit.mkdir(exist_ok=True)
+
+    # Answered already by the tracker that was running before.
+    (agit / "flush-request").write_text("n-answered", encoding="utf-8")
+    (agit / "flush-done").write_text("n-answered", encoding="utf-8")
+    assert background._already_answered_flush_nonce(repo) == "n-answered"
+
+    # Never answered, but older than any hook would still wait: its commit has gone ahead.
+    (agit / "flush-request").write_text("n-old", encoding="utf-8")
+    old = time.time() - 60
+    os.utime(agit / "flush-request", (old, old))
+    assert background._already_answered_flush_nonce(repo) == "n-old"
+
+    # Written moments ago and unanswered: a commit may be waiting on it across the restart.
+    (agit / "flush-request").write_text("n-fresh", encoding="utf-8")
+    assert background._already_answered_flush_nonce(repo) is None
+
+    # And the tracker really starts from it: nothing is forced at startup.
+    (agit / "flush-request").write_text("n-answered", encoding="utf-8")
+    (agit / "flush-done").write_text("n-answered", encoding="utf-8")
+    runner, _repo, _state, backend = _runner(tmp_path, manual=False)
+    forced: list[dict] = []
+    runner._process_once = lambda **kwargs: forced.append(kwargs) or False
+    runner._service_flush_requests()
+    assert forced == []
+
+
+def test_the_trackers_own_fold_commit_does_not_ask_the_tracker_to_flush(tmp_path):
+    """Its pre-commit hook would file a flush request the tracker answered right after the commit,
+    forcing a capture of the turn running at that moment."""
+    from agitrack.proxy.background import OWN_COMMIT_ENV
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+    seen: list = []
+    real_commit = repo.commit
+    repo.commit = lambda message, **kwargs: seen.append(kwargs.get("env")) or real_commit(message, **kwargs)
+
+    runner._auto_fold_pending()
+
+    assert seen == [OWN_COMMIT_ENV]
+
+
+def test_a_turn_polled_again_before_it_moved_on_owes_nothing(tmp_path):
+    """The rest of a turn captured mid-flight is owed only once it has spent tokens beyond the
+    capture. Recording it before it moved on wrote the same turn into history twice, the second
+    copy an empty block."""
+    from agitrack.proxy.commit_engine import continues_partial_capture
+
+    state = AgitrackState(tmp_path, default_backend="claude")
+    captured = TokenUsage(total=7, output=7)
+    state.set_partial_turn_usage("s1", "u1", captured.to_dict())
+
+    unchanged = SessionTurn("u1", "m1", "do x", "", TokenUsage(total=7, output=7), "m", complete=False)
+    assert continues_partial_capture(state, [unchanged], "s1") is False
+
+    moved_on = SessionTurn("u1", "m2", "do x", "done", TokenUsage(total=10, output=10), "m")
+    assert continues_partial_capture(state, [moved_on], "s1") is True
+
+
+def test_the_auto_fold_waits_while_a_turn_is_still_running(tmp_path):
+    """The fold commits everything in the tree, and while a turn runs that includes its
+    half-finished edits: they were committed under the PREVIOUS turn's trace the moment the agent
+    paused long enough for the tree to look settled. A turn whose agent died mid-turn holds it back
+    for a bounded time only."""
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()  # a finished turn, pending
+    runner._worktree_settled = lambda tip: True
+    (tmp_path / "b.txt").write_text("half-finished work of the next turn\n", encoding="utf-8")
+
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "next"})
+    runner._auto_fold_pending()
+    assert len(_git(repo, "log", "--format=%H").split()) == 1  # nothing committed mid-turn
+
+    runner._in_flight_since = time.monotonic() - runner._IN_FLIGHT_FOLD_HOLD_SECONDS - 1
+    runner._auto_fold_pending()  # a turn that never ends does not hold the repo forever
+    assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+    runner._note_in_flight(None)
+    assert runner._turn_still_running() is False
+
+
+def test_the_auto_fold_waits_for_a_turn_from_another_folder_editing_this_tree(tmp_path):
+    """A conversation started in another folder (a parent directory, a sibling checkout) can be
+    mid-turn with edits already in this tree; the fold would commit them under this repository's
+    previous turn just the same."""
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+    runner._worktree_settled = lambda tip: True
+    (tmp_path / "b.txt").write_text("written by a running turn started elsewhere\n", encoding="utf-8")
+
+    runner._note_running_elsewhere(True)
+    runner._auto_fold_pending()
+    assert len(_git(repo, "log", "--format=%H").split()) == 1
+
+    runner._elsewhere_running_since = time.monotonic() - runner._IN_FLIGHT_FOLD_HOLD_SECONDS - 1
+    assert runner._turn_still_running() is False  # bounded, like the local hold
+    runner._note_running_elsewhere(False)
+    runner._auto_fold_pending()
+    assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+
+def test_a_running_turn_is_forgotten_once_it_ends_even_if_nothing_of_it_stays_here(tmp_path):
+    """The in-flight answer is given before the routing filter. A filter that keeps nothing
+    (the turn ended having edited only another tracked repository) returns early, and the last
+    answer, "a turn is running", used to stand after the turn ended: the auto-fold then held
+    this repository's pending turns back for the full half hour."""
+    from agitrack.proxy.commit_engine import CommitEngine
+    from agitrack.proxy.session import Session
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    running = SessionTurn("u1", None, "do x", "", TokenUsage(total=5, output=5), "claude-opus-4-8", complete=False)
+    finished = _turn("u1", "m1", "do x", "done", 20)
+    seen: list = []
+    for turn, keep in ((running, True), (finished, False)):
+        backend.set_session("s1", [turn])
+        session: Any = Session.bare()
+        session.repo, session.state, session.backend = repo, state, backend
+        session.worktree, session.name, session.agent_parse_thread = None, None, None
+        session.agent_parse_result = ("s1", backend.export_session(repo, "s1"), None, state)
+        CommitEngine(repo, state).finish_parse_if_ready(
+            session=session,
+            quiet=True,
+            prompt_untracked=False,
+            require_complete=True,
+            awaited_followups=[],
+            agent_is_active_fn=lambda: False,
+            debug_fn=lambda _m: None,
+            note_session_change_fn=lambda _s: None,
+            mirror_fn=lambda _s: None,
+            commit_fn=lambda **_k: None,
+            note_in_flight_fn=seen.append,
+            turn_filter=lambda _t, keep=keep: keep,
+        )
+    assert seen[0] is not None  # the running turn was reported
+    assert seen[-1] is None  # and its end too, though the filter kept none of it
+
+
+def test_a_tracker_being_replaced_leaves_a_running_turn_to_its_successor(tmp_path):
+    """Re-running `agitrack -b` (how an update is picked up, and what a mode switch and
+    `agitrack redact` do) stops the old tracker and starts another. Its teardown used to
+    force-capture the running turn and commit it half done, so one prompt became two commits.
+    A replaced tracker records finished turns only; a plain stop still captures everything."""
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    running = SessionTurn("u1", None, "do x", "", TokenUsage(total=5, output=5), "claude-opus-4-8", complete=False)
+    backend.set_session("s1", [running])
+    (tmp_path / "a.txt").write_text("half-finished\n", encoding="utf-8")
+    runner._process_once()
+    assert runner._turn_still_running()
+
+    marker = tmp_path / ".agitrack" / "tracker-replacing"
+    marker.write_text(str(os.getpid()), encoding="utf-8")
+    runner._teardown()
+    assert len(_git(repo, "log", "--format=%H").split()) == 1  # nothing committed mid-turn
+    assert runner._manual.pending_count() == 0
+
+    marker.unlink()
+    runner._manual.setup()
+    runner._teardown()  # an ordinary stop: nothing tracks after it, so it is captured
+    assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+
+def test_replacing_a_tracker_tells_it_so_and_cleans_up(tmp_path, monkeypatch):
+    from agitrack.proxy import background
+
+    repo = _init_repo(tmp_path)
+    seen: list[str] = []
+    alive = {"yes": True}
+
+    def terminate(pid):
+        seen.append((tmp_path / ".agitrack" / "tracker-replacing").read_text(encoding="utf-8"))
+        alive["yes"] = False
+
+    monkeypatch.setattr(background, "terminate_pid", terminate)
+    monkeypatch.setattr(background, "pid_alive", lambda pid: alive["yes"])
+    assert background._terminate_and_wait(4242, replacing=repo)
+    assert seen == ["4242"]
+    assert not (tmp_path / ".agitrack" / "tracker-replacing").exists()
+
+
+def test_an_idle_poll_does_not_snapshot_the_tree_while_the_watch_reports_nothing(tmp_path):
+    """Snapshotting the working tree is several git processes, and it ran on every 3 s poll
+    of an idle repository (measured on this repo: ~110 ms of git CPU per poll, ~6% of a core,
+    with no conversation at all). A filesystem watch now says whether anything changed first."""
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    calls: list[int] = []
+    real = repo.snapshot_worktree_tree
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    repo.snapshot_worktree_tree = counting  # type: ignore[method-assign]
+    runner._tree_observer = object()  # a watch is running
+    runner._sample_worktree()
+    assert len(calls) == 1  # the first sample has nothing to reuse
+    for _ in range(5):
+        runner._sample_worktree()
+    assert len(calls) == 1  # quiet: the last snapshot still describes the tree
+
+    (tmp_path / "a.txt").write_text("changed\n", encoding="utf-8")
+    runner._tree_changed.set()  # what the watch does on that write
+    runner._sample_worktree()
+    assert len(calls) == 2 and runner._settle_changed_at > 0  # and the settle clock restarted
+
+    runner._tree_checked_at = time.monotonic() - runner._TREE_RECHECK_SECONDS - 1
+    runner._sample_worktree()  # the safety re-check for a watch that drops events
+    assert len(calls) == 3
+
+    runner._tree_observer = None  # no watch available here: poll as before
+    runner._sample_worktree()
+    runner._sample_worktree()
+    assert len(calls) == 5
+
+
+def test_the_tracker_starts_and_stops_a_watch_on_its_tree(tmp_path):
+    from agitrack.proxy import watch
+
+    if watch.Observer is None:
+        pytest.skip("watchdog is not installed")
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    seen: list[object] = []
+    runner._poll_until_stopped = lambda: seen.append(runner._tree_observer)  # type: ignore[method-assign]
+    runner._loop()
+    assert seen and seen[0] is not None and runner._tree_observer is None
+
+    changed = runner._tree_changed
+    observer = watch.start_watching(tmp_path, changed)
+    try:
+        time.sleep(0.3)
+        (tmp_path / "b.txt").write_text("x\n", encoding="utf-8")
+        assert changed.wait(5.0)
+        time.sleep(1.0)  # FSEvents may deliver the same write more than once, late
+        changed.clear()
+        (tmp_path / ".agitrack").mkdir(exist_ok=True)
+        (tmp_path / ".agitrack" / "state-noise").write_text("x\n", encoding="utf-8")
+        assert not changed.wait(1.0)  # aGiTrack's own state is not a change to the tree
+    finally:
+        watch.stop_watching(observer)
+
+
+def test_an_idle_poll_asks_git_nothing_while_no_ref_has_moved(tmp_path):
+    """`git rev-parse` for HEAD and the latent ref ran on every poll; a ref only moves when its
+    file (or packed-refs) is rewritten, so a stat of those files answers first."""
+    import time
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    assert runner._refs_unchanged() is False  # first look: nothing to compare with
+    assert runner._refs_unchanged() is True
+
+    (tmp_path / "a.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "user work")  # the branch moved
+    assert runner._refs_unchanged() is False
+    assert runner._refs_unchanged() is True
+
+    _git(repo, "checkout", "-qb", "other")  # HEAD moved to another branch
+    assert runner._refs_unchanged() is False
+    assert runner._refs_unchanged() is True
+
+    _git(repo, "update-ref", "refs/agitrack/manual/s1", "HEAD")  # a latent turn was recorded
+    assert runner._refs_unchanged() is False
+    assert runner._refs_unchanged() is True
+
+    _git(repo, "pack-refs", "--all")  # the loose files went into packed-refs
+    assert runner._refs_unchanged() is False
+
+    runner._refs_checked_at = time.monotonic() - runner._TREE_RECHECK_SECONDS - 1
+    assert runner._refs_unchanged() is False  # never trusted for long
+
+
+def test_the_driven_backend_is_asked_about_every_few_seconds_not_every_poll(tmp_path):
+    """Asking every installed backend's store which one is in use was the costliest part of an
+    idle poll. Moving to another agent is deliberate, so it is asked on a slower clock, and at
+    once when a commit is being made."""
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    asked: list[int] = []
+    runner._backend_activity = lambda: asked.append(1) or {}  # type: ignore[method-assign]
+    for _ in range(4):
+        runner._follow_the_driven_backend()
+    assert len(asked) == 1
+
+    (tmp_path / ".agitrack").mkdir(exist_ok=True)
+    (tmp_path / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()  # a commit asks at once
+    assert len(asked) == 2

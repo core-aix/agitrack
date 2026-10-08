@@ -956,9 +956,12 @@ def test_the_fold_never_sweeps_in_the_users_own_untracked_file(tmp_path):
     (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")  # the turn's output
     runner._manual_gate()
     runner._manual_record(_agent_body("do x", 20))
+    runner.agent_in_flight = False  # the turn has ended (the fold waits for that)
+    head_before = repo.rev_parse("HEAD")
 
     runner._auto_fold_latent_pending()
 
+    assert repo.rev_parse("HEAD") != head_before
     files = _git(repo, "show", "--pretty=", "--name-only", "HEAD").split()
     assert files == ["a.txt"], files
     assert "user-note.txt" in _git(repo, "status", "--porcelain")  # still the user's to commit
@@ -978,6 +981,7 @@ def test_the_fold_still_commits_a_file_the_AGENT_created_in_an_earlier_turn(tmp_
     (tmp_path / "second.txt").write_text("from turn 2\n", encoding="utf-8")
     runner._manual_gate()
     runner._manual_record(_agent_body("do y", 20))
+    runner.agent_in_flight = False  # turn 2 has ended (the fold waits for that)
 
     runner._auto_fold_latent_pending()
 
@@ -2773,3 +2777,37 @@ def test_precommit_sync_does_not_ask_for_a_flush_on_a_commit_already_folded(tmp_
         assert asked == [1]
     finally:
         lock.release()
+
+
+def test_noworktree_auto_fold_waits_while_the_next_turn_is_running(tmp_path):
+    # The fold commits the whole tree. While the next turn runs, that is its half-finished
+    # edits, which then landed under the previous turn's trace (the background tracker had
+    # the same defect, `test_the_auto_fold_waits_while_a_turn_is_still_running`).
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))
+    head_before = repo.rev_parse("HEAD")
+
+    runner.agent_in_flight = True  # the next turn is running
+    (tmp_path / "b.txt").write_text("half-finished work of the next turn\n", encoding="utf-8")
+    runner._auto_fold_latent_pending()
+    assert repo.rev_parse("HEAD") == head_before
+
+    runner._note_running_elsewhere(True)  # so is a conversation started in another folder
+    runner.agent_in_flight = False
+    runner._auto_fold_latent_pending()
+    assert repo.rev_parse("HEAD") == head_before
+
+    runner._note_running_elsewhere(False)
+    runner._auto_fold_latent_pending()
+    assert repo.rev_parse("HEAD") != head_before
+
+    runner.agent_in_flight = True  # the exit finalize still lands everything
+    (tmp_path / "c.txt").write_text("more\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do y", 20))
+    head_before = repo.rev_parse("HEAD")
+    runner._auto_fold_latent_pending(force=True)
+    assert repo.rev_parse("HEAD") != head_before

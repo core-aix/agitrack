@@ -208,6 +208,20 @@ def _with_social(html: str, page: str) -> str:
     return html.replace("</head>", _social_head(page) + "\n</head>", 1)
 
 
+def _part_commits(stat) -> list[str]:
+    """The commits a squash's parts name themselves (``covered_commits``), nested squashes
+    included, each id once and only if it is a plain hex id."""
+    found: list[str] = []
+    stack = list(getattr(stat, "constituents", None) or [])
+    while stack:
+        part = stack.pop()
+        for short in getattr(part, "covered_commits", None) or []:
+            if short not in found and all(ch in "0123456789abcdefABCDEF" for ch in short) and 4 <= len(short) <= 40:
+                found.append(short)
+        stack.extend(getattr(part, "constituents", None) or [])
+    return found
+
+
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -655,6 +669,10 @@ def export_static_demo(repo: GitRepo, out_dir: Path, *, force: bool = False) -> 
     # browser with each change's file diff (file history deliberately stays full-depth).
     for stat in demo_stats:
         _write_json(demo / "diff" / f"{stat.sha}.json", commit_diff(repo, stat.sha))
+        # A squashed part's own commits, under the (short) id the part names them by, which is
+        # the id its "file diff" button asks for.
+        for short in _part_commits(stat):
+            _write_json(demo / "diff" / f"{short}.json", commit_diff(repo, short))
     files_payload = browser.files_payload()
     _write_json(demo / "files.json", {"files": files_payload})
     files_index = {row["path"]: i for i, row in enumerate(files_payload)}
