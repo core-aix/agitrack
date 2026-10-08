@@ -2399,8 +2399,9 @@ def test_a_squashed_part_carries_the_commits_it_names_for_their_diffs(tmp_path):
     assert [p.get("commits") for p in fold["parts"] if p.get("commits")] == [["abc1234", "def5678"]]
 
 
-def _render_detail(entry: dict, tmp_path) -> str:
+def _render_detail(entry: dict, tmp_path, tz: str | None = None) -> str:
     """The detail the dashboard script draws when this log entry is opened."""
+    import os
     import shutil
     import subprocess
 
@@ -2430,9 +2431,93 @@ def _render_detail(entry: dict, tmp_path) -> str:
         + "console.log(box.innerHTML);\n",
         encoding="utf-8",
     )
-    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300)
+    env = {**os.environ, "TZ": tz} if tz else None
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
+
+
+def test_a_fold_does_not_list_the_commit_itself_among_its_parts(tmp_path):
+    """A user's commit that folded agent turns opens with its own message and the user block
+    attributing it. The parser reads that block as a first part, which listed the commit as
+    a squashed "user" commit of itself, with the same subject and text shown just above."""
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\nwhat I changed\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> first turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 20\n\n"
+        "<aGiTrack> second turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 30\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    fold = next(c for c in data["commits"] if c["subject"] == "my commit")
+    assert [p["subject"] for p in fold["parts"]] == ["<aGiTrack> second turn", "<aGiTrack> first turn"]
+    assert fold["message"].startswith("my commit")  # the commit's own text is still shown, once
+
+
+def test_a_squashed_user_commit_that_is_not_the_lead_is_still_listed(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "Squash PR (#1)\n\n"
+        "* someone's own commit\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "* <aGiTrack> a turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "tokens_since_last_commit_output: 20\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    squash = next(c for c in data["commits"] if c["subject"].startswith("Squash PR"))
+    assert [p["subject"] for p in squash["parts"]] == ["<aGiTrack> a turn", "someone's own commit"]
+
+
+def test_a_squashed_part_carries_when_its_turn_happened(tmp_path):
+    """Each squashed part carries the moment its turn ended (else began) for the date on its
+    row, and None when it recorded neither, so the row leaves the date out."""
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> ended turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "agent_started_at: 2026-10-08T10:00:00Z\nagent_ended_at: 2026-10-08T10:05:00Z\n\n"
+        "<aGiTrack> started turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+        "agent_started_at: 2026-10-08T11:00:00Z\n\n"
+        "<aGiTrack> undated turn\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+    )
+    data = dashboard_data(build_dashboard(repo))
+    fold = next(c for c in data["commits"] if c["subject"] == "my commit")
+    when = {p["subject"]: p["ts"] for p in fold["parts"]}
+    from datetime import datetime
+
+    def epoch(iso):
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    assert when["<aGiTrack> ended turn"] == epoch("2026-10-08T10:05:00Z")  # the end
+    assert when["<aGiTrack> started turn"] == epoch("2026-10-08T11:00:00Z")  # no end: the start
+    assert when["<aGiTrack> undated turn"] is None
+
+
+def test_a_squashed_part_shows_its_date_on_the_right_only_when_it_has_one(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    ts = 1791453900
+    entry = {
+        "sha": "a" * 40,
+        "subject": "my commit",
+        "message": "my commit",
+        "parts": [
+            {"subject": "dated turn", "kind": "agent", "message": "x", "parts": [], "ts": ts, "model": "m1"},
+            {"subject": "undated turn", "kind": "agent", "message": "y", "parts": [], "ts": None},
+        ],
+    }
+    out = _render_detail(entry, tmp_path, tz="Asia/Tokyo")
+    local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST
+    dated, undated = out.split("undated turn", 1)
+    # On the right, under the part's model and tokens.
+    assert dated.index('class="psubj"') < dated.index('class="pmeta"') < dated.index('class="when"')
+    assert f">{local}</span>" in dated
+    assert 'class="when"' not in undated  # no recorded time: no date at all
 
 
 def test_a_squash_commit_offers_its_combined_diff_and_a_part_its_own_commits(tmp_path):
@@ -2451,3 +2536,52 @@ def test_a_squash_commit_offers_its_combined_diff_and_a_part_its_own_commits(tmp
     assert 'data-diff="0"' in out  # the squash commit's own (combined) diff
     assert 'data-psha="abc1234"' in out  # the part that names a commit of its own
     assert out.count("data-psha=") == 1  # and only that one
+
+
+def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
+    """The log listed sha, kind, subject, lines and tokens, but not WHEN a commit was made.
+    Each row now carries its date and time in the reader's own time zone, with the full moment
+    (zone and UTC) on hover. Rendered by the real page script under node, in a fixed zone."""
+    import os
+    import shutil
+    import subprocess
+    from datetime import datetime, timedelta, timezone
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from tests.test_story import _DOM_STUB
+
+    ts = 1791415320
+    entry = {"sha": "b" * 40, "short": "bbbbbbbb", "subject": "my commit", "kind": "agent", "ts": ts, "tokens": {}}
+    page = render_html(_demo_repo(tmp_path / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = tmp_path / "log.js"
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + "const ENTRY = "
+        + json.dumps(entry)
+        + ";\n"
+        + stub
+        + "const box = stubEl();\n"
+        + "const base = document.getElementById;\n"
+        + "document.getElementById = id => (id === 'commitlog' ? box : base(id));\n"
+        + "global.ENTRY = ENTRY;\n"
+        + "new Function(SOURCE + '\\n;LOGPAGE = {entries:[ENTRY], total:1, offset:0, limit:50}; renderLog();')();\n"
+        + "console.log(box.innerHTML);\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "Asia/Tokyo"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST
+    utc = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+    row = result.stdout
+    # On the right, UNDER the commit's other facts (lines, tokens, model), not before its subject.
+    assert row.index('class="ksub"') < row.index('class="emeta"') < row.index('class="when"')
+    assert f">{local}</span>" in result.stdout  # the reader's local time on the row
+    assert f"({utc} UTC)" in result.stdout  # and the same moment in UTC on hover

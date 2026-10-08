@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, apply_numstat_for, build_dashboard
+from agitrack.metrics.collect import CommitStat, Dashboard, _iso_epoch, apply_numstat_for, build_dashboard
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
@@ -344,8 +344,25 @@ def _display_parts(stat: CommitStat) -> list[dict]:
     """A squash's constituents serialized for the expandable log view, ordered
     **newest-first** to match the newest-first commit log. This reorder is DISPLAY-ONLY: the
     raw commit message keeps its constituents in chronological (oldest-first) order, like any
-    squash merge — only the dashboard shows the latest one at the top."""
-    return [_part_payload(part) for part in reversed(stat.constituents)]
+    squash merge — only the dashboard shows the latest one at the top.
+
+    A FOLD (a user's commit that absorbed agent turns) opens with the commit's OWN message and
+    the ``commit_type: user`` block attributing it, which the parser reads as a first
+    constituent like any other block. That "part" is the commit itself: the same subject and
+    text the detail view already shows above the list, so it is left out of the list."""
+    parts = list(stat.constituents)
+    if parts and _is_own_lead(parts[0], stat):
+        parts = parts[1:]
+    return [_part_payload(part) for part in reversed(parts)]
+
+
+def _is_own_lead(part: CommitStat, stat: CommitStat) -> bool:
+    """Whether ``part`` is the commit's own message with its user attribution block (the lead
+    of a fold), rather than a commit that was squashed into it."""
+    if part.kind != "user" or any(part.tokens.values()):
+        return False
+    head = part.message.partition(METADATA_HEADER)[0].strip()
+    return head == _main_message(stat)
 
 
 def _main_message(stat: CommitStat) -> str:
@@ -371,6 +388,8 @@ def _part_payload(part: CommitStat) -> dict:
         "tokens": part.tokens,
         "started": part.started_at,
         "ended": part.ended_at,
+        # When the part's turn ended (else began), for the date on its row; None leaves it out.
+        "ts": _iso_epoch(part.ended_at) or _iso_epoch(part.started_at),
         # A nested squash's own message likewise drops its (separately-listed) constituents.
         "message": _main_message(part),
         # Commits the part names itself (its `covered_commits`): the only per-part diffs a squash
@@ -1333,6 +1352,9 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry.ops::before{border-color:var(--ops);box-shadow:0 0 8px rgba(103,184,214,.4)}
 .entry.nontracked::before{border-color:var(--amber)}
 .entry .sha{color:var(--amber);font-size:12.5px}
+.entry .emeta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin-left:auto}
+.entry .erow{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;justify-content:flex-end}
+.entry .when{color:var(--fg-dim);font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
 /* overflow-wrap:anywhere so a subject with no spaces (a shell command, a long flag,
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
@@ -1397,7 +1419,10 @@ __UI_COMMIT_CSS__
 .dmsg.md a{color:var(--phosphor)}
 .entry .detail .phead{color:var(--ops);font-size:12px;margin:12px 0 6px}
 .part{border:1px solid var(--line);margin:5px 0;background:var(--panel-2)}
-.part>summary{cursor:pointer;padding:6px 10px;font-size:12.5px;color:var(--fg);list-style:none}
+.part>summary{cursor:pointer;padding:6px 10px;font-size:12.5px;color:var(--fg);list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px}
+.part>summary .psubj{flex:1 1 12em;min-width:0}
+.part .pright{display:flex;flex-direction:column;align-items:flex-end;gap:3px;margin-left:auto}
+.part .when{color:var(--fg-dim);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .part>summary::-webkit-details-marker{display:none}
 .part>summary::before{content:"▸ ";color:var(--ops)}
 .part[open]>summary::before{content:"▾ "}
@@ -2293,6 +2318,17 @@ function onChartUp(){ if(tsDrag){ tsDrag=null; $("ts-canvas").style.cursor=""; }
 function resetZoom(){ tsView=null; tsHover=-1; }
 function renderTimeseries(){ renderLegend(); renderChart(); }
 
+// When a commit was made, in the reader's own time zone ("2026-10-08 10:42"), and the same
+// moment spelled out in full, with its zone and in UTC, for a hover title.
+function commitWhen(ts){
+  if(!ts) return {text:"", title:""};
+  const d = new Date(ts*1000), p = n => String(n).padStart(2, "0");
+  const text = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  let full = text;
+  try{ full = d.toLocaleString(undefined, {dateStyle:"full", timeStyle:"long"}); }catch(e){}
+  const utc = d.toISOString().slice(0,16).replace("T"," ")+" UTC";
+  return {text, title:`${full} (${utc})`};
+}
 function renderLog(){
   const entries = LOGPAGE.entries || [];
   LOG_ENTRIES = entries;
@@ -2313,8 +2349,14 @@ function renderLog(){
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
+    // The right-hand column: lines, tokens and model on top, and under them when the commit
+    // was made, so the date sits with the commit's other facts rather than in front of its subject.
+    const w = commitWhen(c.ts);
+    const facts = `${lc}${tokenBrief(c.tokens)}${m}`;
+    const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
+    const meta = (facts || whenTag) ? `<span class="emeta">${facts ? `<span class="erow">${facts}</span>` : ""}${whenTag}</span>` : "";
     return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
-      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
+      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${meta}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;
@@ -2371,8 +2413,12 @@ function partsHtml(parts){
   // itself (its covered_commits), which are real commits with real diffs.
   const items = parts.map(p => {
     const pcls = AI_KINDS.has(p.kind) ? "ai" : (p.kind==="user" ? "user" : "nt");
-    const out = (p.tokens&&p.tokens.output) ? ` · ${kfmt(p.tokens.output)} out` : "";
-    const mdl = p.model ? ` · ${esc(p.model)}` : "";
+    const facts = [p.model ? esc(p.model) : "", (p.tokens&&p.tokens.output) ? `${kfmt(p.tokens.output)} out` : ""].filter(Boolean).join(" · ");
+    // On the right, like a log row: the part's model and tokens, its date/time below them
+    // (only when the part recorded one).
+    const w = commitWhen(p.ts);
+    const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
+    const right = (facts || whenTag) ? `<span class="pright">${facts ? `<span class="pmeta">${facts}</span>` : ""}${whenTag}</span>` : "";
     const commits = (LIVE && p.commits) ? p.commits.filter(s => /^[0-9a-fA-F]{4,64}$/.test(s)) : [];
     // Buttons in the header row, their boxes BELOW it: the row lays out side by side, and a box
     // inside it was squeezed into a narrow column next to its button.
@@ -2381,7 +2427,7 @@ function partsHtml(parts){
       `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
     const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
-      `${esc(p.subject||"(no subject)")}<span class="pmeta">${mdl}${out}</span></summary>`+
+      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>${right}</summary>`+
       (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
@@ -2849,7 +2895,7 @@ function showLogTab(tab){
   if(hf) hf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
-  const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";
+  const when = commitWhen(c.ts).text;  // the reader's local time, like the commit log
   const who = [c.backend, c.model].filter(Boolean).map(esc).join(" · ");
   const out = (c.tokens && c.tokens.output) ? ` · ${kfmt(c.tokens.output)} out tok` : "";
   const lc = `<span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span>`;
