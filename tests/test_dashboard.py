@@ -2451,3 +2451,51 @@ def test_a_squash_commit_offers_its_combined_diff_and_a_part_its_own_commits(tmp
     assert 'data-diff="0"' in out  # the squash commit's own (combined) diff
     assert 'data-psha="abc1234"' in out  # the part that names a commit of its own
     assert out.count("data-psha=") == 1  # and only that one
+
+
+def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
+    """The log listed sha, kind, subject, lines and tokens, but not WHEN a commit was made.
+    Each row now carries its date and time in the reader's own time zone, with the full moment
+    (zone and UTC) on hover. Rendered by the real page script under node, in a fixed zone."""
+    import os
+    import shutil
+    import subprocess
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from tests.test_story import _DOM_STUB
+
+    ts = 1791415320
+    entry = {"sha": "b" * 40, "short": "bbbbbbbb", "subject": "my commit", "kind": "agent", "ts": ts, "tokens": {}}
+    page = render_html(_demo_repo(tmp_path / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = tmp_path / "log.js"
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + "const ENTRY = "
+        + json.dumps(entry)
+        + ";\n"
+        + stub
+        + "const box = stubEl();\n"
+        + "const base = document.getElementById;\n"
+        + "document.getElementById = id => (id === 'commitlog' ? box : base(id));\n"
+        + "global.ENTRY = ENTRY;\n"
+        + "new Function(SOURCE + '\\n;LOGPAGE = {entries:[ENTRY], total:1, offset:0, limit:50}; renderLog();')();\n"
+        + "console.log(box.innerHTML);\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "Asia/Tokyo"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    local = datetime.fromtimestamp(ts, ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
+    utc = datetime.fromtimestamp(ts, ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M")
+    assert '<span class="when"' in result.stdout
+    assert f">{local}</span>" in result.stdout  # the reader's local time on the row
+    assert f"({utc} UTC)" in result.stdout  # and the same moment in UTC on hover

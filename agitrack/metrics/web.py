@@ -1333,6 +1333,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry.ops::before{border-color:var(--ops);box-shadow:0 0 8px rgba(103,184,214,.4)}
 .entry.nontracked::before{border-color:var(--amber)}
 .entry .sha{color:var(--amber);font-size:12.5px}
+.entry .when{color:var(--fg-dim);font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
 /* overflow-wrap:anywhere so a subject with no spaces (a shell command, a long flag,
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
@@ -2293,6 +2294,17 @@ function onChartUp(){ if(tsDrag){ tsDrag=null; $("ts-canvas").style.cursor=""; }
 function resetZoom(){ tsView=null; tsHover=-1; }
 function renderTimeseries(){ renderLegend(); renderChart(); }
 
+// When a commit was made, in the reader's own time zone ("2026-10-08 10:42"), and the same
+// moment spelled out in full, with its zone and in UTC, for a hover title.
+function commitWhen(ts){
+  if(!ts) return {text:"", title:""};
+  const d = new Date(ts*1000), p = n => String(n).padStart(2, "0");
+  const text = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  let full = text;
+  try{ full = d.toLocaleString(undefined, {dateStyle:"full", timeStyle:"long"}); }catch(e){}
+  const utc = d.toISOString().slice(0,16).replace("T"," ")+" UTC";
+  return {text, title:`${full} (${utc})`};
+}
 function renderLog(){
   const entries = LOGPAGE.entries || [];
   LOG_ENTRIES = entries;
@@ -2313,7 +2325,9 @@ function renderLog(){
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
-    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
+    const w = commitWhen(c.ts);
+    const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${whenTag}${badge}${pend}${trk}${anom}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
@@ -2849,7 +2863,7 @@ function showLogTab(tab){
   if(hf) hf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
-  const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";
+  const when = commitWhen(c.ts).text;  // the reader's local time, like the commit log
   const who = [c.backend, c.model].filter(Boolean).map(esc).join(" · ");
   const out = (c.tokens && c.tokens.output) ? ` · ${kfmt(c.tokens.output)} out tok` : "";
   const lc = `<span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span>`;
