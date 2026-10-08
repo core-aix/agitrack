@@ -2460,8 +2460,7 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
     import os
     import shutil
     import subprocess
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from datetime import datetime, timedelta, timezone
 
     node = shutil.which("node")
     if node is None:
@@ -2494,8 +2493,8 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
         [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "Asia/Tokyo"}
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    local = datetime.fromtimestamp(ts, ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
-    utc = datetime.fromtimestamp(ts, ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M")
+    local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST
+    utc = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
     row = result.stdout
     # On the right, UNDER the commit's other facts (lines, tokens, model), not before its subject.
     assert row.index('class="ksub"') < row.index('class="emeta"') < row.index('class="when"')
