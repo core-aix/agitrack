@@ -247,6 +247,9 @@ printing an explicit "started automatically … stop with `agitrack -b stop`; di
 per repo asks whether to enable this (default on; repo-scoped `autotrack_hook`); `agitrack --remove-hooks`
 turns it off. The hook calls the CURRENT aGiTrack even after a self-update (frozen-aware invocation +
 PATH fallback).
+Whenever an auto-start (on a commit, a finished turn, or an agent session opening) starts a
+tracker and no dashboard is running, it starts the dashboard too, so a reboot does not leave an open
+dashboard tab on a dead page. No browser tab is opened; `open_dashboard_on_start: false` turns it off.
 
 **Keeping the hook's schema current.** Every background start (when `autotrack_hook` isn't `off`)
 re-installs this hook and **stamps the running aGiTrack version** into it (a

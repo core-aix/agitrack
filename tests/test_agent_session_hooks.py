@@ -259,6 +259,105 @@ def test_a_session_opening_respects_the_opt_out(tmp_path, monkeypatch):
     assert spawned == []
 
 
+def _stub_tracker_spawn(monkeypatch, background_module, spawned):
+    monkeypatch.setattr(
+        background_module,
+        "spawn_background_daemon",
+        lambda repo, *, extra_args: spawned.append(extra_args) or types.SimpleNamespace(pid=4321),
+    )
+    monkeypatch.setattr(background_module, "wait_for_handshake", lambda repo, *, pid, timeout: {"pid": pid})
+
+
+def _count_hub_spawns(monkeypatch, *, running: bool) -> list[int]:
+    from agitrack.metrics import hub
+
+    hubs: list[int] = []
+    monkeypatch.setattr(hub, "running_hub", lambda: {"pid": 1} if running else None)
+    monkeypatch.setattr(hub, "_spawn_hub", lambda: hubs.append(1))
+    return hubs
+
+
+def test_an_agent_restarted_after_a_reboot_brings_the_dashboard_back_too(tmp_path, monkeypatch):
+    """A reboot kills the hub along with the tracker. The tracker comes back with the agent's
+    session; a dashboard tab the browser restored should not be left on a dead page."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    spawned: list[list[str]] = []
+    _stub_tracker_spawn(monkeypatch, background_module, spawned)
+    hubs = _count_hub_spawns(monkeypatch, running=False)
+
+    background_module.autostart_on_agent_session(repo)
+
+    assert spawned and hubs == [1]
+
+
+def test_a_running_dashboard_is_not_started_twice(tmp_path, monkeypatch):
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    spawned: list[list[str]] = []
+    _stub_tracker_spawn(monkeypatch, background_module, spawned)
+    hubs = _count_hub_spawns(monkeypatch, running=True)
+
+    background_module.autostart_on_agent_session(repo)
+
+    assert spawned and hubs == []
+
+
+def test_no_dashboard_starts_when_no_tracker_was_auto_started(tmp_path, monkeypatch):
+    """The dashboard rides on the tracker's auto-start. A repo that is opted out (or already
+    tracked) starts nothing, and a dashboard the user stopped stays stopped."""
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    config.set("autotrack_hook", "off", scope="repo")
+    spawned: list[list[str]] = []
+    _stub_tracker_spawn(monkeypatch, background_module, spawned)
+    hubs = _count_hub_spawns(monkeypatch, running=False)
+
+    background_module.autostart_on_agent_session(repo)
+
+    assert spawned == [] and hubs == []
+
+
+def test_the_dashboard_auto_start_honours_open_dashboard_on_start(tmp_path, monkeypatch):
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    config = GlobalConfig()
+    config.load_repo_overlay(tmp_path)
+    config.set("open_dashboard_on_start", False, scope="repo")
+    spawned: list[list[str]] = []
+    _stub_tracker_spawn(monkeypatch, background_module, spawned)
+    hubs = _count_hub_spawns(monkeypatch, running=False)
+
+    background_module.autostart_on_agent_session(repo)
+
+    assert spawned and hubs == []
+
+
+def test_the_turn_end_auto_start_brings_the_dashboard_back_too(tmp_path, monkeypatch):
+    from agitrack.proxy import background as background_module
+
+    repo = _init_repo(tmp_path)
+    AgitrackState(tmp_path, default_backend="claude").save()
+    (tmp_path / "README.md").write_text("changed\n", encoding="utf-8")
+    spawned: list[list[str]] = []
+    _stub_tracker_spawn(monkeypatch, background_module, spawned)
+    hubs = _count_hub_spawns(monkeypatch, running=False)
+
+    background_module.autostart_on_change(repo)
+
+    assert spawned and hubs == [1]
+
+
 # --- the interactive session's borrow --------------------------------------
 
 

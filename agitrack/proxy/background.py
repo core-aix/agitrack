@@ -959,6 +959,31 @@ def _installed_backend(preferred: str | None = None) -> str | None:
     return None
 
 
+def _ensure_dashboard_running(repo: GitRepo) -> None:
+    """Start the dashboard hub beside a tracker an auto-start hook just started, if none is up.
+
+    An auto-started tracker is what comes back after a reboot, and the hub died with the machine
+    too: a dashboard tab the browser restored then shows a dead page, and nothing brings the hub
+    back until someone types `agitrack -d`. Starting it here keeps the two together. Only the HUB
+    is started, never a browser tab: these hooks fire inside the user's agent, and a window
+    appearing every time a session opens would be a surprise (a restored tab simply reconnects).
+
+    Fire-and-forget (no handshake wait) because it runs inside an agent hook, and the hub's own
+    lock settles two repositories auto-starting at once. Off with ``open_dashboard_on_start``,
+    the same switch that keeps the other start paths from bringing up a dashboard."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if not config.open_dashboard_on_start:
+            return
+        from agitrack.metrics import hub
+
+        if hub.running_hub() is None:
+            hub._spawn_hub()
+    except Exception:
+        pass  # tracking never depends on the dashboard
+
+
 def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
     """Every reason NOT to auto-start a tracker for ``repo``, and the arguments to start one
     with when none of them applies. ``None`` means "leave it alone".
@@ -1043,6 +1068,7 @@ def autostart_on_agent_session(repo: GitRepo) -> int:
         args = _autostart_daemon_args(repo)
         if args is not None:
             proc = spawn_background_daemon(repo, extra_args=args)
+            _ensure_dashboard_running(repo)
             started = wait_for_handshake(repo, pid=proc.pid, timeout=_AGENT_AUTOSTART_HANDSHAKE_SECONDS) is not None
     except Exception:
         return 0
@@ -1078,6 +1104,7 @@ def autostart_on_change(repo: GitRepo) -> int:
         if not repo.has_changes():
             return 0  # a question-and-answer turn leaves nothing to track
         spawn_background_daemon(repo, extra_args=extra_args)
+        _ensure_dashboard_running(repo)
     except Exception:
         return 0
     return 0
@@ -1182,6 +1209,7 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # told the user tracking had started.
         extra_args += ["--backend", backend_name]
         spawn_background_daemon(repo, extra_args=extra_args)
+        _ensure_dashboard_running(repo)
         mode_label = "manual" if manual else "auto"
         print(
             f"aGiTrack: started automatically in {mode_label}-commit mode (same as last run) to keep tracking — "
