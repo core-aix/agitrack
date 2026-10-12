@@ -1220,6 +1220,19 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     return 0
 
 
+def _says_something_new(state, turns, session_id: str | None) -> bool:
+    """Whether *turns* hold anything a commit has not already recorded: a turn other than the one
+    a previous commit captured mid-flight, or that turn having moved on since. A commit right after
+    another, with nothing said in between, must not write the same turn again as an empty block."""
+    record = state.partial_turn_usage() if state is not None else None
+    captured = record.get("user_id") if record else None
+    if captured and session_id and record.get("session_id") and record.get("session_id") != session_id:
+        captured = None
+    if any(getattr(turn, "user_message_id", None) != captured for turn in turns):
+        return True
+    return continues_partial_capture(state, turns, session_id)
+
+
 class BackgroundRunner:
     POLL_SECONDS = 3.0
 
@@ -1352,6 +1365,8 @@ class BackgroundRunner:
         # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
         # before that turn ends — the pre-commit flush re-exports first, so this is current.
         self._in_flight: dict | None = None
+        # True while a commit-time capture runs (`_process_once(at_commit=True)`).
+        self._capturing_for_commit = False
         self._in_flight_since: float | None = None  # monotonic time the running turn was first seen
         # Same, for a turn of a conversation started in ANOTHER folder that is editing this one.
         self._elsewhere_running_since: float | None = None
@@ -2185,8 +2200,12 @@ class BackgroundRunner:
         ``at_commit`` is the pre-commit flush: a ``git commit`` is being made right now, so every
         conversation up to this moment is recorded into it (see
         ``CommitEngine.finish_parse_if_ready``)."""
-        home = self._process_home(require_complete=require_complete, at_commit=at_commit)
-        elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
+        self._capturing_for_commit = at_commit
+        try:
+            home = self._process_home(require_complete=require_complete, at_commit=at_commit)
+            elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
+        finally:
+            self._capturing_for_commit = False
         return home or elsewhere
 
     def _process_home(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
@@ -2364,8 +2383,14 @@ class BackgroundRunner:
         # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
         # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
         # ...and so is the rest of a turn a commit captured while it was still running.
-        self._manual.owed_record = bool(in_flight_covered) or continues_partial_capture(
-            self.state, turns, backend_session_id
+        # ...and so is everything said up to a commit being made right now. Between commits a
+        # turn that left the tree as the last record found it waits (a question, the prompt sent
+        # just before committing), but the commit is where the conversation up to it is written
+        # down, and the gate used to stop it at the last EDIT.
+        self._manual.owed_record = (
+            bool(in_flight_covered)
+            or continues_partial_capture(self.state, turns, backend_session_id)
+            or (self._capturing_for_commit and _says_something_new(self.state, turns, backend_session_id))
         )
         result = engine.commit_turns(
             turns=turns,

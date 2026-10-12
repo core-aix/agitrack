@@ -1383,6 +1383,68 @@ def test_a_commit_carries_every_conversation_while_a_sub_agent_is_still_running(
         assert prompt in msg
 
 
+def test_a_manual_commit_carries_the_turns_that_changed_nothing_since_the_last_record(tmp_path):
+    """Manual mode records a turn only when the tree moved since the last record, which is right
+    between commits. At commit time it is not: a question asked after the last edit, and the
+    prompt the user sent just before committing, changed nothing, so the gate refused them and
+    the commit carried the conversation only up to the last EDIT. A commit takes everything said
+    up to it, ending on an unanswered user message if that is where the conversation stands."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.sessions["s1"] = ExportedSession("s1", "m", None, [_turn("u1", "m1", "add a line", "Added.", 10)])
+    backend.latest = "s1"
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._process_once()
+    assert runner._manual.pending_count() == 1  # the edit turn, recorded as usual
+
+    backend.sessions["s1"] = ExportedSession(
+        "s1",
+        "m",
+        None,
+        [
+            _turn("u1", "m1", "add a line", "Added.", 10),
+            _turn("u2", "m2", "why that line?", "It was missing.", 10),
+            SessionTurn("u3", None, "now commit it please", "", TokenUsage(), "m", complete=False),
+        ],
+    )
+    runner._process_once()
+    assert runner._manual.pending_count() == 1  # between commits, a turn that changed nothing waits
+
+    (repo.repo / ".agitrack" / "flush-request").write_text("n-commit", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "my commit")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    for prompt in ("add a line", "why that line?", "now commit it please"):
+        assert prompt in msg
+    assert msg.count("## User\n\nadd a line") == 1  # the earlier record is not folded twice
+    assert msg.split("# aGiTrack Metadata")[-2].rstrip().endswith("now commit it please")  # ends on the ask
+
+
+def test_a_second_commit_with_nothing_new_said_records_nothing(tmp_path):
+    """The commit-time capture records what is NEW: a commit made right after another, with no
+    word said in between, must not fold the same turn again as an empty block."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.sessions["s1"] = ExportedSession("s1", "m", None, [_turn("u1", "m1", "add a line", "Added.", 10)])
+    backend.latest = "s1"
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "first")
+    runner._manual.service()
+
+    (tmp_path / "b.txt").write_text("human\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n2", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "second")
+
+    assert "add a line" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
 def test_precommit_sync_nudges_a_running_daemon_to_flush(tmp_path, monkeypatch):
     # When a LIVE background daemon holds the lock, precommit_sync no longer just bails: it asks the
     # daemon to flush so this commit folds a fresh trailer (it still records nothing itself — the
