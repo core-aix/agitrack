@@ -21,7 +21,6 @@ from agitrack.commits import (
     build_auto_fold_message,
     build_manual_squash_trailer,
     build_pending_trailer,
-    is_in_flight_only_message,
     write_lf,
 )
 from agitrack.git import hooks as git_hooks
@@ -94,42 +93,15 @@ class ManualCommitsMixin(RunnerHost):
             self._debug(f"autotrack hook state read failed: {error!r}")
             self._autotrack_hook_preexisting = True  # unknown: err toward leaving it alone
         self._install_autotrack_precommit_hook()
-        # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
-        # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
-        # ONE snapshot for both recovery steps below: they ask the same question ("does the
-        # working tree still match HEAD?") a moment apart, and taking it twice doubled the cost
-        # of starting on a large repo (measured at 4.4s per snapshot on one).
-        try:
-            worktree_tree: str | None = self.repo.snapshot_worktree_tree()
-        except Exception as error:
-            self._debug(f"startup worktree snapshot failed: {error!r}")
-            worktree_tree = None  # each step falls back to taking its own
-        self._reset_stale_manual_ref(worktree_tree=worktree_tree)
-        # …and the same for chains left by sessions that are GONE — a crash, a Ctrl-C, a mode
-        # switch, or edits the user discarded. `_reset_stale_manual_ref` only ever looks at our
-        # own ref, so nothing revisited those and their turns rode into an unrelated later
-        # commit, attributing AI authorship to code that never contained it.
+        # Recovery: drop a latent chain a commit already holds (the user committed outside
+        # aGiTrack after exiting), so its turns aren't folded into a later commit again; and the
+        # same for chains left by sessions that are gone. Every other recorded turn is kept until
+        # a commit carries it (see ManualCommitTracker.reset_stale_ref).
+        self._reset_stale_manual_ref()
         try:
             from agitrack.commits.manual import prune_abandoned_refs
 
-            dropped = prune_abandoned_refs(
-                self.repo,
-                self._manual_ref(),
-                self._manual_pending_refs(),
-                worktree_tree=worktree_tree,
-                debug=self._debug,
-            )
-            if dropped:
-                # Say so. Discarding a chain is the right call (its work is no longer uncommitted),
-                # but it is still AI attribution going away, and the user should hear about it
-                # rather than find out from a history that is quietly missing a turn.
-                count = len(dropped)
-                chains = "chain" if count == 1 else "chains"
-                self._set_message(
-                    f"aGiTrack: discarded {count} abandoned tracking {chains} from an earlier session — "
-                    "their changes are no longer uncommitted, so they had nothing left to attribute.",
-                    seconds=10.0,
-                )
+            prune_abandoned_refs(self.repo, self._manual_ref(), self._manual_pending_refs(), debug=self._debug)
         except Exception as error:
             self._debug(f"abandoned-ref prune failed: {error!r}")
         # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
@@ -254,16 +226,16 @@ class ManualCommitsMixin(RunnerHost):
     def _in_flight_attribution(self) -> dict | None:
         """The running turn's facts for the fold trailer, or None when nothing should be
         attributed. Mirrors ``ManualCommitTracker.in_flight_attribution``: a turn must actually
-        be in progress AND the working tree must differ from the latent tip, so a commit with no
+        be in progress AND the working tree must differ from HEAD, so a commit with no
         AI work in it still gets no trailer."""
         facts = getattr(self, "_in_flight", None)
         if not facts:
             return None
         try:
-            if not self._manual_tree_differs_from_tip(self.repo.snapshot_worktree_tree()):
+            if not self.repo.worktree_differs_from_head():
                 return None
         except Exception as error:
-            self._debug(f"in-flight snapshot failed: {error!r}")
+            self._debug(f"in-flight tree check failed: {error!r}")
             return None
         return facts
 
@@ -296,150 +268,66 @@ class ManualCommitsMixin(RunnerHost):
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
 
-    def _manual_tree_differs_from_tip(self, tree: str) -> bool:
-        """Whether *tree* differs from the latent tip's tree (or HEAD's when the chain is
-        empty) — i.e. whether there is uncommitted agent work to account for."""
-        tip = self.repo.ref_sha(self._manual_ref())
-        try:
-            # `comparable_tree`, never a raw `^{tree}` — the snapshot on the other side of this
-            # comparison drops the agent scaffolding dirs. See GitRepo.comparable_tree.
-            base_tree = self.repo.comparable_tree(tip or "HEAD")
-        except Exception:
-            base_tree = None
-        return tree != base_tree
-
     def _manual_gate(self) -> bool:
-        """Commit gate for a manual-mode turn: True when the working tree changed since the
-        latent tip (or HEAD when the chain is empty). Caches the snapshot tree so
-        :meth:`_manual_record` doesn't re-snapshot."""
-        try:
-            self._manual_pending_tree = self.repo.snapshot_worktree_tree()
-        except Exception as error:
-            self._debug(f"manual snapshot failed: {error!r}")
-            self._manual_pending_tree = None
-            self._manual_allow_unchanged = False
-            return False
-        if self._manual_tree_differs_from_tip(self._manual_pending_tree):
-            self._manual_allow_unchanged = False
-            return True
-        # An unchanged tree normally means the turn left nothing to record. It does NOT when the
-        # agent committed its own work mid-turn: that commit carries an in-flight block only, so
-        # the turn's trace and tokens are still owed, and declining here loses them outright.
-        # Record with the tree as it stands — the latent commit is metadata, not a diff.
-        self._manual_allow_unchanged = bool(self._uncovered_backend_commits()) or bool(
-            getattr(self, "_manual_owed_continuation", False)
-        )
-        return self._manual_allow_unchanged
+        """Commit gate for a latent turn: always open. Kept in lockstep with
+        ``ManualCommitTracker.gate``: every turn is recorded as a message in the conversation log,
+        whether or not it changed a file."""
+        return True
 
     def _manual_changed_paths(self) -> list[str]:
-        """The paths this turn's latent record will carry.
-
-        Read against the same baseline the gate uses — the latent tip, or HEAD when the chain
-        is empty — so it is this TURN's contribution and not everything since HEAD. Runs after
-        ``_manual_gate`` has cached the snapshot, which is the tree ``_manual_record`` commits.
+        """The paths the commit this turn's record folds into will carry: everything uncommitted
+        against HEAD (one ``git status``; a record no longer holds a tree of its own to diff).
 
         Used only for the interrupted-turn note (see ``message._interrupted_changes_sentence``):
         a cancelled turn's trace stops at the agent's "I'll do X" and cannot account for the
         diff, so the commit has to state its own contents. Best-effort — an empty list simply
         leaves the note without its file list."""
-        tree = getattr(self, "_manual_pending_tree", None)
-        if tree is None:
-            return []
-        tip = self.repo.ref_sha(self._manual_ref())
         try:
-            base = self.repo.comparable_tree(tip or "HEAD")
+            return self.repo.uncommitted_paths()
         except Exception as error:
-            self._debug(f"latent baseline tree failed: {error!r}")
+            self._debug(f"uncommitted path listing failed: {error!r}")
             return []
-        return self.repo.tree_diff_names(base, tree)
 
     def _manual_record(self, message: str) -> str | None:
-        """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
-        commit-tree it onto the latent tip, and advance ONLY the latent ref — HEAD and the
-        user's index are untouched. Returns the short sha, or None if the tree is unchanged."""
-        tree = getattr(self, "_manual_pending_tree", None)
-        self._manual_pending_tree = None
-        if tree is None:
-            try:
-                tree = self.repo.snapshot_worktree_tree()
-            except Exception as error:
-                self._debug(f"manual snapshot failed: {error!r}")
-                return None
+        """Record a turn as a hidden latent commit: ONE ``commit-tree`` reusing its parent's tree,
+        and one ref update. Kept in lockstep with ``ManualCommitTracker.record``; nothing is read
+        from the working tree, so a message costs the same however large the repository is."""
         tip = self.repo.ref_sha(self._manual_ref())
-        re_anchored = False
         if tip is not None and not self.repo.has_object_local(tip):
-            # Kept in lockstep with `ManualCommitTracker.record`: `git gc --prune` can collect a
-            # latent commit (unreachable from any branch by design), after which every lookup
-            # against the tip raises — and record() runs on EVERY turn, so interactive `-m` would
-            # silently stop tracking for the rest of the session. Re-anchor at HEAD: the chain
-            # restarts and only the already-lost turns are lost.
+            # `git gc --prune` can collect a latent commit (unreachable from any branch by
+            # design): re-anchor at HEAD, so only the already-lost turns are lost.
             self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
-            tip, re_anchored = None, True
+            tip = None
         parent = tip or self.repo.rev_parse("HEAD")
-        allow_unchanged = getattr(self, "_manual_allow_unchanged", False)
-        self._manual_allow_unchanged = False
-        # Defensive: nothing new since the baseline — the latent tip, or HEAD when the chain is
-        # EMPTY (the same baseline the gate uses, and previously exempt from this guard, so an
-        # ungated record() wrote a phantom first turn against an untouched tree). Skipped when the
-        # gate allowed an unchanged tree (the agent committed the turn's work itself) and after a
-        # re-anchor, where HEAD is a fallback parent rather than evidence that nothing happened —
-        # either way the turn's tokens would vanish.
-        baseline = None if re_anchored else (tip or "HEAD")
-        if not allow_unchanged and baseline is not None and tree == self.repo.comparable_tree(baseline):
-            return None
-        sha = self.repo.commit_tree(tree, parents=[parent], message=message)
+        sha = self.repo.commit_tree(self.repo.rev_parse(f"{parent}^{{tree}}"), parents=[parent], message=message)
         self.repo.update_ref(self._manual_ref(), sha)
         self._render_manual_trailer()
         return self.repo.short_sha(sha)
 
-    def _reset_stale_manual_ref(self, *, worktree_tree: str | None = None) -> bool:
-        """Reset the latent ref to HEAD when its recorded turns are STALE, so they are never
-        re-folded into an unrelated future commit. The one rule, applied both at startup and
-        on every poll: turns are stale when either
+    def _mark_manual_folded(self) -> None:
+        """Move EVERY latent ref onto HEAD once aGiTrack has folded their turns into a commit
+        itself. Kept in lockstep with ``ManualCommitTracker.mark_folded``."""
+        try:
+            head = self.repo.rev_parse("HEAD")
+        except Exception as error:
+            self._debug(f"mark folded failed: {error!r}")
+            return
+        for ref in dict.fromkeys([*self._manual_pending_refs(), self._manual_ref()]):
+            try:
+                self.repo.update_ref(ref, head)
+            except Exception as error:
+                self._debug(f"mark folded failed for {ref}: {error!r}")
+        self._manual_last_head = head
 
-          * the tip is an ANCESTOR of HEAD — they are already committed/folded (a normal
-            in-aGiTrack commit resets the ref via the post-commit hook; this catches a bypassed
-            or interrupted one); or
-          * the working tree is CLEAN (its snapshot equals HEAD's tree) — nothing is left to
-            fold, so any pending turns are already reflected in HEAD. This is the case when a
-            commit was made OUTSIDE aGiTrack: while aGiTrack runs, the fold hook already
-            combined the turns INTO that commit (any terminal, even ``--no-verify``); after it
-            has exited, the hook is gone so the trace is unavoidably lost for that commit — but
-            either way the pending chain is now redundant and dropping it prevents its trace
-            from re-attaching to a later commit.
-
-        A DIRTY tree with a diverged tip means real uncommitted work remains, so the turns are
-        kept and fold on the next commit. Never merges — the ref is only ever reset, so there
-        is no git conflict. Returns True when it reset the ref.
-
-        ``worktree_tree`` is an already-taken snapshot to reuse, for the one caller that needs
-        this answer twice in a row (see :meth:`_setup_manual_commit_mode`). A snapshot stages the
-        whole working tree into a throwaway index with no stat cache, so it re-hashes every
-        tracked file — seconds on a large repo, and the most expensive thing aGiTrack asks of
-        git."""
+    def _reset_stale_manual_ref(self) -> bool:
+        """Reset the latent ref to HEAD once a commit holds its turns (the tip is an ANCESTOR of
+        HEAD), so they are never folded again. Kept in lockstep with
+        ``ManualCommitTracker.reset_stale_ref``: a turn is a message, kept until a commit carries
+        it, whatever became of its edits. Returns True when it reset the ref."""
         try:
             head = self.repo.rev_parse("HEAD")
             tip = self.repo.ref_sha(self._manual_ref())
-            if not tip:
-                return False
-            snapshot = worktree_tree if worktree_tree is not None else self.repo.snapshot_worktree_tree()
-            clean = snapshot == self.repo.comparable_tree("HEAD")
-            if clean and is_in_flight_only_message(self.repo.commit_message(head)):
-                # A clean tree normally means the fold hook already combined the pending turns
-                # INTO HEAD, so they are redundant. It does NOT when HEAD carries only an
-                # IN-FLIGHT block: the agent committed while its turn was still running, so that
-                # commit records who made the change but not the turn's trace or tokens — which
-                # are still owed. Dropping the chain here is what loses them for good, and in
-                # manual mode (where aGiTrack must not commit) the chain is the ONLY thing
-                # holding them until the user's next commit folds them in.
-                # Same rule as `_uncovered_backend_commits`: in-flight ≠ accounted for.
-                #
-                # Narrow on purpose: a commit with NO aGiTrack metadata (made outside aGiTrack,
-                # where the hook never ran) still drops the chain as before — that trace is
-                # unavoidably lost, and keeping the chain would re-attach it to some later,
-                # unrelated commit.
-                return False
-            if clean or self.repo.is_ancestor(tip, head):
+            if tip and tip != head and self.repo.is_ancestor(tip, head):
                 self.repo.update_ref(self._manual_ref(), head)
                 return True
         except Exception as error:
@@ -557,8 +445,7 @@ class ManualCommitsMixin(RunnerHost):
         try:
             head_tree = self.repo.rev_parse("HEAD^{tree}")
             self.repo.cover_commit(message, first_parent=head, second_parent=tip, tree=head_tree)
-            self._manual_last_head = self.repo.rev_parse("HEAD")
-            self.repo.update_ref(self._manual_ref(), self.repo.rev_parse("HEAD"))
+            self._mark_manual_folded()
         except Exception as error:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
@@ -589,7 +476,7 @@ class ManualCommitsMixin(RunnerHost):
         if not tip:
             return
         try:
-            if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
+            if not self.repo.worktree_differs_from_head():
                 return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
         except Exception:
             return
@@ -632,8 +519,7 @@ class ManualCommitsMixin(RunnerHost):
             from agitrack.proxy.background import OWN_COMMIT_ENV
 
             sha = self.repo.commit(message, env=OWN_COMMIT_ENV)
-            self._reset_stale_manual_ref()
-            self._manual_last_head = self.repo.rev_parse("HEAD")
+            self._mark_manual_folded()
             self._render_manual_trailer()
             self._last_agent_commit_id = sha
             self._sessions_with_activity.add(self.state.session_id)

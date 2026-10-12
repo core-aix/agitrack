@@ -86,17 +86,17 @@ def test_the_parents_snapshot_ignores_nested_repos_even_after_they_commit(parent
     assert repo.snapshot_worktree_tree() != head
 
 
-def test_the_parents_latent_gate_records_nothing_for_nested_work(parent):
-    from agitrack.commits import ManualCommitTracker
-    from agitrack.config import AgitrackState
-
+def test_nested_work_does_not_make_the_parent_look_changed(parent):
+    # The parent's "did the tree change?" question (the in-flight attribution, the auto-fold, the
+    # cover check) must not count work inside a nested repository as its own.
     repo = GitRepo(parent)
-    tracker = ManualCommitTracker(repo, repo, AgitrackState(parent))
     (parent / "inner" / "f.txt").write_text("nested only\n", encoding="utf-8")
-    assert tracker.gate() is False
+    assert repo.worktree_differs_from_head() is False
+    assert repo.uncommitted_paths() == []
 
     (parent / "f.txt").write_text("parent edit\n", encoding="utf-8")
-    assert tracker.gate() is True
+    assert repo.worktree_differs_from_head() is True
+    assert repo.uncommitted_paths() == ["f.txt"]
 
 
 def test_each_repository_resolves_to_its_own_root_and_hooks(parent):

@@ -692,3 +692,59 @@ def test_a_snapshot_reuses_the_stat_cache_instead_of_hashing_every_file(tmp_path
 
     assert _seeded_mtime(repo, plain, "f.txt") == "0:0"
     assert _seeded_mtime(repo, repo._seed_index_from_head, "f.txt") != "0:0"
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [
+        "clean",
+        "edited, unstaged",
+        "staged, then edited back",
+        "staged new file, then deleted",
+        "removed from the index only",
+        "deleted from the tree",
+        "intent to add",
+        "new untracked file",
+        "new untracked folder",
+        "edit to scaffolding only",
+        "ignored file",
+    ],
+)
+def test_the_status_check_answers_what_the_snapshot_comparison_did(tmp_path, arrange):
+    """`worktree_differs_from_head` replaces `snapshot_worktree_tree() != comparable_tree("HEAD")`
+    on every "did the tree change?" path, so it must give the same answer in every index state."""
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    (tmp_path / "g.txt").write_text("g\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "g")
+    if arrange == "edited, unstaged":
+        (tmp_path / "f.txt").write_text("edited\n")
+    elif arrange == "staged, then edited back":
+        (tmp_path / "f.txt").write_text("staged\n")
+        _git(tmp_path, "add", "f.txt")
+        (tmp_path / "f.txt").write_text("base\n")
+    elif arrange == "staged new file, then deleted":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "n.txt")
+        (tmp_path / "n.txt").unlink()
+    elif arrange == "removed from the index only":
+        _git(tmp_path, "rm", "--cached", "-q", "g.txt")
+    elif arrange == "deleted from the tree":
+        (tmp_path / "g.txt").unlink()
+    elif arrange == "intent to add":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "-N", "n.txt")
+    elif arrange == "new untracked file":
+        (tmp_path / "n.txt").write_text("n\n")
+    elif arrange == "new untracked folder":
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "m.py").write_text("x = 1\n")
+    elif arrange == "edit to scaffolding only":
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text("{}\n")
+    elif arrange == "ignored file":
+        (tmp_path / "run.log").write_text("noise\n")
+
+    expected = repo.snapshot_worktree_tree() != repo.comparable_tree("HEAD")
+    assert repo.worktree_differs_from_head() is expected

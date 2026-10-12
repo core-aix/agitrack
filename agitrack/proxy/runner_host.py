@@ -123,8 +123,6 @@ class RunnerHost:
         _backend_update_checked_for: str | None
         _backend_update_notice: Any
         _share_login: Any
-        _manual_pending_tree: str | None
-        _manual_allow_unchanged: bool
         _last_agent_commit_id: str | None
         # Keystrokes parked for the reactor while a part owns stdin (see the shared-session
         # fetch's wait loop, which pushes what the user typed back onto this).

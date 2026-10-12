@@ -42,7 +42,6 @@ from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
 from agitrack.proxy.commit_engine import (
     CommitEngine,
-    continues_partial_capture,
     says_something_new,
     turn_is_finished,
 )
@@ -1357,8 +1356,6 @@ class BackgroundRunner:
         # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
         # before that turn ends — the pre-commit flush re-exports first, so this is current.
         self._in_flight: dict | None = None
-        # True while a commit-time capture runs (`_process_once(at_commit=True)`).
-        self._capturing_for_commit = False
         self._in_flight_since: float | None = None  # monotonic time the running turn was first seen
         # Same, for a turn of a conversation started in ANOTHER folder that is editing this one.
         self._elsewhere_running_since: float | None = None
@@ -2192,12 +2189,8 @@ class BackgroundRunner:
         ``at_commit`` is the pre-commit flush: a ``git commit`` is being made right now, so every
         conversation up to this moment is recorded into it (see
         ``CommitEngine.finish_parse_if_ready``)."""
-        self._capturing_for_commit = at_commit
-        try:
-            home = self._process_home(require_complete=require_complete, at_commit=at_commit)
-            elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
-        finally:
-            self._capturing_for_commit = False
+        home = self._process_home(require_complete=require_complete, at_commit=at_commit)
+        elsewhere = self._process_elsewhere(require_complete=require_complete, at_commit=at_commit)
         return home or elsewhere
 
     def _process_home(self, *, require_complete: bool = True, at_commit: bool = False) -> bool:
@@ -2371,19 +2364,12 @@ class BackgroundRunner:
         # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
         # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
         in_flight_covered = self._uncovered_agent_commits(turns) if turn_complete else []
-        # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
-        # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
-        # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
-        # ...and so is the rest of a turn a commit captured while it was still running.
-        # ...and so is everything said up to a commit being made right now. Between commits a
-        # turn that left the tree as the last record found it waits (a question, the prompt sent
-        # just before committing), but the commit is where the conversation up to it is written
-        # down, and the gate used to stop it at the last EDIT.
-        self._manual.owed_record = (
-            bool(in_flight_covered)
-            or continues_partial_capture(self.state, turns, backend_session_id)
-            or (self._capturing_for_commit and says_something_new(self.state, turns, backend_session_id))
-        )
+        # Every turn is recorded as a message (see ManualCommitTracker.gate), so the one record to
+        # refuse is a repeat: the turn a commit captured mid-flight, polled again before it said or
+        # spent anything new. Writing it then put the same turn into history a second time, as an
+        # empty block beside the first (seen live).
+        if not says_something_new(self.state, turns, backend_session_id):
+            return False
         result = engine.commit_turns(
             turns=turns,
             backend=backend,
@@ -2518,10 +2504,9 @@ class BackgroundRunner:
             head = self.repo.rev_parse("HEAD")
             if head == self._tracked_head:
                 return []  # no new commit since we last accounted (e.g. a pure-Q&A turn)
-            # `comparable_tree`, not a raw `^{tree}`: the snapshot drops the agent scaffolding
-            # dirs, so in a repo that TRACKS `.claude/` this test read "dirty" forever and the
-            # daemon covered NO agent self-commit at all. See GitRepo.comparable_tree.
-            if self.repo.snapshot_worktree_tree() != self.repo.comparable_tree("HEAD"):
+            # Scaffolding excluded, or in a repo that TRACKS `.claude/` this read "dirty" forever
+            # and the daemon covered NO agent self-commit at all.
+            if self.repo.worktree_differs_from_head():
                 return []  # dirty tree ⇒ the agent's edits are uncommitted; record latently instead
             commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
         except Exception as error:
@@ -2602,8 +2587,7 @@ class BackgroundRunner:
             # Clean working tree vs HEAD ⇒ the agent (or user) already committed its work, and the
             # prepare-commit-msg fold hook folded the tracking into THAT commit — nothing to do.
             # The poll's own sample is reused while the watch says nothing has changed since.
-            tree = self._settle_tree if not force and self._tree_unchanged() else None
-            if (tree or self.repo.snapshot_worktree_tree()) == self.repo.comparable_tree("HEAD"):
+            if not self.repo.worktree_differs_from_head():
                 return
         except Exception:
             return
@@ -2644,7 +2628,7 @@ class BackgroundRunner:
             # us to flush. We answered that request once the commit was done, and an answer is a
             # forced capture, so it recorded whatever turn was running at that moment half done.
             self.repo.commit(message, env=OWN_COMMIT_ENV)
-            self._manual.reset_stale_ref()
+            self._manual.mark_folded()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._set_tracked_head(self.repo.rev_parse("HEAD"))  # our own fold commit is accounted for
             self._manual.render_trailer()
@@ -2669,13 +2653,16 @@ class BackgroundRunner:
         match the TUI: there a file watcher stamps ``_last_change_at`` on each write, so by the
         time a turn ends the tree has usually been quiet for a while already and the extra wait
         before committing is near zero. Measuring only from the first fold attempt would instead
-        add a full quiet period to every commit. The snapshot is the same one the fold and the
-        cover check already take each cycle, so this costs nothing extra in practice."""
+        add a full quiet period to every commit.
+
+        A FINGERPRINT (``GitRepo.worktree_fingerprint``: one ``git status`` plus a stat per changed
+        path), not a tree snapshot, which re-read the whole tree and was the slowest thing a poll
+        did while an agent was editing."""
         if self._tree_unchanged():
-            return  # nothing under the tree changed since the last snapshot: it is the same tree
-        self._tree_changed.clear()  # before the snapshot, so a write during it is seen next time
+            return  # nothing under the tree changed since the last sample: it is the same tree
+        self._tree_changed.clear()  # before sampling, so a write during it is seen next time
         try:
-            tree = self.repo.snapshot_worktree_tree()
+            tree = self.repo.worktree_fingerprint()
         except Exception as error:
             self._debug(f"settle sample failed: {error!r}")
             return

@@ -233,6 +233,94 @@ class GitRepo:
         # Only untracked entries: real files, or nested repositories (which do not count).
         return bool(lines) and bool(self.untracked_files())
 
+    def _status_candidates(self) -> list[str]:
+        """Paths ``git status`` reports as possibly differing from HEAD, scaffolding and nested
+        repositories excluded: tracked paths changed in the index or the tree, and untracked files
+        one by one. A superset of the paths that really differ (see :meth:`uncommitted_paths`)."""
+        excludes = [f":(exclude){prefix.rstrip('/')}" for prefix in _NEVER_STAGE_PREFIXES]
+        output = self._run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=all",
+                "--untracked-files=all",
+                "--",
+                ".",
+                *excludes,
+            ]
+        ).stdout
+        return [entry[3:] for entry in output.split("\0") if len(entry) >= 4 and not entry.endswith("/")]
+
+    def uncommitted_paths(self) -> list[str]:
+        """Repo-relative paths whose WORKING-TREE state differs from HEAD (edits, deletions, new
+        files), scaffolding and nested repositories excluded: exactly the paths a snapshot of the
+        tree would record against HEAD, without taking one.
+
+        ``git status`` names the candidates cheaply (it trusts the index's stat cache), but it
+        also reports INDEX-only differences (a change staged and then edited back, a new file
+        staged and then deleted, a file dropped from the index alone) that leave the tree as HEAD
+        has it. So only the candidates are put into a throwaway index seeded from HEAD and
+        compared: git's own filters, modes and symlink handling decide, and the hashing is
+        proportional to what changed rather than to the repository."""
+        candidates = self._status_candidates()
+        if not candidates:
+            return []
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            self._run(["git", "read-tree", "HEAD"], env=env, check=False)
+            # In chunks, so a long list never exceeds the command line.
+            for start in range(0, len(candidates), 500):
+                chunk = candidates[start : start + 500]
+                self._run(["git", "add", "-A", "--ignore-errors", "--", *chunk], env=env, check=False)
+            output = self._run(
+                ["git", "diff-index", "--cached", "--name-only", "-z", "--no-renames", "HEAD"], env=env, check=False
+            ).stdout
+        return [path for path in output.split("\0") if path and not _is_scaffolding(path)]
+
+    def worktree_differs_from_head(self) -> bool:
+        """Whether the working tree holds anything a snapshot would record beyond HEAD: the
+        question ``snapshot_worktree_tree() != comparable_tree("HEAD")`` asks, answered without
+        writing a tree (see :meth:`uncommitted_paths`). A clean tree costs one ``git status``."""
+        return bool(self.uncommitted_paths())
+
+    def worktree_fingerprint(self) -> str:
+        """A cheap value that changes whenever the working tree's uncommitted state does: each
+        path ``git status`` reports (scaffolding excluded, untracked files listed one by one)
+        with its size and modification time. Not a content hash, so it costs one ``git status``
+        and a ``stat`` per changed path however large the repository is; a further edit to a
+        file that was already modified moves its mtime, so it still reads as a change."""
+        import hashlib
+
+        excludes = [f":(exclude){prefix.rstrip('/')}" for prefix in _NEVER_STAGE_PREFIXES]
+        output = self._run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "-z",
+                "--ignore-submodules=all",
+                "--untracked-files=all",
+                "--",
+                ".",
+                *excludes,
+            ]
+        ).stdout
+        digest = hashlib.sha1()
+        for entry in output.split("\0"):
+            if len(entry) < 4:
+                continue
+            path = entry[3:]
+            try:
+                info = os.stat(self.repo / path)
+                stamp = f"{info.st_size}:{info.st_mtime_ns}"
+            except OSError:
+                stamp = "gone"
+            digest.update(f"{entry[:2]} {path} {stamp}\n".encode("utf-8", "surrogateescape"))
+        return digest.hexdigest()
+
     def has_tracked_changes(self) -> bool:
         return (
             self._diff_has_changes(["git", "diff", "--quiet", "--ignore-submodules=dirty"]) or self.has_staged_changes()
