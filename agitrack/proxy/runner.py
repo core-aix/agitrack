@@ -42,7 +42,12 @@ from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
-from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
+from agitrack.proxy.commit_engine import (
+    CommitEngine,
+    continues_partial_capture,
+    says_something_new,
+    turn_is_finished,
+)
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
@@ -9384,8 +9389,13 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             except Exception as error:
                 self._debug(f"clean-tree cover check failed: {error!r}")
         # The rest of a turn a commit captured mid-flight is owed a record even on a clean tree
-        # (see continues_partial_capture); `_manual_gate` reads this.
-        self._manual_owed_continuation = continues_partial_capture(self.state, turns, backend_session_id)
+        # (see continues_partial_capture); `_manual_gate` reads this. So is everything said up to
+        # a commit being made right now (the agent's own mid-turn commit, the user's): between
+        # commits a turn that left the tree as the last record found it waits, but the gate used
+        # to stop the commit's trace at the last EDIT.
+        self._manual_owed_continuation = continues_partial_capture(self.state, turns, backend_session_id) or (
+            getattr(self, "_capturing_for_commit", False) and says_something_new(self.state, turns, backend_session_id)
+        )
         committed = CommitEngine(
             self.repo,
             self.state,
@@ -10165,15 +10175,19 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         ``CommitEngine.finish_parse_if_ready``)."""
         if self.agent_parse_thread and self.agent_parse_thread.is_alive():
             self.agent_parse_thread.join(timeout=20)
-        self._finish_agent_parse_if_ready(
-            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
-        )
-        if self._start_agent_parse() and self.agent_parse_thread:
-            self.agent_parse_thread.join(timeout=20)
-        self._finish_agent_parse_if_ready(
-            quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
-        )
-        self._record_elsewhere(at_commit=True)
+        self._capturing_for_commit = True  # `_create_agent_commit_from_turns_popup` reads it
+        try:
+            self._finish_agent_parse_if_ready(
+                quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+            )
+            if self._start_agent_parse() and self.agent_parse_thread:
+                self.agent_parse_thread.join(timeout=20)
+            self._finish_agent_parse_if_ready(
+                quiet=True, prompt_untracked=False, integrate=False, require_complete=False, at_commit=True
+            )
+            self._record_elsewhere(at_commit=True)
+        finally:
+            self._capturing_for_commit = False
 
     def _commit_latest_turn_sync(self) -> None:
         # Synchronously (joining the parse worker) commit the latest completed

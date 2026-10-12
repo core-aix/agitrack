@@ -40,7 +40,12 @@ from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
-from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
+from agitrack.proxy.commit_engine import (
+    CommitEngine,
+    continues_partial_capture,
+    says_something_new,
+    turn_is_finished,
+)
 from agitrack.proxy.session import Session
 
 
@@ -1220,19 +1225,6 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     return 0
 
 
-def _says_something_new(state, turns, session_id: str | None) -> bool:
-    """Whether *turns* hold anything a commit has not already recorded: a turn other than the one
-    a previous commit captured mid-flight, or that turn having moved on since. A commit right after
-    another, with nothing said in between, must not write the same turn again as an empty block."""
-    record = (state.partial_turn_usage() if state is not None else None) or {}
-    captured = record.get("user_id")
-    if captured and session_id and record.get("session_id") and record.get("session_id") != session_id:
-        captured = None
-    if any(getattr(turn, "user_message_id", None) != captured for turn in turns):
-        return True
-    return continues_partial_capture(state, turns, session_id)
-
-
 class BackgroundRunner:
     POLL_SECONDS = 3.0
 
@@ -2390,7 +2382,7 @@ class BackgroundRunner:
         self._manual.owed_record = (
             bool(in_flight_covered)
             or continues_partial_capture(self.state, turns, backend_session_id)
-            or (self._capturing_for_commit and _says_something_new(self.state, turns, backend_session_id))
+            or (self._capturing_for_commit and says_something_new(self.state, turns, backend_session_id))
         )
         result = engine.commit_turns(
             turns=turns,

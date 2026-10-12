@@ -2811,3 +2811,80 @@ def test_noworktree_auto_fold_waits_while_the_next_turn_is_running(tmp_path):
     head_before = repo.rev_parse("HEAD")
     runner._auto_fold_latent_pending(force=True)
     assert repo.rev_parse("HEAD") != head_before
+
+
+def _parse_ready(runner, turns):
+    """Hand the runner a finished parse holding *turns*, as the parse worker would."""
+    from agitrack.backends.proxy_agents import make_proxy_agent
+    from agitrack.transcripts.types import ExportedSession
+
+    runner.backend = make_proxy_agent("claude")
+    runner.active.agent_parse_result = (
+        "s1",
+        ExportedSession(session_id="s1", model="m", turns=list(turns), updated=1.0),
+        runner.state.backend_message_id_for("s1"),  # the watermark, as the parse worker reads it
+        runner.state,
+    )
+    runner.active.agent_parse_thread = None
+
+
+def test_an_interactive_commit_carries_the_turns_that_changed_nothing_since_the_last_record(tmp_path):
+    """The interactive counterpart of the background fix, and the case it exists for: the agent
+    commits its own work in the middle of a turn. Between commits a turn that left the tree as the
+    last record found it waits, which is right; but a commit is where the conversation up to it is
+    written down, and the gate used to stop that at the last EDIT, dropping the question asked
+    after it and the prompt that is running right now (the trace may end on that prompt)."""
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._start_commit_summary = lambda *a, **k: None
+    runner._start_agent_parse = lambda: False  # the parse handed over below is the fresh one
+    runner.untracked_before_turn = set()
+
+    edit = SessionTurn("u1", "a1", "add a line", "Added.", TokenUsage(total=10, output=10), "m")
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    _parse_ready(runner, [edit])
+    runner._finish_agent_parse_if_ready(quiet=True, prompt_untracked=False, integrate=False)
+    assert runner._manual_pending_count() == 1  # the edit turn, recorded as usual
+
+    _parse_ready(
+        runner,
+        [
+            edit,
+            SessionTurn("u2", "a2", "why that line?", "It was missing.", TokenUsage(total=5, output=5), "m"),
+            SessionTurn("u3", None, "commit it yourself", "", TokenUsage(), "m", complete=False),
+        ],
+    )
+    runner._record_conversation_for_commit()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    for prompt in ("add a line", "why that line?", "commit it yourself"):
+        assert prompt in msg
+    assert msg.count("## User\n\nadd a line") == 1
+    assert runner._capturing_for_commit is False  # the widened gate never outlives the commit
+
+
+def test_an_interactive_commit_with_nothing_new_said_records_nothing(tmp_path):
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._manual_hooks_installed = True
+    runner._start_commit_summary = lambda *a, **k: None
+    runner._start_agent_parse = lambda: False
+    runner.untracked_before_turn = set()
+
+    edit = SessionTurn("u1", "a1", "add a line", "Added.", TokenUsage(total=10, output=10), "m")
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    _parse_ready(runner, [edit])
+    runner._record_conversation_for_commit()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "first")
+    assert "add a line" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+    _parse_ready(runner, [])  # nothing said since
+    (tmp_path / "b.txt").write_text("human\n", encoding="utf-8")
+    runner._record_conversation_for_commit()
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "second")
+    assert "add a line" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
