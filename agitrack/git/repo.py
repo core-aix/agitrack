@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -447,7 +448,7 @@ class GitRepo:
             # Seed from HEAD so `add -A` records the complete delta vs the branch, not
             # just what happens to be staged in the user's real index. check=False so an
             # unborn branch (no HEAD yet) simply starts from an empty index.
-            self._run(["git", "read-tree", "HEAD"], env=env, check=False)
+            self._seed_index_from_head(index, env)
             if self._run(["git", "add", "-A"], env=env, check=False).returncode != 0:
                 # A nested repository with no commit yet (a fresh `git init` in a subfolder)
                 # makes git refuse the whole add. It is not this repository's content anyway, so
@@ -464,6 +465,34 @@ class GitRepo:
                 check=False,
             )
             return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def _seed_index_from_head(self, index: str, env: dict[str, str]) -> None:
+        """Fill the throwaway index *index* with HEAD's entries, reusing the real index's stat
+        cache wherever a file still matches HEAD.
+
+        A bare ``read-tree HEAD`` carries no stat information, so the ``add -A`` after it had to
+        read and hash EVERY tracked file to learn that nothing changed: 22 s per snapshot on a
+        65,000-file repository, and a commit-time flush takes several. That made the pre-commit
+        flush miss the hook's wait, so an agent's own commit folded a stale trailer and the
+        turns leading to it landed in the NEXT commit instead (seen live). ``read-tree -m HEAD``
+        over a copy of the real index gives the very same entries (a one-tree ``-m`` reads the
+        tree as a plain ``read-tree`` would) but keeps each matching entry's stat data, so only
+        files that actually changed are hashed. Anything that stops that (no real index yet, an
+        index git will not merge over, such as one with unmerged paths) falls back to the plain
+        read, which is only slower."""
+        try:
+            real = self._run(["git", "rev-parse", "--path-format=absolute", "--git-path", "index"]).stdout.strip()
+            if real and os.path.isfile(real):
+                shutil.copy2(real, index)
+                if self._run(["git", "read-tree", "-m", "HEAD"], env=env, check=False).returncode == 0:
+                    return
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        try:
+            os.remove(index)
+        except OSError:
+            pass
+        self._run(["git", "read-tree", "HEAD"], env=env, check=False)
 
     def _leave_nested_repos_at_head(self, env: dict[str, str]) -> None:
         """In a snapshot's throwaway index, undo what ``add -A`` did to NESTED repositories: drop
