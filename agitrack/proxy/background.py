@@ -1224,8 +1224,8 @@ def _says_something_new(state, turns, session_id: str | None) -> bool:
     """Whether *turns* hold anything a commit has not already recorded: a turn other than the one
     a previous commit captured mid-flight, or that turn having moved on since. A commit right after
     another, with nothing said in between, must not write the same turn again as an empty block."""
-    record = state.partial_turn_usage() if state is not None else None
-    captured = record.get("user_id") if record else None
+    record = (state.partial_turn_usage() if state is not None else None) or {}
+    captured = record.get("user_id")
     if captured and session_id and record.get("session_id") and record.get("session_id") != session_id:
         captured = None
     if any(getattr(turn, "user_message_id", None) != captured for turn in turns):
