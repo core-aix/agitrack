@@ -42,7 +42,11 @@ from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
-from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
+from agitrack.proxy.commit_engine import (
+    CommitEngine,
+    says_something_new,
+    turn_is_finished,
+)
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
@@ -735,11 +739,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         # the worktree and existing no-worktree paths untouched.
         self._manual_commits = manual_commits
         # Manual-mode runtime state (set in _setup_manual_commit_mode): whether the fold/reset
-        # hooks were installed, the last observed HEAD (poll fallback baseline), and the cached
-        # working-tree snapshot the latent gate hands to the latent record.
+        # hooks were installed, and the last observed HEAD (poll fallback baseline).
         self._manual_hooks_installed = False
         self._manual_last_head: str | None = None
-        self._manual_pending_tree: str | None = None
         # Whether installing the worktree base-commit guard had to step the PERSISTENT auto-track
         # pre-commit hook aside (they share one hook slot). Drives its restore on teardown, so a
         # worktree run after a background/no-worktree one never silently uninstalls it.
@@ -1498,7 +1500,6 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
                 "_manual_commits": False,
                 "_manual_hooks_installed": False,
                 "_manual_last_head": None,
-                "_manual_pending_tree": None,
                 "_in_flight": None,
                 "_noworktree_base_head": None,
                 "_warned_parallel_no_worktree": False,
@@ -9225,12 +9226,7 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
             # The pending turns are now folded into HEAD: advance the latent ref onto it
             # (0 pending again) and refresh the baseline so the poll fallback doesn't also
             # cover this commit. Idempotent with the post-commit hook, which does the same.
-            try:
-                new_head = repo.rev_parse("HEAD")
-                repo.update_ref(self._manual_ref(), new_head)
-                self._manual_last_head = new_head
-            except Exception as error:
-                self._debug(f"manual ref reset after user commit failed: {error!r}")
+            self._mark_manual_folded()
             self._render_manual_trailer()
         state.clear_trace()
         return True
@@ -9367,25 +9363,24 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         turn_complete = bool(turns) and turn_is_finished(turns[-1])
         uncovered = self._uncovered_backend_commits() if turn_complete else []
         # The agent committed its own work MID-TURN and left nothing further to commit, so the
-        # tree is clean. The latent gate only fires on a CHANGED tree, so it would record
-        # nothing at all — and the agent's commit carries only an in-flight block, which
-        # explicitly promises the trace and tokens land later. Both paths then decline and the
-        # turn's whole accounting is lost, silently.
+        # tree is clean. The agent's commit carries only an in-flight block, which explicitly
+        # promises the trace and tokens land later.
         #
         # In AUTO mode take the COVER path instead (the metadata-only commit worktree mode
         # already makes over such hashes). Manual mode must not commit for the user, so it keeps
-        # the latent path — `_manual_gate` widens to record on a clean tree when commits are
-        # owed, and the record waits for the user's next commit to fold it in.
+        # the latent path: the record waits for the user's next commit to fold it in.
         use_latent = self._latent_tracking
         if uncovered and self._noworktree_auto:
             try:
-                if self.repo.snapshot_worktree_tree() == self.repo.comparable_tree("HEAD"):
+                if not self.repo.worktree_differs_from_head():
                     use_latent = False
             except Exception as error:
                 self._debug(f"clean-tree cover check failed: {error!r}")
-        # The rest of a turn a commit captured mid-flight is owed a record even on a clean tree
-        # (see continues_partial_capture); `_manual_gate` reads this.
-        self._manual_owed_continuation = continues_partial_capture(self.state, turns, backend_session_id)
+        # Every turn is recorded as a message (see `_manual_gate`), so the one latent record to
+        # refuse is a repeat: the turn a commit captured mid-flight, polled again before it said
+        # or spent anything new (kept in lockstep with `BackgroundRunner._record_turns`).
+        if use_latent and not says_something_new(self.state, turns, backend_session_id):
+            return False
         committed = CommitEngine(
             self.repo,
             self.state,

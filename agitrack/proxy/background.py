@@ -40,7 +40,11 @@ from agitrack.events import EventLog, exclude_log_file, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
-from agitrack.proxy.commit_engine import CommitEngine, continues_partial_capture, turn_is_finished
+from agitrack.proxy.commit_engine import (
+    CommitEngine,
+    says_something_new,
+    turn_is_finished,
+)
 from agitrack.proxy.session import Session
 
 
@@ -959,6 +963,31 @@ def _installed_backend(preferred: str | None = None) -> str | None:
     return None
 
 
+def _ensure_dashboard_running(repo: GitRepo) -> None:
+    """Start the dashboard hub beside a tracker an auto-start hook just started, if none is up.
+
+    An auto-started tracker is what comes back after a reboot, and the hub died with the machine
+    too: a dashboard tab the browser restored then shows a dead page, and nothing brings the hub
+    back until someone types `agitrack -d`. Starting it here keeps the two together. Only the HUB
+    is started, never a browser tab: these hooks fire inside the user's agent, and a window
+    appearing every time a session opens would be a surprise (a restored tab simply reconnects).
+
+    Fire-and-forget (no handshake wait) because it runs inside an agent hook, and the hub's own
+    lock settles two repositories auto-starting at once. Off with ``open_dashboard_on_start``,
+    the same switch that keeps the other start paths from bringing up a dashboard."""
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if not config.open_dashboard_on_start:
+            return
+        from agitrack.metrics import hub
+
+        if hub.running_hub() is None:
+            hub._spawn_hub()
+    except Exception:
+        pass  # tracking never depends on the dashboard
+
+
 def _autostart_daemon_args(repo: GitRepo) -> list[str] | None:
     """Every reason NOT to auto-start a tracker for ``repo``, and the arguments to start one
     with when none of them applies. ``None`` means "leave it alone".
@@ -1043,6 +1072,7 @@ def autostart_on_agent_session(repo: GitRepo) -> int:
         args = _autostart_daemon_args(repo)
         if args is not None:
             proc = spawn_background_daemon(repo, extra_args=args)
+            _ensure_dashboard_running(repo)
             started = wait_for_handshake(repo, pid=proc.pid, timeout=_AGENT_AUTOSTART_HANDSHAKE_SECONDS) is not None
     except Exception:
         return 0
@@ -1078,6 +1108,7 @@ def autostart_on_change(repo: GitRepo) -> int:
         if not repo.has_changes():
             return 0  # a question-and-answer turn leaves nothing to track
         spawn_background_daemon(repo, extra_args=extra_args)
+        _ensure_dashboard_running(repo)
     except Exception:
         return 0
     return 0
@@ -1182,6 +1213,7 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         # told the user tracking had started.
         extra_args += ["--backend", backend_name]
         spawn_background_daemon(repo, extra_args=extra_args)
+        _ensure_dashboard_running(repo)
         mode_label = "manual" if manual else "auto"
         print(
             f"aGiTrack: started automatically in {mode_label}-commit mode (same as last run) to keep tracking — "
@@ -2332,13 +2364,12 @@ class BackgroundRunner:
         # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
         # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
         in_flight_covered = self._uncovered_agent_commits(turns) if turn_complete else []
-        # A turn whose work the agent committed ITSELF leaves an unchanged tree, but is still owed
-        # its trace and tokens — the tracker's gate/record would otherwise read "unchanged" as
-        # "nothing happened" and drop the whole record. Same list the body names in covered_commits.
-        # ...and so is the rest of a turn a commit captured while it was still running.
-        self._manual.owed_record = bool(in_flight_covered) or continues_partial_capture(
-            self.state, turns, backend_session_id
-        )
+        # Every turn is recorded as a message (see ManualCommitTracker.gate), so the one record to
+        # refuse is a repeat: the turn a commit captured mid-flight, polled again before it said or
+        # spent anything new. Writing it then put the same turn into history a second time, as an
+        # empty block beside the first (seen live).
+        if not says_something_new(self.state, turns, backend_session_id):
+            return False
         result = engine.commit_turns(
             turns=turns,
             backend=backend,
@@ -2473,10 +2504,9 @@ class BackgroundRunner:
             head = self.repo.rev_parse("HEAD")
             if head == self._tracked_head:
                 return []  # no new commit since we last accounted (e.g. a pure-Q&A turn)
-            # `comparable_tree`, not a raw `^{tree}`: the snapshot drops the agent scaffolding
-            # dirs, so in a repo that TRACKS `.claude/` this test read "dirty" forever and the
-            # daemon covered NO agent self-commit at all. See GitRepo.comparable_tree.
-            if self.repo.snapshot_worktree_tree() != self.repo.comparable_tree("HEAD"):
+            # Scaffolding excluded, or in a repo that TRACKS `.claude/` this read "dirty" forever
+            # and the daemon covered NO agent self-commit at all.
+            if self.repo.worktree_differs_from_head():
                 return []  # dirty tree ⇒ the agent's edits are uncommitted; record latently instead
             commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
         except Exception as error:
@@ -2557,8 +2587,7 @@ class BackgroundRunner:
             # Clean working tree vs HEAD ⇒ the agent (or user) already committed its work, and the
             # prepare-commit-msg fold hook folded the tracking into THAT commit — nothing to do.
             # The poll's own sample is reused while the watch says nothing has changed since.
-            tree = self._settle_tree if not force and self._tree_unchanged() else None
-            if (tree or self.repo.snapshot_worktree_tree()) == self.repo.comparable_tree("HEAD"):
+            if not self.repo.worktree_differs_from_head():
                 return
         except Exception:
             return
@@ -2599,7 +2628,7 @@ class BackgroundRunner:
             # us to flush. We answered that request once the commit was done, and an answer is a
             # forced capture, so it recorded whatever turn was running at that moment half done.
             self.repo.commit(message, env=OWN_COMMIT_ENV)
-            self._manual.reset_stale_ref()
+            self._manual.mark_folded()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._set_tracked_head(self.repo.rev_parse("HEAD"))  # our own fold commit is accounted for
             self._manual.render_trailer()
@@ -2624,13 +2653,16 @@ class BackgroundRunner:
         match the TUI: there a file watcher stamps ``_last_change_at`` on each write, so by the
         time a turn ends the tree has usually been quiet for a while already and the extra wait
         before committing is near zero. Measuring only from the first fold attempt would instead
-        add a full quiet period to every commit. The snapshot is the same one the fold and the
-        cover check already take each cycle, so this costs nothing extra in practice."""
+        add a full quiet period to every commit.
+
+        A FINGERPRINT (``GitRepo.worktree_fingerprint``: one ``git status`` plus a stat per changed
+        path), not a tree snapshot, which re-read the whole tree and was the slowest thing a poll
+        did while an agent was editing."""
         if self._tree_unchanged():
-            return  # nothing under the tree changed since the last snapshot: it is the same tree
-        self._tree_changed.clear()  # before the snapshot, so a write during it is seen next time
+            return  # nothing under the tree changed since the last sample: it is the same tree
+        self._tree_changed.clear()  # before sampling, so a write during it is seen next time
         try:
-            tree = self.repo.snapshot_worktree_tree()
+            tree = self.repo.worktree_fingerprint()
         except Exception as error:
             self._debug(f"settle sample failed: {error!r}")
             return

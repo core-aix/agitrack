@@ -441,9 +441,11 @@ def test_stop_finalize_never_covers_a_mid_turn_commit_before_the_final_message(t
     runner._manual.service()
     assert runner._is_agitrack_tracked(agent_commit) is False  # in-flight only ⇒ still owed a record
 
-    # Stop finalize (require_complete=False) while the turn is unfinished: no cover, no attribution,
-    # and the watermark stays put so the completed turn still covers this commit later.
-    assert runner._process_once(require_complete=False) is False
+    # Stop finalize (require_complete=False) while the turn is unfinished: the conversation so far
+    # is recorded as a message, but no cover, no attribution, and the coverage watermark stays put
+    # so the completed turn still covers this commit later.
+    assert runner._process_once(require_complete=False) is True
+    assert runner._manual.pending_count() == 1
     assert repo.rev_parse("HEAD") == agent_commit  # no cover commit was placed on top
     assert runner._is_agitrack_tracked(agent_commit) is False  # not prematurely attributed
     assert runner._tracked_head == base  # watermark never advanced past the unfinished turn
@@ -705,9 +707,7 @@ def test_manual_tracker_gate_and_record(tmp_path):
     tracker = ManualCommitTracker(repo, repo, state)
     head = repo.rev_parse("HEAD")
 
-    assert tracker.gate() is False  # clean tree ⇒ nothing to record
-    (tmp_path / "a.txt").write_text("one\nx\n", encoding="utf-8")
-    assert tracker.gate() is True
+    assert tracker.gate() is True  # every turn is recorded, edit or not
     sha = tracker.record("<aGiTrack> t\n\n# aGiTrack Metadata\ncommit_type: agent\n")
 
     assert sha is not None
@@ -1029,25 +1029,20 @@ def test_a_slow_start_is_not_reported_as_a_failed_one(tmp_path, capsys, monkeypa
     assert "did not start" not in out
 
 
-def test_startup_takes_one_worktree_snapshot_for_both_recovery_steps(tmp_path, monkeypatch):
-    """Snapshotting the working tree stages it into a throwaway index with no stat cache, so it
-    re-hashes every tracked file — 4.4s on one 14 GB repo, taken TWICE by startup for the same
-    question, which is most of why arming outran the launcher's handshake wait."""
+def test_startup_takes_no_worktree_snapshot(tmp_path, monkeypatch):
+    """Snapshotting the working tree re-reads it (4.4 s on one 14 GB repo, 22 s on a 65,000-file
+    one), and startup took one just to decide which recorded turns were stale. A turn is now kept
+    until a commit holds it, which git answers from the refs alone."""
     runner, repo, state, backend = _runner(tmp_path, manual=True)
     (tmp_path / "a.txt").write_text("uncommitted\n", encoding="utf-8")
-    runner._manual.record("turn one")  # a latent tip, so reset_stale_ref does not return early
+    runner._manual.record("turn one")
 
-    real = repo.snapshot_worktree_tree
-    calls: list[str] = []
+    def refuse():
+        raise AssertionError("startup snapshotted the working tree")
 
-    def counted():
-        calls.append("snapshot")
-        return real()
-
-    monkeypatch.setattr(repo, "snapshot_worktree_tree", counted)
+    monkeypatch.setattr(repo, "snapshot_worktree_tree", refuse)
     runner._manual.setup()
-
-    assert len(calls) == 1, f"startup re-snapshotted the working tree: {len(calls)} snapshots"
+    assert runner._manual.pending_count() == 1
 
 
 def test_daemon_installs_autotrack_hook_by_default_and_skips_when_off(tmp_path):
@@ -1381,6 +1376,68 @@ def test_a_commit_carries_every_conversation_while_a_sub_agent_is_still_running(
     msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
     for prompt in ("what algorithm did you use before?", "why was v8 so good?", "yes you can do the authoring test"):
         assert prompt in msg
+
+
+def test_a_manual_commit_carries_the_turns_that_changed_nothing_since_the_last_record(tmp_path):
+    """Manual mode records a turn only when the tree moved since the last record, which is right
+    between commits. At commit time it is not: a question asked after the last edit, and the
+    prompt the user sent just before committing, changed nothing, so the gate refused them and
+    the commit carried the conversation only up to the last EDIT. A commit takes everything said
+    up to it, ending on an unanswered user message if that is where the conversation stands."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.sessions["s1"] = ExportedSession("s1", "m", None, [_turn("u1", "m1", "add a line", "Added.", 10)])
+    backend.latest = "s1"
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._process_once()
+    assert runner._manual.pending_count() == 1  # the edit turn, recorded as usual
+
+    backend.sessions["s1"] = ExportedSession(
+        "s1",
+        "m",
+        None,
+        [
+            _turn("u1", "m1", "add a line", "Added.", 10),
+            _turn("u2", "m2", "why that line?", "It was missing.", 10),
+            SessionTurn("u3", None, "now commit it please", "", TokenUsage(), "m", complete=False),
+        ],
+    )
+    runner._process_once()
+    assert runner._manual.pending_count() == 1  # between commits, a turn that changed nothing waits
+
+    (repo.repo / ".agitrack" / "flush-request").write_text("n-commit", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "my commit")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    for prompt in ("add a line", "why that line?", "now commit it please"):
+        assert prompt in msg
+    assert msg.count("## User\n\nadd a line") == 1  # the earlier record is not folded twice
+    assert msg.split("# aGiTrack Metadata")[-2].rstrip().endswith("now commit it please")  # ends on the ask
+
+
+def test_a_second_commit_with_nothing_new_said_records_nothing(tmp_path):
+    """The commit-time capture records what is NEW: a commit made right after another, with no
+    word said in between, must not fold the same turn again as an empty block."""
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    backend.sessions["s1"] = ExportedSession("s1", "m", None, [_turn("u1", "m1", "add a line", "Added.", 10)])
+    backend.latest = "s1"
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "first")
+    runner._manual.service()
+
+    (tmp_path / "b.txt").write_text("human\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n2", encoding="utf-8")
+    runner._service_flush_requests()
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-m", "second")
+
+    assert "add a line" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
 
 
 def test_precommit_sync_nudges_a_running_daemon_to_flush(tmp_path, monkeypatch):
@@ -1915,20 +1972,6 @@ def test_manual_daemon_records_a_turn_whose_only_action_was_its_own_midturn_comm
     assert agent_head[:7] in bodies[-1], "the agent's own commit must be attributed in covered_commits"
 
 
-def test_the_daemons_record_guard_still_refuses_a_turn_that_changed_nothing(tmp_path):
-    # The guard is loosened, not removed: with no commit owed a record an unchanged tree really
-    # does mean nothing happened, and recording would chain an empty latent commit every poll.
-    runner, repo, state, backend = _runner(tmp_path, manual=True)
-    runner._manual.setup()
-    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
-    assert runner._manual.gate() is True
-    assert runner._manual.record("<aGiTrack> first\n") is not None
-
-    runner._manual.owed_record = False
-    assert runner._manual.gate() is False
-    assert runner._manual.record("<aGiTrack> nothing\n") is None
-
-
 def test_precommit_sync_autostart_resumes_auto_mode(tmp_path, monkeypatch):
     # The mirror of the manual-mode autostart test. A regression here silently flips the user's
     # chosen commit mode after a reboot or a pre-commit-triggered restart: they get aGiTrack
@@ -2016,19 +2059,21 @@ def test_daemon_still_records_latently_while_the_agents_edits_are_uncommitted(tm
     assert repo.ref_sha(runner._manual.ref()) is not None  # …the turn is on the latent ref
 
 
-def test_daemon_does_not_cover_a_pure_qa_turn_in_a_scaffolded_repo(tmp_path):
-    # A turn that changed nothing must still leave no footprint. Reading the tree as permanently
-    # dirty broke this in the other direction from the cover bug: the daemon's manual path
-    # recorded a latent turn against a tree identical to HEAD's.
+def test_a_pure_qa_turn_in_a_scaffolded_repo_is_recorded_but_commits_nothing(tmp_path):
+    # A turn that changed nothing is still a message in the conversation, so it is recorded and
+    # rides into the next commit; but nothing is committed for it, and in a repo that tracks
+    # `.claude/` the tree must not read as changed either.
     runner, repo, state, backend = _runner(tmp_path, manual=True)
     _track_the_agent_config(repo, tmp_path)
     runner._manual.setup()
+    head = repo.rev_parse("HEAD")
     backend.set_session("s1", [_turn("u1", "m1", "what does this do?", "it does x", 20)])
 
     runner._process_once()
 
-    assert repo.ref_sha(runner._manual.ref()) in (None, repo.rev_parse("HEAD"))
-    assert runner._manual.pending_count() == 0
+    assert repo.rev_parse("HEAD") == head
+    assert runner._manual.pending_count() == 1
+    assert repo.worktree_differs_from_head() is False
 
 
 # --- commit guidance in background mode -------------------------------------
@@ -2802,16 +2847,15 @@ def test_the_rest_of_a_turn_captured_mid_flight_is_recorded_when_it_ends(tmp_pat
     assert "tokens_since_last_commit_output: 3" in recorded  # 10 spent, 7 already in the commit
 
 
-def test_a_turn_that_records_nothing_leaves_no_prompts_behind(tmp_path):
-    """A turn the recording gate turns away (nothing changed) must not leave its entries in the
-    pending trace: the next attempt reads them as leftover prompts, and when that attempt is
-    another conversation's they land in its commit as stray `## User` blocks (found in a live
-    pre-release run: one OpenCode session's prompt inside the next session's commit)."""
+def test_a_recorded_turn_leaves_no_prompts_behind(tmp_path):
+    """Once a turn is recorded its entries leave the pending trace: the next attempt reads
+    anything left there as leftover prompts, and when that attempt is another conversation's they
+    land in its commit as stray `## User` blocks (found in a live pre-release run)."""
     runner, repo, state, backend = _runner(tmp_path, manual=True)
     runner._manual.setup()
     backend.set_session("s1", [_turn("u1", "m1", "just a question", "an answer", 5)])
-    runner._process_once()  # tree unchanged: nothing to record
-    assert runner._manual.pending_count() == 0
+    runner._process_once()
+    assert runner._manual.pending_count() == 1
     assert state.pending_trace() == []
 
 
@@ -3055,26 +3099,26 @@ def test_replacing_a_tracker_tells_it_so_and_cleans_up(tmp_path, monkeypatch):
 
 
 def test_an_idle_poll_does_not_snapshot_the_tree_while_the_watch_reports_nothing(tmp_path):
-    """Snapshotting the working tree is several git processes, and it ran on every 3 s poll
-    of an idle repository (measured on this repo: ~110 ms of git CPU per poll, ~6% of a core,
-    with no conversation at all). A filesystem watch now says whether anything changed first."""
+    """Sampling the working tree costs git processes, and it ran on every 3 s poll of an idle
+    repository (measured on this repo: ~110 ms of git CPU per poll, ~6% of a core, with no
+    conversation at all). A filesystem watch now says whether anything changed first."""
     import time
 
     runner, repo, state, backend = _runner(tmp_path, manual=False)
     calls: list[int] = []
-    real = repo.snapshot_worktree_tree
+    real = repo.worktree_fingerprint
 
     def counting():
         calls.append(1)
         return real()
 
-    repo.snapshot_worktree_tree = counting  # type: ignore[method-assign]
+    repo.worktree_fingerprint = counting  # type: ignore[method-assign]
     runner._tree_observer = object()  # a watch is running
     runner._sample_worktree()
     assert len(calls) == 1  # the first sample has nothing to reuse
     for _ in range(5):
         runner._sample_worktree()
-    assert len(calls) == 1  # quiet: the last snapshot still describes the tree
+    assert len(calls) == 1  # quiet: the last sample still describes the tree
 
     (tmp_path / "a.txt").write_text("changed\n", encoding="utf-8")
     runner._tree_changed.set()  # what the watch does on that write

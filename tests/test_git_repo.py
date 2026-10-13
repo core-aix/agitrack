@@ -586,3 +586,165 @@ def test_long_paths_are_not_forced_off_windows(monkeypatch):
     handle._run(["git", "status", "--porcelain"], check=False)
 
     assert "core.longpaths=true" not in seen[0]
+
+
+# --- the working-tree snapshot reuses the real index's stat cache ------------------------------
+
+
+def _plain_snapshot(repo: GitRepo) -> str:
+    """The snapshot as it was built before: a throwaway index read straight from HEAD."""
+    original = repo._seed_index_from_head
+    repo._seed_index_from_head = lambda index, env: repo._run(["git", "read-tree", "HEAD"], env=env, check=False)
+    try:
+        return repo.snapshot_worktree_tree()
+    finally:
+        repo._seed_index_from_head = original
+
+
+def _git(path, *args):
+    return subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, text=True).stdout
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [
+        "clean",
+        "edited, unstaged",
+        "staged, then edited again",
+        "staged new file, then deleted",
+        "removed from the index only",
+        "deleted from the tree",
+        "intent to add",
+        "new untracked file",
+    ],
+)
+def test_a_snapshot_seeded_from_the_real_index_is_the_same_tree(tmp_path, arrange):
+    """The seed reuses the real index's stat cache (a 65,000-file repository took 22 s per
+    snapshot without it, and the commit-time flush missed the hook's wait). Whatever the user has
+    staged, the snapshot must still be the WORKING TREE against HEAD, byte for byte the tree the
+    plain HEAD seed produced."""
+    repo = _init_repo(tmp_path)
+    (tmp_path / "g.txt").write_text("g\n")
+    _git(tmp_path, "add", "g.txt")
+    _git(tmp_path, "commit", "-qm", "g")
+    if arrange == "edited, unstaged":
+        (tmp_path / "f.txt").write_text("edited\n")
+    elif arrange == "staged, then edited again":
+        (tmp_path / "f.txt").write_text("staged\n")
+        _git(tmp_path, "add", "f.txt")
+        (tmp_path / "f.txt").write_text("edited after staging\n")
+    elif arrange == "staged new file, then deleted":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "n.txt")
+        (tmp_path / "n.txt").unlink()
+    elif arrange == "removed from the index only":
+        _git(tmp_path, "rm", "--cached", "-q", "g.txt")
+    elif arrange == "deleted from the tree":
+        (tmp_path / "g.txt").unlink()
+    elif arrange == "intent to add":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "-N", "n.txt")
+    elif arrange == "new untracked file":
+        (tmp_path / "n.txt").write_text("n\n")
+    index_before = (tmp_path / ".git" / "index").read_bytes()
+
+    assert repo.snapshot_worktree_tree() == _plain_snapshot(repo)
+    assert (tmp_path / ".git" / "index").read_bytes() == index_before  # the real index is never touched
+
+
+def test_a_snapshot_during_a_conflicted_merge_falls_back_to_the_plain_seed(tmp_path):
+    # An index with unmerged paths is one git will not `read-tree -m` over; the snapshot must still
+    # be taken (only slower), and be the same tree.
+    repo = _init_repo(tmp_path)
+    base = repo.current_branch()
+    _git(tmp_path, "checkout", "-qb", "other")
+    (tmp_path / "f.txt").write_text("other\n")
+    _git(tmp_path, "commit", "-qam", "other")
+    _git(tmp_path, "checkout", "-q", base)
+    (tmp_path / "f.txt").write_text("mine\n")
+    _git(tmp_path, "commit", "-qam", "mine")
+    subprocess.run(["git", "merge", "-q", "other"], cwd=tmp_path, capture_output=True)
+    assert "UU" in _git(tmp_path, "status", "--porcelain")
+
+    assert repo.snapshot_worktree_tree() == _plain_snapshot(repo)
+
+
+def _seeded_mtime(repo: GitRepo, seed, path: str) -> str:
+    """The stat mtime a seed leaves on *path*'s entry in a throwaway index ("0:0" means none)."""
+    import re
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        index = os.path.join(tmp, "index")
+        env = {"GIT_INDEX_FILE": index}
+        seed(index, env)
+        debug = repo._run(["git", "ls-files", "--debug", "--", path], env=env).stdout
+    match = re.search(r"mtime:\s*(\d+:\d+)", debug)
+    assert match, debug
+    return match.group(1)
+
+
+def test_a_snapshot_reuses_the_stat_cache_instead_of_hashing_every_file(tmp_path):
+    """Checked by its cause rather than by time: an entry with stat data is one `add -A` can skip,
+    and one without has to be read and hashed. The plain HEAD seed leaves none on any entry."""
+    repo = _init_repo(tmp_path)
+    plain = lambda index, env: repo._run(["git", "read-tree", "HEAD"], env=env, check=False)  # noqa: E731
+
+    assert _seeded_mtime(repo, plain, "f.txt") == "0:0"
+    assert _seeded_mtime(repo, repo._seed_index_from_head, "f.txt") != "0:0"
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [
+        "clean",
+        "edited, unstaged",
+        "staged, then edited back",
+        "staged new file, then deleted",
+        "removed from the index only",
+        "deleted from the tree",
+        "intent to add",
+        "new untracked file",
+        "new untracked folder",
+        "edit to scaffolding only",
+        "ignored file",
+    ],
+)
+def test_the_status_check_answers_what_the_snapshot_comparison_did(tmp_path, arrange):
+    """`worktree_differs_from_head` replaces `snapshot_worktree_tree() != comparable_tree("HEAD")`
+    on every "did the tree change?" path, so it must give the same answer in every index state."""
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    (tmp_path / "g.txt").write_text("g\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "g")
+    if arrange == "edited, unstaged":
+        (tmp_path / "f.txt").write_text("edited\n")
+    elif arrange == "staged, then edited back":
+        (tmp_path / "f.txt").write_text("staged\n")
+        _git(tmp_path, "add", "f.txt")
+        (tmp_path / "f.txt").write_text("base\n")
+    elif arrange == "staged new file, then deleted":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "n.txt")
+        (tmp_path / "n.txt").unlink()
+    elif arrange == "removed from the index only":
+        _git(tmp_path, "rm", "--cached", "-q", "g.txt")
+    elif arrange == "deleted from the tree":
+        (tmp_path / "g.txt").unlink()
+    elif arrange == "intent to add":
+        (tmp_path / "n.txt").write_text("n\n")
+        _git(tmp_path, "add", "-N", "n.txt")
+    elif arrange == "new untracked file":
+        (tmp_path / "n.txt").write_text("n\n")
+    elif arrange == "new untracked folder":
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "m.py").write_text("x = 1\n")
+    elif arrange == "edit to scaffolding only":
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text("{}\n")
+    elif arrange == "ignored file":
+        (tmp_path / "run.log").write_text("noise\n")
+
+    expected = repo.snapshot_worktree_tree() != repo.comparable_tree("HEAD")
+    assert repo.worktree_differs_from_head() is expected

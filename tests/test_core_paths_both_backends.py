@@ -114,8 +114,9 @@ def test_the_commit_records_the_turns_token_counts(tmp_path, backend_name):
 
 @pytest.mark.parametrize("backend_name", BACKENDS)
 def test_nothing_is_committed_when_the_agent_changed_nothing(tmp_path, backend_name):
-    # An empty turn must not produce an empty commit on any backend — the history would fill
-    # with noise that says work happened when none did.
+    # An empty turn must not produce an empty commit on any backend: the history would fill with
+    # noise that says work happened when none did. It is still recorded, as a message the next
+    # commit carries, so the record exists while HEAD does not move.
     runner, repo = _runner_on(backend_name, tmp_path)
     head_before = repo.rev_parse("HEAD")
 
@@ -127,8 +128,9 @@ def test_nothing_is_committed_when_the_agent_changed_nothing(tmp_path, backend_n
         quiet=True,
     )
 
-    assert committed is False
+    assert committed is True
     assert repo.rev_parse("HEAD") == head_before
+    assert "think about it" in runner._manual_pending_bodies()[-1]
 
 
 # --- session identity -------------------------------------------------------
