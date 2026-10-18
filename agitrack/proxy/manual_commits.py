@@ -291,7 +291,18 @@ class ManualCommitsMixin(RunnerHost):
     def _manual_record(self, message: str) -> str | None:
         """Record a turn as a hidden latent commit: ONE ``commit-tree`` reusing its parent's tree,
         and one ref update. Kept in lockstep with ``ManualCommitTracker.record``; nothing is read
-        from the working tree, so a message costs the same however large the repository is."""
+        from the working tree, so a message costs the same however large the repository is.
+        Pending turns far older than this one have their trace left out first, as the tracker
+        does (``commits.manual.age_out_pending``)."""
+        from agitrack.commits.manual import _turn_start, age_out_pending
+
+        age_out_pending(
+            self.repo,
+            self._manual_pending_refs(),
+            newest_start=_turn_start(message),
+            max_age_hours=getattr(self.state, "trace_max_age_hours", None),
+            debug=self._debug,
+        )
         tip = self.repo.ref_sha(self._manual_ref())
         if tip is not None and not self.repo.has_object_local(tip):
             # `git gc --prune` can collect a latent commit (unreachable from any branch by
