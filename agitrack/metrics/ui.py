@@ -488,6 +488,10 @@ function noteVersion(version){
   if(version === servedVersion) return;
   // Survive the reload we are about to do, so the new page can say why it happened.
   try{ sessionStorage.setItem("agitrack.reloadedFor", version); }catch(e){}
+  // ...and so it can repaint what was on screen rather than sit on a loading screen while the
+  // restarted daemon reads the history again. Nobody asked for this reload: it is not the
+  // "re-read everything" a person pressing refresh means.
+  try{ sessionStorage.setItem("agitrack.versionReload", String(Date.now())); }catch(e){}
   location.reload();
 }
 

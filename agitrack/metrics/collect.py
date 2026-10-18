@@ -939,20 +939,31 @@ def viewable_branches(repo: GitRepo) -> list[str]:
     return [*local, *remote_only]
 
 
+def collect_dashboard_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
+    """Every commit the dashboard shows for ``ref``: the expensive half of a build."""
+    stats = collect_commit_stats(repo, ref)
+    # Manual-commit mode: surface this session's not-yet-committed latent turns as pending
+    # entries (only when showing HEAD — the live working branch — not a historical ref).
+    if ref == "HEAD":
+        stats = stats + collect_manual_pending(repo)
+    return stats
+
+
 def build_dashboard(
     repo: GitRepo,
     ref: str = "HEAD",
     *,
     sha_logins: dict[str, str] | None = None,
     email_logins: dict[str, str] | None = None,
+    stats: list[CommitStat] | None = None,
 ) -> Dashboard:
+    """The dashboard for ``ref``. ``stats`` is the history already read for exactly this ref and
+    these tips (see :func:`collect_dashboard_stats`): reading it is the whole cost of a build, and
+    a caller that only has new GitHub logins or a changed branch list must not pay it again."""
     from agitrack.metrics.github import commit_url_base
 
-    stats = collect_commit_stats(repo, ref)
-    # Manual-commit mode: surface this session's not-yet-committed latent turns as pending
-    # entries (only when showing HEAD — the live working branch — not a historical ref).
-    if ref == "HEAD":
-        stats = stats + collect_manual_pending(repo)
+    if stats is None:
+        stats = collect_dashboard_stats(repo, ref)
     # The branch the dashboard *shows*: the explicit ref when one is requested,
     # otherwise whatever HEAD currently points at.
     branch = repo.current_branch() if ref == "HEAD" else ref
@@ -1137,6 +1148,28 @@ def squash_header_end(lines: list[str]) -> int:
     return bullets[0] if bullets else 0
 
 
+_FOLD_SUBJECT_PREFIX = "<aGiTrack> "
+
+
+def fold_lead_end(lines: list[str]) -> int:
+    """Where the first folded turn starts in an aGiTrack AUTO-fold message, or 0.
+
+    A fold of several turns is written as the NEWEST turn's subject, a blank line, then every
+    turn's full body oldest first, each opening with its own ``<aGiTrack>`` subject. That lead
+    line belongs to the commit, not to the first turn: reading it as the first part's subject
+    labelled the OLDEST turn with the newest one's subject (two parts with one subject) and made
+    the oldest turn's summary read as the commit's own. Recognised by two ``<aGiTrack>`` subject
+    lines in a row with only blank lines between them, which no single turn's body produces (its
+    summary or trace always follows its subject)."""
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None or not lines[first].startswith(_FOLD_SUBJECT_PREFIX):
+        return 0
+    second = next((i for i in range(first + 1, len(lines)) if lines[i].strip()), None)
+    if second is None or not lines[second].startswith(_FOLD_SUBJECT_PREFIX):
+        return 0
+    return second
+
+
 def _parse_constituents(body: str) -> list[CommitStat]:
     """Split a squashed message into one :class:`CommitStat` per original commit.
 
@@ -1162,7 +1195,7 @@ def _parse_constituents(body: str) -> list[CommitStat]:
     # anywhere — so the blocks are the only boundaries there are.
     headers = metadata_header_lines(lines)
     constituents: list[CommitStat] = []
-    prev_end = 0
+    prev_end = fold_lead_end(lines)
     for header in headers:
         end = len(lines)
         for j in range(header + 1, len(lines)):

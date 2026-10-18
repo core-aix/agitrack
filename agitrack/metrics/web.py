@@ -30,7 +30,14 @@ from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, _iso_epoch, apply_numstat_for, build_dashboard
+from agitrack.metrics.collect import (
+    CommitStat,
+    Dashboard,
+    _iso_epoch,
+    apply_numstat_for,
+    build_dashboard,
+    fold_lead_end,
+)
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
@@ -373,6 +380,12 @@ def _main_message(stat: CommitStat) -> str:
     commit, or a PR title for a squash merge). A non-squash commit keeps its full message."""
     if not stat.constituents:
         return stat.message
+    lines = stat.message.splitlines()
+    lead = fold_lead_end(lines)
+    if lead:
+        # An auto-fold's own text is its lead subject; everything after it is the parts, and the
+        # first part's summary is NOT this commit's (it is the oldest turn's).
+        return "\n".join(lines[:lead]).strip()
     head, _, _ = stat.message.partition("\n" + METADATA_HEADER)
     return head.strip()
 
@@ -1818,7 +1831,16 @@ function snapshotSave(){
 function snapshotRestore(){
   try{
     const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
-    if(nav && nav.type === "reload") return false;   // an explicit refresh means re-read
+    // An explicit refresh means re-read, but a reload the page did itself because aGiTrack was
+    // updated (`noteVersion`) does not: it repaints the last view while the restarted daemon
+    // reads the history again behind it, instead of a full "reading commit history" screen.
+    let ours = false;
+    try{
+      const at = Number(sessionStorage.getItem("agitrack.versionReload") || 0);
+      sessionStorage.removeItem("agitrack.versionReload");
+      ours = at > 0 && Date.now() - at < 60000;
+    }catch(e){}
+    if(nav && nav.type === "reload" && !ours) return false;
     const blob = sessionStorage.getItem(SNAP_KEY);
     if(!blob) return false;
     const d = JSON.parse(blob);
