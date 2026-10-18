@@ -2665,3 +2665,29 @@ def test_the_page_answers_clicks_before_its_first_fetch_returns():
     controls = html[wire:init]
     assert '$("commitlog").addEventListener("click"' in controls
     assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
+
+
+def test_the_log_search_finds_a_commit_by_subject_or_by_what_was_asked(tmp_path):
+    """The log's search box narrows the log alone: every word, ignoring case, in the subject or
+    (`qin=all`) anywhere in the message, which is where the trace records what was asked."""
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _demo_repo(tmp_path)
+    _write_lines(repo, "x.txt", 2)
+    repo.commit("Tidy the parser\n\n# Interaction Trace\n\n## User\n\nplease rename the PINEAPPLE helper\n")
+    scope = RepoScope(repo)
+
+    def subjects(**query):
+        body = scope.get("/log", {k: [v] for k, v in query.items()}).body
+        return [entry["subject"] for entry in _json.loads(body)["entries"]]
+
+    everything = subjects()
+    assert subjects(q="tidy PARSER") == ["Tidy the parser"]
+    assert subjects(q="pineapple") == []  # not in the subject...
+    assert subjects(q="pineapple helper", qin="all") == ["Tidy the parser"]  # ...but it was asked
+    assert subjects(q="tidy unrelated") == []  # every word must match
+    assert subjects(q="   ") == everything
+    data = _json.loads(scope.get("/data", {"q": ["tidy"]}).body)
+    assert data["agg"]["total"] == len(everything)  # the panels above are untouched

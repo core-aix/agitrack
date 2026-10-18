@@ -118,6 +118,29 @@ def _is_scaffolding(path: str) -> bool:
 _BLOB_CONTENT_FLAGS = frozenset({"--numstat", "--stat", "--shortstat", "-p", "--patch", "--patch-with-stat"})
 
 
+# History reads that may need file CONTENT. On a partial clone (`--filter=blob:none`) git fetches
+# an absent blob from the remote the moment such a read touches it, so aGiTrack runs every one of
+# them with lazy fetch OFF unless a person has just asked to see that content (a click on a diff,
+# see `user_requested_content`). Contents the clone never downloaded stay on the remote: the
+# dashboard counts and shows what is local, and only a diff someone opens is fetched. WRITES
+# (checkout, merge, commit, worktree add) are untouched: git needs those blobs to do the job at
+# all, exactly as it would for the user's own command.
+_LOCAL_ONLY_READS = frozenset({"log", "rev-list", "shortlog", "show", "diff", "diff-tree", "blame", "grep"})
+_user_request = threading.local()
+
+
+@contextlib.contextmanager
+def user_requested_content() -> Iterator[None]:
+    """Mark the git reads inside the block as answering a person's explicit request (opening one
+    commit's or one file's diff), so a partial clone may fetch the blobs that diff needs."""
+    previous = getattr(_user_request, "on", False)
+    _user_request.on = True
+    try:
+        yield
+    finally:
+        _user_request.on = previous
+
+
 def _git_read_needs_blobs(command: list[str]) -> bool:
     """Whether a ``git log``/``rev-list`` reads file content (needs blob objects)."""
     return any(a in _BLOB_CONTENT_FLAGS or a.startswith(("--stat=", "-S", "-G")) for a in command)
@@ -1497,7 +1520,7 @@ class GitRepo:
         check: bool = True,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
-        allow_lazy_fetch: bool = True,
+        allow_lazy_fetch: bool | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # THE PROGRAM IS ALWAYS `git`, and this is the one place that can promise it. Every
         # caller builds its argv beginning with the literal, and nothing here ever uses a shell
@@ -1548,6 +1571,15 @@ class GitRepo:
         # caller opened a `read_cache()` scope; see the module header for why the Enter path
         # needs it. Only the plain form is cacheable — a call carrying stdin, a custom env or a
         # timeout is doing something specific enough that it should just run.
+        # None means "decide by the command": a history read is local-only unless a person asked
+        # for the content; anything else keeps git's own behaviour. An explicit value wins.
+        if allow_lazy_fetch is None:
+            allow_lazy_fetch = (
+                getattr(_user_request, "on", False)
+                or len(command) < 2
+                or command[0] != "git"
+                or command[1] not in _LOCAL_ONLY_READS
+            )
         cache_key: tuple | None = None
         cacheable_read = (
             input_text is None
@@ -1597,6 +1629,9 @@ class GitRepo:
             if not allow_lazy_fetch or not _git_read_needs_blobs(command):
                 flags += ["-c", "fetch.disableLazyFetch=true"]
                 extra_env["GIT_NO_LAZY_FETCH"] = "1"
+        elif not allow_lazy_fetch:
+            flags += ["-c", "fetch.disableLazyFetch=true"]
+            extra_env["GIT_NO_LAZY_FETCH"] = "1"
         if flags:
             command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on

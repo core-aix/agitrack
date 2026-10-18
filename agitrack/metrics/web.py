@@ -849,16 +849,22 @@ def log_page(
     offset: int = 0,
     limit: int = PAGE_SIZE,
     sort: str = DEFAULT_LOG_SORT,
+    text: str = "",
+    text_in: str = "subject",
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
 
-    When ``repo`` is given, the page's commits get their exact insertions/deletions
-    fetched on demand — and *only* those commits' blobs are fetched, so a blobless
-    partial clone never pulls its whole history just to render one page (the
-    full-history scan in :func:`collect_commit_stats` counts from local blobs alone)."""
+    ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
+    word must appear, ignoring case, in the commit's subject (``text_in="subject"``) or anywhere
+    in its message (``"all"``: the trace, so what was ASKED is findable). A squash's parts count
+    as part of it.
+
+    When ``repo`` is given, the page's commits get their line counts from the cache or the
+    local blobs, never by fetching (see :func:`agitrack.metrics.collect.apply_numstat_for`)."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
+    stats = _text_filtered(stats, text, text_in)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
@@ -872,6 +878,21 @@ def log_page(
         "limit": limit,
         "entries": [_log_entry(dash, stat, covers) for stat in page],
     }
+
+
+def _text_filtered(stats: list[CommitStat], text: str, text_in: str) -> list[CommitStat]:
+    """The commits whose subject (or whole message) holds every word of ``text``, ignoring case."""
+    words = [word for word in (text or "").lower().split() if word]
+    if not words:
+        return stats
+    whole = text_in == "all"
+
+    def haystack(stat: CommitStat) -> str:
+        parts = [stat.message if whole else stat.subject]
+        parts += [(part.message if whole else part.subject) or "" for part in stat.constituents]
+        return "\n".join(part or "" for part in parts).lower()
+
+    return [stat for stat in stats if all(word in haystack(stat) for word in words)]
 
 
 # A commit id must be a bare hex object name before it is handed to git, so a crafted
@@ -1487,7 +1508,8 @@ __UI_COMMIT_CSS__
   margin:22px 0 12px}
 /* An author `display` beats the `hidden` attribute, so every hidden flex/grid box on this
    page needs this to actually hide (the files filter showed in the commits view without it). */
-#head-files{margin:0 0 12px}
+#head-files,#head-commits{margin:0 0 12px}
+.logsearch .filesearch{min-width:min(70vw,320px)}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1686,6 +1708,10 @@ __UPDATE_BANNER__
       <option value="tokens">most output tokens</option>
     </select></div>
   </div>
+  <div class="panehead" id="head-commits"><div class="logsort logsearch"><input id="f-text" class="filesearch" type="search" placeholder="search commits…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
+      <option value="subject">subject</option>
+      <option value="all">full message</option>
+    </select></div></div>
   <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
 
   <div class="logpane" id="pane-commits">
@@ -1757,7 +1783,7 @@ const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
 const DEFAULT_BRANCH = INIT.branch || "";
-const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", q:"", qin:"subject", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -1898,7 +1924,9 @@ async function loadAgg(){
   return false;
 }
 async function loadLog(offset){
-  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
+  const extra = {offset:offset||0, limit:PAGE_SIZE, sort:state.sort};
+  if(state.q){ extra.q = state.q; extra.qin = state.qin; }   // searches the log only, like the sort
+  try{ const r = await fetch("log?"+qs(extra), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
@@ -2406,7 +2434,10 @@ function renderLog(){
     `<button id="log-next" title="next page" ${nextDis}>›</button>`+
     `<button id="log-last" title="last page" ${nextDis}>»</button>`+
     `<span class="loading pgload" id="pgloading" hidden aria-live="polite"><span class="spin"></span>loading…</span></span>${gotoBox}</div>`;
-  $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
+  const none = state.q
+    ? `no commits match "${esc(state.q)}" in the ${state.qin === "all" ? "full message" : "subject"}`
+    : "no commits";
+  $("commitlog").innerHTML = (rows || `<div class="empty">${none}</div>`) + pager;
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -2915,6 +2946,8 @@ function showLogTab(tab){
   // on its own line under the tabs (the sort control keeps the right-hand end of that row).
   const hf = $("head-files");
   if(hf) hf.hidden = tab !== "files";
+  const hc = $("head-commits");   // the commit search searches commits, so it follows that tab
+  if(hc) hc.hidden = tab !== "commits";
 }
 function fileChangeHtml(c, i){
   const when = commitWhen(c.ts).text;  // the reader's local time, like the commit log
@@ -3042,6 +3075,19 @@ function wireControls(){
   $("f-sort").value = state.sort;
   $("f-sort").onchange = async e => { state.sort = e.target.value; showLoading(true);
     try{ if(await loadLog(0)) renderLog(); } finally { showLoading(false); } };
+  // The commit search narrows the LOG only, so like the sort it reloads just the first page.
+  // Debounced so typing a word does not fetch once per letter; each fetch shows the spinner, and
+  // an answer for an older query is dropped so the list always matches what is in the box.
+  let qTimer = null, qSeq = 0;
+  const runSearch = async () => {
+    const seq = ++qSeq; showLoading(true);
+    try{ const ok = await loadLog(0); if(ok && seq === qSeq) renderLog(); }
+    finally { if(seq === qSeq) showLoading(false); }
+  };
+  $("f-text").addEventListener("input", e => {
+    state.q = e.target.value.trim(); clearTimeout(qTimer); qTimer = setTimeout(runSearch, 250);
+  });
+  $("f-textin").onchange = e => { state.qin = e.target.value; if(state.q) runSearch(); };
   // "custom range…" reveals a date-range popup anchored under the select; the presets and
   // "all time" hide it. Wired by the shared helper (ui.RANGE_JS), so the story page's copy
   // of this control behaves identically - including re-opening the popup when "custom" is
@@ -3054,6 +3100,7 @@ function wireControls(){
     state.meta=[]; advDraft=null; renderAdvanced(); syncAdvBtn(); syncApply();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
+    state.q=""; $("f-text").value=""; state.qin="subject"; $("f-textin").value="subject";
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };

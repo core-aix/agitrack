@@ -32,11 +32,18 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
+from agitrack.git.repo import user_requested_content
 from agitrack.git.repo import read_cache
 from agitrack.proc import UTF8_TEXT
 from agitrack.metrics import learn as learn_page
 from agitrack.metrics import story as story_page
-from agitrack.metrics.collect import Dashboard, build_dashboard, collect_dashboard_stats, viewable_branches
+from agitrack.metrics.collect import (
+    Dashboard,
+    build_dashboard,
+    collect_dashboard_stats,
+    recount_after_click,
+    viewable_branches,
+)
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
 from agitrack.metrics import progress
@@ -218,12 +225,24 @@ class RepoScope:
                         offset=_int(query, "offset", 0),
                         limit=_int(query, "limit", 50),
                         sort=_str(query, "sort"),
+                        text=_str(query, "q"),
+                        text_in=_str(query, "qin") or "subject",
                     )
                 )
         if path == "/diff":
             # This commit's file diffs, straight from the local clone — so the dashboard shows
-            # changes without GitHub. The sha is validated as a hex id in commit_diff.
-            return json_response(commit_diff(self.repo, _str(query, "sha")))
+            # changes without GitHub. The sha is validated as a hex id in commit_diff. A person
+            # clicked for this, so it is the one read allowed to fetch absent blobs on a partial
+            # clone, and once it has, the commit's line count is made exact (and served back).
+            sha = _str(query, "sha")
+            with user_requested_content():
+                payload = commit_diff(self.repo, sha)
+                if not payload.get("error") and self.repo.is_partial_clone():
+                    counts = recount_after_click(self.repo, sha)
+                    if counts is not None:
+                        payload["ins"], payload["del"] = counts
+                        self._apply_count(sha, counts)
+            return json_response(payload)
         if path == "/files":
             # The file browser: every changed file with its per-file change history and the
             # conversation/tokens behind each change (same view as --backtrace, real commits).
@@ -231,7 +250,9 @@ class RepoScope:
         if path == "/filelog":
             return json_response(self._browser(ref).file_log_payload(_str(query, "path")))
         if path == "/filediff":
-            return json_response(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha")))
+            browser = self._browser(ref)
+            with user_requested_content():  # a click on one change: the content may be fetched
+                return json_response(browser.file_diff(_str(query, "path"), _str(query, "sha")))
         if path == "/story":
             # The storyline: the backend agent tells this branch's history as chapters
             # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
@@ -405,6 +426,14 @@ class RepoScope:
             self._dash_cache.clear()  # only the current state is worth keeping
             self._dash_cache[key] = dash
             return dash
+
+    def _apply_count(self, sha: str, counts: tuple[int, int]) -> None:
+        """Put an exact count, just made possible by a click, on the cached history too, so the
+        log shows it without waiting for the next rebuild."""
+        for stats in self._stats_cache.values():
+            for stat in stats:
+                if stat.sha == sha or (len(sha) < 40 and stat.sha.startswith(sha)):
+                    stat.insertions, stat.deletions = counts
 
     def _history_state(self, ref: str) -> str:
         """The tips the HISTORY depends on: the shown branch and the latent (manual-mode) refs.

@@ -88,7 +88,12 @@ def test_content_free_traversals_disable_commit_graph_and_lazy_fetch(tmp_path: P
         assert sub in ("log", "rev-list", "shortlog"), cmd
 
 
-def test_numstat_keeps_lazy_fetch_for_blob_content(tmp_path: Path, monkeypatch) -> None:
+def test_a_content_read_fetches_only_when_a_person_asked_for_it(tmp_path: Path, monkeypatch) -> None:
+    """On a partial clone aGiTrack leaves the contents the clone never downloaded on the remote:
+    every history read is local-only, and only a read made for a person's explicit request (a
+    click on a diff) may fetch. Writes keep git's own behaviour."""
+    from agitrack.git.repo import user_requested_content
+
     repo = GitRepo.init(tmp_path)
     (tmp_path / "f.txt").write_text("hi\n", encoding="utf-8")
     repo.stage_paths(["f.txt"])
@@ -96,13 +101,21 @@ def test_numstat_keeps_lazy_fetch_for_blob_content(tmp_path: Path, monkeypatch) 
 
     calls = _captured_git_calls(monkeypatch)
     repo._run(["git", "log", "--numstat", "--format=%H", "HEAD"], check=False)
+    repo._run(["git", "show", "--patch", "HEAD"], check=False)
+    with user_requested_content():
+        repo._run(["git", "show", "--patch", "HEAD"], check=False)
+    repo._run(["git", "status", "--short"], check=False)
 
-    cmd, env = calls[0]
-    # A line-count read still needs blob objects, which a blobless partial clone fetches
-    # lazily — so the commit-graph is still bypassed, but lazy fetch stays ON by default or
-    # the numbers would be zeroed.
-    assert _config_values(cmd, "core.commitGraph") == ["false"], cmd
-    assert not _no_lazy_fetch(env), (cmd, env)
+    (log_cmd, log_env), (show_env), (asked_env), (status_env) = (
+        calls[0],
+        calls[1][1],
+        calls[2][1],
+        calls[3][1],
+    )
+    assert _config_values(log_cmd, "core.commitGraph") == ["false"], log_cmd
+    assert _no_lazy_fetch(log_env) and _no_lazy_fetch(show_env)  # never fetched on its own
+    assert not _no_lazy_fetch(asked_env)  # ...only for the diff someone opened
+    assert not _no_lazy_fetch(status_env)  # and what is not a history read is left alone
 
 
 def test_allow_lazy_fetch_false_disables_fetch_even_for_content_read(tmp_path: Path, monkeypatch) -> None:
@@ -180,13 +193,13 @@ def test_apply_numstat_for_fetches_only_the_named_commits(tmp_path: Path, monkey
     calls = _captured_git_calls(monkeypatch)
     apply_numstat_for(repo, [target.sha], by_sha)
 
-    # Exactly one scoped numstat read, bounded with --no-walk to the commits named on stdin,
-    # and it keeps lazy fetch ON so a blobless clone fetches just this page's blobs.
+    # Exactly one scoped numstat read, bounded with --no-walk to the commits named on stdin, and
+    # LOCAL-ONLY: showing a log page never downloads anything a partial clone left on the remote.
     numstat_calls = [(cmd, env) for cmd, env in calls if "--numstat" in cmd]
     assert len(numstat_calls) == 1, calls
     cmd, env = numstat_calls[0]
     assert "--no-walk=unsorted" in cmd and "--stdin" in cmd
-    assert not _no_lazy_fetch(env), (cmd, env)
+    assert _no_lazy_fetch(env), (cmd, env)
     # c3 wrote 4 lines into f3.txt; the scoped pass restored its real count.
     assert target.insertions == 4 and target.deletions == 0
 
@@ -268,10 +281,12 @@ def test_the_whole_history_is_diffed_once_and_then_cached(tmp_path: Path, monkey
     assert all(line.endswith(" E") for line in _cache_lines(tmp_path))  # a full clone: exact
 
 
-def test_a_partial_clones_history_count_is_a_floor_the_page_still_recounts(tmp_path: Path, monkeypatch) -> None:
-    """On a partial clone the whole-history scan counts without fetching, so its answer can be
-    short — it is cached as a floor, and the commits actually displayed are still recounted with
-    fetching allowed (and only then remembered as final)."""
+def test_a_partial_clones_history_count_is_a_floor_until_someone_opens_the_diff(tmp_path: Path, monkeypatch) -> None:
+    """On a partial clone the history is counted without fetching, so its answer can be short:
+    it is cached as a floor, a displayed page is served that floor without fetching anything, and
+    the count becomes final only when someone opens the commit's diff (the one fetch allowed)."""
+    from agitrack.metrics.collect import recount_after_click
+
     repo = GitRepo.init(tmp_path)
     (tmp_path / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
     repo.stage_paths(["a.txt"])
@@ -286,8 +301,9 @@ def test_a_partial_clones_history_count_is_a_floor_the_page_still_recounts(tmp_p
     target = next(s for s in stats if s.subject == "c0")
     calls = _captured_git_calls(monkeypatch)
     apply_numstat_for(repo, [target.sha], by_sha)
+    assert not _numstat_reads(calls), "showing a page must not recount, let alone fetch"
 
-    assert _numstat_reads(calls), "a floor must not be served as the exact count"
+    assert recount_after_click(repo, target.sha) == (2, 0)
     assert any(line.startswith(target.sha) and line.endswith(" E") for line in _cache_lines(tmp_path))
 
 

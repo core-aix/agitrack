@@ -1401,8 +1401,8 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
     historical blob from the promisor remote — tens of seconds per dashboard poll, and the
     interrupted fetches litter `.git/objects/pack` with `tmp_pack_*` files — so the dashboard
     appears to hang with no commits. There, a local count is a FLOOR, so it is cached as such
-    (see :data:`_NUMSTAT_LOCAL`) and the commits actually displayed are recounted exactly by
-    :func:`apply_numstat_for`. Merge commits (cover commits #58, integration merges) report no
+    (see :data:`_NUMSTAT_LOCAL`); a commit becomes exact when someone opens its diff
+    (:func:`recount_after_click`). Merge commits (cover commits #58, integration merges) report no
     numstat by default, so a turn's lines are counted exactly once — on the commits that
     introduced them."""
     cached = _read_numstat_cache(repo)
@@ -1440,17 +1440,14 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
 
 
 def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitStat]) -> None:
-    """Give SPECIFIC commits their exact insertions/deletions, fetching only those commits'
-    blobs (allow_lazy_fetch stays on). This is how the dashboard gets exact line counts for the
-    log page it is about to show, and for manual mode's pending turns, without pulling the rest
-    of a partial clone's history: only what is displayed is fetched. A commit whose blobs still
-    can't be reached (offline, or an aGiTrack-only ref the remote doesn't have) keeps the count
-    it already had, rather than being zeroed.
+    """Give SPECIFIC commits their line counts (the log page being shown, manual mode's pending
+    turns), from the cache or else from LOCAL blobs, never fetching.
 
-    Cached, and only an EXACT cache entry is accepted: a floor recorded by the whole-history
-    pass is exactly what this function exists to improve on. Measured on one partial clone,
-    where the lazy fetches dominate: 18.3s for a 50-commit log page and 12.1s for 20 pending
-    turns, on EVERY dashboard rebuild, both of which the cache turns into a one-off."""
+    It used to fetch: on a partial clone it recounted every displayed commit with lazy fetch on,
+    so merely LOOKING at a log page downloaded the contents of up to fifty commits the clone had
+    deliberately left on the remote. aGiTrack downloads a commit's contents only when a person
+    opens its diff (`user_requested_content`), and that click is also what makes its count exact
+    (:func:`recount_after_click`). Until then a partial clone shows the local count, a floor."""
     targets = {sha for sha in shas if sha and sha in by_sha}
     if not targets:
         return
@@ -1458,22 +1455,41 @@ def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitSt
     missing: list[str] = []
     for sha in sorted(targets):
         entry = cached.get(sha)
-        if entry is not None and entry[2] == _NUMSTAT_EXACT:
+        if entry is not None:
             by_sha[sha].insertions, by_sha[sha].deletions = entry[0], entry[1]
             continue
         missing.append(sha)
     if not missing:
         return
     partial = repo.is_partial_clone()
+    tier = _NUMSTAT_LOCAL if partial else _NUMSTAT_EXACT
     for start in range(0, len(missing), _EXACT_CHUNK):
-        progress.step("fetching exact line counts", start, len(missing))
+        progress.step("counting changed lines", start, len(missing))
         batch = missing[start : start + _EXACT_CHUNK]
-        fresh, seen = _numstat_of(repo, batch, allow_lazy_fetch=True)
-        for sha in seen:
+        fresh, seen = _numstat_of(repo, batch, allow_lazy_fetch=False)
+        for sha in batch:
             by_sha[sha].insertions = fresh[sha].insertions
             by_sha[sha].deletions = fresh[sha].deletions
-        _write_numstat_cache(repo, cached, _cache_rows(fresh, seen if partial else set(batch), _NUMSTAT_EXACT))
-    progress.step("fetching exact line counts", len(missing), len(missing))
+        rows = _cache_rows(fresh, seen if partial else set(batch), tier)
+        if partial:
+            stamp = f"{_NUMSTAT_MISSING}{int(time.time())}"
+            rows.update({sha: (0, 0, stamp) for sha in batch if sha not in seen})
+        _write_numstat_cache(repo, cached, rows)
+    progress.step("counting changed lines", len(missing), len(missing))
+
+
+def recount_after_click(repo: GitRepo, sha: str) -> tuple[int, int] | None:
+    """The exact line counts of ONE commit whose diff a person just opened, recorded as final.
+
+    Opening the diff is the one moment aGiTrack may fetch a commit's blobs on a partial clone, so
+    once it has, the count can be made exact at no further network cost (the blobs are local
+    now) and the floor or "not local yet" entry is replaced. Returns ``(insertions, deletions)``,
+    or None when git produced nothing to count."""
+    fresh, seen = _numstat_of(repo, [sha], allow_lazy_fetch=True)
+    if sha not in seen:
+        return None
+    _write_numstat_cache(repo, {}, _cache_rows(fresh, {sha}, _NUMSTAT_EXACT))
+    return fresh[sha].insertions, fresh[sha].deletions
 
 
 def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tuple[dict[str, CommitStat], set[str]]:
@@ -1509,7 +1525,7 @@ def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tu
 # file. EXACT means every blob the diff touches was available, so the number is final. LOCAL
 # means it was counted on a partial clone without fetching, so it is a floor: good enough for
 # the whole-history aggregates (which must never trigger a fetch) but not for a commit being
-# displayed, which apply_numstat_for recounts and then records as EXACT.
+# displayed is made exact only when someone opens its diff (recount_after_click).
 _NUMSTAT_EXACT = "E"
 _NUMSTAT_LOCAL = "L"
 # MISSING: a partial clone diffed a commit without fetching and git emitted nothing, because the
@@ -1517,7 +1533,7 @@ _NUMSTAT_LOCAL = "L"
 # until it is a day old, then tried again in case the blobs have arrived since. Before this the
 # commit was simply not recorded, so every rebuild diffed it again for nothing: 32 such commits
 # cost a restarted dashboard 3.8 s on this repository, every time. A commit being DISPLAYED is
-# still recounted exactly by apply_numstat_for, which accepts nothing but EXACT.
+# made exact only when someone opens its diff (recount_after_click), which may fetch.
 _NUMSTAT_MISSING = "M"
 _MISSING_RETRY_SECONDS = 86400
 # Commits per git call when filling the cache. Small enough that the loading page's bar moves

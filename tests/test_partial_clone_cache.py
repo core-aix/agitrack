@@ -93,3 +93,37 @@ def test_the_file_browser_on_a_partial_clone_diffs_nothing_twice(tmp_path, monke
     calls = _count_numstat_calls(monkeypatch, files)
     files._numstat_by_commit(repo, known)
     assert calls == []
+
+
+def _missing_blobs(repo: GitRepo) -> int:
+    out = _git(repo.repo, "rev-list", "--objects", "--missing=print", "--all")
+    return sum(1 for line in out.splitlines() if line.startswith("?"))
+
+
+def test_only_opening_a_diff_downloads_anything(tmp_path):
+    """Contents a partial clone left on the remote stay there: building and showing the
+    dashboard downloads nothing, and opening one commit's diff downloads just what that diff
+    needs, after which that commit's line count is exact."""
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo, shas = _partial_clone(tmp_path)
+    before = _missing_blobs(repo)
+    assert before > 0
+
+    scope = RepoScope(repo)
+    scope.get("/data", {})
+    log = _json.loads(scope.get("/log", {"offset": ["0"], "limit": ["50"]}).body)
+    scope.get("/files", {})
+    assert _missing_blobs(repo) == before  # looking fetched nothing
+    row = next(entry for entry in log["entries"] if entry["sha"] == shas["two"])
+    assert (row["ins"], row["del"]) == (0, 0)  # a floor until someone opens it
+
+    diff = _json.loads(scope.get("/diff", {"sha": [shas["two"]]}).body)
+    assert "second version" in diff["diff"]
+    assert _missing_blobs(repo) < before  # the click fetched what it needed
+    assert (diff["ins"], diff["del"]) == (2, 1)
+    log = _json.loads(scope.get("/log", {"offset": ["0"], "limit": ["50"]}).body)
+    row = next(entry for entry in log["entries"] if entry["sha"] == shas["two"])
+    assert (row["ins"], row["del"]) == (2, 1)  # ...and the log shows it straight away
