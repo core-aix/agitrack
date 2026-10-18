@@ -327,6 +327,20 @@ class ManualCommitTracker:
                 self._debug(f"mark folded failed for {ref}: {error!r}")
         self.last_head = head
 
+    def discard_pending(self) -> int:
+        """Drop every pending latent turn, on every session's ref, without folding it anywhere.
+
+        The user's answer to "these turns from an earlier run never reached a commit; keep them?"
+        (issue #296). The refs move onto HEAD exactly as a fold would leave them, so nothing
+        reads them as pending again, and the trailer is re-rendered so a commit made before the
+        next poll cannot fold the discarded text from the old file. Returns how many turns were
+        dropped."""
+        count = self.pending_count()
+        if count:
+            self.mark_folded()
+        self.render_trailer()
+        return count
+
     def service(self) -> None:
         """Per-loop upkeep. With the hooks installed, react to a commit (the post-commit signal
         fired, or HEAD simply moved) by dropping the now-stale latent chain and re-rendering the
