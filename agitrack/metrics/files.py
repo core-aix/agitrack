@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
 from agitrack.metrics import progress
-from agitrack.metrics.collect import CommitStat
+from agitrack.metrics.collect import _MISSING_RETRY_SECONDS, CommitStat
 
 # A provider that returns the files a commit/turn changed, each as ``(path, insertions,
 # deletions)``. Empty for a change that touched no files (a pure-conversation turn, a merge).
@@ -326,15 +327,28 @@ def _numstat_by_commit(repo, known: set[str]) -> dict[str, list[tuple[str, int, 
         progress.step("indexing changed files", start, len(missing))
         batch = missing[start : start + _FILE_CHUNK]
         output = repo._run(
-            ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", "--stdin", "--"],
+            ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H %P", "--stdin", "--"],
             input_text="".join(f"{sha}\n" for sha in batch),
             check=False,
             allow_lazy_fetch=False,
         ).stdout
         fresh = _parse_numstat_rows(output, set(batch))
         out.update(fresh)
-        record = set(fresh) if partial else set(batch)
+        # A merge touches no files in this view whatever blobs are local, so its empty answer is
+        # final even on a partial clone. A commit that produced nothing there because its blobs
+        # are still on the remote is remembered as such, and retried after a day. Before, neither
+        # was recorded on a partial clone, so each rebuild of the browser diffed them all again:
+        # 27 s on every build on this repository (160 merges, 32 commits with remote blobs).
+        merges = {
+            parts[0]
+            for parts in (line[1:].split() for line in output.splitlines() if line.startswith("\x01"))
+            if len(parts) > 2
+        }
+        record = (set(fresh) | merges) if partial else set(batch)
         _write_file_numstat_cache(repo, computed, {sha: fresh.get(sha, []) for sha in record})
+        if partial:
+            unknown = [sha for sha in batch if sha not in record]
+            _write_file_numstat_cache(repo, computed, {sha: [] for sha in unknown}, missing=True)
     progress.step("indexing changed files", len(missing), len(missing))
     return out
 
@@ -345,7 +359,7 @@ def _parse_numstat_rows(output: str, wanted: set[str]) -> dict[str, list[tuple[s
     current: str | None = None
     for line in output.splitlines():
         if line.startswith("\x01"):
-            current = line[1:].strip()
+            current = (line[1:].split() or [""])[0]  # the sha, then (ignored) its parents
             continue
         if current is None or current not in wanted:
             continue
@@ -391,6 +405,16 @@ def _read_file_numstat_cache(repo) -> tuple[dict[str, list[tuple[str, int, int]]
             rows[parts[0]] = []  # a fresh record for this commit replaces anything before it
             computed.add(parts[0])
             continue
+        if len(parts) == 2 and parts[1].startswith("*M") and parts[1][2:].isdigit():
+            # Diffed on a partial clone while its blobs were still on the remote: nothing to show
+            # yet, and not worth diffing again until a day has passed.
+            if time.time() - int(parts[1][2:]) <= _MISSING_RETRY_SECONDS:
+                rows[parts[0]] = []
+                computed.add(parts[0])
+            else:
+                rows.pop(parts[0], None)
+                computed.discard(parts[0])
+            continue
         if len(parts) != 4 or parts[0] not in computed:
             continue  # a torn line, or rows whose header never arrived
         try:
@@ -400,7 +424,9 @@ def _read_file_numstat_cache(repo) -> tuple[dict[str, list[tuple[str, int, int]]
     return rows, computed
 
 
-def _write_file_numstat_cache(repo, existing: set[str], fresh: dict[str, list[tuple[str, int, int]]]) -> None:
+def _write_file_numstat_cache(
+    repo, existing: set[str], fresh: dict[str, list[tuple[str, int, int]]], *, missing: bool = False
+) -> None:
     """Append the newly diffed commits to the cache. Best-effort: a repo whose ``.agitrack/``
     cannot be written simply keeps recomputing."""
     if not fresh:
@@ -408,7 +434,7 @@ def _write_file_numstat_cache(repo, existing: set[str], fresh: dict[str, list[tu
     path = _file_numstat_cache_path(repo)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        text = _file_numstat_lines(fresh)
+        text = "".join(f"{sha}\t*M{int(time.time())}\n" for sha in fresh) if missing else _file_numstat_lines(fresh)
         if len(existing) + sum(len(rows) + 1 for rows in fresh.values()) > _FILE_CACHE_LIMIT:
             # Rewritten, not grown without bound: only what was just asked for is kept, so a
             # repo whose branches have moved on does not carry their commits forever.

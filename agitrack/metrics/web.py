@@ -3025,32 +3025,12 @@ function stackStickyBanner(){
   restackControls();
   window.addEventListener("resize", restackControls);
 }
-async function init(){
-  hideFabricatedChrome();
-  stackStickyBanner();
-  // Shell mode: the chrome is already on screen with the loading animation; fetch the
-  // real aggregates + first log page, then drop the loader and render. A big repo's
-  // git-log crunch happens here, behind the animation, instead of blocking first paint.
-  if(!HAVE_DATA){
-    // Paint the previous view first when there is one (returning from story/learn), so the
-    // page is immediately usable; the fetch below then quietly brings it up to date.
-    if(snapshotRestore()){
-      document.body.classList.remove("booting");
-      syncFilters(); renderAgg(); renderLog();
-    }
-    bootProgress(true);
-    try{ await loadAgg(); await loadLog(0); }
-    finally{ bootProgress(false); }           // always stop polling, even if a fetch failed
-    document.body.classList.remove("booting");
-  }
-  // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
-  // (server already gone), skip the renders — the offline banner is up and the poll
-  // below recovers once the server is back — rather than crashing on null data.
-  const ready = AGG && OPTIONS && LOGPAGE;
-  if(ready){ syncFilters(); }
-  // Show the real range from the first paint: bound the pickers to the history
-  // span and fill from/to with it (default period is "all time" = full history).
-  if(ready){ setDateBounds(); applyPeriod(); }
+// Every control is wired BEFORE any data is awaited. A restored view (returning from story/learn,
+// or the reload aGiTrack does after an update) is on screen at once, and the refresh behind it
+// can take a while: a restarted daemon re-reads the history first. Wiring after that await left
+// a page that looked ready and ignored every click, expanding a commit included, for as long as
+// the read took. The page must answer from its first paint, with a spinner for what is pending.
+function wireControls(){
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
   $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
@@ -3112,7 +3092,44 @@ async function init(){
   // Whether a commit message keeps its source line breaks depends on the column width, so
   // every open message is re-measured when the window changes size.
   let rf; window.addEventListener("resize", () => { clearTimeout(rf); rf = setTimeout(() => reflowParagraphs(document), 150); });
-  if(ready){ renderAgg(); renderLog(); }
+}
+async function init(){
+  hideFabricatedChrome();
+  stackStickyBanner();
+  wireControls();
+  // Shell mode: the chrome is already on screen with the loading animation; fetch the
+  // real aggregates + first log page, then drop the loader and render. A big repo's
+  // git-log crunch happens here, behind the animation, instead of blocking first paint.
+  let restored = false, shownLog = "";
+  if(!HAVE_DATA){
+    // Paint the previous view first when there is one, so the page is immediately usable; the
+    // fetch below then brings it up to date behind the small "loading" spinner.
+    if(snapshotRestore()){
+      restored = true;
+      document.body.classList.remove("booting");
+      syncFilters(); renderAgg(); renderLog();
+      shownLog = JSON.stringify(LOGPAGE);
+      showLoading(true);
+    }
+    bootProgress(!restored);
+    try{ await loadAgg(); await loadLog(0); }
+    finally{ bootProgress(false); if(restored) showLoading(false); }
+    document.body.classList.remove("booting");
+  }
+  // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
+  // (server already gone), skip the renders — the offline banner is up and the poll
+  // below recovers once the server is back — rather than crashing on null data.
+  const ready = AGG && OPTIONS && LOGPAGE;
+  if(ready){ syncFilters(); }
+  // Show the real range from the first paint: bound the pickers to the history
+  // span and fill from/to with it (default period is "all time" = full history).
+  if(ready){ setDateBounds(); applyPeriod(); }
+  if(ready){
+    renderAgg();
+    // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
+    // log that came back unchanged is left exactly as it is.
+    if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+  }
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();

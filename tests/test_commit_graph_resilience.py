@@ -279,7 +279,8 @@ def test_a_partial_clones_history_count_is_a_floor_the_page_still_recounts(tmp_p
     monkeypatch.setattr(GitRepo, "is_partial_clone", lambda self: True)
 
     stats = collect_commit_stats(repo, "HEAD")
-    assert all(line.endswith(" L") for line in _cache_lines(tmp_path))
+    # A floor either way: counted locally (L), or produced nothing locally (M, retried later).
+    assert all(line.endswith(" L") or line.split()[-1].startswith("M") for line in _cache_lines(tmp_path))
 
     by_sha = {s.sha: s for s in stats if s.sha}
     target = next(s for s in stats if s.subject == "c0")

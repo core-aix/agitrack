@@ -35,6 +35,7 @@ agent-merge) versus non-tracked (user + untracked); there is no "human" bucket.
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -1430,7 +1431,11 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
         for sha in batch:
             by_sha[sha].insertions += fresh[sha].insertions
             by_sha[sha].deletions += fresh[sha].deletions
-        _write_numstat_cache(repo, cached, _cache_rows(fresh, seen if partial else set(batch), tier))
+        rows = _cache_rows(fresh, seen if partial else set(batch), tier)
+        if partial:
+            stamp = f"{_NUMSTAT_MISSING}{int(time.time())}"
+            rows.update({sha: (0, 0, stamp) for sha in batch if sha not in seen})
+        _write_numstat_cache(repo, cached, rows)
     progress.step("counting changed lines", len(missing), len(missing))
 
 
@@ -1476,15 +1481,26 @@ def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tu
 
     ``--no-walk`` diffs each named commit against its parent with no ancestry traversal, so the
     work (and, when fetching is allowed, the network) is bounded to the commits asked for.
-    ``--stdin`` carries them with no argv length limit — a history of any size is one call."""
+    ``--stdin`` carries them with no argv length limit — a history of any size is one call.
+
+    A MERGE is in the returned set too: git reports no numstat for a merge whatever blobs are
+    present, so its 0 is final. Without that, a partial clone (where "no rows" otherwise means
+    "the blobs may still be on the remote") never cached a single merge, and every rebuild diffed
+    all of them again: 160 merges, 8 of the 9 seconds a restarted dashboard spent re-reading this
+    repository's history before the page could answer."""
     output = repo._run(
-        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", "--stdin", "--"],
+        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H %P", "--stdin", "--"],
         input_text="".join(f"{sha}\n" for sha in shas),
         check=False,
         allow_lazy_fetch=allow_lazy_fetch,
     ).stdout
     fresh: dict[str, CommitStat] = {sha: CommitStat(sha=sha, author="", email="", subject="", kind="") for sha in shas}
-    return fresh, _accumulate_numstat(output, fresh)
+    merges = {
+        parts[0]
+        for parts in (line[1:].split() for line in output.splitlines() if line.startswith(_FIELD_SEP))
+        if len(parts) > 2
+    }
+    return fresh, _accumulate_numstat(output, fresh) | merges
 
 
 # The on-disk cache: one line per commit, `<sha> <insertions> <deletions> <tier>`.
@@ -1496,6 +1512,14 @@ def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tu
 # displayed, which apply_numstat_for recounts and then records as EXACT.
 _NUMSTAT_EXACT = "E"
 _NUMSTAT_LOCAL = "L"
+# MISSING: a partial clone diffed a commit without fetching and git emitted nothing, because the
+# blobs are still on the remote. Written as `M<epoch>` and counted as 0 (a floor, like LOCAL)
+# until it is a day old, then tried again in case the blobs have arrived since. Before this the
+# commit was simply not recorded, so every rebuild diffed it again for nothing: 32 such commits
+# cost a restarted dashboard 3.8 s on this repository, every time. A commit being DISPLAYED is
+# still recounted exactly by apply_numstat_for, which accepts nothing but EXACT.
+_NUMSTAT_MISSING = "M"
+_MISSING_RETRY_SECONDS = 86400
 # Commits per git call when filling the cache. Small enough that the loading page's bar moves
 # several times a second on a slow history, large enough that git's own start-up cost stays
 # noise next to the diffing.
@@ -1534,8 +1558,15 @@ def _read_numstat_cache(repo: GitRepo) -> dict[str, tuple[int, int, str]]:
     counts: dict[str, tuple[int, int, str]] = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) != 4 or parts[3] not in (_NUMSTAT_EXACT, _NUMSTAT_LOCAL):
-            continue  # a torn last line from a concurrent append, or a format we do not know
+        if len(parts) != 4:
+            continue  # a torn last line from a concurrent append
+        tier = parts[3]
+        if tier.startswith(_NUMSTAT_MISSING) and tier[1:].isdigit():
+            if time.time() - int(tier[1:]) > _MISSING_RETRY_SECONDS:
+                counts.pop(parts[0], None)  # old enough to try again: the blobs may be here now
+                continue
+        elif tier not in (_NUMSTAT_EXACT, _NUMSTAT_LOCAL):
+            continue  # a format we do not know
         try:
             counts[parts[0]] = (int(parts[1]), int(parts[2]), parts[3])
         except ValueError:
@@ -1582,7 +1613,7 @@ def _accumulate_numstat(output: str, by_sha: dict[str, CommitStat]) -> set[str]:
     seen: set[str] = set()
     for line in output.splitlines():
         if line.startswith(_FIELD_SEP):
-            current_sha = line[1:].strip()
+            current_sha = (line[1:].split() or [""])[0]  # the sha, then (ignored) its parents
             current = by_sha.get(current_sha)
             continue
         match = _NUMSTAT_RE.match(line)

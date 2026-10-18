@@ -2649,3 +2649,19 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
     assert row.index('class="ksub"') < row.index('class="emeta"') < row.index('class="when"')
     assert f">{local}</span>" in result.stdout  # the reader's local time on the row
     assert f"({utc} UTC)" in result.stdout  # and the same moment in UTC on hover
+
+
+def test_the_page_answers_clicks_before_its_first_fetch_returns():
+    """A restored view is on screen at once, and the refresh behind it can take as long as a
+    restarted daemon needs to re-read the history. The commit-log click handler (expanding a
+    commit) was attached only AFTER that fetch, so the page looked ready and ignored clicks for
+    up to a minute. Every control is wired before anything is awaited, and the refresh behind a
+    restored view shows the loading spinner."""
+    html = _rendered_dashboard()
+    wire = html.index("function wireControls(){")
+    init = html.index("async function init(){")
+    body = html[init : html.index("\n}\n", init)]
+    assert body.index("wireControls();") < body.index("await loadAgg()")
+    controls = html[wire:init]
+    assert '$("commitlog").addEventListener("click"' in controls
+    assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
