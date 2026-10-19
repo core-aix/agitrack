@@ -2667,6 +2667,68 @@ def test_the_page_answers_clicks_before_its_first_fetch_returns():
     assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
 
 
+def test_the_log_search_can_look_in_the_users_words_the_agents_words_or_the_whole_trace(tmp_path):
+    """Beyond the subject and the whole message, the search can be narrowed to what the user
+    said, what the agent said, or the interaction trace (the metadata is outside all three)."""
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _demo_repo(tmp_path)
+    _write_lines(repo, "y.txt", 2)
+    repo.commit(
+        "Tidy the parser\n\n"
+        "# Interaction Trace\n\n## User\n\nplease rename the PINEAPPLE helper\n\n"
+        "## Agent\n\nRenamed it; the KUMQUAT test still passes.\n\n"
+        "```\n## User\nQUOTED inside a fence\n```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: GUAVA-model\n"
+    )
+    scope = RepoScope(repo)
+
+    def found(q, qin):
+        body = scope.get("/log", {"q": [q], "qin": [qin]}).body
+        return [entry["subject"] for entry in _json.loads(body)["entries"]]
+
+    hit = ["Tidy the parser"]
+    assert found("pineapple", "user") == hit and found("pineapple", "agent") == []
+    assert found("kumquat", "agent") == hit and found("kumquat", "user") == []
+    assert found("kumquat pineapple", "trace") == hit
+    assert found("quoted", "agent") == hit  # a fenced "## User" is the agent's text, not a role
+    assert found("guava", "trace") == [] and found("guava", "all") == hit  # metadata is not trace
+    assert found("pineapple", "nonsense") == []  # an unknown scope falls back to the subject
+
+
+def test_a_squash_says_which_of_its_parts_match_the_search_before_it_is_opened(tmp_path):
+    """A search matching a squash marks the parts that hold the words, and counts them on the
+    squash's own row, so the reader knows which squash (and which part) is worth opening."""
+    from agitrack.commits import build_auto_fold_message
+    from agitrack.metrics.collect import _parse_constituents
+    from agitrack.metrics.web import _mark_matching_parts, _part_payload, _text_filtered
+
+    def body(prompt: str) -> str:
+        return build_agent_commit_message(
+            latest_prompt=prompt,
+            trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "did " + prompt}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 3, "input": 5},
+        )
+
+    message = build_auto_fold_message([body("rename the PAPAYA helper"), body("fix the docs"), body("tidy up")])
+    parts = _parse_constituents(message)
+    stat = CommitStat(
+        sha="x", author="", email="", subject="tidy up", kind="agent", message=message, constituents=parts
+    )
+    assert _text_filtered([stat], "papaya", "user") == [stat]
+
+    payload = [_part_payload(part) for part in parts]
+    assert _mark_matching_parts(payload, "papaya", "user") == 1
+    assert [bool(p.get("match")) for p in payload] == [True, False, False]
+    assert _mark_matching_parts(payload, "", "user") == 0  # no search, no marks
+
+
 def test_the_log_search_finds_a_commit_by_subject_or_by_what_was_asked(tmp_path):
     """The log's search box narrows the log alone: every word, ignoring case, in the subject or
     (`qin=all`) anywhere in the message, which is where the trace records what was asked."""

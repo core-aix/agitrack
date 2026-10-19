@@ -857,9 +857,9 @@ def log_page(
     payload stay bounded however deep the history is.
 
     ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
-    word must appear, ignoring case, in the commit's subject (``text_in="subject"``) or anywhere
-    in its message (``"all"``: the trace, so what was ASKED is findable). A squash's parts count
-    as part of it.
+    word must appear, ignoring case, in the part ``text_in`` names: the subject, the user's
+    messages, the agent's messages, the whole interaction trace, or the whole message
+    (:data:`_TEXT_SCOPES`). A squash's parts count as part of it.
 
     When ``repo`` is given, the page's commits get their line counts from the cache or the
     local blobs, never by fetching (see :func:`agitrack.metrics.collect.apply_numstat_for`)."""
@@ -876,23 +876,93 @@ def log_page(
         "total": len(stats),
         "offset": offset,
         "limit": limit,
-        "entries": [_log_entry(dash, stat, covers) for stat in page],
+        "entries": [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page],
     }
 
 
+def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
+    count = _mark_matching_parts(entry.get("parts") or [], text, text_in)
+    if count:
+        entry["part_matches"] = count
+    return entry
+
+
+_TEXT_SCOPES = ("subject", "user", "agent", "trace", "all")
+
+
+def _trace_sections(message: str) -> dict[str, str]:
+    """A commit message's interaction trace split the way the search offers it: what the user
+    said (every ``## User`` section), what the agent said (every ``## Agent`` section) and the
+    whole trace. A squash or a fold carries one trace per turn, and all of them count. Fenced
+    code is followed so a ``## User`` QUOTED inside a message is not read as a heading; a
+    message's own headings are pushed down two levels when the trace is written, so a line
+    starting ``## `` outside a fence is always a role."""
+    sections: dict[str, list[str]] = {"user": [], "agent": [], "trace": []}
+    in_trace = in_fence = False
+    role: str | None = None
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            role = None
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            role = {"## User": "user", "## Agent": "agent"}.get(stripped)
+            continue
+        if in_trace:
+            sections["trace"].append(line)
+            if role:
+                sections[role].append(line)
+    return {key: "\n".join(lines) for key, lines in sections.items()}
+
+
 def _text_filtered(stats: list[CommitStat], text: str, text_in: str) -> list[CommitStat]:
-    """The commits whose subject (or whole message) holds every word of ``text``, ignoring case."""
+    """The commits holding every word of ``text``, ignoring case, in the part of the commit
+    ``text_in`` names: the subject, what the user said, what the agent said, the interaction
+    trace, or the whole message."""
     words = [word for word in (text or "").lower().split() if word]
     if not words:
         return stats
-    whole = text_in == "all"
+    scope = text_in if text_in in _TEXT_SCOPES else "subject"
 
     def haystack(stat: CommitStat) -> str:
-        parts = [stat.message if whole else stat.subject]
-        parts += [(part.message if whole else part.subject) or "" for part in stat.constituents]
+        if scope == "subject":
+            parts = [stat.subject, *(part.subject for part in stat.constituents)]
+        elif scope == "all":
+            parts = [stat.message, *(part.message for part in stat.constituents)]
+        else:
+            parts = [_trace_sections(stat.message)[scope]]
         return "\n".join(part or "" for part in parts).lower()
 
     return [stat for stat in stats if all(word in haystack(stat) for word in words)]
+
+
+def _mark_matching_parts(parts: list[dict], text: str, text_in: str) -> int:
+    """Flag each squashed part (``match: True``) holding every search word in the searched
+    scope, recursively, and return how many of THIS level's parts match. A squash's row shows
+    the count and each matching part a badge, so the reader can tell which squash, and which
+    part inside it, is worth opening before opening it."""
+    words = [word for word in (text or "").lower().split() if word]
+    if not words:
+        return 0
+    scope = text_in if text_in in _TEXT_SCOPES else "subject"
+    count = 0
+    for part in parts:
+        message = part.get("message") or ""
+        if scope == "subject":
+            hay = part.get("subject") or ""
+        elif scope == "all":
+            hay = message
+        else:
+            hay = _trace_sections(message)[scope]
+        hay = hay.lower()
+        inner = _mark_matching_parts(part.get("parts") or [], text, text_in)
+        if all(word in hay for word in words) or inner:
+            part["match"] = True
+            count += 1
+    return count
 
 
 # A commit id must be a bare hex object name before it is handed to git, so a crafted
@@ -1510,6 +1580,13 @@ __UI_COMMIT_CSS__
    page needs this to actually hide (the files filter showed in the commits view without it). */
 #head-files,#head-commits{margin:0 0 12px}
 .logsearch .filesearch{min-width:min(70vw,320px)}
+/* A search word found on the page: the amber of the controls, so it reads as "what you asked
+   for", and dark text on it so it stays legible inside code and the dim trace prose alike. */
+mark.hit{background:var(--amber);color:var(--ink);border-radius:2px;padding:0 1px}
+/* The same amber on the "N match(es)" note beside a squash and the "match" badge on each part
+   that contains the search words: where to look, before anything is opened. */
+.pmatch{color:var(--ink);background:var(--amber);border-radius:2px;padding:0 5px;font-size:11px;
+  letter-spacing:.3px;white-space:nowrap}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1710,6 +1787,9 @@ __UPDATE_BANNER__
   </div>
   <div class="panehead" id="head-commits"><div class="logsort logsearch"><input id="f-text" class="filesearch" type="search" placeholder="search commits…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
       <option value="subject">subject</option>
+      <option value="user">user messages</option>
+      <option value="agent">agent messages</option>
+      <option value="trace">interaction trace</option>
       <option value="all">full message</option>
     </select></div></div>
   <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
@@ -1822,6 +1902,37 @@ function setOffline(on){
 // Show the "loading…" spinner while a user-initiated filter change re-fetches the data
 // (not during the background refresh poll, which would make it flicker constantly).
 function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
+
+// --- the commit search: what it searches, and marking what it found ---------------------
+const QIN_LABEL = {subject:"subject", user:"user messages", agent:"agent messages",
+                   trace:"interaction trace", all:"full message"};
+function searchWords(){ return (state.q || "").toLowerCase().split(/\s+/).filter(Boolean); }
+// Wrap every occurrence of the search words in <mark class="hit"> inside `root`, wherever it
+// shows on the page (a log row, an expanded message, a squash's parts), whichever part of the
+// commit the search ran over: a word is worth pointing at wherever the reader's eye lands on
+// it. TEXT nodes only, so no markup is ever re-parsed (a word inside a tag or an attribute is
+// never touched), and nothing inside a button or an existing mark.
+function highlightIn(root){
+  const words = searchWords();
+  if(!root || !words.length || !document.createTreeWalker) return;
+  const re = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "gi");
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {acceptNode: n =>
+    (n.parentNode && n.parentNode.closest && n.parentNode.closest("mark.hit, button, script, style"))
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT});
+  const hits = [];
+  while(walker.nextNode()){ const n = walker.currentNode; re.lastIndex = 0; if(re.test(n.nodeValue)) hits.push(n); }
+  for(const n of hits){
+    const text = n.nodeValue, frag = document.createDocumentFragment();
+    let last = 0, m; re.lastIndex = 0;
+    while((m = re.exec(text))){
+      if(m.index > last) frag.append(text.slice(last, m.index));
+      const mark = document.createElement("mark"); mark.className = "hit"; mark.textContent = m[0];
+      frag.append(mark); last = m.index + m[0].length;
+    }
+    if(last < text.length) frag.append(text.slice(last));
+    n.parentNode.replaceChild(frag, n);
+  }
+}
 
 function qs(extra){
   const p = new URLSearchParams();
@@ -2393,7 +2504,10 @@ function renderLog(){
     // is already tracked vs. what `--backtrace commit` would still add.
     const trk = (BACKTRACE && c.tracked)?`<span class="badge tracked" title="already committed to git with aGiTrack metadata">committed</span>`:"";
     const anom = c.token_anomaly?`<span class="badge anomaly" title="This commit re-exported conversation history that earlier commits already accounted for (a lost watermark on an older aGiTrack), so its token counts are excluded from every total.">tokens excluded</span>`:"";
-    const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
+    // With a search on, a squash also says how many of its parts match, so the reader can tell
+    // which squash is worth opening without opening each one.
+    const pm = c.part_matches ? ` · <span class="pmatch">${c.part_matches} matching part${c.part_matches===1?"":"s"}</span>` : "";
+    const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed${pm}</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
@@ -2435,9 +2549,10 @@ function renderLog(){
     `<button id="log-last" title="last page" ${nextDis}>»</button>`+
     `<span class="loading pgload" id="pgloading" hidden aria-live="polite"><span class="spin"></span>loading…</span></span>${gotoBox}</div>`;
   const none = state.q
-    ? `no commits match "${esc(state.q)}" in the ${state.qin === "all" ? "full message" : "subject"}`
+    ? `no commits match "${esc(state.q)}" in the ${QIN_LABEL[state.qin] || "subject"}`
     : "no commits";
   $("commitlog").innerHTML = (rows || `<div class="empty">${none}</div>`) + pager;
+  highlightIn($("commitlog"));
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -2480,7 +2595,9 @@ function partsHtml(parts){
       `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
     const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
-      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>${right}</summary>`+
+      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>`+
+      (p.match ? `<span class="pmatch" title="this part contains what you searched for">match</span>` : "")+
+      `${right}</summary>`+
       (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
@@ -2532,6 +2649,7 @@ function toggleDetail(i){
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);
     reflowParagraphs(detail);   // covers the squashed constituents' messages too
+    highlightIn(detail);        // the search words, in the message and in every part
   });
 }
 
@@ -2572,6 +2690,7 @@ async function toggleDiff(i){
     body.dataset.mode = "msg"; body.className = "dmsg md";
     body.innerHTML = md(c.message||"(no message recorded)");
     reflowParagraphs(body);
+    highlightIn(body);
     if(btn) btn.textContent = "show file diff";
     return;
   }
