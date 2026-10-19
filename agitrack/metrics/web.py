@@ -24,6 +24,7 @@ and ad-hoc use; the live page does not embed it.
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -428,6 +429,11 @@ def _effective(stat: CommitStat, covers: dict[str, CommitStat]) -> tuple[str | N
 # ---------------------------------------------------------------------------
 
 PAGE_SIZE = 50
+# The timeline shows each commit's messages beside it, so a page of 50 commits can hold hundreds
+# of items. A timeline page therefore also ends once it holds this many items, commits and
+# messages together (a commit is never split from its messages, so one commit with more
+# messages than this is a page of its own).
+TIMELINE_PAGE_ITEMS = 250
 _KINDS = ("agent", "covered", "agent-merge", "user", "agitrack-ops", "untracked")
 
 
@@ -837,25 +843,42 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     }
 
 
-def _timeline_turns(stat: CommitStat) -> list[dict]:
+def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
     """The turns behind a commit, oldest first, each with when it began (``at``, epoch seconds,
     None when the turn recorded no start) and every message the user sent in it, in full, for
     the log's timeline view. A squash or a fold has one turn per part (recursively); the fold's
     own lead block is the commit itself and holds no prompt. Messages sent while a turn ran (a
-    queued follow-up) carry no time of their own in the trace, so they share the turn's."""
+    queued follow-up) carry no time of their own in the trace, so they share the turn's.
+
+    Each turn also says WHERE its messages are shown when the commit is opened, so the
+    timeline's link can open that place and mark the message: ``path`` is the part's position
+    in the displayed parts tree (newest first, as :func:`_display_parts` orders it; empty for
+    the commit's own message), and ``sections`` gives, per prompt, which ``## User`` section of
+    that message's interaction trace it is."""
     parts = list(stat.constituents)
     if parts and _is_own_lead(parts[0], stat):
         parts = parts[1:]
     if not parts:
-        messages = _trace_user_messages(stat.message)
-        return [{"at": _iso_epoch(stat.started_at), "prompts": messages}] if messages else []
-    return [turn for part in parts for turn in _timeline_turns(part)]
+        found = _trace_user_sections(stat.message)
+        if not found:
+            return []
+        return [
+            {
+                "at": _iso_epoch(stat.started_at),
+                "prompts": [text for _, text in found],
+                "path": list(path),
+                "sections": [ordinal for ordinal, _ in found],
+            }
+        ]
+    last = len(parts) - 1
+    return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j))]
 
 
-def _trace_user_messages(message: str) -> list[str]:
-    """Every ``## User`` section of a message's interaction trace, one string each, its text
-    kept as written. Fence-aware like :func:`_trace_sections`, so a heading QUOTED in a code
-    block is not a role."""
+def _trace_user_sections(message: str) -> list[tuple[int, str]]:
+    """Every non-empty ``## User`` section of a message's interaction trace, its text kept as
+    written, with its ordinal among ALL the trace's ``## User`` sections (empty ones counted),
+    so the page can find the same section in the rendered message. Fence-aware like
+    :func:`_trace_sections`, so a heading QUOTED in a code block is not a role."""
     messages: list[list[str]] = []
     in_trace = in_fence = in_user = False
     for line in (message or "").splitlines():
@@ -873,7 +896,8 @@ def _trace_user_messages(message: str) -> list[str]:
             continue
         if in_trace and in_user:
             messages[-1].append(line)
-    return [text for text in ("\n".join(lines).strip() for lines in messages) if text]
+    found = ((k, "\n".join(lines).strip()) for k, lines in enumerate(messages))
+    return [(k, text) for k, text in found if text]
 
 
 def log_page(
@@ -891,10 +915,17 @@ def log_page(
     sort: str = DEFAULT_LOG_SORT,
     text: str = "",
     text_in: str = "subject",
+    view: str = "commits",
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
+
+    ``view="timeline"`` pages the way the timeline shows the log: a page ends at ``limit``
+    commits or at :data:`TIMELINE_PAGE_ITEMS` items, commits and their messages together,
+    whichever comes first. Pages then differ in size, so the payload carries ``page_starts``
+    (every page's offset) for the pager, and an ``offset`` inside a page is moved back to that
+    page's start (switching from the commit list keeps the reader where they were).
 
     ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
     word must appear, ignoring case, in the part ``text_in`` names: the subject, the user's
@@ -909,15 +940,59 @@ def log_page(
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
-    page = stats[offset : offset + limit]
+    starts: list[int] | None = None
+    if view == "timeline":
+        starts = _timeline_page_starts(stats, limit)
+        index = bisect.bisect_right(starts, offset) - 1
+        offset = starts[index]
+        end = starts[index + 1] if index + 1 < len(starts) else len(stats)
+        page = stats[offset:end]
+    else:
+        page = stats[offset : offset + limit]
     if repo is not None and page:
         apply_numstat_for(repo, [stat.sha for stat in page], {stat.sha: stat for stat in page})
-    return {
+    payload = {
         "total": len(stats),
         "offset": offset,
         "limit": limit,
         "entries": [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page],
     }
+    if starts is not None:
+        payload["page_starts"] = starts
+    return payload
+
+
+def _timeline_page_starts(stats: list[CommitStat], limit: int) -> list[int]:
+    """Where each timeline page begins. A page holds at most ``limit`` commits and at most
+    :data:`TIMELINE_PAGE_ITEMS` items (each commit plus the messages shown with it): a commit
+    that would take it past either starts the next page. A commit is never split from its
+    messages, so the one exception is a single commit with more than that many, alone on its page."""
+    starts = [0]
+    commits = items = 0
+    for index, stat in enumerate(stats):
+        size = 1 + _message_count(stat)
+        if commits and (commits >= limit or items + size > TIMELINE_PAGE_ITEMS):
+            starts.append(index)
+            commits = items = 0
+        commits += 1
+        items += size
+    return starts
+
+
+# How many messages each commit shows in the timeline, by commit. A commit's message never
+# changes, so the count is worked out once; every timeline page request needs the whole
+# filtered history's counts (24 ms for this repository's 1,151 commits, uncached).
+_MESSAGE_COUNTS: dict[tuple[str, int], int] = {}
+
+
+def _message_count(stat: CommitStat) -> int:
+    key = (stat.sha, len(stat.message))
+    count = _MESSAGE_COUNTS.get(key)
+    if count is None:
+        if len(_MESSAGE_COUNTS) > 50_000:
+            _MESSAGE_COUNTS.clear()
+        count = _MESSAGE_COUNTS[key] = sum(len(turn["prompts"]) for turn in _timeline_turns(stat))
+    return count
 
 
 def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
@@ -1055,7 +1130,7 @@ def initial_payload(
         "backtrace": backtrace,
         "insights": insights or [],
         **aggregates_payload(dash, frm=frm),
-        "log": log_page(dash, frm=frm),
+        "log": log_page(dash, frm=frm, view="timeline"),
         "shared_sessions": shared_sessions or [],
     }
 
@@ -1503,24 +1578,44 @@ h2.section::before{content:"# ";color:var(--amber)}
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
 .entry .ksub{flex:1;min-width:200px;color:var(--fg);overflow-wrap:anywhere}
-/* The timeline: the user's messages between the commits they went into. */
-.tprompt{position:relative;margin:6px 0 6px 18px;padding:7px 10px 8px 12px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06)}
-.tprompt .thead{display:flex;gap:10px;align-items:baseline;font-size:11.5px;color:var(--fg-dim);margin-bottom:3px}
+/* The timeline: the user's messages between the commits they went into. A message is an item
+   on the rail in its own right, level with the commits and with its own marker (a diamond where
+   a commit has a dot): indented under a commit it read as part of that commit, when it belongs to
+   whichever commit its link names, often not the one drawn above it. */
+.tprompt{position:relative;padding:9px 10px 10px 12px;border-bottom:1px dashed var(--line);background:rgba(103,184,214,.05)}
+.tprompt:last-child{border-bottom:none}
+.tprompt::before{content:"";position:absolute;left:-30px;top:13px;width:9px;height:9px;transform:rotate(45deg);
+  background:var(--ink);border:2px solid var(--ops)}
+.tprompt .thead{display:flex;flex-wrap:wrap;gap:2px 10px;align-items:baseline;font-size:11.5px;color:var(--fg-dim);margin-bottom:3px}
 .tprompt .twho{color:var(--ops);letter-spacing:.5px;font-size:11px}
 .tprompt .twho .tid{font-weight:600}
 .tprompt .when{font-variant-numeric:tabular-nums;white-space:nowrap}
-.tprompt .tgo{margin-left:auto;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
+.tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
+.tprompt .tgo .tsha{font-variant-numeric:tabular-nums}
 .tprompt .tbody{color:var(--fg);overflow-wrap:anywhere}
 .tprompt .tbody > :first-child{margin-top:0}
 .tprompt .tbody > :last-child{margin-bottom:0}
 .tprompt .tmore{display:none;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:4px 0 0;cursor:pointer}
 .tprompt.clamp .tbody{max-height:15em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
-.tprompt.clamp .tmore{display:inline}
+/* A long message keeps its toggle both ways: "show all" while cut off, "collapse" once open. */
+.tprompt.clamp .tmore,.tprompt.long .tmore{display:inline}
+/* While an opened long message is on screen, its "collapse" stays at the bottom of the screen
+   (sticky inside the message, so it rests at the message's end once that is reached): it can be
+   collapsed from anywhere in it, without scrolling to the end first. */
+.tprompt.long:not(.clamp) .tmore{display:inline-block;position:sticky;bottom:10px;z-index:1;margin-top:6px;
+  padding:3px 10px;background:var(--ink);border:1px solid var(--amber-dim);box-shadow:0 2px 10px rgba(0,0,0,.5)}
+.tprompt.long:not(.clamp) .tmore:hover{border-color:var(--amber)}
 .log.timeline .entry.linked,.tprompt.linked{background:rgba(255,180,84,.08)}
-.entry.flash{animation:tflash 1.2s ease-out}
+.entry.flash,.tlmark.flash,.tprompt.flash{animation:tflash 1.2s ease-out}
 @keyframes tflash{from{background:rgba(255,180,84,.3)}to{background:transparent}}
-@media (prefers-reduced-motion: reduce){.entry.flash{animation:none}}
+@media (prefers-reduced-motion: reduce){.entry.flash,.tlmark.flash,.tprompt.flash{animation:none}}
+/* The message a timeline link was followed from, marked inside the opened commit. */
+.dmsg .tlmark{position:relative;margin:6px 0;padding:1px 10px;border-left:2px solid var(--amber);background:rgba(255,180,84,.08)}
+/* Undo the link: close what it opened and return to the message it was followed from. */
+.tlmark .tlback{float:right;margin:8px 0 4px 10px;font:inherit;font-size:11.5px;color:var(--amber);background:var(--ink);
+  border:1px solid var(--amber-dim);padding:2px 8px;cursor:pointer}
+.tlmark .tlback:hover,.tlmark .tlback:focus-visible{border-color:var(--amber);outline:none}
 .entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
@@ -1559,8 +1654,9 @@ __UI_COMMIT_CSS__
 .dmsg.md p{margin:7px 0}
 /* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway):
    the source line breaks stop rendering and the paragraph flows as prose. The
-   space preceding each <br> in the markup keeps the words apart. */
-.dmsg.md p.mdp.reflow br{display:none}
+   space preceding each <br> in the markup keeps the words apart. Not
+   scoped to .dmsg: the timeline's messages are rendered outside one. */
+p.mdp.reflow br{display:none}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
 /* Heading depth reads at a glance: structural sections (# …) brightest/largest,
    the ## User/## Agent role one step down, and a message's own nested headings
@@ -1638,6 +1734,14 @@ __UI_COMMIT_CSS__
    page needs this to actually hide (the files filter showed in the commits view without it). */
 #head-files,#head-commits{margin:0 0 12px}
 .logsearch .filesearch{min-width:min(70vw,320px)}
+/* The search box's own clear button, shown while there is something to clear. The browser's
+   built-in one is hidden: only some browsers draw it, and in their own colours. */
+.searchbox{position:relative;display:inline-flex}
+.searchbox .filesearch{padding-right:28px}
+.searchbox input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
+.sclear{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:20px;height:20px;padding:0;
+  border:0;background:none;color:var(--fg-dim);font:inherit;font-size:16px;line-height:20px;cursor:pointer}
+.sclear:hover,.sclear:focus-visible{color:var(--amber);outline:none}
 /* A search word found on the page: the amber of the controls, so it reads as "what you asked
    for", and dark text on it so it stays legible inside code and the dim trace prose alike. */
 mark.hit{background:var(--amber);color:var(--ink);border-radius:2px;padding:0 1px}
@@ -1703,7 +1807,7 @@ footer .flink:hover{text-decoration:underline}
   /* Rail line and entry dots stay concentric at the narrower offset. */
   .log{padding-left:18px}
   .log::before{left:6px}
-  .entry::before{left:-17.5px}
+  .entry::before,.tprompt::before{left:-17.5px}
   .entry .ksub{min-width:0;flex-basis:100%}
 }
 </style>
@@ -1834,8 +1938,8 @@ __UPDATE_BANNER__
   </div>
   <div class="panebar">
     <div class="logtabs">
-      <button class="logtab active" data-tab="commits">commits</button>
-      <button class="logtab" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
+      <button class="logtab active" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
+      <button class="logtab" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
@@ -1844,7 +1948,7 @@ __UPDATE_BANNER__
       <option value="tokens">most output tokens</option>
     </select></div>
   </div>
-  <div class="panehead" id="head-commits"><div class="logsort logsearch"><input id="f-text" class="filesearch" type="search" placeholder="search commits…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
+  <div class="panehead" id="head-commits"><div class="logsort logsearch"><span class="searchbox"><input id="f-text" class="filesearch" type="search" placeholder="search…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><button type="button" id="f-text-clear" class="sclear" title="clear the search" aria-label="clear the search" hidden>×</button></span><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
       <option value="subject">subject</option>
       <option value="user">user messages</option>
       <option value="agent">agent messages</option>
@@ -1966,8 +2070,10 @@ function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
 const QIN_LABEL = {subject:"subject", user:"user messages", agent:"agent messages",
                    trace:"interaction trace", all:"full message"};
 const LOGTAB_KEY = "agitrack:logtab";
-let LOGTAB = "commits";
-try{ if(localStorage.getItem(LOGTAB_KEY) === "timeline") LOGTAB = "timeline"; }catch(e){}
+// The timeline is the default view: it is the log with what was asked laid in between, so it
+// answers more at a glance. A reader who chose the plain commit list keeps it.
+let LOGTAB = "timeline";
+try{ if(localStorage.getItem(LOGTAB_KEY) === "commits") LOGTAB = "commits"; }catch(e){}
 function searchWords(){ return (state.q || "").toLowerCase().split(/\s+/).filter(Boolean); }
 // Wrap every occurrence of the search words in <mark class="hit"> inside `root`, wherever it
 // shows on the page (a log row, an expanded message, a squash's parts), whichever part of the
@@ -2098,6 +2204,7 @@ async function loadAgg(){
 }
 async function loadLog(offset){
   const extra = {offset:offset||0, limit:PAGE_SIZE, sort:state.sort};
+  if(LOGTAB === "timeline") extra.view = "timeline";  // pages by commits AND messages (log_page)
   if(state.q){ extra.q = state.q; extra.qin = state.qin; }   // searches the log only, like the sort
   try{ const r = await fetch("log?"+qs(extra), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
@@ -2559,6 +2666,13 @@ function commitWhen(ts){
 // sent; under another sort, each commit is followed by its own messages. Each message is labelled
 // with its commit's committer ID: a log holds several people's work, and the trace records no
 // sender of its own.
+// The long-message toggle says what pressing it will do.
+function setMessageToggle(el){
+  const more = el.querySelector(".tmore"), cut = el.classList.contains("clamp");
+  if(!more) return;
+  more.textContent = cut ? "show all" : "collapse";
+  more.title = cut ? "show the whole message" : "cut the message short again";
+}
 function timelineHtml(entries, commitRow){
   const items = [];
   entries.forEach((c, i) => {
@@ -2566,7 +2680,8 @@ function timelineHtml(entries, commitRow){
     let seq = 0;
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
-        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text});
+        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text,
+          path: turn.path || [], sec: (turn.sections || [])[k]});
       });
     }
   });
@@ -2579,7 +2694,8 @@ function timelineHtml(entries, commitRow){
     const when = it.approx
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
       : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
-    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
+    const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
+    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
@@ -2621,7 +2737,12 @@ function renderLog(){
   const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
   $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
   const from = total ? offset+1 : 0, to = offset+entries.length;
-  const pages = Math.max(1, Math.ceil(total/limit)), cur = Math.min(pages, Math.floor(offset/limit)+1);
+  // The timeline's pages differ in size (a page ends at 50 commits or 250 items, see log_page), so
+  // the server names where each one starts; the commit list's pages are all `limit` long.
+  const starts = LOGTAB === "timeline" ? LOGPAGE.page_starts : null;
+  const pages = starts ? Math.max(1, starts.length) : Math.max(1, Math.ceil(total/limit));
+  const cur = starts ? Math.max(1, starts.filter(s => s <= offset).length) : Math.min(pages, Math.floor(offset/limit)+1);
+  const pageOffset = p => starts ? (starts[p-1] || 0) : (p-1)*limit;
   // Numbered page buttons: all of them when few, otherwise first + a window around
   // the current page + last, with … gaps (0 marks a gap).
   let nums = [];
@@ -2652,9 +2773,17 @@ function renderLog(){
   document.querySelectorAll("#commitlog .tprompt .tbody").forEach(reflowParagraphs);
   highlightIn($("commitlog"));
   // A long message is shown clamped; one holding a search hit is shown whole, so the hit is seen.
+  // A message that only just overflows is shown whole too: the clamped box carries a "show all"
+  // line of its own, so when the hidden part is no taller than that line, showing everything
+  // takes no more room, and pressing "show all" would only have made the box SHORTER.
+  // A message that is long enough to cut off is marked `long`, so once opened it can be collapsed
+  // again; one shown whole because it holds a search hit is long too, and starts open.
   document.querySelectorAll("#commitlog .tprompt.clamp").forEach(el => {
+    const body = el.querySelector(".tbody"), more = el.querySelector(".tmore");
+    if(body.scrollHeight <= body.clientHeight + (more ? more.offsetHeight : 0) + 2){ el.classList.remove("clamp"); return; }
+    el.classList.add("long");
     if(el.querySelector("mark.hit")) el.classList.remove("clamp");
-    else if(el.querySelector(".tbody").scrollHeight <= el.querySelector(".tbody").clientHeight + 2) el.classList.remove("clamp");
+    setMessageToggle(el);
   });
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
@@ -2663,7 +2792,7 @@ function renderLog(){
     // selector. renderLog replaces the whole log (badge included) on success; only a
     // failed fetch leaves this pager standing, so re-hide it then.
     const busy = $("pgloading"); if(busy) busy.hidden = false;
-    if(await loadLog((p-1)*limit)) renderLog();
+    if(await loadLog(pageOffset(p))) renderLog();
     else if(busy) busy.hidden = true;
   };
   for(const [id, p] of [["log-first",1],["log-prev",cur-1],["log-next",cur+1],["log-last",pages]]){
@@ -2756,6 +2885,83 @@ function toggleDetail(i){
   });
 }
 
+// The timeline's "→ <sha>": open the commit a message went into, down through the squashed
+// parts to the one holding it (path: display indices, newest first, from the server), and mark
+// the message there. Without a place to mark (a hand-built entry, a part the page no longer
+// shows) it falls back to flashing the commit's row.
+function showMessageInCommit(i, path, sec, from){
+  const row = document.querySelector('#commitlog .entry[data-i="'+i+'"]'), detail = $("detail-"+i);
+  if(!row || !detail) return;
+  // What the link changes, so "back" can undo exactly that and nothing the reader opened.
+  const undo = {i, from, scrollY: window.scrollY, openedDetail: detail.hidden, openedParts: []};
+  if(detail.hidden) toggleDetail(i);
+  let frames = 0;
+  const reveal = () => {
+    const body = $("dbody-"+i);
+    // toggleDetail builds the detail on the next frame; wait for it.
+    if(!body){ if(++frames < 120) requestAnimationFrame(reveal); return; }
+    if(body.dataset.mode === "diff" && !path.length) toggleDiff(i);  // back to the message
+    let box = detail;
+    for(const k of path){
+      box = box && box.querySelectorAll(":scope > details.part")[k];
+      if(box && !box.open){ box.open = true; undo.openedParts.push(box); }
+    }
+    const msg = !box ? null : path.length ? box.querySelector(":scope > .dmsg.md") : $("dbody-"+i);
+    const mark = msg && markUserSection(msg, sec);
+    if(mark) addBackButton(mark, undo);
+    const target = mark || row;
+    target.scrollIntoView({block:"center", behavior:"smooth"});
+    target.classList.remove("flash"); void target.offsetWidth; target.classList.add("flash");
+  };
+  reveal();
+}
+// The marked message's "back" button: close what the link opened (the commit, the squashed parts
+// on the way to the message), drop the mark, and return to where the reader was, flashing the
+// timeline message the link was followed from. Restoring the scroll position after the closing
+// puts the page exactly where it was, since everything above it is as it was then.
+function addBackButton(mark, undo){
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "tlback"; btn.textContent = "↩ back";
+  btn.title = "close this and go back to the message in the timeline";
+  btn.onclick = e => {
+    e.stopPropagation();
+    unmarkUserSections();
+    undo.openedParts.reverse().forEach(d => { d.open = false; });
+    const detail = $("detail-"+undo.i);
+    if(undo.openedDetail && detail && !detail.hidden) toggleDetail(undo.i);
+    window.scrollTo({top: undo.scrollY, behavior: "smooth"});
+    const from = undo.from;
+    if(from && from.isConnected){ from.classList.remove("flash"); void from.offsetWidth; from.classList.add("flash"); }
+  };
+  mark.prepend(btn);
+}
+function unmarkUserSections(){
+  document.querySelectorAll("#commitlog .tlmark").forEach(m => {
+    m.querySelectorAll(":scope > .tlback").forEach(b => b.remove());
+    m.replaceWith(...m.childNodes);
+  });
+}
+// Wrap the sec-th "## User" section of a rendered message's interaction trace (counted the way
+// the server counted it: "# Interaction Trace" renders as an h3, "## User" as an h4) in a
+// marker, after removing any earlier marker in the log. Returns the marker, or null.
+function markUserSection(msg, sec){
+  unmarkUserSections();
+  if(sec == null) return null;
+  const picked = [];
+  let inTrace = false, n = -1, taking = false;
+  for(const el of [...msg.children]){
+    const heading = el.matches("h3.md-h, h4.md-h");
+    if(heading && el.tagName === "H3"){ inTrace = el.textContent.trim() === "Interaction Trace"; taking = false; continue; }
+    if(heading && inTrace){ taking = el.textContent.trim() === "User" && ++n === sec; if(!taking && el.textContent.trim() === "User") continue; }
+    if(taking) picked.push(el);
+  }
+  if(!picked.length) return null;
+  const mark = document.createElement("div");
+  mark.className = "tlmark";
+  picked[0].before(mark);
+  mark.append(...picked);
+  return mark;
+}
 // One box that flips between the commit message and this commit's file diff — the button toggles
 // which is shown, so you never juggle two panes. The diff (from the local clone via /diff, no
 // GitHub) is fetched once and cached by sha, so flipping back and forth is instant.
@@ -3163,7 +3369,13 @@ function showLogTab(tab){
   // The timeline is the commit log with the user's messages laid in between, so it shares the
   // commit pane, its pager, sort and search; only the rendering differs.
   const commitish = tab === "commits" || tab === "timeline";
-  if(commitish && tab !== LOGTAB){ LOGTAB = tab; renderLog(); }
+  if(commitish && tab !== LOGTAB){
+    LOGTAB = tab; renderLog();
+    // The two views page differently (the timeline also counts messages), so fetch this view's
+    // page at the same place; the server moves the offset back to the start of its page.
+    showLoading(true);
+    loadLog(LOGPAGE.offset||0).then(ok => { if(ok && LOGTAB === tab) renderLog(); }).finally(() => showLoading(false));
+  }
   if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
   if(pc) pc.hidden = !commitish;
   if(pf) pf.hidden = tab !== "files";
@@ -3311,9 +3523,18 @@ function wireControls(){
     try{ const ok = await loadLog(0); if(ok && seq === qSeq) renderLog(); }
     finally { if(seq === qSeq) showLoading(false); }
   };
+  const syncClear = () => { $("f-text-clear").hidden = !$("f-text").value; };
   $("f-text").addEventListener("input", e => {
+    syncClear();
     state.q = e.target.value.trim(); clearTimeout(qTimer); qTimer = setTimeout(runSearch, 250);
   });
+  // The × clears the box and shows the whole log again at once, with no typing delay to wait
+  // out, and leaves the caret in the box for the next search.
+  $("f-text-clear").onclick = () => {
+    $("f-text").value = ""; syncClear(); $("f-text").focus();
+    clearTimeout(qTimer);
+    if(state.q){ state.q = ""; runSearch(); }
+  };
   $("f-textin").onchange = e => { state.qin = e.target.value; if(state.q) runSearch(); };
   // "custom range…" reveals a date-range popup anchored under the select; the presets and
   // "all time" hide it. Wired by the shared helper (ui.RANGE_JS), so the story page's copy
@@ -3327,7 +3548,7 @@ function wireControls(){
     state.meta=[]; advDraft=null; renderAdvanced(); syncAdvBtn(); syncApply();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
-    state.q=""; $("f-text").value=""; state.qin="subject"; $("f-textin").value="subject";
+    state.q=""; $("f-text").value=""; $("f-text-clear").hidden=true; state.qin="subject"; $("f-textin").value="subject";
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };
@@ -3340,12 +3561,18 @@ function wireControls(){
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const more = e.target.closest(".tmore");
-    if(more){ more.closest(".tprompt").classList.remove("clamp"); return; }
+    if(more){
+      const el = more.closest(".tprompt");
+      el.classList.toggle("clamp");
+      setMessageToggle(el);
+      // Collapsing a message read to its end leaves its start above the screen; bring it back.
+      if(el.classList.contains("clamp") && el.getBoundingClientRect().top < 0) el.scrollIntoView({block:"start", behavior:"smooth"});
+      return;
+    }
     const go = e.target.closest(".tgo");
     if(go){
-      const row = document.querySelector('#commitlog .entry[data-i="'+go.dataset.go+'"]');
-      if(row){ row.scrollIntoView({block:"center", behavior:"smooth"}); row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
-        const d = $("detail-"+go.dataset.go); if(d && d.hidden) toggleDetail(+go.dataset.go); }
+      const path = go.dataset.path ? go.dataset.path.split(".").map(Number) : [];
+      showMessageInCommit(+go.dataset.go, path, go.dataset.sec === undefined ? null : +go.dataset.sec, go.closest(".tprompt"));
       return;
     }
     const entry = e.target.closest(".entry");
@@ -3359,6 +3586,12 @@ function wireControls(){
     document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]')
       .forEach(n => n.classList.toggle("linked", on));
   };
+  // A squashed part is a closed <details> when its commit opens, so its paragraphs have no
+  // layout to measure then; they are re-flowed the moment the part is opened. "toggle" does
+  // not bubble, hence the capture phase.
+  $("commitlog").addEventListener("toggle", e => {
+    if(e.target.matches && e.target.matches("details.part") && e.target.open) reflowParagraphs(e.target);
+  }, true);
   $("commitlog").addEventListener("mouseover", e => linkHover(e, true));
   $("commitlog").addEventListener("mouseout", e => linkHover(e, false));
   // Toggle a series on/off from the legend; redraw the plot in place.
@@ -3390,6 +3623,12 @@ async function init(){
   hideFabricatedChrome();
   stackStickyBanner();
   wireControls();
+  // A #timeline link is settled BEFORE the log is first drawn. It used to be applied after the
+  // file browser had loaded (a second or more on a big repo), by switching tabs, and that switch
+  // redrew the whole log: a commit opened in the meantime (the timeline's own "→ <sha>" link,
+  // pressed as soon as it appeared) closed again under the reader.
+  if(location.hash === "#timeline") LOGTAB = "timeline";
+  else if(location.hash === "#commits") LOGTAB = "commits";
   // Shell mode: the chrome is already on screen with the loading animation; fetch the
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
@@ -3423,11 +3662,13 @@ async function init(){
     // log that came back unchanged is left exactly as it is.
     if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
   }
+  // The log was drawn in its tab already; this only lights that tab, without waiting for the
+  // file browser below.
+  if(location.hash !== "#files") showLogTab(LOGTAB);
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();
   if(location.hash === "#files" && FILES && FILES.length) showLogTab("files");  // deep-link to the Files tab
-  else if(location.hash === "#timeline" || LOGTAB === "timeline"){ LOGTAB = ""; showLogTab("timeline"); }
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).

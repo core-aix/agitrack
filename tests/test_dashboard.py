@@ -194,10 +194,47 @@ def test_commit_message_paragraphs_reflow_when_the_column_is_narrower(tmp_path):
     assert 'join(" <br>")' in html  # lines of one paragraph, breaks kept as <br>
     assert '<p class="mdp${inMeta?" keep":""}">' in html  # metadata paragraphs opt out
     assert "/agitrack\\s+metadata/i.test(h[2])" in html  # …detected from the heading
-    assert ".dmsg.md p.mdp.reflow br{display:none}" in html
+    assert "p.mdp.reflow br{display:none}" in html
     assert "function reflowParagraphs(root)" in html
     assert "tops.length > breaks + 1" in html  # more line boxes than source lines => wrapped
     assert "reflowParagraphs(document), 150" in html  # re-decided on resize
+
+
+def test_timeline_messages_and_squashed_parts_reflow_too(tmp_path):
+    # The timeline's user messages are rendered by the same Markdown renderer as a commit
+    # message, but outside a ".dmsg" box: a rule scoped to ".dmsg" marked their paragraphs
+    # for reflow and never hid the breaks. A squashed part is a closed <details> when its
+    # commit opens, and a browser that does not lay out closed content (Safari) measured it as
+    # fitting, so it is measured again the moment it is opened. Checked in headless Chrome at
+    # phone width against this repository's own history: 40 of 40 timeline paragraphs and
+    # 19 of 19 part paragraphs reflowed, against 0 and 0 before.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "\np.mdp.reflow br{display:none}" in html  # not scoped to .dmsg
+    assert ".dmsg.md p.mdp.reflow br" not in html
+    assert '$("commitlog").addEventListener("toggle"' in html
+    assert 'e.target.matches("details.part") && e.target.open) reflowParagraphs(e.target)' in html
+
+
+def test_a_timeline_message_that_only_just_overflows_is_shown_whole(tmp_path):
+    # A clamped message carries its own "show all" line, so a message whose hidden part is no
+    # taller than that line got SHORTER when "show all" was pressed. Such a message is shown
+    # whole from the start. Checked in headless Chrome over six pages of this repository's
+    # timeline: 6 such messages at 390px and 2 at 1280px before, none after.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "body.scrollHeight <= body.clientHeight + (more ? more.offsetHeight : 0) + 2" in html
+    # Once shown whole, a long message can be collapsed again with the same button.
+    assert 'more.textContent = cut ? "show all" : "collapse";' in html
+    assert ".tprompt.clamp .tmore,.tprompt.long .tmore{display:inline}" in html
+    # While an opened long message is on screen its "collapse" floats at the bottom of the
+    # screen. That only works because the page clips sideways overflow with `clip`: `hidden`
+    # on html and body made body a scroll container, and a sticky element stuck to it instead
+    # (checked in headless Chrome: the button sat at the message's end, off screen).
+    assert ".tprompt.long:not(.clamp) .tmore{display:inline-block;position:sticky;bottom:10px;" in html
+    assert "html,body{overflow-x:hidden;overflow-x:clip}" in html
 
 
 def test_phone_layout_uses_the_full_width(tmp_path):
@@ -208,7 +245,7 @@ def test_phone_layout_uses_the_full_width(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert ".wrap{padding-left:6px;padding-right:6px}" in html
     assert ".log{padding-left:18px}" in html  # the timeline rail narrows with it
-    assert ".entry::before{left:-17.5px}" in html  # …dots stay centred on the rail
+    assert ".entry::before,.tprompt::before{left:-17.5px}" in html  # …dots stay centred on the rail
     # A subject with no spaces (a shell command, a long flag) must break rather than push
     # the row past the screen — that gave the whole page a horizontal scrollbar.
     assert "overflow-wrap:anywhere}" in html.split(".entry .ksub{", 1)[1][:120]
@@ -2788,10 +2825,34 @@ def test_the_timeline_lists_each_turns_prompts_with_when_the_turn_began(tmp_path
     stats = {s.subject: s for s in build_dashboard(repo).stats}
 
     assert _timeline_turns(stats["my commit"]) == [
-        {"at": epoch("2026-10-08T10:00:00Z"), "prompts": ["rename the helper\nand its test"]},
-        {"at": None, "prompts": ["fix the docs", "and the README"]},  # no start recorded
+        # `path` is where the part is shown (the parts list runs newest first) and `sections`
+        # which "## User" of its trace each message is, so the timeline's link can open that
+        # part and mark that message.
+        {
+            "at": epoch("2026-10-08T10:00:00Z"),
+            "prompts": ["rename the helper\nand its test"],
+            "path": [1],
+            "sections": [0],
+        },
+        {"at": None, "prompts": ["fix the docs", "and the README"], "path": [0], "sections": [0, 1]},
     ]
     assert _timeline_turns(stats["plain user commit"]) == []
+
+
+def test_a_timeline_message_in_a_plain_commit_points_at_its_own_section(tmp_path):
+    # A commit that is not a squash shows its messages in its own message (an empty path), and
+    # an empty "## User" section is still counted, because the page counts the headings it
+    # renders, empty ones included.
+    from agitrack.metrics.web import _timeline_turns
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 3)
+    repo.commit(
+        "<aGiTrack> tidy\n\n# Interaction Trace\n\n## User\n\n## Agent\n\nhm?\n\n"
+        "## User\n\nrename it\n\n## Agent\n\ndone\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+    )
+    stat = next(s for s in build_dashboard(repo).stats if s.subject == "<aGiTrack> tidy")
+    assert _timeline_turns(stat) == [{"at": None, "prompts": ["rename it"], "path": [], "sections": [1]}]
 
 
 def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
@@ -2872,11 +2933,388 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     out = _render_log([newer, older], tmp_path, setup='LOGTAB = "timeline"; ')
     order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
     assert order == sorted(order)
-    assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
+    # Each message says where to find more: the commit it went into, by id.
+    assert out.count('more in <span class="tsha">bbbbbbbb</span> →') == 3
+    assert out.count('more in <span class="tsha">aaaaaaaa</span> →') == 1
     assert "followed up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
     # Labelled with the committer, never "you": the log holds several people's work.
     assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
     assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
 
-    commits = _render_log([newer, older], tmp_path)
+    commits = _render_log([newer, older], tmp_path, setup='LOGTAB = "commits"; ')
     assert "ORANGE" not in commits and "fold commit" in commits
+    # The timeline is what a reader sees first; the plain commit list is the next tab.
+    assert "ORANGE" in _render_log([newer, older], tmp_path)
+
+
+def _two_people_merged(repo_dir) -> dict[str, str]:
+    """Alice and Bob each drive an agent on their own branch at the same time; both branches
+    are merged into main with merge commits. Bob's second commit folds two turns. Returns the
+    commit ids, so a test can check every message points at the commit it went into."""
+    import os
+    import subprocess
+
+    def git(*args, who=None, at=None):
+        env = dict(os.environ)
+        if who:
+            env.update(
+                GIT_AUTHOR_NAME=who,
+                GIT_AUTHOR_EMAIL=f"{who}@example.com",
+                GIT_COMMITTER_NAME=who,
+                GIT_COMMITTER_EMAIL=f"{who}@example.com",
+            )
+        if at:
+            env.update(GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at)
+        return subprocess.run(
+            ["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True, env=env
+        ).stdout.strip()
+
+    def turn(subject, prompts, started):
+        asked = "".join(f"## User\n\n{p}\n\n" for p in prompts)
+        return (
+            f"<aGiTrack> {subject}\n\n# Interaction Trace\n\n{asked}## Agent\n\ndone\n\n"
+            f"# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: {started}\n"
+            "tokens_since_last_commit_output: 10\n"
+        )
+
+    def commit(who, at, path, message):
+        with open(os.path.join(repo_dir, path), "a") as f:
+            f.write(f"{who} {at}\n")
+        git("add", path)
+        git("commit", "-q", "--cleanup=whitespace", "-m", message, who=who, at=at)
+        return git("rev-parse", "HEAD")
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)
+    commit("carol", "2026-10-19T09:00:00Z", "README.md", "initial commit")
+    ids = {}
+    git("checkout", "-q", "-b", "alice-work")
+    ids["A1"] = commit("alice", "2026-10-19T10:05:00Z", "a.txt", turn("alice one", ["ALICE-1"], "2026-10-19T10:00:00Z"))
+    git("checkout", "-q", "main")
+    git("checkout", "-q", "-b", "bob-work")
+    ids["B1"] = commit("bob", "2026-10-19T10:12:00Z", "b.txt", turn("bob one", ["BOB-1"], "2026-10-19T10:10:00Z"))
+    git("checkout", "-q", "alice-work")
+    ids["A2"] = commit(
+        "alice", "2026-10-19T10:25:00Z", "a.txt", turn("alice two", ["ALICE-2", "ALICE-2b"], "2026-10-19T10:20:00Z")
+    )
+    git("checkout", "-q", "bob-work")
+    fold = (
+        "bob fold\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: s\n\n"
+        + turn("bob two", ["BOB-2"], "2026-10-19T10:15:00Z")
+        + "\n"
+        + turn("bob three", ["BOB-3"], "2026-10-19T10:30:00Z")
+    )
+    ids["B2"] = commit("bob", "2026-10-19T10:35:00Z", "b.txt", fold)
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "Merge alice-work", "alice-work", who="carol", at="2026-10-19T10:40:00Z")
+    git("merge", "-q", "--no-ff", "-m", "Merge bob-work", "bob-work", who="carol", at="2026-10-19T10:45:00Z")
+    return ids
+
+
+def test_the_timeline_of_two_people_working_at_once_on_merged_branches(tmp_path):
+    # Two people talk to their own agents at the same time, commit separately on their own
+    # branches, and both branches are merged. Every message is shown once, labelled with the
+    # person whose commit it went into, at the time it was asked (so the two people's messages
+    # interleave), pointing at that commit and, for a fold, at the right part. The merges carry
+    # no messages of their own, so nothing appears twice. Also checked in headless Chrome on
+    # the same repository: all six links opened the right commit or part and marked the
+    # message, and filtering to one committer left only that person's messages.
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo_dir = tmp_path / "team"
+    ids = _two_people_merged(repo_dir)
+    entries = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {}).body)["entries"]
+    by_sha = {e["sha"]: e for e in entries}
+
+    asked = {
+        (e["sha"], e["author"], prompt, tuple(t["path"]), section)
+        for e in entries
+        for t in e.get("turns", [])
+        for prompt, section in zip(t["prompts"], t["sections"])
+    }
+    assert asked == {
+        (ids["A1"], "alice", "ALICE-1", (), 0),
+        (ids["B1"], "bob", "BOB-1", (), 0),
+        (ids["A2"], "alice", "ALICE-2", (), 0),
+        (ids["A2"], "alice", "ALICE-2b", (), 1),
+        (ids["B2"], "bob", "BOB-2", (1,), 0),  # the fold's older part is listed second
+        (ids["B2"], "bob", "BOB-3", (0,), 0),
+    }
+    assert [e["subject"] for e in entries if e["subject"].startswith("Merge")] == ["Merge bob-work", "Merge alice-work"]
+    assert all(not e.get("turns") for e in entries if e["subject"].startswith("Merge"))
+    assert by_sha[ids["B2"]]["parts"][1]["subject"] == "<aGiTrack> bob two"
+
+    out = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
+    order = [out.index(word) for word in ("BOB-3", "ALICE-2b", "ALICE-2<", "BOB-2", "BOB-1", "ALICE-1")]
+    assert order == sorted(order)  # newest first, the two people's messages interleaved by time
+    assert out.count("bob</b> asked") == 3 and out.count("alice</b> asked") == 2
+    assert out.count("alice</b> followed up") == 1
+    assert out.count(f'<span class="tsha">{by_sha[ids["B2"]]["short"]}</span>') == 2
+    assert out.count(f'<span class="tsha">{by_sha[ids["A2"]]["short"]}</span>') == 2
+
+
+def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tmp_path):
+    # Indented under the commit drawn above it, a message read as part of that commit, when it
+    # belongs to whichever commit its link names (often a different one). It is an item on the
+    # rail of its own: no indent, its own marker where a commit has a dot (also at phone width),
+    # the same divider, and a link that never breaks between the arrow and the commit id.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    rule = next(line for line in html.splitlines() if line.startswith(".tprompt{"))
+    assert "margin" not in rule and "border-left" not in rule
+    assert "border-bottom:1px dashed var(--line)" in rule
+    assert '.tprompt::before{content:"";position:absolute;left:-30px;' in html
+    assert ".entry::before,.tprompt::before{left:-17.5px}" in html
+    assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
+
+
+def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp_path, monkeypatch):
+    # A timeline page ends at `limit` commits or at TIMELINE_PAGE_ITEMS items (commits plus
+    # their messages), whichever comes first, and a commit is never split from its messages.
+    # Pages differ in size, so the payload names every page's start; an offset inside a page is
+    # moved back to its start. A rewritten commit has a new id, so the cached message counts
+    # can never answer for it: the same live scope re-pages after the rewrite by itself.
+    # Checked at full size on a 70-commit dummy repository rewritten by `git filter-branch` and by
+    # `agitrack redact`, and in Chrome on an open page that picked the rewrite up on its refresh.
+    import json as _json
+    import subprocess
+
+    from agitrack.metrics import web
+    from agitrack.metrics.server import RepoScope
+
+    monkeypatch.setattr(web, "TIMELINE_PAGE_ITEMS", 5)
+    repo = GitRepo.init(tmp_path)
+    for i, asked in enumerate([0, 3, 1, 0, 0, 0, 6, 1]):  # oldest first
+        _write_lines(repo, "x.txt", i + 1)
+        users = "".join(f"## User\n\nC{i}-{k}\n\n" for k in range(asked))
+        repo.commit(
+            f"<aGiTrack> c{i}\n\n# Interaction Trace\n\n{users}## Agent\n\nok\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+        )
+    scope = RepoScope(repo)
+
+    def log(**query):
+        return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
+
+    first = log(view="timeline", limit=3)
+    # Newest first, items per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
+    # GitRepo.init makes (1). A commit that would take a page past 5 items, or past 3 commits,
+    # starts the next one: c6 alone exceeds 5, c5..c3 fill 3 commits, c1+c0 fill exactly 5.
+    assert first["page_starts"] == [0, 1, 2, 5, 6, 8]
+    assert [e["subject"] for e in first["entries"]] == ["<aGiTrack> c7"]
+    assert [e["subject"] for e in log(view="timeline", limit=3, offset=3)["entries"]] == [
+        "<aGiTrack> c5",
+        "<aGiTrack> c4",
+        "<aGiTrack> c3",
+    ]  # moved back to its page's start
+    assert log(view="timeline", limit=3, offset=3)["offset"] == 2
+    assert "page_starts" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+
+    # Rewrite the newest commit so it carries four messages (five items, a full page on its own).
+    message = subprocess.run(
+        ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True
+    ).stdout.replace("## Agent", "## User\n\nmore\n\n## User\n\nmore\n\n## User\n\nmore\n\n## Agent")
+    subprocess.run(
+        ["git", "-C", str(repo.repo), "commit", "-q", "--amend", "--cleanup=whitespace", "-m", message], check=True
+    )
+    rewritten = log(view="timeline", limit=3)
+    assert rewritten["page_starts"] == [0, 1, 2, 5, 6, 8]
+    assert sum(len(t["prompts"]) for t in rewritten["entries"][0]["turns"]) == 4
+    assert (
+        rewritten["entries"][0]["sha"]
+        == subprocess.run(
+            ["git", "-C", str(repo.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    )
+
+
+def test_a_timeline_link_names_the_part_and_the_message_it_opens(tmp_path):
+    # "more in <sha> →" opens the commit at the message: the squashed part it is in (a path of display
+    # indices, nested parts joined by ".") and which "## User" of that part's trace it is. The
+    # page script follows them (showMessageInCommit / markUserSection); checked in headless
+    # Chrome on this repository's own history: all 65 links on the first page, at 390px and
+    # 1280px, opened the right part and marked exactly that message, and a nested squash too.
+    entry = {
+        "sha": "c" * 40,
+        "short": "cccccccc",
+        "author": "alice-gh",
+        "subject": "a squash",
+        "kind": "agent",
+        "ts": 3000,
+        "tokens": {},
+        "turns": [
+            {"at": 1000, "prompts": ["PEAR"], "path": [0, 1], "sections": [2]},
+            {"at": 2000, "prompts": ["PLUM"], "path": [], "sections": [0]},
+        ],
+    }
+    out = _render_log([entry], tmp_path, setup='LOGTAB = "timeline"; ')
+    assert 'data-go="0" data-path="0.1" data-sec="2"' in out
+    assert 'data-go="0" data-path="" data-sec="0"' in out
+
+
+def test_a_failed_login_crawl_keeps_what_an_earlier_one_learned(monkeypatch, tmp_path):
+    # A person is labelled "login (Name)" only while their login is known. A crawl that timed out
+    # or ran offline used to replace a good map with an empty one, flipping everyone back to their
+    # bare git name for the next five minutes.
+    from agitrack.metrics import github
+
+    repo = GitRepo.init(tmp_path)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Ok:
+        returncode = 0
+        stdout = "sha1\toctocat\n"
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+
+    answers = [_Ok(), _Failed()]
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: answers.pop(0))
+
+    assert github.resolve_logins(repo) == {"sha1": "octocat"}
+    assert github.resolve_logins(repo, refresh=True) == {"sha1": "octocat"}
+
+
+def test_logins_learned_once_are_known_again_after_a_restart(monkeypatch, tmp_path):
+    # Held in memory alone, the map was empty after every dashboard start until the crawl landed,
+    # so the first view after a restart showed bare git names. It is kept on disk.
+    from agitrack.metrics import github
+
+    repo = GitRepo.init(tmp_path)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Ok:
+        returncode = 0
+        stdout = "sha1\toctocat\n"
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Ok())
+    github.resolve_logins(repo)
+
+    github._reset_cache_for_tests()  # a new process: nothing in memory
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: None)  # the crawl has not landed
+    monkeypatch.setattr(github.threading.Thread, "start", lambda self: None)
+    assert github.cached_logins(repo) == {"sha1": "octocat"}
+
+
+def test_a_login_known_only_by_id_is_labelled_like_the_tracked_log():
+    # The backtrace knows a shared session's author only by GitHub id; it must name them the way
+    # the tracked log does, "login (Name)", not by the bare id.
+    from agitrack.metrics.collect import login_labels
+
+    history = [
+        CommitStat(sha="a", author="Mona Lisa", email="mona@example.com", subject="", kind="user"),
+        CommitStat(sha="b", author="t", email="t@t", subject="", kind="user"),
+    ]
+    assert login_labels(history, {"a": "OctoCat"}) == {"octocat": "octocat (Mona)"}
+
+
+def _people_taking_turns_on_main(repo_dir) -> None:
+    """Alice, Bob and Carol talk to their agents at the same time and commit straight onto main,
+    each asking BEFORE someone else's commit lands; Bob's fold carries a turn asked before every
+    other commit here. Then two branches worked on at once are merged."""
+    import os
+    import subprocess
+
+    def git(*args, who=None, at=None):
+        env = dict(os.environ)
+        if who:
+            env.update(
+                GIT_AUTHOR_NAME=who,
+                GIT_AUTHOR_EMAIL=f"{who}@example.com",
+                GIT_COMMITTER_NAME=who,
+                GIT_COMMITTER_EMAIL=f"{who}@example.com",
+            )
+        if at:
+            env.update(GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at)
+        subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, env=env)
+
+    def turn(subject, prompts, started):
+        asked = "".join(f"## User\n\n{p}\n\n" for p in prompts)
+        return (
+            f"<aGiTrack> {subject}\n\n# Interaction Trace\n\n{asked}## Agent\n\ndone\n\n"
+            f"# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: {started}\n"
+            "tokens_since_last_commit_output: 10\n"
+        )
+
+    def commit(who, at, message):
+        with open(os.path.join(repo_dir, f"{who}.txt"), "a") as f:
+            f.write(at + "\n")
+        git("add", "-A")
+        git("commit", "-q", "--cleanup=whitespace", "-m", message, who=who, at=at)
+
+    d = "2026-10-19T"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)
+    commit("carol", d + "09:00:00Z", "initial commit")
+    commit("alice", d + "10:05:00Z", turn("alice a", ["ALICE-1"], d + "10:00:00Z"))
+    commit("bob", d + "10:08:00Z", turn("bob b", ["BOB-1"], d + "10:02:00Z"))
+    commit("carol", d + "10:12:00Z", turn("carol c", ["CAROL-1"], d + "10:06:00Z"))
+    commit("alice", d + "10:15:00Z", turn("alice a2", ["ALICE-2", "ALICE-2 again"], d + "10:09:00Z"))
+    fold = (
+        "bob fold\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: s\n\n"
+        + turn("bob two", ["BOB-2"], d + "10:01:00Z")
+        + "\n"
+        + turn("bob three", ["BOB-3"], d + "10:13:00Z")
+    )
+    commit("bob", d + "10:20:00Z", fold)
+    commit("carol", d + "10:22:00Z", turn("carol c2", ["CAROL-2"], d + "10:16:00Z"))
+    git("checkout", "-q", "-b", "alice-work")
+    commit("alice", d + "10:35:00Z", turn("alice branch", ["ALICE-3"], d + "10:25:00Z"))
+    git("checkout", "-q", "main")
+    git("checkout", "-q", "-b", "bob-work")
+    commit("bob", d + "10:30:00Z", turn("bob branch", ["BOB-4"], d + "10:27:00Z"))
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "Merge alice-work", "alice-work", who="carol", at=d + "10:40:00Z")
+    git("merge", "-q", "--no-ff", "-m", "Merge bob-work", "bob-work", who="carol", at=d + "10:45:00Z")
+
+
+def test_hovering_a_timeline_message_lights_its_own_commit_even_when_others_lie_between(tmp_path):
+    # Pointing at a message lights up the commit that INCLUDED it and that commit's other
+    # messages, never "the stretch of rail around it": with several people committing at once,
+    # someone else's commit (and their messages) routinely sits between a message and its own
+    # commit, so the lit items are not one block. Also checked in headless Chrome on the same
+    # repository at 1280 and 390 px with real mouse moves: all 10 messages lit exactly their own
+    # commit and its messages, 9 of them as split blocks.
+    import json as _json
+    import subprocess
+
+    from agitrack.metrics.server import RepoScope
+
+    repo_dir = tmp_path / "team"
+    _people_taking_turns_on_main(repo_dir)
+    entries = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {}).body)["entries"]
+    html = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
+
+    # The rail in order: commits carry data-i, messages data-c (the commit they went into).
+    rail = re.findall(r'<div class="(entry[^"]*|tprompt[^"]*)" data-(i|c)="(\d+)"', html)
+    assert rail, html[:500]
+    messages = [m.group(1).strip() for m in re.finditer(r'<div class="tbody md">(.*?)</div>', html, re.S)]
+    messages = [re.sub(r"<[^>]+>", "", m).strip() for m in messages]
+    assert len(messages) == sum(1 for _cls, kind, _n in rail if kind == "c") == 10
+
+    def lit_by(index: str) -> list[int]:
+        # What the hover handler selects: `.entry[data-i=N]` and `.tprompt[data-c=N]`.
+        return [pos for pos, (_cls, _kind, n) in enumerate(rail) if n == index]
+
+    split = 0
+    message_at = iter(messages)
+    for pos, (_cls, kind, n) in enumerate(rail):
+        if kind != "c":
+            continue
+        text = next(message_at)
+        sha = entries[int(n)]["sha"]
+        body = subprocess.run(
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%B", sha], capture_output=True, text=True
+        ).stdout
+        assert f"## User\n\n{text}\n" in body, (text, entries[int(n)]["subject"])
+        lit = lit_by(n)
+        assert pos in lit and sum(1 for p in lit if rail[p][1] == "i") == 1
+        split += any(b - a > 1 for a, b in zip(lit, lit[1:]))
+    assert split >= 5  # the highlight follows the commit, not the neighbourhood
+
+    # And the page's hover handler keys on exactly that association.
+    page = render_html(_demo_repo(tmp_path / "demo"))
+    assert """'#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]'""" in page

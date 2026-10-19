@@ -238,14 +238,15 @@ def test_windows_read_master_returns_echo_output():
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             readable, _, _ = select.select([handle.master_fd], [], [], 0.5)
+            # Read to end of stream, not until the process is gone: a fast child's output
+            # can still be on its way when it exits.
             if readable:
                 chunk = handle.read_master(4096)
-                if chunk:
-                    combined += chunk
+                if not chunk:
+                    break  # EOF: the pump closed its end
+                combined += chunk
                 if b"hello-win" in combined.lower():
                     break
-            elif handle.poll_exited():
-                break
         assert b"hello-win" in combined.lower(), f"output not found in: {combined!r}"
     finally:
         handle.teardown()

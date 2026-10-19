@@ -41,8 +41,12 @@ TOKENS = """:root{
 
 BASE_CSS = """*{box-sizing:border-box}
 /* No page may scroll sideways: a single over-wide element otherwise drags the whole
-   document with it, which is worse on a phone than the element being clipped. */
-html,body{overflow-x:hidden}
+   document with it, which is worse on a phone than the element being clipped. `clip`, not
+   `hidden`: `hidden` on both html and body makes body a scroll container that never scrolls,
+   and every `position:sticky` on the page then sticks to it instead of the screen (the
+   timeline's floating "collapse" did not float). `hidden` stays first for browsers that
+   predate `clip`. */
+html,body{overflow-x:hidden;overflow-x:clip}
 /* `hidden` is a UA-level display:none, which ANY author `display` outranks: a hidden flex or
    grid box stays on screen without this. It is the reason the dashboard's file filter showed
    in the commits view for a while. Every page gets it. */
@@ -200,8 +204,9 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 .dmsg .diffempty b{color:var(--phosphor);font-style:normal}
 .dmsg.md p{margin:7px 0}
 /* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway): the source
-   line breaks stop rendering and the paragraph flows as prose. */
-.dmsg.md p.mdp.reflow br{display:none}
+   line breaks stop rendering and the paragraph flows as prose. Not scoped to .dmsg: the
+   timeline's messages are rendered by the same renderer outside one. */
+p.mdp.reflow br{display:none}
 /* Every property a host page might have opinions about is set HERE, including the ones this
    block would otherwise leave to inheritance. The story page styles its own section headings
    (".commits h4") in small caps, and that rule reached into a commit message's "## User"

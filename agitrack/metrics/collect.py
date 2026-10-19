@@ -580,6 +580,27 @@ def resolve_committers(
     return labels
 
 
+def login_labels(
+    stats: list[CommitStat],
+    sha_logins: dict[str, str] | None = None,
+    email_logins: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Each GitHub login (lowercased) seen in ``stats`` mapped to the committer label
+    :func:`resolve_committers` shows that person under, e.g. ``octocat`` -> ``octocat (Mona)``.
+    For a view that knows WHO by login alone (the backtrace's shared sessions) and must name
+    them the way the tracked log does."""
+    sha_logins = sha_logins or {}
+    email_logins = email_logins or {}
+    labels = resolve_committers(stats, sha_logins, email_logins)
+    out: dict[str, str] = {}
+    for stat in stats:
+        email = (stat.email or "").strip().lower()
+        login = sha_logins.get(stat.sha) or _login_of(email) or email_logins.get(email)
+        if login:
+            out.setdefault(login.lower(), labels[(stat.author or "", email)])
+    return out
+
+
 def _first_name(names: Counter[str], login: str) -> str | None:
     """A committer's first name for display next to their GitHub login, taken from
     their git author name. Prefers a "First Last" style name when one exists (so
