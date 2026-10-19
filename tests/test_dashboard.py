@@ -2826,7 +2826,12 @@ def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
         encoding="utf-8",
     )
     result = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "UTC"}
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env={**os.environ, "TZ": "UTC"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
