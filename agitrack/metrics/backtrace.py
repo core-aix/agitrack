@@ -31,7 +31,7 @@ from agitrack import paths
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _mask_secrets, _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
+from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo, login_labels
 from agitrack.metrics.routing import Response
 from agitrack.transcripts import claude, codex, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
@@ -306,6 +306,30 @@ def _local_owner(directory: Path) -> str:
     except Exception:
         return ""
     return "" if login == "anonymous" else login
+
+
+def _owner_labels(directory: Path, owners: set[str]) -> dict[str, str]:
+    """The label each session owner (a GitHub id) is shown under in the TRACKED log, e.g.
+    ``octocat`` -> ``octocat (Mona)``, read from the repository's own commits. A shared session
+    carries only the id it was shared under, so the backtrace used to name someone ``octocat``
+    while the tracked view named the same person ``octocat (Mona)``. An owner with no commit
+    here keeps the bare id; so does every owner when the directory is not a repository."""
+    try:
+        from agitrack.metrics.github import cached_logins
+
+        repo = GitRepo.discover(directory)
+        log = repo._run(["git", "log", "--all", "--format=%H%x1f%an%x1f%ae"], check=False).stdout
+        sha_logins = cached_logins(repo)
+    except Exception:
+        return {}
+    history = []
+    for line in log.splitlines():
+        sha, _, rest = line.partition("\x1f")
+        name, _, email = rest.partition("\x1f")
+        if sha:
+            history.append(CommitStat(sha=sha, author=name, email=email, subject="", kind="user"))
+    labels = login_labels(history, sha_logins)
+    return {owner: labels[owner.lower()] for owner in owners if owner and owner.lower() in labels}
 
 
 def _remote_sources(directory: Path, *, local_ids: set[str]) -> list[_Source]:
@@ -649,6 +673,10 @@ def build_backtrace(
     _mark_tracked(directory, fresh_sessions, stats, assistant_id_by_sha)
 
     stats.sort(key=lambda stat: (stat.timestamp, stat.sha))  # oldest first, like git log order
+    if contributors:
+        names = _owner_labels(directory, contributors)
+        stats = [replace(stat, author=names.get(stat.author, stat.author)) for stat in stats]
+        contributors = {names.get(owner, owner) for owner in contributors}
     dashboard = Dashboard(
         repo=_display_repo(str(directory)),
         branch="",

@@ -3151,3 +3151,62 @@ def test_a_timeline_link_names_the_part_and_the_message_it_opens(tmp_path):
     out = _render_log([entry], tmp_path, setup='LOGTAB = "timeline"; ')
     assert 'data-go="0" data-path="0.1" data-sec="2"' in out
     assert 'data-go="0" data-path="" data-sec="0"' in out
+
+
+def test_a_failed_login_crawl_keeps_what_an_earlier_one_learned(monkeypatch, tmp_path):
+    # A person is labelled "login (Name)" only while their login is known. A crawl that timed out
+    # or ran offline used to replace a good map with an empty one, flipping everyone back to their
+    # bare git name for the next five minutes.
+    from agitrack.metrics import github
+
+    repo = GitRepo.init(tmp_path)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Ok:
+        returncode = 0
+        stdout = "sha1\toctocat\n"
+
+    class _Failed:
+        returncode = 1
+        stdout = ""
+
+    answers = [_Ok(), _Failed()]
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: answers.pop(0))
+
+    assert github.resolve_logins(repo) == {"sha1": "octocat"}
+    assert github.resolve_logins(repo, refresh=True) == {"sha1": "octocat"}
+
+
+def test_logins_learned_once_are_known_again_after_a_restart(monkeypatch, tmp_path):
+    # Held in memory alone, the map was empty after every dashboard start until the crawl landed,
+    # so the first view after a restart showed bare git names. It is kept on disk.
+    from agitrack.metrics import github
+
+    repo = GitRepo.init(tmp_path)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Ok:
+        returncode = 0
+        stdout = "sha1\toctocat\n"
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Ok())
+    github.resolve_logins(repo)
+
+    github._reset_cache_for_tests()  # a new process: nothing in memory
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: None)  # the crawl has not landed
+    monkeypatch.setattr(github.threading.Thread, "start", lambda self: None)
+    assert github.cached_logins(repo) == {"sha1": "octocat"}
+
+
+def test_a_login_known_only_by_id_is_labelled_like_the_tracked_log():
+    # The backtrace knows a shared session's author only by GitHub id; it must name them the way
+    # the tracked log does, "login (Name)", not by the bare id.
+    from agitrack.metrics.collect import login_labels
+
+    history = [
+        CommitStat(sha="a", author="Mona Lisa", email="mona@example.com", subject="", kind="user"),
+        CommitStat(sha="b", author="t", email="t@t", subject="", kind="user"),
+    ]
+    assert login_labels(history, {"a": "OctoCat"}) == {"octocat": "octocat (Mona)"}
