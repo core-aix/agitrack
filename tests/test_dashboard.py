@@ -226,6 +226,15 @@ def test_a_timeline_message_that_only_just_overflows_is_shown_whole(tmp_path):
 
     html = shell_html(_seeded(tmp_path))
     assert "body.scrollHeight <= body.clientHeight + (more ? more.offsetHeight : 0) + 2" in html
+    # Once shown whole, a long message can be collapsed again with the same button.
+    assert 'more.textContent = cut ? "show all" : "collapse";' in html
+    assert ".tprompt.clamp .tmore,.tprompt.long .tmore{display:inline}" in html
+    # While an opened long message is on screen its "collapse" floats at the bottom of the
+    # screen. That only works because the page clips sideways overflow with `clip`: `hidden`
+    # on html and body made body a scroll container, and a sticky element stuck to it instead
+    # (checked in headless Chrome: the button sat at the message's end, off screen).
+    assert ".tprompt.long:not(.clamp) .tmore{display:inline-block;position:sticky;bottom:10px;" in html
+    assert "html,body{overflow-x:hidden;overflow-x:clip}" in html
 
 
 def test_phone_layout_uses_the_full_width(tmp_path):
@@ -236,7 +245,7 @@ def test_phone_layout_uses_the_full_width(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert ".wrap{padding-left:6px;padding-right:6px}" in html
     assert ".log{padding-left:18px}" in html  # the timeline rail narrows with it
-    assert ".entry::before{left:-17.5px}" in html  # …dots stay centred on the rail
+    assert ".entry::before,.tprompt::before{left:-17.5px}" in html  # …dots stay centred on the rail
     # A subject with no spaces (a shell command, a long flag) must break rather than push
     # the row past the screen — that gave the whole page a horizontal scrollbar.
     assert "overflow-wrap:anywhere}" in html.split(".entry .ksub{", 1)[1][:120]
@@ -2924,7 +2933,9 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     out = _render_log([newer, older], tmp_path, setup='LOGTAB = "timeline"; ')
     order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
     assert order == sorted(order)
-    assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
+    # Each message says where to find more: the commit it went into, by id.
+    assert out.count('more in <span class="tsha">bbbbbbbb</span> →') == 3
+    assert out.count('more in <span class="tsha">aaaaaaaa</span> →') == 1
     assert "followed up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
     # Labelled with the committer, never "you": the log holds several people's work.
     assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
@@ -3039,12 +3050,87 @@ def test_the_timeline_of_two_people_working_at_once_on_merged_branches(tmp_path)
     assert order == sorted(order)  # newest first, the two people's messages interleaved by time
     assert out.count("bob</b> asked") == 3 and out.count("alice</b> asked") == 2
     assert out.count("alice</b> followed up") == 1
-    assert out.count(f"→ {by_sha[ids['B2']]['short']}<") == 2
-    assert out.count(f"→ {by_sha[ids['A2']]['short']}<") == 2
+    assert out.count(f'<span class="tsha">{by_sha[ids["B2"]]["short"]}</span>') == 2
+    assert out.count(f'<span class="tsha">{by_sha[ids["A2"]]["short"]}</span>') == 2
+
+
+def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tmp_path):
+    # Indented under the commit drawn above it, a message read as part of that commit, when it
+    # belongs to whichever commit its link names (often a different one). It is an item on the
+    # rail of its own: no indent, its own marker where a commit has a dot (also at phone width),
+    # the same divider, and a link that never breaks between the arrow and the commit id.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    rule = next(line for line in html.splitlines() if line.startswith(".tprompt{"))
+    assert "margin" not in rule and "border-left" not in rule
+    assert "border-bottom:1px dashed var(--line)" in rule
+    assert '.tprompt::before{content:"";position:absolute;left:-30px;' in html
+    assert ".entry::before,.tprompt::before{left:-17.5px}" in html
+    assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
+
+
+def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp_path, monkeypatch):
+    # A timeline page ends at `limit` commits or at TIMELINE_PAGE_ITEMS items (commits plus
+    # their messages), whichever comes first, and a commit is never split from its messages.
+    # Pages differ in size, so the payload names every page's start; an offset inside a page is
+    # moved back to its start. A rewritten commit has a new id, so the cached message counts
+    # can never answer for it: the same live scope re-pages after the rewrite by itself.
+    # Checked at full size on a 70-commit dummy repository rewritten by `git filter-branch` and by
+    # `agitrack redact`, and in Chrome on an open page that picked the rewrite up on its refresh.
+    import json as _json
+    import subprocess
+
+    from agitrack.metrics import web
+    from agitrack.metrics.server import RepoScope
+
+    monkeypatch.setattr(web, "TIMELINE_PAGE_ITEMS", 5)
+    repo = GitRepo.init(tmp_path)
+    for i, asked in enumerate([0, 3, 1, 0, 0, 0, 6, 1]):  # oldest first
+        _write_lines(repo, "x.txt", i + 1)
+        users = "".join(f"## User\n\nC{i}-{k}\n\n" for k in range(asked))
+        repo.commit(
+            f"<aGiTrack> c{i}\n\n# Interaction Trace\n\n{users}## Agent\n\nok\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+        )
+    scope = RepoScope(repo)
+
+    def log(**query):
+        return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
+
+    first = log(view="timeline", limit=3)
+    # Newest first, items per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
+    # GitRepo.init makes (1). A commit that would take a page past 5 items, or past 3 commits,
+    # starts the next one: c6 alone exceeds 5, c5..c3 fill 3 commits, c1+c0 fill exactly 5.
+    assert first["page_starts"] == [0, 1, 2, 5, 6, 8]
+    assert [e["subject"] for e in first["entries"]] == ["<aGiTrack> c7"]
+    assert [e["subject"] for e in log(view="timeline", limit=3, offset=3)["entries"]] == [
+        "<aGiTrack> c5",
+        "<aGiTrack> c4",
+        "<aGiTrack> c3",
+    ]  # moved back to its page's start
+    assert log(view="timeline", limit=3, offset=3)["offset"] == 2
+    assert "page_starts" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+
+    # Rewrite the newest commit so it carries four messages (five items, a full page on its own).
+    message = subprocess.run(
+        ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True
+    ).stdout.replace("## Agent", "## User\n\nmore\n\n## User\n\nmore\n\n## User\n\nmore\n\n## Agent")
+    subprocess.run(
+        ["git", "-C", str(repo.repo), "commit", "-q", "--amend", "--cleanup=whitespace", "-m", message], check=True
+    )
+    rewritten = log(view="timeline", limit=3)
+    assert rewritten["page_starts"] == [0, 1, 2, 5, 6, 8]
+    assert sum(len(t["prompts"]) for t in rewritten["entries"][0]["turns"]) == 4
+    assert (
+        rewritten["entries"][0]["sha"]
+        == subprocess.run(
+            ["git", "-C", str(repo.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+    )
 
 
 def test_a_timeline_link_names_the_part_and_the_message_it_opens(tmp_path):
-    # "→ <sha>" opens the commit at the message: the squashed part it is in (a path of display
+    # "more in <sha> →" opens the commit at the message: the squashed part it is in (a path of display
     # indices, nested parts joined by ".") and which "## User" of that part's trace it is. The
     # page script follows them (showMessageInCommit / markUserSection); checked in headless
     # Chrome on this repository's own history: all 65 links on the first page, at 390px and

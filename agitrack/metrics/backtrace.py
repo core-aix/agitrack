@@ -1236,6 +1236,7 @@ class BacktraceScope:
                     sort=_str(query, "sort"),
                     text=_str(query, "q"),
                     text_in=_str(query, "qin") or "subject",
+                    view=_str(query, "view") or "commits",
                 )
             )
         if path == "/diff":

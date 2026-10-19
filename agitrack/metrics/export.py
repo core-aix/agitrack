@@ -14,6 +14,7 @@ Layout of the exported directory::
     demo/                 the pre-rendered responses the shims serve:
       data-<granularity>.json     /data for hour/day/week/month (last-30-days scope)
       log-<sort>-<offset>.json    every /log page for every sort order (same scope)
+      log-timeline-<sort>-<offset>.json  every timeline page (they end at 50 commits or 250 items)
       diff/<sha>.json             every commit's /diff
       files.json                  /files
       filelog/<n>.json            /filelog per file (n = index in files.json order)
@@ -366,6 +367,12 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     if (name === "log") {{
       var sort = p.get("sort") || "date";
       if (["date","lines","tokens"].indexOf(sort) < 0) sort = "date";
+      if (p.get("view") === "timeline") {{
+        // Timeline pages are not all the same size, so an offset from the commit list may not
+        // start one; the first page answers then.
+        var start = "log-timeline-" + sort + "-";
+        return file(start + (parseInt(p.get("offset") || "0", 10) || 0) + ".json", function(){{ return file(start + "0.json", unavailable); }});
+      }}
       var page = {PAGE_SIZE};
       var offset = Math.max(0, Math.floor((parseInt(p.get("offset") || "0", 10) || 0) / page) * page);
       return file("log-" + sort + "-" + offset + ".json", unavailable);
@@ -664,6 +671,12 @@ def export_static_demo(repo: GitRepo, out_dir: Path, *, force: bool = False) -> 
             _write_json(
                 demo / f"log-{sort}-{offset}.json", log_page(dash, repo=repo, frm=frm, offset=offset, sort=sort)
             )
+        first = log_page(dash, repo=repo, frm=frm, sort=sort, view="timeline")
+        for offset in first["page_starts"]:
+            timeline_page = (
+                first if offset == 0 else log_page(dash, repo=repo, frm=frm, offset=offset, sort=sort, view="timeline")
+            )
+            _write_json(demo / f"log-timeline-{sort}-{offset}.json", timeline_page)
 
     # Every in-scope commit's diff (only they appear in the log), and the whole file
     # browser with each change's file diff (file history deliberately stays full-depth).

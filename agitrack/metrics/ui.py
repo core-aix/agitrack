@@ -41,8 +41,12 @@ TOKENS = """:root{
 
 BASE_CSS = """*{box-sizing:border-box}
 /* No page may scroll sideways: a single over-wide element otherwise drags the whole
-   document with it, which is worse on a phone than the element being clipped. */
-html,body{overflow-x:hidden}
+   document with it, which is worse on a phone than the element being clipped. `clip`, not
+   `hidden`: `hidden` on both html and body makes body a scroll container that never scrolls,
+   and every `position:sticky` on the page then sticks to it instead of the screen (the
+   timeline's floating "collapse" did not float). `hidden` stays first for browsers that
+   predate `clip`. */
+html,body{overflow-x:hidden;overflow-x:clip}
 /* `hidden` is a UA-level display:none, which ANY author `display` outranks: a hidden flex or
    grid box stays on screen without this. It is the reason the dashboard's file filter showed
    in the commits view for a while. Every page gets it. */
