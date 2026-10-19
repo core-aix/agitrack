@@ -2580,7 +2580,7 @@ function timelineHtml(entries, commitRow){
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
       : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
-    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "follow-up" : "asked"}</span>`+
+    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
   }).join("");

@@ -2863,9 +2863,9 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
     assert order == sorted(order)
     assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
-    assert "follow-up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
+    assert "followed up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
     # Labelled with the committer, never "you": the log holds several people's work.
-    assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> follow-up") == 1
+    assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
     assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
 
     commits = _render_log([newer, older], tmp_path)
