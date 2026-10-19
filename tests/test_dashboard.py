@@ -2496,7 +2496,7 @@ def _render_detail(entry: dict, tmp_path, tz: str | None = None) -> str:
         encoding="utf-8",
     )
     env = {**os.environ, "TZ": tz} if tz else None
-    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300, env=env)
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=300, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
 
@@ -2639,7 +2639,12 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
         encoding="utf-8",
     )
     result = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "Asia/Tokyo"}
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env={**os.environ, "TZ": "Asia/Tokyo"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST

@@ -250,14 +250,16 @@ def test_spawn_cmd_child_on_windows():
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             readable, _, _ = select.select([proc.master_fd], [], [], 0.5)
+            # Read until the bridge reports end of stream, NOT until the process is gone:
+            # a fast child's output can still be in the pump when it exits, so stopping on
+            # the raw exit state lost "hello" on Windows CI.
             if readable:
                 chunk = proc.drain()
-                if chunk:
-                    combined += chunk
+                if chunk is None:
+                    break
+                combined += chunk
                 if b"hello" in combined.lower():
                     break
-            elif proc._handle is not None and proc._handle.poll_exited():
-                break
         assert b"hello" in combined.lower(), f"output not found in: {combined!r}"
     finally:
         proc.teardown()
