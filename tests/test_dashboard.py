@@ -2179,6 +2179,70 @@ def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch)
         server.server_close()
 
 
+def test_logins_or_branch_names_arriving_do_not_reread_the_history(tmp_path, monkeypatch):
+    """Right after every start (an update restart included) the GitHub logins and the
+    remote-pruned branch list fill in in the background. Both are part of the dashboard's cache
+    key, and each used to re-read the whole history, so the page showed "reading commit history"
+    two or three times with no new commit. Only the history read is expensive; it depends on
+    the tips alone."""
+    import agitrack.metrics.server as server_mod
+
+    repo = _demo_repo(tmp_path)
+    server = build_server(repo, port=0)
+    reads = []
+    real = server_mod.collect_dashboard_stats
+    monkeypatch.setattr(server_mod, "collect_dashboard_stats", lambda *a, **k: (reads.append(1), real(*a, **k))[1])
+    logins: dict[str, str] = {}
+    monkeypatch.setattr(server_mod, "cached_logins", lambda *_a, **_k: dict(logins))
+    try:
+        scope = server.RequestHandlerClass.scope
+        first = scope._dashboard()
+        logins["deadbeef"] = "someone"  # identities resolved in the background
+        second = scope._dashboard()
+        assert second is not first and second.sha_logins == {"deadbeef": "someone"}
+        repo._run(["git", "branch", "side"])  # the selector's branch list changed
+        third = scope._dashboard()
+        assert "side" in third.branches
+        assert len(reads) == 1  # ...and the history was read once for all three
+
+        _write_lines(repo, "later.txt", 3)
+        repo.commit("something new")
+        scope._dashboard()
+        assert len(reads) == 2  # a moved tip still re-reads it
+    finally:
+        scope._dash_cache.clear()
+        server.server_close()
+
+
+def test_an_auto_fold_of_several_turns_gives_each_part_its_own_subject():
+    """A fold of several turns leads with the NEWEST turn's subject, then every turn's body
+    oldest first. That lead was read as the first part's subject, so the oldest part carried the
+    newest subject (two parts with one subject) and the commit's own text was the oldest turn's
+    summary."""
+    from agitrack.commits import build_auto_fold_message
+    from agitrack.metrics.collect import _parse_constituents
+    from agitrack.metrics.web import _main_message
+
+    def body(prompt: str) -> str:
+        return build_agent_commit_message(
+            latest_prompt=prompt,
+            trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "did " + prompt}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 3, "input": 5},
+        )
+
+    message = build_auto_fold_message([body("older question"), body("newest edit")])
+    parts = _parse_constituents(message)
+    assert [p.subject for p in parts] == ["<aGiTrack> older question", "<aGiTrack> newest edit"]
+    stat = CommitStat(
+        sha="x", author="", email="", subject=message.splitlines()[0], kind="agent", message=message, constituents=parts
+    )
+    assert _main_message(stat) == "<aGiTrack> newest edit"
+
+
 def _rendered_dashboard() -> str:
     """The page as a browser sees it: the shared UI blocks (agitrack/metrics/ui.py) are
     substituted at render time, so asserting against the raw template would miss them."""
@@ -2432,7 +2496,7 @@ def _render_detail(entry: dict, tmp_path, tz: str | None = None) -> str:
         encoding="utf-8",
     )
     env = {**os.environ, "TZ": tz} if tz else None
-    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=300, env=env)
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=300, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
 
@@ -2575,7 +2639,12 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
         encoding="utf-8",
     )
     result = subprocess.run(
-        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "Asia/Tokyo"}
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env={**os.environ, "TZ": "Asia/Tokyo"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
     local = datetime.fromtimestamp(ts, timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")  # Tokyo has no DST
@@ -2585,3 +2654,229 @@ def test_each_commit_in_the_log_shows_when_it_was_made(tmp_path):
     assert row.index('class="ksub"') < row.index('class="emeta"') < row.index('class="when"')
     assert f">{local}</span>" in result.stdout  # the reader's local time on the row
     assert f"({utc} UTC)" in result.stdout  # and the same moment in UTC on hover
+
+
+def test_the_page_answers_clicks_before_its_first_fetch_returns():
+    """A restored view is on screen at once, and the refresh behind it can take as long as a
+    restarted daemon needs to re-read the history. The commit-log click handler (expanding a
+    commit) was attached only AFTER that fetch, so the page looked ready and ignored clicks for
+    up to a minute. Every control is wired before anything is awaited, and the refresh behind a
+    restored view shows the loading spinner."""
+    html = _rendered_dashboard()
+    wire = html.index("function wireControls(){")
+    init = html.index("async function init(){")
+    body = html[init : html.index("\n}\n", init)]
+    assert body.index("wireControls();") < body.index("await loadAgg()")
+    controls = html[wire:init]
+    assert '$("commitlog").addEventListener("click"' in controls
+    assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
+
+
+def test_the_log_search_can_look_in_the_users_words_the_agents_words_or_the_whole_trace(tmp_path):
+    """Beyond the subject and the whole message, the search can be narrowed to what the user
+    said, what the agent said, or the interaction trace (the metadata is outside all three)."""
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _demo_repo(tmp_path)
+    _write_lines(repo, "y.txt", 2)
+    repo.commit(
+        "Tidy the parser\n\n"
+        "# Interaction Trace\n\n## User\n\nplease rename the PINEAPPLE helper\n\n"
+        "## Agent\n\nRenamed it; the KUMQUAT test still passes.\n\n"
+        "```\n## User\nQUOTED inside a fence\n```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: GUAVA-model\n"
+    )
+    scope = RepoScope(repo)
+
+    def found(q, qin):
+        body = scope.get("/log", {"q": [q], "qin": [qin]}).body
+        return [entry["subject"] for entry in _json.loads(body)["entries"]]
+
+    hit = ["Tidy the parser"]
+    assert found("pineapple", "user") == hit and found("pineapple", "agent") == []
+    assert found("kumquat", "agent") == hit and found("kumquat", "user") == []
+    assert found("kumquat pineapple", "trace") == hit
+    assert found("quoted", "agent") == hit  # a fenced "## User" is the agent's text, not a role
+    assert found("guava", "trace") == [] and found("guava", "all") == hit  # metadata is not trace
+    assert found("pineapple", "nonsense") == []  # an unknown scope falls back to the subject
+
+
+def test_a_squash_says_which_of_its_parts_match_the_search_before_it_is_opened(tmp_path):
+    """A search matching a squash marks the parts that hold the words, and counts them on the
+    squash's own row, so the reader knows which squash (and which part) is worth opening."""
+    from agitrack.commits import build_auto_fold_message
+    from agitrack.metrics.collect import _parse_constituents
+    from agitrack.metrics.web import _mark_matching_parts, _part_payload, _text_filtered
+
+    def body(prompt: str) -> str:
+        return build_agent_commit_message(
+            latest_prompt=prompt,
+            trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "did " + prompt}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 3, "input": 5},
+        )
+
+    message = build_auto_fold_message([body("rename the PAPAYA helper"), body("fix the docs"), body("tidy up")])
+    parts = _parse_constituents(message)
+    stat = CommitStat(
+        sha="x", author="", email="", subject="tidy up", kind="agent", message=message, constituents=parts
+    )
+    assert _text_filtered([stat], "papaya", "user") == [stat]
+
+    payload = [_part_payload(part) for part in parts]
+    assert _mark_matching_parts(payload, "papaya", "user") == 1
+    assert [bool(p.get("match")) for p in payload] == [True, False, False]
+    assert _mark_matching_parts(payload, "", "user") == 0  # no search, no marks
+
+
+def test_the_log_search_finds_a_commit_by_subject_or_by_what_was_asked(tmp_path):
+    """The log's search box narrows the log alone: every word, ignoring case, in the subject or
+    (`qin=all`) anywhere in the message, which is where the trace records what was asked."""
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _demo_repo(tmp_path)
+    _write_lines(repo, "x.txt", 2)
+    repo.commit("Tidy the parser\n\n# Interaction Trace\n\n## User\n\nplease rename the PINEAPPLE helper\n")
+    scope = RepoScope(repo)
+
+    def subjects(**query):
+        body = scope.get("/log", {k: [v] for k, v in query.items()}).body
+        return [entry["subject"] for entry in _json.loads(body)["entries"]]
+
+    everything = subjects()
+    assert subjects(q="tidy PARSER") == ["Tidy the parser"]
+    assert subjects(q="pineapple") == []  # not in the subject...
+    assert subjects(q="pineapple helper", qin="all") == ["Tidy the parser"]  # ...but it was asked
+    assert subjects(q="tidy unrelated") == []  # every word must match
+    assert subjects(q="   ") == everything
+    data = _json.loads(scope.get("/data", {"q": ["tidy"]}).body)
+    assert data["agg"]["total"] == len(everything)  # the panels above are untouched
+
+
+def test_the_timeline_lists_each_turns_prompts_with_when_the_turn_began(tmp_path):
+    """The log's timeline view lays the user's messages between the commits they went into. A
+    log entry carries its turns oldest first: when each began, and every message sent in it (a
+    queued follow-up shares its turn's time), in full. A fold has one turn per part, a heading
+    quoted in a fence is not a message, and a commit with no trace has no turns."""
+    from datetime import datetime
+
+    from agitrack.metrics.web import _timeline_turns
+
+    def epoch(iso):
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> first turn\n\n# Interaction Trace\n\n## User\n\nrename the helper\nand its test\n\n"
+        "## Agent\n\ndone\n\n```\n## User\nquoted, not asked\n```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: 2026-10-08T10:00:00Z\n\n"
+        "<aGiTrack> second turn\n\n# Interaction Trace\n\n## User\n\nfix the docs\n\n## User\n\nand the README\n\n"
+        "## Agent\n\nok\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+    )
+    _write_lines(repo, "t.txt", 3)
+    repo.commit("plain user commit")
+    stats = {s.subject: s for s in build_dashboard(repo).stats}
+
+    assert _timeline_turns(stats["my commit"]) == [
+        {"at": epoch("2026-10-08T10:00:00Z"), "prompts": ["rename the helper\nand its test"]},
+        {"at": None, "prompts": ["fix the docs", "and the README"]},  # no start recorded
+    ]
+    assert _timeline_turns(stats["plain user commit"]) == []
+
+
+def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
+    """What the dashboard script draws for this log page (``renderLog``), under node."""
+    import os
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from tests.test_story import _DOM_STUB
+
+    import tempfile
+
+    work = Path(tempfile.mkdtemp(dir=tmp_path))
+    page = render_html(_demo_repo(work / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = work / "log.js"
+    run = (
+        setup
+        + f"LOGPAGE = {{entries: {json.dumps(entries)}, total: {len(entries)}, offset: 0, limit: 50}}; renderLog();"
+    )
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + stub
+        + "const box = stubEl();\n"
+        + "const base = document.getElementById;\n"
+        + "document.getElementById = id => (id === 'commitlog' ? box : base(id));\n"
+        + "new Function(SOURCE + '\\n;' + "
+        + json.dumps(run)
+        + ")();\n"
+        + "console.log(box.innerHTML);\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env={**os.environ, "TZ": "UTC"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_path):
+    """Newest first, by time: a message shows where it was sent, even when it went into a LATER
+    commit than the one made just after it (a fold), and each says which commit it went into.
+    The commits tab is unchanged."""
+    newer = {
+        "sha": "b" * 40,
+        "short": "bbbbbbbb",
+        "author": "alice-gh",
+        "subject": "fold commit",
+        "kind": "agent",
+        "ts": 3000,
+        "tokens": {},
+        "turns": [
+            {"at": 1000, "prompts": ["ORANGE asked first"]},
+            {"at": 2500, "prompts": ["LEMON asked", "LIME follow-up"]},
+        ],
+    }
+    older = {
+        "sha": "a" * 40,
+        "short": "aaaaaaaa",
+        "author": "bob-gh",
+        "subject": "middle commit",
+        "kind": "user",
+        "ts": 2000,
+        "tokens": {},
+        "turns": [{"at": None, "prompts": ["KIWI undated"]}],
+    }
+    out = _render_log([newer, older], tmp_path, setup='LOGTAB = "timeline"; ')
+    order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
+    assert order == sorted(order)
+    assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
+    assert "followed up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
+    # Labelled with the committer, never "you": the log holds several people's work.
+    assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
+    assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
+
+    commits = _render_log([newer, older], tmp_path)
+    assert "ORANGE" not in commits and "fold commit" in commits

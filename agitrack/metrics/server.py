@@ -32,11 +32,18 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
+from agitrack.git.repo import user_requested_content
 from agitrack.git.repo import read_cache
 from agitrack.proc import UTF8_TEXT
 from agitrack.metrics import learn as learn_page
 from agitrack.metrics import story as story_page
-from agitrack.metrics.collect import Dashboard, build_dashboard, viewable_branches
+from agitrack.metrics.collect import (
+    Dashboard,
+    build_dashboard,
+    collect_dashboard_stats,
+    recount_after_click,
+    viewable_branches,
+)
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
 from agitrack.metrics import progress
@@ -128,6 +135,10 @@ class RepoScope:
         self._insights_cache: dict[tuple, list[dict]] = {}
         # The built Dashboard itself, keyed by the refs it was built from (see _dashboard).
         self._dash_cache: dict[tuple, Dashboard] = {}
+        # The history it was built from, keyed only by the tips that history depends on. The
+        # Dashboard's key also carries what fills in AFTER a start (resolved GitHub logins, the
+        # remote-pruned branch list); without this, each of those re-read the whole history.
+        self._stats_cache: dict[tuple, list] = {}
         # One build at a time per repository. The server is threaded, so a page fetching /data
         # while another tab (or the hub) asks for the same thing had every thread indexing the
         # SAME history in parallel: the full first-load cost paid twice over, and both writing
@@ -214,12 +225,24 @@ class RepoScope:
                         offset=_int(query, "offset", 0),
                         limit=_int(query, "limit", 50),
                         sort=_str(query, "sort"),
+                        text=_str(query, "q"),
+                        text_in=_str(query, "qin") or "subject",
                     )
                 )
         if path == "/diff":
             # This commit's file diffs, straight from the local clone — so the dashboard shows
-            # changes without GitHub. The sha is validated as a hex id in commit_diff.
-            return json_response(commit_diff(self.repo, _str(query, "sha")))
+            # changes without GitHub. The sha is validated as a hex id in commit_diff. A person
+            # clicked for this, so it is the one read allowed to fetch absent blobs on a partial
+            # clone, and once it has, the commit's line count is made exact (and served back).
+            sha = _str(query, "sha")
+            with user_requested_content():
+                payload = commit_diff(self.repo, sha)
+                if not payload.get("error") and self.repo.is_partial_clone():
+                    counts = recount_after_click(self.repo, sha)
+                    if counts is not None:
+                        payload["ins"], payload["del"] = counts
+                        self._apply_count(sha, counts)
+            return json_response(payload)
         if path == "/files":
             # The file browser: every changed file with its per-file change history and the
             # conversation/tokens behind each change (same view as --backtrace, real commits).
@@ -227,7 +250,9 @@ class RepoScope:
         if path == "/filelog":
             return json_response(self._browser(ref).file_log_payload(_str(query, "path")))
         if path == "/filediff":
-            return json_response(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha")))
+            browser = self._browser(ref)
+            with user_requested_content():  # a click on one change: the content may be fetched
+                return json_response(browser.file_diff(_str(query, "path"), _str(query, "sha")))
         if path == "/story":
             # The storyline: the backend agent tells this branch's history as chapters
             # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
@@ -373,7 +398,8 @@ class RepoScope:
         # or /story. It only changes when a ref moves, so key it on the tips we actually read
         # (the branch, and the manual-mode latent refs the pending rows come from) plus how many
         # identities are resolved so far.
-        key = (ref, self._ref_state(ref), len(logins), len(self.email_logins))
+        history = self._history_state(ref)
+        key = (ref, history + "|" + self._branch_names(), len(logins), len(self.email_logins))
         hit = self._dash_cache.get(key)
         if hit is not None:
             return hit
@@ -381,13 +407,54 @@ class RepoScope:
             hit = self._dash_cache.get(key)
             if hit is not None:
                 return hit  # another thread built it while this one waited
-            # The one place a request can block for minutes (a repository whose commits have
-            # never been diffed), so it is the one place that says how far along it is.
-            with progress.publishing(self.root):
-                dash = build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+            # Only the HISTORY is expensive, and it depends on the tips alone. A key that moved
+            # because more GitHub logins resolved, or because the remote check dropped a stale
+            # branch, both of which happen in the background right after every start (an update
+            # restart included), reuses it: each used to re-read the whole history, and the page
+            # sat on "reading commit history" two or three times over with no new commit at all.
+            stats_key = (ref, history) if history else None
+            stats = self._stats_cache.get(stats_key) if stats_key else None
+            if stats is None:
+                # The one place a request can block for minutes (a repository whose commits have
+                # never been diffed), so it is the one place that says how far along it is.
+                with progress.publishing(self.root):
+                    stats = collect_dashboard_stats(self.repo, ref)
+                self._stats_cache.clear()  # only the current history is worth keeping
+                if stats_key:
+                    self._stats_cache[stats_key] = stats
+            dash = build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins, stats=stats)
             self._dash_cache.clear()  # only the current state is worth keeping
             self._dash_cache[key] = dash
             return dash
+
+    def _apply_count(self, sha: str, counts: tuple[int, int]) -> None:
+        """Put an exact count, just made possible by a click, on the cached history too, so the
+        log shows it without waiting for the next rebuild."""
+        for stats in self._stats_cache.values():
+            for stat in stats:
+                if stat.sha == sha or (len(sha) < 40 and stat.sha.startswith(sha)):
+                    stat.insertions, stat.deletions = counts
+
+    def _history_state(self, ref: str) -> str:
+        """The tips the HISTORY depends on: the shown branch and the latent (manual-mode) refs.
+        Empty when unreadable, which never matches a cached history."""
+        try:
+            head = self.repo.rev_parse(ref)
+        except Exception:
+            return ""  # unreadable: fall through to a rebuild rather than serve a guess
+        try:
+            latent = self.repo._run(
+                ["git", "for-each-ref", "--format=%(objectname)", "refs/agitrack/manual"], check=False
+            ).stdout
+        except Exception:
+            latent = ""
+        return head + "|" + latent.strip()
+
+    def _branch_names(self) -> str:
+        try:
+            return "\n".join(viewable_branches(self.repo))
+        except Exception:
+            return ""
 
     def _ref_state(self, ref: str) -> str:
         """A cheap fingerprint of everything the dashboard reads: the shown branch's tip, the
@@ -400,21 +467,10 @@ class RepoScope:
         pulled branch stayed invisible until the user happened to commit. Names, not tips — a
         branch merely MOVING changes nothing the selector shows, and rebuilding the whole
         history for it would be pure churn."""
-        try:
-            head = self.repo.rev_parse(ref)
-        except Exception:
-            return ""  # unreadable: fall through to a rebuild rather than serve a guess
-        try:
-            latent = self.repo._run(
-                ["git", "for-each-ref", "--format=%(objectname)", "refs/agitrack/manual"], check=False
-            ).stdout
-        except Exception:
-            latent = ""
-        try:
-            names = "\n".join(viewable_branches(self.repo))
-        except Exception:
-            names = ""
-        return head + "|" + latent.strip() + "|" + names
+        history = self._history_state(ref)
+        if not history:
+            return ""
+        return history + "|" + self._branch_names()
 
     def _browser(self, ref: str = "HEAD") -> FileBrowser:
         # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll that

@@ -1612,6 +1612,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # second one. (It was a read-only probe before, so no lock was held during startup and
     # the extension couldn't yet see the session.)
     management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    # Whether this start took over from a live background tracker (set below when it did).
+    replaced = False
     # A `--background-serve` child is a DAEMON TAKING OVER, not a second writer asking
     # permission: it is spawned either by the `-b` launcher (which released the lock first) or
     # by a tracker restarting itself onto new code (which now does too). Either way its
@@ -1621,7 +1623,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # exited 0, and the repo was left with nothing tracking it.
     if not management_lock.acquire(retry_seconds=5.0 if args.background_serve else 0.0):
         owner_pid = management_lock.owner_pid()
-        replaced = False
         if args.background_serve:
             # Never the launcher's "already running — left in place": that branch exists to stop
             # a SECOND tracker starting, and this process IS the tracker. Reporting success here
@@ -1721,6 +1722,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             _maybe_prompt_background_hook(
                 config, scripted=scripted, backend=_autostart_backend(repo, args.backend, config)
             )
+            # Leftover turns from an earlier run: only when this start REPLACES nothing. A
+            # tracker that was live until a moment ago was recording them as they happened, so
+            # they are the ordinary pending turns of this session, not leftovers.
+            if manual_commits and not replaced:
+                _offer_leftover_manual_traces(repo, scripted=scripted)
             # Launcher: spawn the tracker as a DETACHED daemon (like `agitrack -d`) so the
             # terminal is freed, then return to the shell. The child re-execs aGiTrack with
             # --background-serve and takes its own lock, so release ours first (the child owns
@@ -1797,6 +1803,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
+            if manual_commits:
+                _offer_leftover_manual_traces(repo, scripted=scripted)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -2377,6 +2385,57 @@ def _autostart_backend(repo, requested: str | None, config: GlobalConfig) -> str
     except Exception:
         recorded = None
     return recorded or getattr(config, "default_backend", None)
+
+
+def _offer_leftover_manual_traces(repo: GitRepo, *, scripted: bool) -> None:
+    """At a manual-commit start the user typed, ask what to do with turns an earlier run
+    recorded that never reached a commit (issue #296).
+
+    Manual mode keeps each turn as a hidden latent commit until the user's own commit folds it
+    in. When the machine was shut down (or aGiTrack otherwise ended) with some still pending,
+    they would silently fold into whatever the user commits next, possibly days later and about
+    something else. So the start asks: keep them for the next commit (the default, since
+    discarding cannot be undone), or discard them. Discarding also moves the tracking floor to
+    now, so a turn that was still running at the shutdown, or anything said while nothing was
+    tracking, is not picked up from the transcript afterwards either.
+
+    The caller holds the repo's single-writer lock, so no tracker can be recording while the
+    refs are reset. Never asks without a terminal (an auto-start, a script): those keep the
+    turns, as before."""
+    if scripted or not (stdin_is_interactive() and stdout_is_interactive()):
+        return
+    try:
+        from agitrack.commits.manual import ManualCommitTracker
+        from agitrack.config import AgitrackState
+
+        tracker = ManualCommitTracker(repo, repo, AgitrackState(repo.repo))
+        count = tracker.pending_count()
+    except Exception:
+        return
+    if not count:
+        return
+    turns = "1 agent turn" if count == 1 else f"{count} agent turns"
+    print(
+        f"\n{turns} recorded by an earlier aGiTrack run on this repo never reached a commit\n"
+        "(aGiTrack was not stopped before it ended, or you have not committed since).\n"
+        "Keep them, and they are folded into your next commit. Discard them, and they, along with\n"
+        "anything said in your agent before now that aGiTrack has not yet recorded, never reach\n"
+        "a commit message. Your files are not touched either way."
+    )
+    try:
+        answer = _ask("Include them in your next commit? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not answer.startswith("n"):
+        return
+    try:
+        from agitrack import tracking_gap
+
+        dropped = tracker.discard_pending()
+        tracking_gap.discard_before(repo.repo)
+        print(f"Discarded {dropped} earlier turn(s). Tracking starts fresh from now.")
+    except Exception as error:
+        print(f"Could not discard the earlier turns ({error}); they stay pending.")
 
 
 def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool, backend: str | None = None) -> None:

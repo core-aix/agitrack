@@ -30,7 +30,14 @@ from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, _iso_epoch, apply_numstat_for, build_dashboard
+from agitrack.metrics.collect import (
+    CommitStat,
+    Dashboard,
+    _iso_epoch,
+    apply_numstat_for,
+    build_dashboard,
+    fold_lead_end,
+)
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
@@ -373,6 +380,12 @@ def _main_message(stat: CommitStat) -> str:
     commit, or a PR title for a squash merge). A non-squash commit keeps its full message."""
     if not stat.constituents:
         return stat.message
+    lines = stat.message.splitlines()
+    lead = fold_lead_end(lines)
+    if lead:
+        # An auto-fold's own text is its lead subject; everything after it is the parts, and the
+        # first part's summary is NOT this commit's (it is the oldest turn's).
+        return "\n".join(lines[:lead]).strip()
     head, _, _ = stat.message.partition("\n" + METADATA_HEADER)
     return head.strip()
 
@@ -820,7 +833,47 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "message": _main_message(stat),  # squash constituents stripped (shown in "parts")
         "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
         "parts": _display_parts(stat),  # newest-first display (message stays chronological)
+        "turns": _timeline_turns(stat),  # what the user asked, and when, for the timeline view
     }
+
+
+def _timeline_turns(stat: CommitStat) -> list[dict]:
+    """The turns behind a commit, oldest first, each with when it began (``at``, epoch seconds,
+    None when the turn recorded no start) and every message the user sent in it, in full, for
+    the log's timeline view. A squash or a fold has one turn per part (recursively); the fold's
+    own lead block is the commit itself and holds no prompt. Messages sent while a turn ran (a
+    queued follow-up) carry no time of their own in the trace, so they share the turn's."""
+    parts = list(stat.constituents)
+    if parts and _is_own_lead(parts[0], stat):
+        parts = parts[1:]
+    if not parts:
+        messages = _trace_user_messages(stat.message)
+        return [{"at": _iso_epoch(stat.started_at), "prompts": messages}] if messages else []
+    return [turn for part in parts for turn in _timeline_turns(part)]
+
+
+def _trace_user_messages(message: str) -> list[str]:
+    """Every ``## User`` section of a message's interaction trace, one string each, its text
+    kept as written. Fence-aware like :func:`_trace_sections`, so a heading QUOTED in a code
+    block is not a role."""
+    messages: list[list[str]] = []
+    in_trace = in_fence = in_user = False
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            in_user = False
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            in_user = stripped == "## User"
+            if in_user:
+                messages.append([])
+            continue
+        if in_trace and in_user:
+            messages[-1].append(line)
+    return [text for text in ("\n".join(lines).strip() for lines in messages) if text]
 
 
 def log_page(
@@ -836,16 +889,22 @@ def log_page(
     offset: int = 0,
     limit: int = PAGE_SIZE,
     sort: str = DEFAULT_LOG_SORT,
+    text: str = "",
+    text_in: str = "subject",
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
 
-    When ``repo`` is given, the page's commits get their exact insertions/deletions
-    fetched on demand — and *only* those commits' blobs are fetched, so a blobless
-    partial clone never pulls its whole history just to render one page (the
-    full-history scan in :func:`collect_commit_stats` counts from local blobs alone)."""
+    ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
+    word must appear, ignoring case, in the part ``text_in`` names: the subject, the user's
+    messages, the agent's messages, the whole interaction trace, or the whole message
+    (:data:`_TEXT_SCOPES`). A squash's parts count as part of it.
+
+    When ``repo`` is given, the page's commits get their line counts from the cache or the
+    local blobs, never by fetching (see :func:`agitrack.metrics.collect.apply_numstat_for`)."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
+    stats = _text_filtered(stats, text, text_in)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
@@ -857,8 +916,93 @@ def log_page(
         "total": len(stats),
         "offset": offset,
         "limit": limit,
-        "entries": [_log_entry(dash, stat, covers) for stat in page],
+        "entries": [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page],
     }
+
+
+def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
+    count = _mark_matching_parts(entry.get("parts") or [], text, text_in)
+    if count:
+        entry["part_matches"] = count
+    return entry
+
+
+_TEXT_SCOPES = ("subject", "user", "agent", "trace", "all")
+
+
+def _trace_sections(message: str) -> dict[str, str]:
+    """A commit message's interaction trace split the way the search offers it: what the user
+    said (every ``## User`` section), what the agent said (every ``## Agent`` section) and the
+    whole trace. A squash or a fold carries one trace per turn, and all of them count. Fenced
+    code is followed so a ``## User`` QUOTED inside a message is not read as a heading; a
+    message's own headings are pushed down two levels when the trace is written, so a line
+    starting ``## `` outside a fence is always a role."""
+    sections: dict[str, list[str]] = {"user": [], "agent": [], "trace": []}
+    in_trace = in_fence = False
+    role: str | None = None
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            role = None
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            role = {"## User": "user", "## Agent": "agent"}.get(stripped)
+            continue
+        if in_trace:
+            sections["trace"].append(line)
+            if role:
+                sections[role].append(line)
+    return {key: "\n".join(lines) for key, lines in sections.items()}
+
+
+def _text_filtered(stats: list[CommitStat], text: str, text_in: str) -> list[CommitStat]:
+    """The commits holding every word of ``text``, ignoring case, in the part of the commit
+    ``text_in`` names: the subject, what the user said, what the agent said, the interaction
+    trace, or the whole message."""
+    words = [word for word in (text or "").lower().split() if word]
+    if not words:
+        return stats
+    scope = text_in if text_in in _TEXT_SCOPES else "subject"
+
+    def haystack(stat: CommitStat) -> str:
+        if scope == "subject":
+            parts = [stat.subject, *(part.subject for part in stat.constituents)]
+        elif scope == "all":
+            parts = [stat.message, *(part.message for part in stat.constituents)]
+        else:
+            parts = [_trace_sections(stat.message)[scope]]
+        return "\n".join(part or "" for part in parts).lower()
+
+    return [stat for stat in stats if all(word in haystack(stat) for word in words)]
+
+
+def _mark_matching_parts(parts: list[dict], text: str, text_in: str) -> int:
+    """Flag each squashed part (``match: True``) holding every search word in the searched
+    scope, recursively, and return how many of THIS level's parts match. A squash's row shows
+    the count and each matching part a badge, so the reader can tell which squash, and which
+    part inside it, is worth opening before opening it."""
+    words = [word for word in (text or "").lower().split() if word]
+    if not words:
+        return 0
+    scope = text_in if text_in in _TEXT_SCOPES else "subject"
+    count = 0
+    for part in parts:
+        message = part.get("message") or ""
+        if scope == "subject":
+            hay = part.get("subject") or ""
+        elif scope == "all":
+            hay = message
+        else:
+            hay = _trace_sections(message)[scope]
+        hay = hay.lower()
+        inner = _mark_matching_parts(part.get("parts") or [], text, text_in)
+        if all(word in hay for word in words) or inner:
+            part["match"] = True
+            count += 1
+    return count
 
 
 # A commit id must be a bare hex object name before it is handed to git, so a crafted
@@ -1359,6 +1503,24 @@ h2.section::before{content:"# ";color:var(--amber)}
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
 .entry .ksub{flex:1;min-width:200px;color:var(--fg);overflow-wrap:anywhere}
+/* The timeline: the user's messages between the commits they went into. */
+.tprompt{position:relative;margin:6px 0 6px 18px;padding:7px 10px 8px 12px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06)}
+.tprompt .thead{display:flex;gap:10px;align-items:baseline;font-size:11.5px;color:var(--fg-dim);margin-bottom:3px}
+.tprompt .twho{color:var(--ops);letter-spacing:.5px;font-size:11px}
+.tprompt .twho .tid{font-weight:600}
+.tprompt .when{font-variant-numeric:tabular-nums;white-space:nowrap}
+.tprompt .tgo{margin-left:auto;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
+.tprompt .tgo:hover{text-decoration:underline}
+.tprompt .tbody{color:var(--fg);overflow-wrap:anywhere}
+.tprompt .tbody > :first-child{margin-top:0}
+.tprompt .tbody > :last-child{margin-bottom:0}
+.tprompt .tmore{display:none;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:4px 0 0;cursor:pointer}
+.tprompt.clamp .tbody{max-height:15em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
+.tprompt.clamp .tmore{display:inline}
+.log.timeline .entry.linked,.tprompt.linked{background:rgba(255,180,84,.08)}
+.entry.flash{animation:tflash 1.2s ease-out}
+@keyframes tflash{from{background:rgba(255,180,84,.3)}to{background:transparent}}
+@media (prefers-reduced-motion: reduce){.entry.flash{animation:none}}
 .entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
@@ -1474,7 +1636,15 @@ __UI_COMMIT_CSS__
   margin:22px 0 12px}
 /* An author `display` beats the `hidden` attribute, so every hidden flex/grid box on this
    page needs this to actually hide (the files filter showed in the commits view without it). */
-#head-files{margin:0 0 12px}
+#head-files,#head-commits{margin:0 0 12px}
+.logsearch .filesearch{min-width:min(70vw,320px)}
+/* A search word found on the page: the amber of the controls, so it reads as "what you asked
+   for", and dark text on it so it stays legible inside code and the dim trace prose alike. */
+mark.hit{background:var(--amber);color:var(--ink);border-radius:2px;padding:0 1px}
+/* The same amber on the "N match(es)" note beside a squash and the "match" badge on each part
+   that contains the search words: where to look, before anything is opened. */
+.pmatch{color:var(--ink);background:var(--amber);border-radius:2px;padding:0 5px;font-size:11px;
+  letter-spacing:.3px;white-space:nowrap}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1665,6 +1835,7 @@ __UPDATE_BANNER__
   <div class="panebar">
     <div class="logtabs">
       <button class="logtab active" data-tab="commits">commits</button>
+      <button class="logtab" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
@@ -1673,6 +1844,13 @@ __UPDATE_BANNER__
       <option value="tokens">most output tokens</option>
     </select></div>
   </div>
+  <div class="panehead" id="head-commits"><div class="logsort logsearch"><input id="f-text" class="filesearch" type="search" placeholder="search commits…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
+      <option value="subject">subject</option>
+      <option value="user">user messages</option>
+      <option value="agent">agent messages</option>
+      <option value="trace">interaction trace</option>
+      <option value="all">full message</option>
+    </select></div></div>
   <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
 
   <div class="logpane" id="pane-commits">
@@ -1744,7 +1922,7 @@ const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
 const DEFAULT_BRANCH = INIT.branch || "";
-const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", meta:[], fromTs:0, toTs:0, sort:"date", q:"", qin:"subject", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -1784,6 +1962,40 @@ function setOffline(on){
 // (not during the background refresh poll, which would make it flicker constantly).
 function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
 
+// --- the commit search: what it searches, and marking what it found ---------------------
+const QIN_LABEL = {subject:"subject", user:"user messages", agent:"agent messages",
+                   trace:"interaction trace", all:"full message"};
+const LOGTAB_KEY = "agitrack:logtab";
+let LOGTAB = "commits";
+try{ if(localStorage.getItem(LOGTAB_KEY) === "timeline") LOGTAB = "timeline"; }catch(e){}
+function searchWords(){ return (state.q || "").toLowerCase().split(/\s+/).filter(Boolean); }
+// Wrap every occurrence of the search words in <mark class="hit"> inside `root`, wherever it
+// shows on the page (a log row, an expanded message, a squash's parts), whichever part of the
+// commit the search ran over: a word is worth pointing at wherever the reader's eye lands on
+// it. TEXT nodes only, so no markup is ever re-parsed (a word inside a tag or an attribute is
+// never touched), and nothing inside a button or an existing mark.
+function highlightIn(root){
+  const words = searchWords();
+  if(!root || !words.length || !document.createTreeWalker) return;
+  const re = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "gi");
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {acceptNode: n =>
+    (n.parentNode && n.parentNode.closest && n.parentNode.closest("mark.hit, button, script, style"))
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT});
+  const hits = [];
+  while(walker.nextNode()){ const n = walker.currentNode; re.lastIndex = 0; if(re.test(n.nodeValue)) hits.push(n); }
+  for(const n of hits){
+    const text = n.nodeValue, frag = document.createDocumentFragment();
+    let last = 0, m; re.lastIndex = 0;
+    while((m = re.exec(text))){
+      if(m.index > last) frag.append(text.slice(last, m.index));
+      const mark = document.createElement("mark"); mark.className = "hit"; mark.textContent = m[0];
+      frag.append(mark); last = m.index + m[0].length;
+    }
+    if(last < text.length) frag.append(text.slice(last));
+    n.parentNode.replaceChild(frag, n);
+  }
+}
+
 function qs(extra){
   const p = new URLSearchParams();
   // A non-default branch rescopes the whole view (stats + log) server-side.
@@ -1818,7 +2030,16 @@ function snapshotSave(){
 function snapshotRestore(){
   try{
     const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
-    if(nav && nav.type === "reload") return false;   // an explicit refresh means re-read
+    // An explicit refresh means re-read, but a reload the page did itself because aGiTrack was
+    // updated (`noteVersion`) does not: it repaints the last view while the restarted daemon
+    // reads the history again behind it, instead of a full "reading commit history" screen.
+    let ours = false;
+    try{
+      const at = Number(sessionStorage.getItem("agitrack.versionReload") || 0);
+      sessionStorage.removeItem("agitrack.versionReload");
+      ours = at > 0 && Date.now() - at < 60000;
+    }catch(e){}
+    if(nav && nav.type === "reload" && !ours) return false;
     const blob = sessionStorage.getItem(SNAP_KEY);
     if(!blob) return false;
     const d = JSON.parse(blob);
@@ -1876,7 +2097,9 @@ async function loadAgg(){
   return false;
 }
 async function loadLog(offset){
-  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
+  const extra = {offset:offset||0, limit:PAGE_SIZE, sort:state.sort};
+  if(state.q){ extra.q = state.q; extra.qin = state.qin; }   // searches the log only, like the sort
+  try{ const r = await fetch("log?"+qs(extra), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
@@ -2329,11 +2552,44 @@ function commitWhen(ts){
   const utc = d.toISOString().slice(0,16).replace("T"," ")+" UTC";
   return {text, title:`${full} (${utc})`};
 }
+// The log's TIMELINE view: every message the user sent, with when its turn began, laid between
+// the commits on this page, each pointing at the commit it went into. Paging stays per commit:
+// a page holds its commits and every message behind them. Sorted by date, prompts and commits
+// interleave by time (newest first), so a message folded into a later commit shows where it was
+// sent; under another sort, each commit is followed by its own messages. Each message is labelled
+// with its commit's committer ID: a log holds several people's work, and the trace records no
+// sender of its own.
+function timelineHtml(entries, commitRow){
+  const items = [];
+  entries.forEach((c, i) => {
+    items.push({t: c.ts || 0, commit: true, seq: 0, i});
+    let seq = 0;
+    for(const turn of (c.turns || [])){
+      (turn.prompts || []).forEach((text, k) => {
+        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text});
+      });
+    }
+  });
+  const byTime = state.sort === "date";
+  items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
+    (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+  return items.map(it => {
+    if(it.commit) return commitRow(entries[it.i], it.i);
+    const c = entries[it.i], w = commitWhen(it.t);
+    const when = it.approx
+      ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
+      : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
+    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
+    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
+      `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
+      `<button class="tmore" title="show the whole message">show all</button></div>`;
+  }).join("");
+}
 function renderLog(){
   const entries = LOGPAGE.entries || [];
   LOG_ENTRIES = entries;
   const total = LOGPAGE.total||0, offset = LOGPAGE.offset||0, limit = LOGPAGE.limit||PAGE_SIZE;
-  const rows = entries.map((c, i) => {
+  const commitRow = (c, i) => {
     const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agitrack-ops" ? "ops" : "nontracked");
     const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
     // A manual-commit-mode latent turn not yet folded into a commit — flag it so the user
@@ -2343,7 +2599,10 @@ function renderLog(){
     // is already tracked vs. what `--backtrace commit` would still add.
     const trk = (BACKTRACE && c.tracked)?`<span class="badge tracked" title="already committed to git with aGiTrack metadata">committed</span>`:"";
     const anom = c.token_anomaly?`<span class="badge anomaly" title="This commit re-exported conversation history that earlier commits already accounted for (a lost watermark on an older aGiTrack), so its token counts are excluded from every total.">tokens excluded</span>`:"";
-    const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
+    // With a search on, a squash also says how many of its parts match, so the reader can tell
+    // which squash is worth opening without opening each one.
+    const pm = c.part_matches ? ` · <span class="pmatch">${c.part_matches} matching part${c.part_matches===1?"":"s"}</span>` : "";
+    const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed${pm}</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
@@ -2358,7 +2617,9 @@ function renderLog(){
     return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${meta}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
-  }).join("");
+  };
+  const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
+  $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
   const from = total ? offset+1 : 0, to = offset+entries.length;
   const pages = Math.max(1, Math.ceil(total/limit)), cur = Math.min(pages, Math.floor(offset/limit)+1);
   // Numbered page buttons: all of them when few, otherwise first + a window around
@@ -2384,7 +2645,17 @@ function renderLog(){
     `<button id="log-next" title="next page" ${nextDis}>›</button>`+
     `<button id="log-last" title="last page" ${nextDis}>»</button>`+
     `<span class="loading pgload" id="pgloading" hidden aria-live="polite"><span class="spin"></span>loading…</span></span>${gotoBox}</div>`;
-  $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
+  const none = state.q
+    ? `no commits match "${esc(state.q)}" in the ${QIN_LABEL[state.qin] || "subject"}`
+    : "no commits";
+  $("commitlog").innerHTML = (rows || `<div class="empty">${none}</div>`) + pager;
+  document.querySelectorAll("#commitlog .tprompt .tbody").forEach(reflowParagraphs);
+  highlightIn($("commitlog"));
+  // A long message is shown clamped; one holding a search hit is shown whole, so the hit is seen.
+  document.querySelectorAll("#commitlog .tprompt.clamp").forEach(el => {
+    if(el.querySelector("mark.hit")) el.classList.remove("clamp");
+    else if(el.querySelector(".tbody").scrollHeight <= el.querySelector(".tbody").clientHeight + 2) el.classList.remove("clamp");
+  });
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -2427,7 +2698,9 @@ function partsHtml(parts){
       `<button class="diffbtn" data-psha="${esc(s)}" data-pbox="${ids[k]}">file diff of ${esc(s.slice(0,8))}</button>`).join("");
     const boxes = ids.map(id => `<div class="dmsg diff" id="${id}" hidden></div>`).join("");
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
-      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>${right}</summary>`+
+      `<span class="psubj">${esc(p.subject||"(no subject)")}</span>`+
+      (p.match ? `<span class="pmatch" title="this part contains what you searched for">match</span>` : "")+
+      `${right}</summary>`+
       (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
@@ -2479,6 +2752,7 @@ function toggleDetail(i){
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);
     reflowParagraphs(detail);   // covers the squashed constituents' messages too
+    highlightIn(detail);        // the search words, in the message and in every part
   });
 }
 
@@ -2519,6 +2793,7 @@ async function toggleDiff(i){
     body.dataset.mode = "msg"; body.className = "dmsg md";
     body.innerHTML = md(c.message||"(no message recorded)");
     reflowParagraphs(body);
+    highlightIn(body);
     if(btn) btn.textContent = "show file diff";
     return;
   }
@@ -2885,7 +3160,12 @@ function renderFiles(){
 function showLogTab(tab){
   document.querySelectorAll(".logtab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   const pc = $("pane-commits"), pf = $("pane-files");
-  if(pc) pc.hidden = tab !== "commits";
+  // The timeline is the commit log with the user's messages laid in between, so it shares the
+  // commit pane, its pager, sort and search; only the rendering differs.
+  const commitish = tab === "commits" || tab === "timeline";
+  if(commitish && tab !== LOGTAB){ LOGTAB = tab; renderLog(); }
+  if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
+  if(pc) pc.hidden = !commitish;
   if(pf) pf.hidden = tab !== "files";
   // The tabs and the pane's own control (sort / file filter) share one row, so the control
   // has to follow the tab.
@@ -2893,6 +3173,8 @@ function showLogTab(tab){
   // on its own line under the tabs (the sort control keeps the right-hand end of that row).
   const hf = $("head-files");
   if(hf) hf.hidden = tab !== "files";
+  const hc = $("head-commits");   // the commit search searches commits, so it follows that tab
+  if(hc) hc.hidden = !commitish;
 }
 function fileChangeHtml(c, i){
   const when = commitWhen(c.ts).text;  // the reader's local time, like the commit log
@@ -3003,32 +3285,12 @@ function stackStickyBanner(){
   restackControls();
   window.addEventListener("resize", restackControls);
 }
-async function init(){
-  hideFabricatedChrome();
-  stackStickyBanner();
-  // Shell mode: the chrome is already on screen with the loading animation; fetch the
-  // real aggregates + first log page, then drop the loader and render. A big repo's
-  // git-log crunch happens here, behind the animation, instead of blocking first paint.
-  if(!HAVE_DATA){
-    // Paint the previous view first when there is one (returning from story/learn), so the
-    // page is immediately usable; the fetch below then quietly brings it up to date.
-    if(snapshotRestore()){
-      document.body.classList.remove("booting");
-      syncFilters(); renderAgg(); renderLog();
-    }
-    bootProgress(true);
-    try{ await loadAgg(); await loadLog(0); }
-    finally{ bootProgress(false); }           // always stop polling, even if a fetch failed
-    document.body.classList.remove("booting");
-  }
-  // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
-  // (server already gone), skip the renders — the offline banner is up and the poll
-  // below recovers once the server is back — rather than crashing on null data.
-  const ready = AGG && OPTIONS && LOGPAGE;
-  if(ready){ syncFilters(); }
-  // Show the real range from the first paint: bound the pickers to the history
-  // span and fill from/to with it (default period is "all time" = full history).
-  if(ready){ setDateBounds(); applyPeriod(); }
+// Every control is wired BEFORE any data is awaited. A restored view (returning from story/learn,
+// or the reload aGiTrack does after an update) is on screen at once, and the refresh behind it
+// can take a while: a restarted daemon re-reads the history first. Wiring after that await left
+// a page that looked ready and ignored every click, expanding a commit included, for as long as
+// the read took. The page must answer from its first paint, with a spinner for what is pending.
+function wireControls(){
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
   $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
@@ -3040,6 +3302,19 @@ async function init(){
   $("f-sort").value = state.sort;
   $("f-sort").onchange = async e => { state.sort = e.target.value; showLoading(true);
     try{ if(await loadLog(0)) renderLog(); } finally { showLoading(false); } };
+  // The commit search narrows the LOG only, so like the sort it reloads just the first page.
+  // Debounced so typing a word does not fetch once per letter; each fetch shows the spinner, and
+  // an answer for an older query is dropped so the list always matches what is in the box.
+  let qTimer = null, qSeq = 0;
+  const runSearch = async () => {
+    const seq = ++qSeq; showLoading(true);
+    try{ const ok = await loadLog(0); if(ok && seq === qSeq) renderLog(); }
+    finally { if(seq === qSeq) showLoading(false); }
+  };
+  $("f-text").addEventListener("input", e => {
+    state.q = e.target.value.trim(); clearTimeout(qTimer); qTimer = setTimeout(runSearch, 250);
+  });
+  $("f-textin").onchange = e => { state.qin = e.target.value; if(state.q) runSearch(); };
   // "custom range…" reveals a date-range popup anchored under the select; the presets and
   // "all time" hide it. Wired by the shared helper (ui.RANGE_JS), so the story page's copy
   // of this control behaves identically - including re-opening the popup when "custom" is
@@ -3052,6 +3327,7 @@ async function init(){
     state.meta=[]; advDraft=null; renderAdvanced(); syncAdvBtn(); syncApply();
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     state.sort="date"; $("f-sort").value="date";  // back to newest-first
+    state.q=""; $("f-text").value=""; state.qin="subject"; $("f-textin").value="subject";
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };
@@ -3063,9 +3339,28 @@ async function init(){
     if(dbtn && dbtn.dataset.psha){ e.preventDefault(); togglePartDiff(dbtn); return; }
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
+    const more = e.target.closest(".tmore");
+    if(more){ more.closest(".tprompt").classList.remove("clamp"); return; }
+    const go = e.target.closest(".tgo");
+    if(go){
+      const row = document.querySelector('#commitlog .entry[data-i="'+go.dataset.go+'"]');
+      if(row){ row.scrollIntoView({block:"center", behavior:"smooth"}); row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
+        const d = $("detail-"+go.dataset.go); if(d && d.hidden) toggleDetail(+go.dataset.go); }
+      return;
+    }
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
   });
+  // In the timeline, pointing at a message lights up the commit it went into, and the reverse.
+  const linkHover = (e, on) => {
+    const el = e.target.closest && e.target.closest(".tprompt, .entry");
+    if(!el || !$("commitlog").classList.contains("timeline")) return;
+    const i = el.dataset.c !== undefined ? el.dataset.c : el.dataset.i;
+    document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]')
+      .forEach(n => n.classList.toggle("linked", on));
+  };
+  $("commitlog").addEventListener("mouseover", e => linkHover(e, true));
+  $("commitlog").addEventListener("mouseout", e => linkHover(e, false));
   // Toggle a series on/off from the legend; redraw the plot in place.
   $("ts-legend").addEventListener("click", e => {
     const btn = e.target.closest(".lg"); if(!btn) return;
@@ -3090,11 +3385,49 @@ async function init(){
   // Whether a commit message keeps its source line breaks depends on the column width, so
   // every open message is re-measured when the window changes size.
   let rf; window.addEventListener("resize", () => { clearTimeout(rf); rf = setTimeout(() => reflowParagraphs(document), 150); });
-  if(ready){ renderAgg(); renderLog(); }
+}
+async function init(){
+  hideFabricatedChrome();
+  stackStickyBanner();
+  wireControls();
+  // Shell mode: the chrome is already on screen with the loading animation; fetch the
+  // real aggregates + first log page, then drop the loader and render. A big repo's
+  // git-log crunch happens here, behind the animation, instead of blocking first paint.
+  let restored = false, shownLog = "";
+  if(!HAVE_DATA){
+    // Paint the previous view first when there is one, so the page is immediately usable; the
+    // fetch below then brings it up to date behind the small "loading" spinner.
+    if(snapshotRestore()){
+      restored = true;
+      document.body.classList.remove("booting");
+      syncFilters(); renderAgg(); renderLog();
+      shownLog = JSON.stringify(LOGPAGE);
+      showLoading(true);
+    }
+    bootProgress(!restored);
+    try{ await loadAgg(); await loadLog(0); }
+    finally{ bootProgress(false); if(restored) showLoading(false); }
+    document.body.classList.remove("booting");
+  }
+  // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
+  // (server already gone), skip the renders — the offline banner is up and the poll
+  // below recovers once the server is back — rather than crashing on null data.
+  const ready = AGG && OPTIONS && LOGPAGE;
+  if(ready){ syncFilters(); }
+  // Show the real range from the first paint: bound the pickers to the history
+  // span and fill from/to with it (default period is "all time" = full history).
+  if(ready){ setDateBounds(); applyPeriod(); }
+  if(ready){
+    renderAgg();
+    // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
+    // log that came back unchanged is left exactly as it is.
+    if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+  }
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();
   if(location.hash === "#files" && FILES && FILES.length) showLogTab("files");  // deep-link to the Files tab
+  else if(location.hash === "#timeline" || LOGTAB === "timeline"){ LOGTAB = ""; showLogTab("timeline"); }
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).

@@ -35,6 +35,7 @@ agent-merge) versus non-tracked (user + untracked); there is no "human" bucket.
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -939,20 +940,31 @@ def viewable_branches(repo: GitRepo) -> list[str]:
     return [*local, *remote_only]
 
 
+def collect_dashboard_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
+    """Every commit the dashboard shows for ``ref``: the expensive half of a build."""
+    stats = collect_commit_stats(repo, ref)
+    # Manual-commit mode: surface this session's not-yet-committed latent turns as pending
+    # entries (only when showing HEAD — the live working branch — not a historical ref).
+    if ref == "HEAD":
+        stats = stats + collect_manual_pending(repo)
+    return stats
+
+
 def build_dashboard(
     repo: GitRepo,
     ref: str = "HEAD",
     *,
     sha_logins: dict[str, str] | None = None,
     email_logins: dict[str, str] | None = None,
+    stats: list[CommitStat] | None = None,
 ) -> Dashboard:
+    """The dashboard for ``ref``. ``stats`` is the history already read for exactly this ref and
+    these tips (see :func:`collect_dashboard_stats`): reading it is the whole cost of a build, and
+    a caller that only has new GitHub logins or a changed branch list must not pay it again."""
     from agitrack.metrics.github import commit_url_base
 
-    stats = collect_commit_stats(repo, ref)
-    # Manual-commit mode: surface this session's not-yet-committed latent turns as pending
-    # entries (only when showing HEAD — the live working branch — not a historical ref).
-    if ref == "HEAD":
-        stats = stats + collect_manual_pending(repo)
+    if stats is None:
+        stats = collect_dashboard_stats(repo, ref)
     # The branch the dashboard *shows*: the explicit ref when one is requested,
     # otherwise whatever HEAD currently points at.
     branch = repo.current_branch() if ref == "HEAD" else ref
@@ -1137,6 +1149,28 @@ def squash_header_end(lines: list[str]) -> int:
     return bullets[0] if bullets else 0
 
 
+_FOLD_SUBJECT_PREFIX = "<aGiTrack> "
+
+
+def fold_lead_end(lines: list[str]) -> int:
+    """Where the first folded turn starts in an aGiTrack AUTO-fold message, or 0.
+
+    A fold of several turns is written as the NEWEST turn's subject, a blank line, then every
+    turn's full body oldest first, each opening with its own ``<aGiTrack>`` subject. That lead
+    line belongs to the commit, not to the first turn: reading it as the first part's subject
+    labelled the OLDEST turn with the newest one's subject (two parts with one subject) and made
+    the oldest turn's summary read as the commit's own. Recognised by two ``<aGiTrack>`` subject
+    lines in a row with only blank lines between them, which no single turn's body produces (its
+    summary or trace always follows its subject)."""
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is None or not lines[first].startswith(_FOLD_SUBJECT_PREFIX):
+        return 0
+    second = next((i for i in range(first + 1, len(lines)) if lines[i].strip()), None)
+    if second is None or not lines[second].startswith(_FOLD_SUBJECT_PREFIX):
+        return 0
+    return second
+
+
 def _parse_constituents(body: str) -> list[CommitStat]:
     """Split a squashed message into one :class:`CommitStat` per original commit.
 
@@ -1162,7 +1196,7 @@ def _parse_constituents(body: str) -> list[CommitStat]:
     # anywhere — so the blocks are the only boundaries there are.
     headers = metadata_header_lines(lines)
     constituents: list[CommitStat] = []
-    prev_end = 0
+    prev_end = fold_lead_end(lines)
     for header in headers:
         end = len(lines)
         for j in range(header + 1, len(lines)):
@@ -1367,8 +1401,8 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
     historical blob from the promisor remote — tens of seconds per dashboard poll, and the
     interrupted fetches litter `.git/objects/pack` with `tmp_pack_*` files — so the dashboard
     appears to hang with no commits. There, a local count is a FLOOR, so it is cached as such
-    (see :data:`_NUMSTAT_LOCAL`) and the commits actually displayed are recounted exactly by
-    :func:`apply_numstat_for`. Merge commits (cover commits #58, integration merges) report no
+    (see :data:`_NUMSTAT_LOCAL`); a commit becomes exact when someone opens its diff
+    (:func:`recount_after_click`). Merge commits (cover commits #58, integration merges) report no
     numstat by default, so a turn's lines are counted exactly once — on the commits that
     introduced them."""
     cached = _read_numstat_cache(repo)
@@ -1397,22 +1431,23 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
         for sha in batch:
             by_sha[sha].insertions += fresh[sha].insertions
             by_sha[sha].deletions += fresh[sha].deletions
-        _write_numstat_cache(repo, cached, _cache_rows(fresh, seen if partial else set(batch), tier))
+        rows = _cache_rows(fresh, seen if partial else set(batch), tier)
+        if partial:
+            stamp = f"{_NUMSTAT_MISSING}{int(time.time())}"
+            rows.update({sha: (0, 0, stamp) for sha in batch if sha not in seen})
+        _write_numstat_cache(repo, cached, rows)
     progress.step("counting changed lines", len(missing), len(missing))
 
 
 def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitStat]) -> None:
-    """Give SPECIFIC commits their exact insertions/deletions, fetching only those commits'
-    blobs (allow_lazy_fetch stays on). This is how the dashboard gets exact line counts for the
-    log page it is about to show, and for manual mode's pending turns, without pulling the rest
-    of a partial clone's history: only what is displayed is fetched. A commit whose blobs still
-    can't be reached (offline, or an aGiTrack-only ref the remote doesn't have) keeps the count
-    it already had, rather than being zeroed.
+    """Give SPECIFIC commits their line counts (the log page being shown, manual mode's pending
+    turns), from the cache or else from LOCAL blobs, never fetching.
 
-    Cached, and only an EXACT cache entry is accepted: a floor recorded by the whole-history
-    pass is exactly what this function exists to improve on. Measured on one partial clone,
-    where the lazy fetches dominate: 18.3s for a 50-commit log page and 12.1s for 20 pending
-    turns, on EVERY dashboard rebuild, both of which the cache turns into a one-off."""
+    It used to fetch: on a partial clone it recounted every displayed commit with lazy fetch on,
+    so merely LOOKING at a log page downloaded the contents of up to fifty commits the clone had
+    deliberately left on the remote. aGiTrack downloads a commit's contents only when a person
+    opens its diff (`user_requested_content`), and that click is also what makes its count exact
+    (:func:`recount_after_click`). Until then a partial clone shows the local count, a floor."""
     targets = {sha for sha in shas if sha and sha in by_sha}
     if not targets:
         return
@@ -1420,22 +1455,41 @@ def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitSt
     missing: list[str] = []
     for sha in sorted(targets):
         entry = cached.get(sha)
-        if entry is not None and entry[2] == _NUMSTAT_EXACT:
+        if entry is not None:
             by_sha[sha].insertions, by_sha[sha].deletions = entry[0], entry[1]
             continue
         missing.append(sha)
     if not missing:
         return
     partial = repo.is_partial_clone()
+    tier = _NUMSTAT_LOCAL if partial else _NUMSTAT_EXACT
     for start in range(0, len(missing), _EXACT_CHUNK):
-        progress.step("fetching exact line counts", start, len(missing))
+        progress.step("counting changed lines", start, len(missing))
         batch = missing[start : start + _EXACT_CHUNK]
-        fresh, seen = _numstat_of(repo, batch, allow_lazy_fetch=True)
-        for sha in seen:
+        fresh, seen = _numstat_of(repo, batch, allow_lazy_fetch=False)
+        for sha in batch:
             by_sha[sha].insertions = fresh[sha].insertions
             by_sha[sha].deletions = fresh[sha].deletions
-        _write_numstat_cache(repo, cached, _cache_rows(fresh, seen if partial else set(batch), _NUMSTAT_EXACT))
-    progress.step("fetching exact line counts", len(missing), len(missing))
+        rows = _cache_rows(fresh, seen if partial else set(batch), tier)
+        if partial:
+            stamp = f"{_NUMSTAT_MISSING}{int(time.time())}"
+            rows.update({sha: (0, 0, stamp) for sha in batch if sha not in seen})
+        _write_numstat_cache(repo, cached, rows)
+    progress.step("counting changed lines", len(missing), len(missing))
+
+
+def recount_after_click(repo: GitRepo, sha: str) -> tuple[int, int] | None:
+    """The exact line counts of ONE commit whose diff a person just opened, recorded as final.
+
+    Opening the diff is the one moment aGiTrack may fetch a commit's blobs on a partial clone, so
+    once it has, the count can be made exact at no further network cost (the blobs are local
+    now) and the floor or "not local yet" entry is replaced. Returns ``(insertions, deletions)``,
+    or None when git produced nothing to count."""
+    fresh, seen = _numstat_of(repo, [sha], allow_lazy_fetch=True)
+    if sha not in seen:
+        return None
+    _write_numstat_cache(repo, {}, _cache_rows(fresh, {sha}, _NUMSTAT_EXACT))
+    return fresh[sha].insertions, fresh[sha].deletions
 
 
 def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tuple[dict[str, CommitStat], set[str]]:
@@ -1443,15 +1497,26 @@ def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tu
 
     ``--no-walk`` diffs each named commit against its parent with no ancestry traversal, so the
     work (and, when fetching is allowed, the network) is bounded to the commits asked for.
-    ``--stdin`` carries them with no argv length limit — a history of any size is one call."""
+    ``--stdin`` carries them with no argv length limit — a history of any size is one call.
+
+    A MERGE is in the returned set too: git reports no numstat for a merge whatever blobs are
+    present, so its 0 is final. Without that, a partial clone (where "no rows" otherwise means
+    "the blobs may still be on the remote") never cached a single merge, and every rebuild diffed
+    all of them again: 160 merges, 8 of the 9 seconds a restarted dashboard spent re-reading this
+    repository's history before the page could answer."""
     output = repo._run(
-        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", "--stdin", "--"],
+        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H %P", "--stdin", "--"],
         input_text="".join(f"{sha}\n" for sha in shas),
         check=False,
         allow_lazy_fetch=allow_lazy_fetch,
     ).stdout
     fresh: dict[str, CommitStat] = {sha: CommitStat(sha=sha, author="", email="", subject="", kind="") for sha in shas}
-    return fresh, _accumulate_numstat(output, fresh)
+    merges = {
+        parts[0]
+        for parts in (line[1:].split() for line in output.splitlines() if line.startswith(_FIELD_SEP))
+        if len(parts) > 2
+    }
+    return fresh, _accumulate_numstat(output, fresh) | merges
 
 
 # The on-disk cache: one line per commit, `<sha> <insertions> <deletions> <tier>`.
@@ -1460,9 +1525,17 @@ def _numstat_of(repo: GitRepo, shas: list[str], *, allow_lazy_fetch: bool) -> tu
 # file. EXACT means every blob the diff touches was available, so the number is final. LOCAL
 # means it was counted on a partial clone without fetching, so it is a floor: good enough for
 # the whole-history aggregates (which must never trigger a fetch) but not for a commit being
-# displayed, which apply_numstat_for recounts and then records as EXACT.
+# displayed is made exact only when someone opens its diff (recount_after_click).
 _NUMSTAT_EXACT = "E"
 _NUMSTAT_LOCAL = "L"
+# MISSING: a partial clone diffed a commit without fetching and git emitted nothing, because the
+# blobs are still on the remote. Written as `M<epoch>` and counted as 0 (a floor, like LOCAL)
+# until it is a day old, then tried again in case the blobs have arrived since. Before this the
+# commit was simply not recorded, so every rebuild diffed it again for nothing: 32 such commits
+# cost a restarted dashboard 3.8 s on this repository, every time. A commit being DISPLAYED is
+# made exact only when someone opens its diff (recount_after_click), which may fetch.
+_NUMSTAT_MISSING = "M"
+_MISSING_RETRY_SECONDS = 86400
 # Commits per git call when filling the cache. Small enough that the loading page's bar moves
 # several times a second on a slow history, large enough that git's own start-up cost stays
 # noise next to the diffing.
@@ -1501,8 +1574,15 @@ def _read_numstat_cache(repo: GitRepo) -> dict[str, tuple[int, int, str]]:
     counts: dict[str, tuple[int, int, str]] = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) != 4 or parts[3] not in (_NUMSTAT_EXACT, _NUMSTAT_LOCAL):
-            continue  # a torn last line from a concurrent append, or a format we do not know
+        if len(parts) != 4:
+            continue  # a torn last line from a concurrent append
+        tier = parts[3]
+        if tier.startswith(_NUMSTAT_MISSING) and tier[1:].isdigit():
+            if time.time() - int(tier[1:]) > _MISSING_RETRY_SECONDS:
+                counts.pop(parts[0], None)  # old enough to try again: the blobs may be here now
+                continue
+        elif tier not in (_NUMSTAT_EXACT, _NUMSTAT_LOCAL):
+            continue  # a format we do not know
         try:
             counts[parts[0]] = (int(parts[1]), int(parts[2]), parts[3])
         except ValueError:
@@ -1549,7 +1629,7 @@ def _accumulate_numstat(output: str, by_sha: dict[str, CommitStat]) -> set[str]:
     seen: set[str] = set()
     for line in output.splitlines():
         if line.startswith(_FIELD_SEP):
-            current_sha = line[1:].strip()
+            current_sha = (line[1:].split() or [""])[0]  # the sha, then (ignored) its parents
             current = by_sha.get(current_sha)
             continue
         match = _NUMSTAT_RE.match(line)

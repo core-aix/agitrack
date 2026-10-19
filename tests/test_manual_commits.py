@@ -2717,3 +2717,74 @@ def test_a_fold_without_the_post_commit_hook_never_folds_the_same_turns_twice(tm
     assert "do x" in message and "another session prompt" in message
     assert runner._manual_pending_count() == 0
     assert repo.ref_sha(other) == repo.rev_parse("HEAD")
+
+
+# --- the age cap applies as turns are RECORDED, not when they are folded ----------------------
+
+
+def _timed_turn(name: str, started: int, *, tokens: int = 7) -> str:
+    from datetime import datetime, timezone
+
+    stamp = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        f"<aGiTrack> {name}\n\nsummary of {name}\n\n# Interaction Trace\n\n## User\n\n{name} prompt\n\n"
+        f"## Agent\n\n{name} reply\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+        f"tokens_since_last_commit_output: {tokens}\nagent_started_at: {stamp}\nagent_ended_at: {stamp}\n"
+    )
+
+
+def _pending_messages(tracker) -> list[str]:
+    return [tracker.repo.commit_message(sha) for sha in tracker._pending_shas()]
+
+
+def test_a_pending_turn_far_older_than_the_new_one_loses_its_trace_but_keeps_its_tokens(tmp_path):
+    # Two questions asked five days earlier changed no files, so they waited for the next commit
+    # that did and were folded into it in full. The 24-hour cap only ever ran over one rendered
+    # trace; in the latent modes each turn is its own record, so it never saw them together.
+    tracker, repo = _tracker(tmp_path)
+    now = 2_000_000_000
+    tracker.record(_timed_turn("ancient", now - 5 * 86400, tokens=11))
+    old_sha = tracker._pending_shas()[0]
+    repo.notes_add(old_sha, "ancient summary", namespace="agitrack/commit-summary")
+    tracker.record(_timed_turn("recent", now - 3600))
+    recent_sha = tracker._pending_shas()[1]
+    repo.notes_add(recent_sha, "recent summary", namespace="agitrack/commit-summary")
+
+    tracker.record(_timed_turn("newest", now))
+
+    ancient, recent, newest = _pending_messages(tracker)
+    assert "ancient prompt" not in ancient and "summary of ancient" not in ancient
+    assert ancient.startswith("<aGiTrack> (earlier turn, trace left out)")
+    assert "more than 24 hours before the latest one" in ancient
+    assert "tokens_since_last_commit_output: 11" in ancient and "trace_aged_out:" in ancient
+    assert "recent prompt" in recent and "newest prompt" in newest  # within the cap: untouched
+    shas = tracker._pending_shas()
+    assert repo.notes_show(shas[0], namespace="agitrack/commit-summary") is None  # written from the trace
+    assert (repo.notes_show(shas[1], namespace="agitrack/commit-summary") or "").strip() == "recent summary"
+    assert repo.commit_timestamp(shas[1]) == repo.commit_timestamp(recent_sha)  # dates kept, order kept
+
+    fold = (tmp_path / ".agitrack" / "manual-pending-trailer").read_text(encoding="utf-8")
+    assert "ancient prompt" not in fold and "ancient summary" not in fold
+    assert "recent summary" in fold and "newest prompt" in fold
+
+    tracker.record(_timed_turn("later", now + 60))  # an already-shortened turn is left alone
+    assert _pending_messages(tracker)[0] == ancient
+
+
+def test_the_age_cap_at_record_time_follows_the_repos_setting(tmp_path):
+    tracker, repo = _tracker(tmp_path)
+    tracker.state.config["trace_max_age_hours"] = 0  # 0 keeps everything, as for one commit
+    now = 2_000_000_000
+    tracker.record(_timed_turn("ancient", now - 5 * 86400))
+    tracker.record(_timed_turn("newest", now))
+    assert "ancient prompt" in _pending_messages(tracker)[0]
+
+
+def test_the_proxys_own_record_ages_out_old_turns_the_same_way(tmp_path):
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    now = 2_000_000_000
+    runner._manual_record(_timed_turn("ancient", now - 5 * 86400))
+    runner._manual_record(_timed_turn("newest", now))
+    messages = [repo.commit_message(sha) for sha in repo.unlanded_commits(runner._manual_ref())]
+    assert "ancient prompt" not in messages[0] and "trace_aged_out:" in messages[0]
+    assert "newest prompt" in messages[1]

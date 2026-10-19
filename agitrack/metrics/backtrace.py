@@ -1234,6 +1234,8 @@ class BacktraceScope:
                     offset=_int(query, "offset", 0),
                     limit=_int(query, "limit", 50),
                     sort=_str(query, "sort"),
+                    text=_str(query, "q"),
+                    text_in=_str(query, "qin") or "subject",
                 )
             )
         if path == "/diff":

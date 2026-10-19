@@ -278,7 +278,17 @@ class ManualCommitTracker:
         """Record a turn as a hidden latent commit on this session's ref: ONE ``commit-tree``
         reusing its parent's tree, and one ref update. HEAD, the user's index and the working
         tree are untouched, and nothing is read from the working tree: recording a message costs
-        the same however large the repository is. Returns the short sha."""
+        the same however large the repository is. Returns the short sha.
+
+        First, pending turns that began more than ``trace_max_age_hours`` before this one have
+        their trace left out (:func:`age_out_pending`), so a commit never carries days-old text."""
+        age_out_pending(
+            self.repo,
+            self.pending_refs(),
+            newest_start=_turn_start(message),
+            max_age_hours=getattr(self.state, "trace_max_age_hours", None),
+            debug=self._debug,
+        )
         tip = self.repo.ref_sha(self.ref())
         if tip is not None and not self.repo.has_object_local(tip):
             # The ref names a commit this repo no longer has — `git gc --prune` can collect a
@@ -326,6 +336,20 @@ class ManualCommitTracker:
             except Exception as error:
                 self._debug(f"mark folded failed for {ref}: {error!r}")
         self.last_head = head
+
+    def discard_pending(self) -> int:
+        """Drop every pending latent turn, on every session's ref, without folding it anywhere.
+
+        The user's answer to "these turns from an earlier run never reached a commit; keep them?"
+        (issue #296). The refs move onto HEAD exactly as a fold would leave them, so nothing
+        reads them as pending again, and the trailer is re-rendered so a commit made before the
+        next poll cannot fold the discarded text from the old file. Returns how many turns were
+        dropped."""
+        count = self.pending_count()
+        if count:
+            self.mark_folded()
+        self.render_trailer()
+        return count
 
     def service(self) -> None:
         """Per-loop upkeep. With the hooks installed, react to a commit (the post-commit signal
@@ -383,6 +407,84 @@ class ManualCommitTracker:
         except Exception as error:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self.render_trailer()
+
+
+def _turn_start(message: str) -> float | None:
+    """When the turn a latent record describes began (its metadata's span), or None."""
+    from agitrack.redact import _blocks, _span
+
+    starts = [span[0] for span in (_span(block.meta) for block in _blocks(message.split("\n"))) if span]
+    return min(starts) if starts else None
+
+
+def age_out_pending(
+    repo: GitRepo,
+    refs: list[str],
+    *,
+    newest_start: float | None,
+    max_age_hours: float | None,
+    debug: Callable[[str], None] | None = None,
+) -> int:
+    """Leave out the trace of every pending turn that began more than ``max_age_hours`` before
+    the turn being recorded now (``newest_start``). Returns how many turns were shortened.
+
+    The age cap (``trace_max_age_hours``, 24 by default) bounds what one commit says, measured
+    from its newest turn. In the latent modes a turn is written as its own record when it ends,
+    and a commit later joins every pending record, so the cap never saw them together: a turn
+    that changed nothing waits for the next commit that changes something, and two questions
+    asked five days earlier were folded, in full, into an unrelated commit. So the cap is applied
+    HERE, as each turn is recorded, and the fold stays a plain join of what was recorded.
+
+    A shortened turn keeps its metadata (tokens, model, times), so the numbers do not move: only
+    its subject, summary and trace give way to a note, the same rewrite ``agitrack redact`` makes,
+    marked ``trace_aged_out``. Its summary note is dropped (it was written from the trace); every
+    other record on the chain is rewritten byte for byte onto the new parents, dates and summary
+    notes kept, so the order the fold reads them in is unchanged. A turn with no recorded time
+    cannot be placed and is kept, as the cap does everywhere else."""
+    from agitrack.redact import AGED_KEY, AGED_SUBJECT, _cat_commit, _rewritten_object, _write_commit, redact_message
+
+    log = debug or (lambda _message: None)
+    if newest_start is None or not isinstance(max_age_hours, (int, float)) or max_age_hours <= 0:
+        return 0
+    cutoff = newest_start - float(max_age_hours) * 3600
+    hours = f"{max_age_hours:g}"
+    note = (
+        f"> This turn began more than {hours} hours before the latest one recorded, so its trace "
+        "is left out of the commit. Its token counts are kept below."
+    )
+    shortened = 0
+    for ref in refs:
+        try:
+            shas = repo.unlanded_commits(ref)
+            rewrites: dict[str, str] = {}
+            for sha in shas:
+                message, count = redact_message(
+                    repo.commit_message(sha),
+                    window=(0.0, cutoff),
+                    committed_at=None,
+                    subject=AGED_SUBJECT,
+                    note=note,
+                    marker_key=AGED_KEY,
+                )
+                if count:
+                    rewrites[sha] = message
+            if not rewrites:
+                continue
+            mapping: dict[str, str] = {}
+            first = next(index for index, sha in enumerate(shas) if sha in rewrites)
+            for sha in shas[first:]:
+                parents = [mapping.get(parent, parent) for parent in repo.parents(sha)]
+                new = _write_commit(repo, _rewritten_object(_cat_commit(repo, sha), parents, rewrites.get(sha)))
+                mapping[sha] = new
+                if sha not in rewrites:
+                    summary = repo.notes_show(sha, namespace="agitrack/commit-summary")
+                    if summary and summary.strip():
+                        repo.notes_add(new, summary.strip(), namespace="agitrack/commit-summary")
+            repo.update_ref(ref, mapping[shas[-1]])
+            shortened += len(rewrites)
+        except Exception as error:
+            log(f"aging out old pending turns failed for {ref}: {error!r}")
+    return shortened
 
 
 def prune_abandoned_refs(

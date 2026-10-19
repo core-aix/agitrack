@@ -100,6 +100,23 @@ def resume_tracking(repo_root: Path, *, now: float | None = None) -> float | Non
     return moment if _write(repo_root, record) else None
 
 
+def discard_before(repo_root: Path, *, now: float | None = None) -> float | None:
+    """Move the floor to *now*: no turn that began before this moment is ever recorded.
+
+    The user's "discard" answer at a manual-mode start (issue #296): the turns an earlier run
+    left behind are dropped from the latent refs by the caller, and this keeps the ones it never
+    got round to recording (a turn running when the machine went down, or whatever was said
+    while nothing was tracking) out as well. Closes an open gap too, since it is a start the
+    user asked for. Returns the floor, or None when the record could not be written."""
+    record = _read(repo_root)
+    moment = float(now if now is not None else time.time())
+    stopped_at = _stamp(record.get("stopped_at"))
+    if stopped_at is None or stopped_at > moment:
+        record["stopped_at"] = moment
+    record["resumed_at"] = moment
+    return moment if _write(repo_root, record) else None
+
+
 def gap_is_open(repo_root: Path) -> bool:
     """Whether the user has stopped tracking here and not started it again.
 

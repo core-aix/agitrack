@@ -57,6 +57,11 @@ from agitrack.proc import console_isolation_kwargs
 # turn that is already redacted.
 REMOVED_KEY = "trace_removed"
 REMOVED_SUBJECT = f"{AGITRACK_SUBJECT_PREFIX}(interaction trace removed)"
+# A pending turn whose trace was left out because it began long before the latest one
+# (`commits.manual.age_out_pending`). A trace that is already gone, either way, is never
+# rewritten again.
+AGED_KEY = "trace_aged_out"
+AGED_SUBJECT = f"{AGITRACK_SUBJECT_PREFIX}(earlier turn, trace left out)"
 _REDACTIONS_NAME = "redactions.json"
 _SUMMARY_NOTES = "refs/notes/agitrack/commit-summary"
 
@@ -224,6 +229,9 @@ def redact_message(
     committed_at: float | None,
     keep_summary: bool = False,
     today: str | None = None,
+    subject: str = REMOVED_SUBJECT,
+    note: str | None = None,
+    marker_key: str = REMOVED_KEY,
 ) -> tuple[str, int]:
     """*message* with the selected turns' traces removed, and how many turns were redacted.
 
@@ -238,7 +246,7 @@ def redact_message(
     cursor = 0
     redacted = 0
     for block in blocks:
-        if block.trace is None or REMOVED_KEY in block.meta:
+        if block.trace is None or REMOVED_KEY in block.meta or AGED_KEY in block.meta:
             continue
         if window is not None:
             span = _span(block.meta)
@@ -255,19 +263,19 @@ def redact_message(
             # prompt itself), so they go with it.
             bullet = "* " if lead[subject_at].lstrip().startswith("* ") else ""
             out.extend(lead[:subject_at])
-            out.extend([f"{bullet}{REMOVED_SUBJECT}", ""])
+            out.extend([f"{bullet}{subject}", ""])
         else:
             out.extend(lead)
         out.extend(
             [
                 TRACE_HEADER,
                 "",
-                f"> The interaction trace of this turn was removed with `agitrack redact` on {today}.",
+                note or f"> The interaction trace of this turn was removed with `agitrack redact` on {today}.",
                 "",
             ]
         )
         out.extend(lines[block.header : block.end])
-        out.append(f"{REMOVED_KEY}: {today}")
+        out.append(f"{marker_key}: {today}")
         cursor = block.end
         redacted += 1
     if not redacted:

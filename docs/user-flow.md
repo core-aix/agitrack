@@ -189,7 +189,12 @@ separate cover commit and no `<aGiTrack>` commits polluting the branch. Enable i
 
 ```mermaid
 flowchart TD
-  s(["Manual-commit mode: -m / manual_commits (implies --no-worktree)"]) --> turn["Agent runs a turn, editing the current branch directly"]
+  s(["Manual-commit mode: -m / manual_commits (implies --no-worktree)"]) --> left{"Turns left pending by an earlier run (no live tracker; you typed the start)?"}
+  left -->|"No, or no terminal (auto-start, script)"| turn["Agent runs a turn, editing the current branch directly"]
+  left -->|Yes| ask{"'N agent turns recorded by an earlier aGiTrack run never reached a commit. Include them in your next commit? [Y/n]'"}
+  ask -->|"Y (default)"| turn
+  ask -->|n| discard[["Discard: every latent ref moves onto HEAD and the tracking floor moves to now, so neither those turns nor anything said earlier that was never recorded reach a commit message. Files untouched"]]
+  discard --> turn
   turn --> changed{"Working tree changed since the last latent turn?"}
   changed -->|No| loopb(["Back to the input loop — nothing recorded"])
   changed -->|Yes| latent[["Record a HIDDEN latent commit on refs/agitrack/manual/&lt;session&gt;: snapshot the working tree, same &lt;aGiTrack&gt; trace + metadata as a normal turn commit. HEAD does NOT move; your git index is untouched"]]
@@ -208,6 +213,11 @@ flowchart TD
 > work. A commit made with **no** pending turns is still a plain, session-attributed user commit.
 > Recovery: if a prior run left the latent ref already contained in `HEAD` (an interrupted commit),
 > the next start resets it so those turns are never re-folded.
+> Leftovers: when a start you typed (`agitrack -b -m`, `agitrack -i -m`) finds turns an earlier run
+> recorded but never folded (the machine shut down, or you stopped aGiTrack before committing), it
+> asks whether to include them in your next commit or discard them. A start that replaces a live
+> tracker, an auto-start hook and a scripted run never ask and keep them. Turns from while you had
+> deliberately stopped aGiTrack (`agitrack stop`) are excluded either way.
 
 **Jump to:** [`git-commit`](#8-git-commit) · [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
