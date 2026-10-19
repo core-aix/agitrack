@@ -157,15 +157,25 @@ if sys.platform == "win32":
         r_sock.setblocking(False)
 
         def _pump() -> None:
+            # Read to end of stream, not until the process is gone: the console can still
+            # be delivering a fast child's output after it exits, and stopping on the exit
+            # state lost that output (seen on Windows CI). Once the child is gone, a short
+            # stretch with nothing more to read counts as the end.
+            quiet_after_exit = 0
             try:
-                while proc.isalive():
+                while True:
                     try:
                         data = proc.read(65536)
                     except Exception:
                         break
                     if not data:
+                        if not proc.isalive():
+                            quiet_after_exit += 1
+                            if quiet_after_exit > 60:  # ~300 ms
+                                break
                         time.sleep(0.005)
                         continue
+                    quiet_after_exit = 0
                     if isinstance(data, str):
                         data = data.encode("utf-8", errors="replace")
                     try:
