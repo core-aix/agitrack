@@ -2816,10 +2816,34 @@ def test_the_timeline_lists_each_turns_prompts_with_when_the_turn_began(tmp_path
     stats = {s.subject: s for s in build_dashboard(repo).stats}
 
     assert _timeline_turns(stats["my commit"]) == [
-        {"at": epoch("2026-10-08T10:00:00Z"), "prompts": ["rename the helper\nand its test"]},
-        {"at": None, "prompts": ["fix the docs", "and the README"]},  # no start recorded
+        # `path` is where the part is shown (the parts list runs newest first) and `sections`
+        # which "## User" of its trace each message is, so the timeline's link can open that
+        # part and mark that message.
+        {
+            "at": epoch("2026-10-08T10:00:00Z"),
+            "prompts": ["rename the helper\nand its test"],
+            "path": [1],
+            "sections": [0],
+        },
+        {"at": None, "prompts": ["fix the docs", "and the README"], "path": [0], "sections": [0, 1]},
     ]
     assert _timeline_turns(stats["plain user commit"]) == []
+
+
+def test_a_timeline_message_in_a_plain_commit_points_at_its_own_section(tmp_path):
+    # A commit that is not a squash shows its messages in its own message (an empty path), and
+    # an empty "## User" section is still counted, because the page counts the headings it
+    # renders, empty ones included.
+    from agitrack.metrics.web import _timeline_turns
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 3)
+    repo.commit(
+        "<aGiTrack> tidy\n\n# Interaction Trace\n\n## User\n\n## Agent\n\nhm?\n\n"
+        "## User\n\nrename it\n\n## Agent\n\ndone\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+    )
+    stat = next(s for s in build_dashboard(repo).stats if s.subject == "<aGiTrack> tidy")
+    assert _timeline_turns(stat) == [{"at": None, "prompts": ["rename it"], "path": [], "sections": [1]}]
 
 
 def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
@@ -2908,3 +2932,27 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
 
     commits = _render_log([newer, older], tmp_path)
     assert "ORANGE" not in commits and "fold commit" in commits
+
+
+def test_a_timeline_link_names_the_part_and_the_message_it_opens(tmp_path):
+    # "→ <sha>" opens the commit at the message: the squashed part it is in (a path of display
+    # indices, nested parts joined by ".") and which "## User" of that part's trace it is. The
+    # page script follows them (showMessageInCommit / markUserSection); checked in headless
+    # Chrome on this repository's own history: all 65 links on the first page, at 390px and
+    # 1280px, opened the right part and marked exactly that message, and a nested squash too.
+    entry = {
+        "sha": "c" * 40,
+        "short": "cccccccc",
+        "author": "alice-gh",
+        "subject": "a squash",
+        "kind": "agent",
+        "ts": 3000,
+        "tokens": {},
+        "turns": [
+            {"at": 1000, "prompts": ["PEAR"], "path": [0, 1], "sections": [2]},
+            {"at": 2000, "prompts": ["PLUM"], "path": [], "sections": [0]},
+        ],
+    }
+    out = _render_log([entry], tmp_path, setup='LOGTAB = "timeline"; ')
+    assert 'data-go="0" data-path="0.1" data-sec="2"' in out
+    assert 'data-go="0" data-path="" data-sec="0"' in out

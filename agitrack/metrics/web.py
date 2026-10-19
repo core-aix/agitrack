@@ -837,25 +837,42 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     }
 
 
-def _timeline_turns(stat: CommitStat) -> list[dict]:
+def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
     """The turns behind a commit, oldest first, each with when it began (``at``, epoch seconds,
     None when the turn recorded no start) and every message the user sent in it, in full, for
     the log's timeline view. A squash or a fold has one turn per part (recursively); the fold's
     own lead block is the commit itself and holds no prompt. Messages sent while a turn ran (a
-    queued follow-up) carry no time of their own in the trace, so they share the turn's."""
+    queued follow-up) carry no time of their own in the trace, so they share the turn's.
+
+    Each turn also says WHERE its messages are shown when the commit is opened, so the
+    timeline's link can open that place and mark the message: ``path`` is the part's position
+    in the displayed parts tree (newest first, as :func:`_display_parts` orders it; empty for
+    the commit's own message), and ``sections`` gives, per prompt, which ``## User`` section of
+    that message's interaction trace it is."""
     parts = list(stat.constituents)
     if parts and _is_own_lead(parts[0], stat):
         parts = parts[1:]
     if not parts:
-        messages = _trace_user_messages(stat.message)
-        return [{"at": _iso_epoch(stat.started_at), "prompts": messages}] if messages else []
-    return [turn for part in parts for turn in _timeline_turns(part)]
+        found = _trace_user_sections(stat.message)
+        if not found:
+            return []
+        return [
+            {
+                "at": _iso_epoch(stat.started_at),
+                "prompts": [text for _, text in found],
+                "path": list(path),
+                "sections": [ordinal for ordinal, _ in found],
+            }
+        ]
+    last = len(parts) - 1
+    return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j))]
 
 
-def _trace_user_messages(message: str) -> list[str]:
-    """Every ``## User`` section of a message's interaction trace, one string each, its text
-    kept as written. Fence-aware like :func:`_trace_sections`, so a heading QUOTED in a code
-    block is not a role."""
+def _trace_user_sections(message: str) -> list[tuple[int, str]]:
+    """Every non-empty ``## User`` section of a message's interaction trace, its text kept as
+    written, with its ordinal among ALL the trace's ``## User`` sections (empty ones counted),
+    so the page can find the same section in the rendered message. Fence-aware like
+    :func:`_trace_sections`, so a heading QUOTED in a code block is not a role."""
     messages: list[list[str]] = []
     in_trace = in_fence = in_user = False
     for line in (message or "").splitlines():
@@ -873,7 +890,8 @@ def _trace_user_messages(message: str) -> list[str]:
             continue
         if in_trace and in_user:
             messages[-1].append(line)
-    return [text for text in ("\n".join(lines).strip() for lines in messages) if text]
+    found = ((k, "\n".join(lines).strip()) for k, lines in enumerate(messages))
+    return [(k, text) for k, text in found if text]
 
 
 def log_page(
@@ -1518,9 +1536,11 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt.clamp .tbody{max-height:15em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
 .tprompt.clamp .tmore{display:inline}
 .log.timeline .entry.linked,.tprompt.linked{background:rgba(255,180,84,.08)}
-.entry.flash{animation:tflash 1.2s ease-out}
+.entry.flash,.tlmark.flash{animation:tflash 1.2s ease-out}
 @keyframes tflash{from{background:rgba(255,180,84,.3)}to{background:transparent}}
-@media (prefers-reduced-motion: reduce){.entry.flash{animation:none}}
+@media (prefers-reduced-motion: reduce){.entry.flash,.tlmark.flash{animation:none}}
+/* The message a timeline link was followed from, marked inside the opened commit. */
+.dmsg .tlmark{margin:6px 0;padding:1px 10px;border-left:2px solid var(--amber);background:rgba(255,180,84,.08)}
 .entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
@@ -2567,7 +2587,8 @@ function timelineHtml(entries, commitRow){
     let seq = 0;
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
-        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text});
+        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text,
+          path: turn.path || [], sec: (turn.sections || [])[k]});
       });
     }
   });
@@ -2580,7 +2601,8 @@ function timelineHtml(entries, commitRow){
     const when = it.approx
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
       : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
-    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
+    const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
+    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">→ ${esc(c.short || "")}</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
@@ -2761,6 +2783,53 @@ function toggleDetail(i){
   });
 }
 
+// The timeline's "→ <sha>": open the commit a message went into, down through the squashed
+// parts to the one holding it (path: display indices, newest first, from the server), and mark
+// the message there. Without a place to mark (a hand-built entry, a part the page no longer
+// shows) it falls back to flashing the commit's row.
+function showMessageInCommit(i, path, sec){
+  const row = document.querySelector('#commitlog .entry[data-i="'+i+'"]'), detail = $("detail-"+i);
+  if(!row || !detail) return;
+  if(detail.hidden) toggleDetail(i);
+  let frames = 0;
+  const reveal = () => {
+    const body = $("dbody-"+i);
+    // toggleDetail builds the detail on the next frame; wait for it.
+    if(!body){ if(++frames < 120) requestAnimationFrame(reveal); return; }
+    if(body.dataset.mode === "diff" && !path.length) toggleDiff(i);  // back to the message
+    let box = detail;
+    for(const k of path){
+      box = box && box.querySelectorAll(":scope > details.part")[k];
+      if(box) box.open = true;
+    }
+    const msg = !box ? null : path.length ? box.querySelector(":scope > .dmsg.md") : $("dbody-"+i);
+    const target = (msg && markUserSection(msg, sec)) || row;
+    target.scrollIntoView({block:"center", behavior:"smooth"});
+    target.classList.remove("flash"); void target.offsetWidth; target.classList.add("flash");
+  };
+  reveal();
+}
+// Wrap the sec-th "## User" section of a rendered message's interaction trace (counted the way
+// the server counted it: "# Interaction Trace" renders as an h3, "## User" as an h4) in a
+// marker, after removing any earlier marker in the log. Returns the marker, or null.
+function markUserSection(msg, sec){
+  document.querySelectorAll("#commitlog .tlmark").forEach(m => { m.replaceWith(...m.childNodes); });
+  if(sec == null) return null;
+  const picked = [];
+  let inTrace = false, n = -1, taking = false;
+  for(const el of [...msg.children]){
+    const heading = el.matches("h3.md-h, h4.md-h");
+    if(heading && el.tagName === "H3"){ inTrace = el.textContent.trim() === "Interaction Trace"; taking = false; continue; }
+    if(heading && inTrace){ taking = el.textContent.trim() === "User" && ++n === sec; if(!taking && el.textContent.trim() === "User") continue; }
+    if(taking) picked.push(el);
+  }
+  if(!picked.length) return null;
+  const mark = document.createElement("div");
+  mark.className = "tlmark";
+  picked[0].before(mark);
+  mark.append(...picked);
+  return mark;
+}
 // One box that flips between the commit message and this commit's file diff — the button toggles
 // which is shown, so you never juggle two panes. The diff (from the local clone via /diff, no
 // GitHub) is fetched once and cached by sha, so flipping back and forth is instant.
@@ -3348,9 +3417,8 @@ function wireControls(){
     if(more){ more.closest(".tprompt").classList.remove("clamp"); return; }
     const go = e.target.closest(".tgo");
     if(go){
-      const row = document.querySelector('#commitlog .entry[data-i="'+go.dataset.go+'"]');
-      if(row){ row.scrollIntoView({block:"center", behavior:"smooth"}); row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
-        const d = $("detail-"+go.dataset.go); if(d && d.hidden) toggleDetail(+go.dataset.go); }
+      const path = go.dataset.path ? go.dataset.path.split(".").map(Number) : [];
+      showMessageInCommit(+go.dataset.go, path, go.dataset.sec === undefined ? null : +go.dataset.sec);
       return;
     }
     const entry = e.target.closest(".entry");
@@ -3401,6 +3469,11 @@ async function init(){
   hideFabricatedChrome();
   stackStickyBanner();
   wireControls();
+  // A #timeline link is settled BEFORE the log is first drawn. It used to be applied after the
+  // file browser had loaded (a second or more on a big repo), by switching tabs, and that switch
+  // redrew the whole log: a commit opened in the meantime (the timeline's own "→ <sha>" link,
+  // pressed as soon as it appeared) closed again under the reader.
+  if(location.hash === "#timeline") LOGTAB = "timeline";
   // Shell mode: the chrome is already on screen with the loading animation; fetch the
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
@@ -3434,11 +3507,13 @@ async function init(){
     // log that came back unchanged is left exactly as it is.
     if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
   }
+  // The log was drawn as a timeline already; this only lights the tab, without waiting for the
+  // file browser below.
+  if(LOGTAB === "timeline" && location.hash !== "#files") showLogTab("timeline");
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();
   if(location.hash === "#files" && FILES && FILES.length) showLogTab("files");  // deep-link to the Files tab
-  else if(location.hash === "#timeline" || LOGTAB === "timeline"){ LOGTAB = ""; showLogTab("timeline"); }
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).
