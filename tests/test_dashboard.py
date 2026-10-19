@@ -2839,6 +2839,7 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     newer = {
         "sha": "b" * 40,
         "short": "bbbbbbbb",
+        "author": "alice-gh",
         "subject": "fold commit",
         "kind": "agent",
         "ts": 3000,
@@ -2851,6 +2852,7 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     older = {
         "sha": "a" * 40,
         "short": "aaaaaaaa",
+        "author": "bob-gh",
         "subject": "middle commit",
         "kind": "user",
         "ts": 2000,
@@ -2862,6 +2864,9 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     assert order == sorted(order)
     assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
     assert "follow-up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
+    # Labelled with the committer, never "you": the log holds several people's work.
+    assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> follow-up") == 1
+    assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
 
     commits = _render_log([newer, older], tmp_path)
     assert "ORANGE" not in commits and "fold commit" in commits

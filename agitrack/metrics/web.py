@@ -1506,7 +1506,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* The timeline: the user's messages between the commits they went into. */
 .tprompt{position:relative;margin:6px 0 6px 18px;padding:7px 10px 8px 12px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06)}
 .tprompt .thead{display:flex;gap:10px;align-items:baseline;font-size:11.5px;color:var(--fg-dim);margin-bottom:3px}
-.tprompt .twho{color:var(--ops);letter-spacing:.5px;text-transform:uppercase;font-size:10.5px}
+.tprompt .twho{color:var(--ops);letter-spacing:.5px;font-size:11px}
+.tprompt .twho .tid{font-weight:600}
 .tprompt .when{font-variant-numeric:tabular-nums;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
@@ -2555,7 +2556,9 @@ function commitWhen(ts){
 // the commits on this page, each pointing at the commit it went into. Paging stays per commit:
 // a page holds its commits and every message behind them. Sorted by date, prompts and commits
 // interleave by time (newest first), so a message folded into a later commit shows where it was
-// sent; under another sort, each commit is followed by its own messages.
+// sent; under another sort, each commit is followed by its own messages. Each message is labelled
+// with its commit's committer ID: a log holds several people's work, and the trace records no
+// sender of its own.
 function timelineHtml(entries, commitRow){
   const items = [];
   entries.forEach((c, i) => {
@@ -2577,7 +2580,7 @@ function timelineHtml(entries, commitRow){
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
       : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
-    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho">${it.follow ? "follow-up" : "you asked"}</span>`+
+    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "follow-up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
   }).join("");
