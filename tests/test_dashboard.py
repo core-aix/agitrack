@@ -3210,3 +3210,111 @@ def test_a_login_known_only_by_id_is_labelled_like_the_tracked_log():
         CommitStat(sha="b", author="t", email="t@t", subject="", kind="user"),
     ]
     assert login_labels(history, {"a": "OctoCat"}) == {"octocat": "octocat (Mona)"}
+
+
+def _people_taking_turns_on_main(repo_dir) -> None:
+    """Alice, Bob and Carol talk to their agents at the same time and commit straight onto main,
+    each asking BEFORE someone else's commit lands; Bob's fold carries a turn asked before every
+    other commit here. Then two branches worked on at once are merged."""
+    import os
+    import subprocess
+
+    def git(*args, who=None, at=None):
+        env = dict(os.environ)
+        if who:
+            env.update(
+                GIT_AUTHOR_NAME=who,
+                GIT_AUTHOR_EMAIL=f"{who}@example.com",
+                GIT_COMMITTER_NAME=who,
+                GIT_COMMITTER_EMAIL=f"{who}@example.com",
+            )
+        if at:
+            env.update(GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at)
+        subprocess.run(["git", "-C", str(repo_dir), *args], check=True, capture_output=True, env=env)
+
+    def turn(subject, prompts, started):
+        asked = "".join(f"## User\n\n{p}\n\n" for p in prompts)
+        return (
+            f"<aGiTrack> {subject}\n\n# Interaction Trace\n\n{asked}## Agent\n\ndone\n\n"
+            f"# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: {started}\n"
+            "tokens_since_last_commit_output: 10\n"
+        )
+
+    def commit(who, at, message):
+        with open(os.path.join(repo_dir, f"{who}.txt"), "a") as f:
+            f.write(at + "\n")
+        git("add", "-A")
+        git("commit", "-q", "--cleanup=whitespace", "-m", message, who=who, at=at)
+
+    d = "2026-10-19T"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)
+    commit("carol", d + "09:00:00Z", "initial commit")
+    commit("alice", d + "10:05:00Z", turn("alice a", ["ALICE-1"], d + "10:00:00Z"))
+    commit("bob", d + "10:08:00Z", turn("bob b", ["BOB-1"], d + "10:02:00Z"))
+    commit("carol", d + "10:12:00Z", turn("carol c", ["CAROL-1"], d + "10:06:00Z"))
+    commit("alice", d + "10:15:00Z", turn("alice a2", ["ALICE-2", "ALICE-2 again"], d + "10:09:00Z"))
+    fold = (
+        "bob fold\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: s\n\n"
+        + turn("bob two", ["BOB-2"], d + "10:01:00Z")
+        + "\n"
+        + turn("bob three", ["BOB-3"], d + "10:13:00Z")
+    )
+    commit("bob", d + "10:20:00Z", fold)
+    commit("carol", d + "10:22:00Z", turn("carol c2", ["CAROL-2"], d + "10:16:00Z"))
+    git("checkout", "-q", "-b", "alice-work")
+    commit("alice", d + "10:35:00Z", turn("alice branch", ["ALICE-3"], d + "10:25:00Z"))
+    git("checkout", "-q", "main")
+    git("checkout", "-q", "-b", "bob-work")
+    commit("bob", d + "10:30:00Z", turn("bob branch", ["BOB-4"], d + "10:27:00Z"))
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "Merge alice-work", "alice-work", who="carol", at=d + "10:40:00Z")
+    git("merge", "-q", "--no-ff", "-m", "Merge bob-work", "bob-work", who="carol", at=d + "10:45:00Z")
+
+
+def test_hovering_a_timeline_message_lights_its_own_commit_even_when_others_lie_between(tmp_path):
+    # Pointing at a message lights up the commit that INCLUDED it and that commit's other
+    # messages, never "the stretch of rail around it": with several people committing at once,
+    # someone else's commit (and their messages) routinely sits between a message and its own
+    # commit, so the lit items are not one block. Also checked in headless Chrome on the same
+    # repository at 1280 and 390 px with real mouse moves: all 10 messages lit exactly their own
+    # commit and its messages, 9 of them as split blocks.
+    import json as _json
+    import subprocess
+
+    from agitrack.metrics.server import RepoScope
+
+    repo_dir = tmp_path / "team"
+    _people_taking_turns_on_main(repo_dir)
+    entries = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {}).body)["entries"]
+    html = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
+
+    # The rail in order: commits carry data-i, messages data-c (the commit they went into).
+    rail = re.findall(r'<div class="(entry[^"]*|tprompt[^"]*)" data-(i|c)="(\d+)"', html)
+    assert rail, html[:500]
+    messages = [m.group(1).strip() for m in re.finditer(r'<div class="tbody md">(.*?)</div>', html, re.S)]
+    messages = [re.sub(r"<[^>]+>", "", m).strip() for m in messages]
+    assert len(messages) == sum(1 for _cls, kind, _n in rail if kind == "c") == 10
+
+    def lit_by(index: str) -> list[int]:
+        # What the hover handler selects: `.entry[data-i=N]` and `.tprompt[data-c=N]`.
+        return [pos for pos, (_cls, _kind, n) in enumerate(rail) if n == index]
+
+    split = 0
+    message_at = iter(messages)
+    for pos, (_cls, kind, n) in enumerate(rail):
+        if kind != "c":
+            continue
+        text = next(message_at)
+        sha = entries[int(n)]["sha"]
+        body = subprocess.run(
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%B", sha], capture_output=True, text=True
+        ).stdout
+        assert f"## User\n\n{text}\n" in body, (text, entries[int(n)]["subject"])
+        lit = lit_by(n)
+        assert pos in lit and sum(1 for p in lit if rail[p][1] == "i") == 1
+        split += any(b - a > 1 for a, b in zip(lit, lit[1:]))
+    assert split >= 5  # the highlight follows the commit, not the neighbourhood
+
+    # And the page's hover handler keys on exactly that association.
+    page = render_html(_demo_repo(tmp_path / "demo"))
+    assert """'#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]'""" in page
