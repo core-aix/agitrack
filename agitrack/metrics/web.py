@@ -1855,8 +1855,8 @@ __UPDATE_BANNER__
   </div>
   <div class="panebar">
     <div class="logtabs">
-      <button class="logtab active" data-tab="commits">commits</button>
-      <button class="logtab" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
+      <button class="logtab active" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
+      <button class="logtab" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
@@ -1987,8 +1987,10 @@ function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
 const QIN_LABEL = {subject:"subject", user:"user messages", agent:"agent messages",
                    trace:"interaction trace", all:"full message"};
 const LOGTAB_KEY = "agitrack:logtab";
-let LOGTAB = "commits";
-try{ if(localStorage.getItem(LOGTAB_KEY) === "timeline") LOGTAB = "timeline"; }catch(e){}
+// The timeline is the default view: it is the log with what was asked laid in between, so it
+// answers more at a glance. A reader who chose the plain commit list keeps it.
+let LOGTAB = "timeline";
+try{ if(localStorage.getItem(LOGTAB_KEY) === "commits") LOGTAB = "commits"; }catch(e){}
 function searchWords(){ return (state.q || "").toLowerCase().split(/\s+/).filter(Boolean); }
 // Wrap every occurrence of the search words in <mark class="hit"> inside `root`, wherever it
 // shows on the page (a log row, an expanded message, a squash's parts), whichever part of the
@@ -3474,6 +3476,7 @@ async function init(){
   // redrew the whole log: a commit opened in the meantime (the timeline's own "→ <sha>" link,
   // pressed as soon as it appeared) closed again under the reader.
   if(location.hash === "#timeline") LOGTAB = "timeline";
+  else if(location.hash === "#commits") LOGTAB = "commits";
   // Shell mode: the chrome is already on screen with the loading animation; fetch the
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
@@ -3507,9 +3510,9 @@ async function init(){
     // log that came back unchanged is left exactly as it is.
     if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
   }
-  // The log was drawn as a timeline already; this only lights the tab, without waiting for the
+  // The log was drawn in its tab already; this only lights that tab, without waiting for the
   // file browser below.
-  if(LOGTAB === "timeline" && location.hash !== "#files") showLogTab("timeline");
+  if(location.hash !== "#files") showLogTab(LOGTAB);
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();

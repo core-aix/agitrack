@@ -2930,8 +2930,117 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
     assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
 
-    commits = _render_log([newer, older], tmp_path)
+    commits = _render_log([newer, older], tmp_path, setup='LOGTAB = "commits"; ')
     assert "ORANGE" not in commits and "fold commit" in commits
+    # The timeline is what a reader sees first; the plain commit list is the next tab.
+    assert "ORANGE" in _render_log([newer, older], tmp_path)
+
+
+def _two_people_merged(repo_dir) -> dict[str, str]:
+    """Alice and Bob each drive an agent on their own branch at the same time; both branches
+    are merged into main with merge commits. Bob's second commit folds two turns. Returns the
+    commit ids, so a test can check every message points at the commit it went into."""
+    import os
+    import subprocess
+
+    def git(*args, who=None, at=None):
+        env = dict(os.environ)
+        if who:
+            env.update(
+                GIT_AUTHOR_NAME=who,
+                GIT_AUTHOR_EMAIL=f"{who}@example.com",
+                GIT_COMMITTER_NAME=who,
+                GIT_COMMITTER_EMAIL=f"{who}@example.com",
+            )
+        if at:
+            env.update(GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at)
+        return subprocess.run(
+            ["git", "-C", str(repo_dir), *args], check=True, capture_output=True, text=True, env=env
+        ).stdout.strip()
+
+    def turn(subject, prompts, started):
+        asked = "".join(f"## User\n\n{p}\n\n" for p in prompts)
+        return (
+            f"<aGiTrack> {subject}\n\n# Interaction Trace\n\n{asked}## Agent\n\ndone\n\n"
+            f"# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: {started}\n"
+            "tokens_since_last_commit_output: 10\n"
+        )
+
+    def commit(who, at, path, message):
+        with open(os.path.join(repo_dir, path), "a") as f:
+            f.write(f"{who} {at}\n")
+        git("add", path)
+        git("commit", "-q", "--cleanup=whitespace", "-m", message, who=who, at=at)
+        return git("rev-parse", "HEAD")
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True)
+    commit("carol", "2026-10-19T09:00:00Z", "README.md", "initial commit")
+    ids = {}
+    git("checkout", "-q", "-b", "alice-work")
+    ids["A1"] = commit("alice", "2026-10-19T10:05:00Z", "a.txt", turn("alice one", ["ALICE-1"], "2026-10-19T10:00:00Z"))
+    git("checkout", "-q", "main")
+    git("checkout", "-q", "-b", "bob-work")
+    ids["B1"] = commit("bob", "2026-10-19T10:12:00Z", "b.txt", turn("bob one", ["BOB-1"], "2026-10-19T10:10:00Z"))
+    git("checkout", "-q", "alice-work")
+    ids["A2"] = commit(
+        "alice", "2026-10-19T10:25:00Z", "a.txt", turn("alice two", ["ALICE-2", "ALICE-2b"], "2026-10-19T10:20:00Z")
+    )
+    git("checkout", "-q", "bob-work")
+    fold = (
+        "bob fold\n\n# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: s\n\n"
+        + turn("bob two", ["BOB-2"], "2026-10-19T10:15:00Z")
+        + "\n"
+        + turn("bob three", ["BOB-3"], "2026-10-19T10:30:00Z")
+    )
+    ids["B2"] = commit("bob", "2026-10-19T10:35:00Z", "b.txt", fold)
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "Merge alice-work", "alice-work", who="carol", at="2026-10-19T10:40:00Z")
+    git("merge", "-q", "--no-ff", "-m", "Merge bob-work", "bob-work", who="carol", at="2026-10-19T10:45:00Z")
+    return ids
+
+
+def test_the_timeline_of_two_people_working_at_once_on_merged_branches(tmp_path):
+    # Two people talk to their own agents at the same time, commit separately on their own
+    # branches, and both branches are merged. Every message is shown once, labelled with the
+    # person whose commit it went into, at the time it was asked (so the two people's messages
+    # interleave), pointing at that commit and, for a fold, at the right part. The merges carry
+    # no messages of their own, so nothing appears twice. Also checked in headless Chrome on
+    # the same repository: all six links opened the right commit or part and marked the
+    # message, and filtering to one committer left only that person's messages.
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo_dir = tmp_path / "team"
+    ids = _two_people_merged(repo_dir)
+    entries = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {}).body)["entries"]
+    by_sha = {e["sha"]: e for e in entries}
+
+    asked = {
+        (e["sha"], e["author"], prompt, tuple(t["path"]), section)
+        for e in entries
+        for t in e.get("turns", [])
+        for prompt, section in zip(t["prompts"], t["sections"])
+    }
+    assert asked == {
+        (ids["A1"], "alice", "ALICE-1", (), 0),
+        (ids["B1"], "bob", "BOB-1", (), 0),
+        (ids["A2"], "alice", "ALICE-2", (), 0),
+        (ids["A2"], "alice", "ALICE-2b", (), 1),
+        (ids["B2"], "bob", "BOB-2", (1,), 0),  # the fold's older part is listed second
+        (ids["B2"], "bob", "BOB-3", (0,), 0),
+    }
+    assert [e["subject"] for e in entries if e["subject"].startswith("Merge")] == ["Merge bob-work", "Merge alice-work"]
+    assert all(not e.get("turns") for e in entries if e["subject"].startswith("Merge"))
+    assert by_sha[ids["B2"]]["parts"][1]["subject"] == "<aGiTrack> bob two"
+
+    out = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
+    order = [out.index(word) for word in ("BOB-3", "ALICE-2b", "ALICE-2<", "BOB-2", "BOB-1", "ALICE-1")]
+    assert order == sorted(order)  # newest first, the two people's messages interleaved by time
+    assert out.count("bob</b> asked") == 3 and out.count("alice</b> asked") == 2
+    assert out.count("alice</b> followed up") == 1
+    assert out.count(f"→ {by_sha[ids['B2']]['short']}<") == 2
+    assert out.count(f"→ {by_sha[ids['A2']]['short']}<") == 2
 
 
 def test_a_timeline_link_names_the_part_and_the_message_it_opens(tmp_path):
