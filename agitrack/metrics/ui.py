@@ -200,8 +200,9 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 .dmsg .diffempty b{color:var(--phosphor);font-style:normal}
 .dmsg.md p{margin:7px 0}
 /* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway): the source
-   line breaks stop rendering and the paragraph flows as prose. */
-.dmsg.md p.mdp.reflow br{display:none}
+   line breaks stop rendering and the paragraph flows as prose. Not scoped to .dmsg: the
+   timeline's messages are rendered by the same renderer outside one. */
+p.mdp.reflow br{display:none}
 /* Every property a host page might have opinions about is set HERE, including the ones this
    block would otherwise leave to inheritance. The story page styles its own section headings
    (".commits h4") in small caps, and that rule reached into a commit message's "## User"

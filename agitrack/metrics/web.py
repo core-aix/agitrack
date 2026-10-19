@@ -1559,8 +1559,9 @@ __UI_COMMIT_CSS__
 .dmsg.md p{margin:7px 0}
 /* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway):
    the source line breaks stop rendering and the paragraph flows as prose. The
-   space preceding each <br> in the markup keeps the words apart. */
-.dmsg.md p.mdp.reflow br{display:none}
+   space preceding each <br> in the markup keeps the words apart. Not
+   scoped to .dmsg: the timeline's messages are rendered outside one. */
+p.mdp.reflow br{display:none}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
 /* Heading depth reads at a glance: structural sections (# …) brightest/largest,
    the ## User/## Agent role one step down, and a message's own nested headings
@@ -2652,9 +2653,13 @@ function renderLog(){
   document.querySelectorAll("#commitlog .tprompt .tbody").forEach(reflowParagraphs);
   highlightIn($("commitlog"));
   // A long message is shown clamped; one holding a search hit is shown whole, so the hit is seen.
+  // A message that only just overflows is shown whole too: the clamped box carries a "show all"
+  // line of its own, so when the hidden part is no taller than that line, showing everything
+  // takes no more room, and pressing "show all" would only have made the box SHORTER.
   document.querySelectorAll("#commitlog .tprompt.clamp").forEach(el => {
+    const body = el.querySelector(".tbody"), more = el.querySelector(".tmore");
     if(el.querySelector("mark.hit")) el.classList.remove("clamp");
-    else if(el.querySelector(".tbody").scrollHeight <= el.querySelector(".tbody").clientHeight + 2) el.classList.remove("clamp");
+    else if(body.scrollHeight <= body.clientHeight + (more ? more.offsetHeight : 0) + 2) el.classList.remove("clamp");
   });
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
@@ -3359,6 +3364,12 @@ function wireControls(){
     document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]')
       .forEach(n => n.classList.toggle("linked", on));
   };
+  // A squashed part is a closed <details> when its commit opens, so its paragraphs have no
+  // layout to measure then; they are re-flowed the moment the part is opened. "toggle" does
+  // not bubble, hence the capture phase.
+  $("commitlog").addEventListener("toggle", e => {
+    if(e.target.matches && e.target.matches("details.part") && e.target.open) reflowParagraphs(e.target);
+  }, true);
   $("commitlog").addEventListener("mouseover", e => linkHover(e, true));
   $("commitlog").addEventListener("mouseout", e => linkHover(e, false));
   // Toggle a series on/off from the legend; redraw the plot in place.

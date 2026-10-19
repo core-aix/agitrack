@@ -194,10 +194,38 @@ def test_commit_message_paragraphs_reflow_when_the_column_is_narrower(tmp_path):
     assert 'join(" <br>")' in html  # lines of one paragraph, breaks kept as <br>
     assert '<p class="mdp${inMeta?" keep":""}">' in html  # metadata paragraphs opt out
     assert "/agitrack\\s+metadata/i.test(h[2])" in html  # …detected from the heading
-    assert ".dmsg.md p.mdp.reflow br{display:none}" in html
+    assert "p.mdp.reflow br{display:none}" in html
     assert "function reflowParagraphs(root)" in html
     assert "tops.length > breaks + 1" in html  # more line boxes than source lines => wrapped
     assert "reflowParagraphs(document), 150" in html  # re-decided on resize
+
+
+def test_timeline_messages_and_squashed_parts_reflow_too(tmp_path):
+    # The timeline's user messages are rendered by the same Markdown renderer as a commit
+    # message, but outside a ".dmsg" box: a rule scoped to ".dmsg" marked their paragraphs
+    # for reflow and never hid the breaks. A squashed part is a closed <details> when its
+    # commit opens, and a browser that does not lay out closed content (Safari) measured it as
+    # fitting, so it is measured again the moment it is opened. Checked in headless Chrome at
+    # phone width against this repository's own history: 40 of 40 timeline paragraphs and
+    # 19 of 19 part paragraphs reflowed, against 0 and 0 before.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "\np.mdp.reflow br{display:none}" in html  # not scoped to .dmsg
+    assert ".dmsg.md p.mdp.reflow br" not in html
+    assert '$("commitlog").addEventListener("toggle"' in html
+    assert 'e.target.matches("details.part") && e.target.open) reflowParagraphs(e.target)' in html
+
+
+def test_a_timeline_message_that_only_just_overflows_is_shown_whole(tmp_path):
+    # A clamped message carries its own "show all" line, so a message whose hidden part is no
+    # taller than that line got SHORTER when "show all" was pressed. Such a message is shown
+    # whole from the start. Checked in headless Chrome over six pages of this repository's
+    # timeline: 6 such messages at 390px and 2 at 1280px before, none after.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "body.scrollHeight <= body.clientHeight + (more ? more.offsetHeight : 0) + 2" in html
 
 
 def test_phone_layout_uses_the_full_width(tmp_path):
