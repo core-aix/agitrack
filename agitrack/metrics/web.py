@@ -833,7 +833,47 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "message": _main_message(stat),  # squash constituents stripped (shown in "parts")
         "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
         "parts": _display_parts(stat),  # newest-first display (message stays chronological)
+        "turns": _timeline_turns(stat),  # what the user asked, and when, for the timeline view
     }
+
+
+def _timeline_turns(stat: CommitStat) -> list[dict]:
+    """The turns behind a commit, oldest first, each with when it began (``at``, epoch seconds,
+    None when the turn recorded no start) and every message the user sent in it, in full, for
+    the log's timeline view. A squash or a fold has one turn per part (recursively); the fold's
+    own lead block is the commit itself and holds no prompt. Messages sent while a turn ran (a
+    queued follow-up) carry no time of their own in the trace, so they share the turn's."""
+    parts = list(stat.constituents)
+    if parts and _is_own_lead(parts[0], stat):
+        parts = parts[1:]
+    if not parts:
+        messages = _trace_user_messages(stat.message)
+        return [{"at": _iso_epoch(stat.started_at), "prompts": messages}] if messages else []
+    return [turn for part in parts for turn in _timeline_turns(part)]
+
+
+def _trace_user_messages(message: str) -> list[str]:
+    """Every ``## User`` section of a message's interaction trace, one string each, its text
+    kept as written. Fence-aware like :func:`_trace_sections`, so a heading QUOTED in a code
+    block is not a role."""
+    messages: list[list[str]] = []
+    in_trace = in_fence = in_user = False
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            in_user = False
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            in_user = stripped == "## User"
+            if in_user:
+                messages.append([])
+            continue
+        if in_trace and in_user:
+            messages[-1].append(line)
+    return [text for text in ("\n".join(lines).strip() for lines in messages) if text]
 
 
 def log_page(
@@ -1463,6 +1503,23 @@ h2.section::before{content:"# ";color:var(--amber)}
    a URL) breaks instead of pushing the row past the screen and giving the whole page
    a horizontal scrollbar. */
 .entry .ksub{flex:1;min-width:200px;color:var(--fg);overflow-wrap:anywhere}
+/* The timeline: the user's messages between the commits they went into. */
+.tprompt{position:relative;margin:6px 0 6px 18px;padding:7px 10px 8px 12px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06)}
+.tprompt .thead{display:flex;gap:10px;align-items:baseline;font-size:11.5px;color:var(--fg-dim);margin-bottom:3px}
+.tprompt .twho{color:var(--ops);letter-spacing:.5px;text-transform:uppercase;font-size:10.5px}
+.tprompt .when{font-variant-numeric:tabular-nums;white-space:nowrap}
+.tprompt .tgo{margin-left:auto;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
+.tprompt .tgo:hover{text-decoration:underline}
+.tprompt .tbody{color:var(--fg);overflow-wrap:anywhere}
+.tprompt .tbody > :first-child{margin-top:0}
+.tprompt .tbody > :last-child{margin-bottom:0}
+.tprompt .tmore{display:none;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:4px 0 0;cursor:pointer}
+.tprompt.clamp .tbody{max-height:15em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 75%,transparent);mask-image:linear-gradient(#000 75%,transparent)}
+.tprompt.clamp .tmore{display:inline}
+.log.timeline .entry.linked,.tprompt.linked{background:rgba(255,180,84,.08)}
+.entry.flash{animation:tflash 1.2s ease-out}
+@keyframes tflash{from{background:rgba(255,180,84,.3)}to{background:transparent}}
+@media (prefers-reduced-motion: reduce){.entry.flash{animation:none}}
 .entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
@@ -1777,6 +1834,7 @@ __UPDATE_BANNER__
   <div class="panebar">
     <div class="logtabs">
       <button class="logtab active" data-tab="commits">commits</button>
+      <button class="logtab" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
@@ -1906,6 +1964,9 @@ function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
 // --- the commit search: what it searches, and marking what it found ---------------------
 const QIN_LABEL = {subject:"subject", user:"user messages", agent:"agent messages",
                    trace:"interaction trace", all:"full message"};
+const LOGTAB_KEY = "agitrack:logtab";
+let LOGTAB = "commits";
+try{ if(localStorage.getItem(LOGTAB_KEY) === "timeline") LOGTAB = "timeline"; }catch(e){}
 function searchWords(){ return (state.q || "").toLowerCase().split(/\s+/).filter(Boolean); }
 // Wrap every occurrence of the search words in <mark class="hit"> inside `root`, wherever it
 // shows on the page (a log row, an expanded message, a squash's parts), whichever part of the
@@ -2490,11 +2551,42 @@ function commitWhen(ts){
   const utc = d.toISOString().slice(0,16).replace("T"," ")+" UTC";
   return {text, title:`${full} (${utc})`};
 }
+// The log's TIMELINE view: every message the user sent, with when its turn began, laid between
+// the commits on this page, each pointing at the commit it went into. Paging stays per commit:
+// a page holds its commits and every message behind them. Sorted by date, prompts and commits
+// interleave by time (newest first), so a message folded into a later commit shows where it was
+// sent; under another sort, each commit is followed by its own messages.
+function timelineHtml(entries, commitRow){
+  const items = [];
+  entries.forEach((c, i) => {
+    items.push({t: c.ts || 0, commit: true, seq: 0, i});
+    let seq = 0;
+    for(const turn of (c.turns || [])){
+      (turn.prompts || []).forEach((text, k) => {
+        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text});
+      });
+    }
+  });
+  const byTime = state.sort === "date";
+  items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
+    (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+  return items.map(it => {
+    if(it.commit) return commitRow(entries[it.i], it.i);
+    const c = entries[it.i], w = commitWhen(it.t);
+    const when = it.approx
+      ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
+      : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
+    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" title="show the commit this went into">→ ${esc(c.short || "")}</button>`;
+    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho">${it.follow ? "follow-up" : "you asked"}</span>`+
+      `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
+      `<button class="tmore" title="show the whole message">show all</button></div>`;
+  }).join("");
+}
 function renderLog(){
   const entries = LOGPAGE.entries || [];
   LOG_ENTRIES = entries;
   const total = LOGPAGE.total||0, offset = LOGPAGE.offset||0, limit = LOGPAGE.limit||PAGE_SIZE;
-  const rows = entries.map((c, i) => {
+  const commitRow = (c, i) => {
     const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agitrack-ops" ? "ops" : "nontracked");
     const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
     // A manual-commit-mode latent turn not yet folded into a commit — flag it so the user
@@ -2522,7 +2614,9 @@ function renderLog(){
     return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${meta}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
-  }).join("");
+  };
+  const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
+  $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
   const from = total ? offset+1 : 0, to = offset+entries.length;
   const pages = Math.max(1, Math.ceil(total/limit)), cur = Math.min(pages, Math.floor(offset/limit)+1);
   // Numbered page buttons: all of them when few, otherwise first + a window around
@@ -2552,7 +2646,13 @@ function renderLog(){
     ? `no commits match "${esc(state.q)}" in the ${QIN_LABEL[state.qin] || "subject"}`
     : "no commits";
   $("commitlog").innerHTML = (rows || `<div class="empty">${none}</div>`) + pager;
+  document.querySelectorAll("#commitlog .tprompt .tbody").forEach(reflowParagraphs);
   highlightIn($("commitlog"));
+  // A long message is shown clamped; one holding a search hit is shown whole, so the hit is seen.
+  document.querySelectorAll("#commitlog .tprompt.clamp").forEach(el => {
+    if(el.querySelector("mark.hit")) el.classList.remove("clamp");
+    else if(el.querySelector(".tbody").scrollHeight <= el.querySelector(".tbody").clientHeight + 2) el.classList.remove("clamp");
+  });
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -3057,7 +3157,12 @@ function renderFiles(){
 function showLogTab(tab){
   document.querySelectorAll(".logtab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   const pc = $("pane-commits"), pf = $("pane-files");
-  if(pc) pc.hidden = tab !== "commits";
+  // The timeline is the commit log with the user's messages laid in between, so it shares the
+  // commit pane, its pager, sort and search; only the rendering differs.
+  const commitish = tab === "commits" || tab === "timeline";
+  if(commitish && tab !== LOGTAB){ LOGTAB = tab; renderLog(); }
+  if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
+  if(pc) pc.hidden = !commitish;
   if(pf) pf.hidden = tab !== "files";
   // The tabs and the pane's own control (sort / file filter) share one row, so the control
   // has to follow the tab.
@@ -3066,7 +3171,7 @@ function showLogTab(tab){
   const hf = $("head-files");
   if(hf) hf.hidden = tab !== "files";
   const hc = $("head-commits");   // the commit search searches commits, so it follows that tab
-  if(hc) hc.hidden = tab !== "commits";
+  if(hc) hc.hidden = !commitish;
 }
 function fileChangeHtml(c, i){
   const when = commitWhen(c.ts).text;  // the reader's local time, like the commit log
@@ -3231,9 +3336,28 @@ function wireControls(){
     if(dbtn && dbtn.dataset.psha){ e.preventDefault(); togglePartDiff(dbtn); return; }
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
+    const more = e.target.closest(".tmore");
+    if(more){ more.closest(".tprompt").classList.remove("clamp"); return; }
+    const go = e.target.closest(".tgo");
+    if(go){
+      const row = document.querySelector('#commitlog .entry[data-i="'+go.dataset.go+'"]');
+      if(row){ row.scrollIntoView({block:"center", behavior:"smooth"}); row.classList.remove("flash"); void row.offsetWidth; row.classList.add("flash");
+        const d = $("detail-"+go.dataset.go); if(d && d.hidden) toggleDetail(+go.dataset.go); }
+      return;
+    }
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
   });
+  // In the timeline, pointing at a message lights up the commit it went into, and the reverse.
+  const linkHover = (e, on) => {
+    const el = e.target.closest && e.target.closest(".tprompt, .entry");
+    if(!el || !$("commitlog").classList.contains("timeline")) return;
+    const i = el.dataset.c !== undefined ? el.dataset.c : el.dataset.i;
+    document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]')
+      .forEach(n => n.classList.toggle("linked", on));
+  };
+  $("commitlog").addEventListener("mouseover", e => linkHover(e, true));
+  $("commitlog").addEventListener("mouseout", e => linkHover(e, false));
   // Toggle a series on/off from the legend; redraw the plot in place.
   $("ts-legend").addEventListener("click", e => {
     const btn = e.target.closest(".lg"); if(!btn) return;
@@ -3300,6 +3424,7 @@ async function init(){
   wireFileBrowser();
   await loadFiles(); renderFiles();
   if(location.hash === "#files" && FILES && FILES.length) showLogTab("files");  // deep-link to the Files tab
+  else if(location.hash === "#timeline" || LOGTAB === "timeline"){ LOGTAB = ""; showLogTab("timeline"); }
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).

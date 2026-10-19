@@ -2753,3 +2753,115 @@ def test_the_log_search_finds_a_commit_by_subject_or_by_what_was_asked(tmp_path)
     assert subjects(q="   ") == everything
     data = _json.loads(scope.get("/data", {"q": ["tidy"]}).body)
     assert data["agg"]["total"] == len(everything)  # the panels above are untouched
+
+
+def test_the_timeline_lists_each_turns_prompts_with_when_the_turn_began(tmp_path):
+    """The log's timeline view lays the user's messages between the commits they went into. A
+    log entry carries its turns oldest first: when each began, and every message sent in it (a
+    queued follow-up shares its turn's time), in full. A fold has one turn per part, a heading
+    quoted in a fence is not a message, and a commit with no trace has no turns."""
+    from datetime import datetime
+
+    from agitrack.metrics.web import _timeline_turns
+
+    def epoch(iso):
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "my commit\n\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagitrack_session_id: a\n\n"
+        "<aGiTrack> first turn\n\n# Interaction Trace\n\n## User\n\nrename the helper\nand its test\n\n"
+        "## Agent\n\ndone\n\n```\n## User\nquoted, not asked\n```\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nagent_started_at: 2026-10-08T10:00:00Z\n\n"
+        "<aGiTrack> second turn\n\n# Interaction Trace\n\n## User\n\nfix the docs\n\n## User\n\nand the README\n\n"
+        "## Agent\n\nok\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\n"
+    )
+    _write_lines(repo, "t.txt", 3)
+    repo.commit("plain user commit")
+    stats = {s.subject: s for s in build_dashboard(repo).stats}
+
+    assert _timeline_turns(stats["my commit"]) == [
+        {"at": epoch("2026-10-08T10:00:00Z"), "prompts": ["rename the helper\nand its test"]},
+        {"at": None, "prompts": ["fix the docs", "and the README"]},  # no start recorded
+    ]
+    assert _timeline_turns(stats["plain user commit"]) == []
+
+
+def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
+    """What the dashboard script draws for this log page (``renderLog``), under node."""
+    import os
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from tests.test_story import _DOM_STUB
+
+    import tempfile
+
+    work = Path(tempfile.mkdtemp(dir=tmp_path))
+    page = render_html(_demo_repo(work / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = work / "log.js"
+    run = (
+        setup
+        + f"LOGPAGE = {{entries: {json.dumps(entries)}, total: {len(entries)}, offset: 0, limit: 50}}; renderLog();"
+    )
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\n"
+        + stub
+        + "const box = stubEl();\n"
+        + "const base = document.getElementById;\n"
+        + "document.getElementById = id => (id === 'commitlog' ? box : base(id));\n"
+        + "new Function(SOURCE + '\\n;' + "
+        + json.dumps(run)
+        + ")();\n"
+        + "console.log(box.innerHTML);\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [node, str(script)], capture_output=True, text=True, timeout=300, env={**os.environ, "TZ": "UTC"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_path):
+    """Newest first, by time: a message shows where it was sent, even when it went into a LATER
+    commit than the one made just after it (a fold), and each says which commit it went into.
+    The commits tab is unchanged."""
+    newer = {
+        "sha": "b" * 40,
+        "short": "bbbbbbbb",
+        "subject": "fold commit",
+        "kind": "agent",
+        "ts": 3000,
+        "tokens": {},
+        "turns": [
+            {"at": 1000, "prompts": ["ORANGE asked first"]},
+            {"at": 2500, "prompts": ["LEMON asked", "LIME follow-up"]},
+        ],
+    }
+    older = {
+        "sha": "a" * 40,
+        "short": "aaaaaaaa",
+        "subject": "middle commit",
+        "kind": "user",
+        "ts": 2000,
+        "tokens": {},
+        "turns": [{"at": None, "prompts": ["KIWI undated"]}],
+    }
+    out = _render_log([newer, older], tmp_path, setup='LOGTAB = "timeline"; ')
+    order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
+    assert order == sorted(order)
+    assert out.count("→ bbbbbbbb") == 3 and out.count("→ aaaaaaaa") == 1
+    assert "follow-up" in out and "≈ " in out  # the follow-up is labelled; the undated one approximate
+
+    commits = _render_log([newer, older], tmp_path)
+    assert "ORANGE" not in commits and "fold commit" in commits
