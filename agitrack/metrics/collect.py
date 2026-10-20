@@ -730,6 +730,11 @@ def collect_manual_pending(repo: GitRepo) -> list[CommitStat]:
     pending: list[CommitStat] = []
     seen: set[str] = set()
     for ref in refs:
+        # Only the turn RECORDS still awaiting a fold: a commit a hard reset dropped from the
+        # branch is on no branch either, and must not read as pending work (issue #303).
+        records = set(repo.pending_latent_commits(ref))
+        if not records:
+            continue
         log = repo._run(
             ["git", "log", "--format=%H%x01%an%x01%ae%x01%at%x01%B%x00", f"HEAD..{ref}", "--"],
             check=False,
@@ -743,7 +748,7 @@ def collect_manual_pending(repo: GitRepo) -> list[CommitStat]:
             email, _, rest = rest.partition(_FIELD_SEP)
             committed_at, _, body = rest.partition(_FIELD_SEP)
             sha = sha.strip()
-            if not sha or sha in seen:
+            if not sha or sha in seen or sha not in records:
                 continue
             seen.add(sha)
             stat = _parse_commit(sha, author, email, committed_at.strip(), body)

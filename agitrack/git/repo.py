@@ -852,6 +852,52 @@ class GitRepo:
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
+    def pending_latent_commits(self, ref: str) -> list[str]:
+        """The latent turn RECORDS on *ref* that no branch holds yet, oldest first.
+
+        :meth:`unlanded_commits` is not enough on its own. After a fold the ref points at the
+        commit the turns were folded into, a real commit, and once ``git reset --hard HEAD~1``
+        drops that commit from every branch it is "reachable from no branch" too: the abandoned
+        commit's whole message (trace, metadata, tokens) then read as a pending turn and folded
+        into the next commit (issue #303). A record has one parent and an ``<aGiTrack>`` subject,
+        and was never checked out. Today's records also reuse their parent's tree, which answers
+        it for free; a record written by an older aGiTrack (which snapshotted the tree) is told
+        from a commit that was once on a branch by HEAD's reflog, read only when such a commit
+        turns up. The pending turns are the records above the newest commit that is not one;
+        everything at or below a real commit was folded already, or is real history."""
+        result = self._run(
+            ["git", "log", "--format=%H%x09%T%x09%P%x09%s", ref, "--not", "--branches", "--tags", "--remotes"],
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        rows = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 3)
+            if len(parts) == 4 and parts[0].strip():
+                rows.append(parts)
+        trees = {sha: tree for sha, tree, _parents, _subject in rows}
+        records: list[str] = []
+        checked_out: set[str] | None = None
+        for sha, tree, parents, subject in rows:  # newest first
+            parent_list = parents.split()
+            if len(parent_list) != 1 or not subject.startswith("<aGiTrack>"):
+                break
+            parent = parent_list[0]
+            parent_tree = trees.get(parent)
+            if parent_tree is None:
+                lookup = self._run(["git", "rev-parse", f"{parent}^{{tree}}"], check=False)
+                parent_tree = lookup.stdout.strip() if lookup.returncode == 0 else None
+            if parent_tree != tree:
+                if checked_out is None:
+                    reflog = self._run(["git", "reflog", "show", "--format=%H", "HEAD"], check=False)
+                    checked_out = set(reflog.stdout.split()) if reflog.returncode == 0 else set()
+                if sha in checked_out:
+                    break
+            records.append(sha)
+        records.reverse()
+        return records
+
     def list_refs(self, prefix: str) -> list[str]:
         """Full names of the refs under *prefix* (e.g. ``refs/agitrack/manual/``), or ``[]``."""
         output = self._run(["git", "for-each-ref", "--format=%(refname)", prefix], check=False).stdout

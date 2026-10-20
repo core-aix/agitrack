@@ -174,7 +174,7 @@ class ManualCommitsMixin(RunnerHost):
         stamped: list[tuple[int, str]] = []
         for ref in self._manual_pending_refs():
             try:
-                shas = self.repo.unlanded_commits(ref)
+                shas = self.repo.pending_latent_commits(ref)
             except Exception as error:
                 self._debug(f"manual pending walk failed for {ref}: {error!r}")
                 continue

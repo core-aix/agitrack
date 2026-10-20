@@ -174,7 +174,7 @@ class ManualCommitTracker:
                 # `HEAD..ref` is not enough: after a fold the ref points at a real branch commit,
                 # so switching to another branch made that (already-folded) work look pending and
                 # it folded a second time — duplicating the trace and double-counting its tokens.
-                shas = self.repo.unlanded_commits(ref)
+                shas = self.repo.pending_latent_commits(ref)
             except Exception as error:
                 self._debug(f"manual pending walk failed for {ref}: {error!r}")
                 continue
@@ -455,7 +455,7 @@ def age_out_pending(
     shortened = 0
     for ref in refs:
         try:
-            shas = repo.unlanded_commits(ref)
+            shas = repo.pending_latent_commits(ref)
             rewrites: dict[str, str] = {}
             for sha in shas:
                 message, count = redact_message(
