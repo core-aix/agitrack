@@ -146,6 +146,14 @@ def _git_read_needs_blobs(command: list[str]) -> bool:
     return any(a in _BLOB_CONTENT_FLAGS or a.startswith(("--stat=", "-S", "-G")) for a in command)
 
 
+def _left_by_reset(reflog: list[tuple[str, str]], sha: str) -> bool:
+    """Whether HEAD last moved AWAY from ``sha`` by a ``git reset`` (reflog newest first)."""
+    for index in range(1, len(reflog)):
+        if reflog[index][0] == sha and reflog[index - 1][0] != sha:
+            return reflog[index - 1][1].startswith("reset:")
+    return False
+
+
 class GitRepo:
     def __init__(self, repo: Path) -> None:
         self.repo = repo.resolve()
@@ -853,50 +861,76 @@ class GitRepo:
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def pending_latent_commits(self, ref: str) -> list[str]:
-        """The latent turn RECORDS on *ref* that no branch holds yet, oldest first.
+        """The latent turn RECORDS on *ref* still awaiting a fold, oldest first.
 
-        :meth:`unlanded_commits` is not enough on its own. After a fold the ref points at the
-        commit the turns were folded into, a real commit, and once ``git reset --hard HEAD~1``
-        drops that commit from every branch it is "reachable from no branch" too: the abandoned
-        commit's whole message (trace, metadata, tokens) then read as a pending turn and folded
-        into the next commit (issue #303). A record has one parent and an ``<aGiTrack>`` subject,
-        and was never checked out. Today's records also reuse their parent's tree, which answers
-        it for free; a record written by an older aGiTrack (which snapshotted the tree) is told
-        from a commit that was once on a branch by HEAD's reflog, read only when such a commit
-        turns up. The pending turns are the records above the newest commit that is not one;
-        everything at or below a real commit was folded already, or is real history."""
+        :meth:`unlanded_commits` is not enough on its own (issue #303). After a fold the ref
+        points at the commit the turns were folded into, a real commit, and once ``git reset
+        --hard HEAD~1`` drops that commit from every branch it is "reachable from no branch" too:
+        the abandoned commit's whole message (trace, metadata, tokens) read as a pending turn and
+        folded into the next commit. A record has one parent and was never checked out, so a
+        commit HEAD's reflog names is real history, never a record. The pending turns are the
+        records above the newest real commit; everything at or below it was folded already.
+
+        And when that real commit is one the user threw away with ``git reset``, the records on
+        top of it go with it: they were said about the abandoned work (a question asked after
+        the commit, before the reset), and nothing the user did asked to keep them. A rebase,
+        an amend or a pull also leave the old commit on no branch, but there the work was
+        rewritten rather than abandoned, so its turns are kept; only a ``reset:`` move away from
+        the commit counts. Without a reflog (``core.logAllRefUpdates`` off) a record is told by
+        reusing its parent's tree, which every record written today does."""
         result = self._run(
-            ["git", "log", "--format=%H%x09%T%x09%P%x09%s", ref, "--not", "--branches", "--tags", "--remotes"],
+            ["git", "log", "--format=%H%x09%T%x09%P", ref, "--not", "--branches", "--tags", "--remotes"],
             check=False,
         )
         if result.returncode != 0:
             return []
         rows = []
         for line in result.stdout.splitlines():
-            parts = line.split("\t", 3)
-            if len(parts) == 4 and parts[0].strip():
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[0].strip():
                 rows.append(parts)
-        trees = {sha: tree for sha, tree, _parents, _subject in rows}
+        if not rows:
+            return []
+        reflog = self._head_reflog()
+        checked_out = {sha for sha, _action in reflog}
+        trees = {sha: tree for sha, tree, _parents in rows}
         records: list[str] = []
-        checked_out: set[str] | None = None
-        for sha, tree, parents, subject in rows:  # newest first
+        base: str | None = None
+        for sha, tree, parents in rows:  # newest first
             parent_list = parents.split()
-            if len(parent_list) != 1 or not subject.startswith("<aGiTrack>"):
+            if len(parent_list) != 1:
+                base = sha
                 break
-            parent = parent_list[0]
-            parent_tree = trees.get(parent)
-            if parent_tree is None:
-                lookup = self._run(["git", "rev-parse", f"{parent}^{{tree}}"], check=False)
-                parent_tree = lookup.stdout.strip() if lookup.returncode == 0 else None
-            if parent_tree != tree:
-                if checked_out is None:
-                    reflog = self._run(["git", "reflog", "show", "--format=%H", "HEAD"], check=False)
-                    checked_out = set(reflog.stdout.split()) if reflog.returncode == 0 else set()
+            if reflog:
                 if sha in checked_out:
+                    base = sha
+                    break
+            else:
+                parent = parent_list[0]
+                parent_tree = trees.get(parent)
+                if parent_tree is None:
+                    lookup = self._run(["git", "rev-parse", f"{parent}^{{tree}}"], check=False)
+                    parent_tree = lookup.stdout.strip() if lookup.returncode == 0 else None
+                if parent_tree != tree:
+                    base = sha
                     break
             records.append(sha)
+        if records and base is not None and _left_by_reset(reflog, base):
+            return []
         records.reverse()
         return records
+
+    def _head_reflog(self) -> list[tuple[str, str]]:
+        """HEAD's reflog, newest first, as ``(sha, action)``; ``[]`` when there is none."""
+        result = self._run(["git", "reflog", "show", "--format=%H%x09%gs", "HEAD"], check=False)
+        if result.returncode != 0:
+            return []
+        entries = []
+        for line in result.stdout.splitlines():
+            sha, _, action = line.partition("\t")
+            if sha.strip():
+                entries.append((sha.strip(), action))
+        return entries
 
     def list_refs(self, prefix: str) -> list[str]:
         """Full names of the refs under *prefix* (e.g. ``refs/agitrack/manual/``), or ``[]``."""
