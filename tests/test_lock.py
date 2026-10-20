@@ -276,3 +276,25 @@ def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
 
 def test_clearing_a_missing_lock_file_is_harmless(tmp_path):
     RepoLock(tmp_path / "nope" / "lock").clear_owner_record()  # must not raise
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to delete a file another handle has locked")
+def test_a_lock_knows_when_its_file_is_no_longer_the_one_at_its_path(tmp_path):
+    # The lock guards a FILE. Once `.agitrack/` is deleted (the repo recreated at the same path,
+    # or `git clean -fdx`), the holder's lock is on a file nothing can reach, and the next process
+    # takes a fresh one at the same path. Only the holder can notice.
+    path = tmp_path / ".agitrack" / "lock"
+    lock = RepoLock(path)
+    assert lock.acquire()
+    assert lock.still_guards_path()
+
+    path.unlink()
+    assert not lock.still_guards_path()  # gone
+
+    other = RepoLock(path)
+    assert other.acquire()  # a second holder: exactly the state the check exists to catch
+    assert not lock.still_guards_path()  # a different file at the path
+    assert other.still_guards_path()
+    other.release()
+    lock.release()
+    assert not RepoLock(path).still_guards_path()  # a lock never acquired guards nothing

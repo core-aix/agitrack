@@ -55,6 +55,24 @@ from agitrack.proxy.session import Session
 _INSTALLED_BACKENDS_TTL_SECONDS = 300.0
 
 
+def repo_identity(root: Path) -> tuple[tuple[int, int], ...] | None:
+    """Which repository sits at *root*: the (device, inode) of the directory and of its ``.git``.
+
+    A path is not a repository. Deleting a repository and recreating it at the same path (a
+    re-clone, a scratch repo rebuilt by a script) gives the path a NEW directory, while deleting
+    only ``.agitrack/`` (``git clean -fdx`` removes it, since it is ignored) leaves both of these
+    exactly as they were. That is the one question a tracker needs answered when its lock file
+    vanishes: is this still the repository I was started on? None when it cannot be read, or the
+    platform reports no inodes, which callers treat as "cannot tell"."""
+    try:
+        parts = [os.stat(root), os.stat(root / ".git")]
+    except OSError:
+        return None
+    if not all(part.st_ino for part in parts):
+        return None
+    return tuple((part.st_dev, part.st_ino) for part in parts)
+
+
 def background_handshake_path(repo: GitRepo) -> Path:
     """Where a running background tracker records its pid, so `agitrack -b stop`/`status` can
     find it. Separate from the repo lock (which every mode shares) so stop/status target ONLY a
@@ -1256,6 +1274,10 @@ class BackgroundRunner:
         exclude_log_file(repo.repo, self.events.path)
         self._poll_seconds = poll_seconds if poll_seconds is not None else self.POLL_SECONDS
         self._lock = _lock
+        # The repository this tracker was started on, and whether teardown must leave the
+        # directory alone because it now belongs to someone else (see `_repo_still_ours`).
+        self._repo_identity = repo_identity(repo.repo)
+        self._hands_off = False
         self._stop = threading.Event()
         # Periodic self-update check (never auto-applies — installing a newer aGiTrack can't be
         # fully automated). A found update is recorded to the shared marker so `-b status`, the
@@ -1568,6 +1590,16 @@ class BackgroundRunner:
             self._debug(f"stale worktree guard removal failed: {error!r}")
 
     def _teardown(self, *, restarting: bool = False) -> None:
+        if self._hands_off:
+            # The directory is gone, or now holds another repository or another tracker's
+            # files. The handshake, the fold hooks, the session note and the trailer at that
+            # path are not this tracker's to remove: removing them would uninstall the tracking
+            # the new owner just set up. Only what lives outside the repository is cleaned up.
+            from agitrack import daemons
+
+            daemons.deregister()
+            self._print("background tracker stopped.")
+            return
         # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
         # =False` and `force=True` mirror the proxy's exit finalize: a turn still running when
         # the daemon stops is captured rather than dropped, and the fold does not sit out the
@@ -1918,6 +1950,46 @@ class BackgroundRunner:
             return False  # cannot tell (a permission error, a stalled mount): keep tracking
         return True
 
+    def _repo_still_ours(self) -> str | None:
+        """Why this tracker must stand down, or None while the repository is still its own.
+
+        `_repo_is_gone` catches a deleted repository only if it is still gone when the next poll
+        looks. Recreated at the same path in between (a re-clone, a test or script rebuilding a
+        scratch repo), the path exists again and this tracker carried on, its lock held on a file
+        that went with the old directory. The next aGiTrack to start there found the new
+        `.agitrack/lock` free, and two trackers recorded every turn: the same turn written into
+        one commit three times was seen live, with three such orphans running.
+
+        Two checks, both a couple of `stat` calls:
+
+        * The directory or its `.git` is a different one (`repo_identity`): this is a different
+          repository. Its history, refs and hooks were never this tracker's, so it stops and
+          leaves all of them alone.
+        * The same repository, but the lock file at the path is no longer the one held
+          (`RepoLock.still_guards_path`; `git clean -fdx` deletes the ignored `.agitrack/`):
+          take the lock again at the path and keep tracking. If another aGiTrack has already
+          taken it, that one is the writer now, and this one stops."""
+        current = repo_identity(self.repo.repo)
+        if self._repo_identity is not None and current is not None and current != self._repo_identity:
+            return (
+                f"repository {self.repo.repo} was replaced by a new one at the same path; stopping. "
+                "Run `agitrack -b` there to track the new repository."
+            )
+        if self._lock is None or self._lock.still_guards_path():
+            return None
+        try:
+            self._lock.release()
+            if self._lock.acquire():
+                self._debug("the repo lock file was deleted; took it again at the same path")
+                self._write_handshake()  # `.agitrack/` went with it, and `-b stop` reads this
+                return None
+        except Exception as error:
+            self._debug(f"re-taking the repo lock failed: {error!r}")
+        return (
+            f"the repo lock in {self.repo.repo} was deleted and another aGiTrack has taken it; "
+            "stopping so only one tracker records this repository."
+        )
+
     def _loop(self) -> None:
         from agitrack.proxy import watch
 
@@ -1935,6 +2007,14 @@ class BackgroundRunner:
                 # for the update-restart path, which must not resurrect a tracker for a repo that
                 # no longer exists.
                 self._print(f"repository {self.repo.repo} no longer exists; stopping.")
+                self._hands_off = True  # anything recreated at the path in the meantime is not ours
+                self._explicit_stop = True
+                self._stop.set()
+                return
+            lost = self._repo_still_ours()
+            if lost:
+                self._print(lost)
+                self._hands_off = True
                 self._explicit_stop = True
                 self._stop.set()
                 return
