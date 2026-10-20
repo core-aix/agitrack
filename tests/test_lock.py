@@ -230,32 +230,60 @@ def test_acquire_retries_for_a_lock_the_previous_holder_has_not_released_yet(tmp
     lock.release()
 
 
+class _FakeClock:
+    """Stands in for `agitrack.git.lock.time`: `sleep` advances `monotonic` instead of waiting.
+
+    The retry tests used to measure wall-clock time against a bound, and a loaded CI runner
+    breaks any such bound (Windows measured 0.61 s for an `acquire()` that never sleeps, against
+    a 0.5 s limit). Counting what `acquire` asks of the clock tests the same promise exactly."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def time(self) -> float:  # the owner record's timestamp
+        return self.now
+
+
 def test_acquire_without_retry_still_fails_fast(tmp_path, monkeypatch):
     """The default stays non-blocking: an ordinary second instance must be refused at once, not
     after a wait. Only the just-terminated-the-holder path asks for a retry."""
-    import time as _time
-
     from agitrack.git import lock as lock_mod
 
-    monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    attempts = {"n": 0}
+
+    def _held(fd):
+        attempts["n"] += 1
+        return False
+
+    clock = _FakeClock()
+    monkeypatch.setattr(lock_mod, "_try_lock", _held)
+    monkeypatch.setattr(lock_mod, "time", clock)
     lock = RepoLock(tmp_path / ".agitrack" / "lock")
 
-    started = _time.monotonic()
     assert lock.acquire() is False
-    assert _time.monotonic() - started < 0.5
+    assert attempts["n"] == 1  # asked once
+    assert clock.slept == []  # and never waited
 
 
 def test_acquire_gives_up_when_the_lock_is_genuinely_held(tmp_path, monkeypatch):
-    import time as _time
-
     from agitrack.git import lock as lock_mod
 
+    clock = _FakeClock()
     monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    monkeypatch.setattr(lock_mod, "time", clock)
     lock = RepoLock(tmp_path / ".agitrack" / "lock")
 
-    started = _time.monotonic()
     assert lock.acquire(retry_seconds=0.3) is False
-    assert 0.25 <= _time.monotonic() - started < 3.0
+    waited = sum(clock.slept)
+    assert 0.3 <= waited < 0.3 + 0.05  # retried for the whole window, then stopped
 
 
 def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
