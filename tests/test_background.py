@@ -106,6 +106,24 @@ def _runner(tmp_path, *, manual: bool):
 # --- manual mode ------------------------------------------------------------
 
 
+def _loop_until_it_stands_down(runner, *, deadline: float = 15.0) -> None:
+    """Run the tracker's poll loop, expecting the tracker to stop ITSELF.
+
+    A loop that never returns hung CI for the whole 45-minute job before this existed (the
+    recreated-repo test, on Linux, where a deleted directory's inode number is reused): the
+    deadline stops it and fails the test instead, naming it."""
+    import threading
+
+    timer = threading.Timer(deadline, runner._stop.set)
+    timer.daemon = True
+    timer.start()
+    try:
+        runner._loop()
+    finally:
+        timer.cancel()
+    assert runner._explicit_stop is True, "the tracker did not stand down; the deadline stopped it"
+
+
 def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
     # A tracker that outlives its repo has nothing to do and NO WAY to be told so: `-b stop` and
     # `agitrack stop` both work through files under `<repo>/.agitrack/`, which went with the
@@ -118,7 +136,7 @@ def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
     runner._explicit_stop = False
     _delete_tree(repo.repo)
 
-    runner._loop()  # returns rather than polling forever
+    _loop_until_it_stands_down(runner)  # returns rather than polling forever
 
     assert runner._stop.is_set()
     # `_explicit_stop` so the update-restart path does not resurrect a tracker for a repo that
@@ -178,8 +196,27 @@ def test_a_tracker_stands_down_when_its_repository_is_recreated_at_the_same_path
     _reinit_repo(repo.repo)
 
     assert "replaced" in (runner._repo_still_ours() or "")
-    runner._loop()  # returns rather than tracking a repository that is not its own
+    _loop_until_it_stands_down(runner)  # returns rather than tracking a repository that is not its own
     assert runner._stop.is_set() and runner._explicit_stop is True
+
+
+def test_a_new_repository_is_told_apart_even_where_the_directory_inode_is_the_same(tmp_path):
+    # What Linux does to a deleted-and-recreated directory: the new one gets the old inode
+    # number, so an inode-based identity read the new repository as the old one and the tracker
+    # never stood down (it hung CI, where this runs on ext4). Replacing only `.git` keeps the
+    # directory's inode on EVERY filesystem, so it reproduces that case here too: the id kept in
+    # `.git` is what tells the two repositories apart.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    inode = os.stat(repo.repo).st_ino
+    _delete_tree(repo.repo / ".git")
+    subprocess.run(["git", "init", "-q", str(repo.repo)], check=True)
+    assert os.stat(repo.repo).st_ino == inode  # same directory, different repository
+
+    assert "replaced" in (runner._repo_still_ours() or "")
+    _loop_until_it_stands_down(runner)
 
 
 def test_a_tracker_standing_down_leaves_the_new_repositorys_files_alone(tmp_path):
@@ -198,7 +235,7 @@ def test_a_tracker_standing_down_leaves_the_new_repositorys_files_alone(tmp_path
     hook = repo.repo / ".git" / "hooks" / "prepare-commit-msg"
     hook.write_text("#!/bin/sh\n# the new tracker's fold hook\n", encoding="utf-8")
 
-    runner._loop()
+    _loop_until_it_stands_down(runner)
     runner._teardown()
 
     assert successor.exists(), "removed the new tracker's handshake"

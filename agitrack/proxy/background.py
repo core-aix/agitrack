@@ -55,22 +55,51 @@ from agitrack.proxy.session import Session
 _INSTALLED_BACKENDS_TTL_SECONDS = 300.0
 
 
-def repo_identity(root: Path) -> tuple[tuple[int, int], ...] | None:
-    """Which repository sits at *root*: the (device, inode) of the directory and of its ``.git``.
+# The file in a repository's shared git directory that says WHICH repository it is to a tracker.
+_REPO_ID_FILE = "agitrack-repo-id"
+
+
+def repo_identity(root: Path, *, create: bool = False) -> str | None:
+    """Which repository sits at *root*, as a random id kept inside its ``.git``.
 
     A path is not a repository. Deleting a repository and recreating it at the same path (a
-    re-clone, a scratch repo rebuilt by a script) gives the path a NEW directory, while deleting
-    only ``.agitrack/`` (``git clean -fdx`` removes it, since it is ignored) leaves both of these
-    exactly as they were. That is the one question a tracker needs answered when its lock file
-    vanishes: is this still the repository I was started on? None when it cannot be read, or the
-    platform reports no inodes, which callers treat as "cannot tell"."""
+    re-clone, a scratch repo rebuilt by a script) gives the path a NEW ``.git``, while deleting
+    only ``.agitrack/`` (``git clean -fdx`` removes it, since it is ignored) leaves ``.git``
+    exactly as it was, and git never removes a file it does not own from there. So the id is
+    written into ``.git`` the first time a tracker starts and read back on every poll: the same
+    id means the same repository, a ``.git`` without it means a different one.
+
+    The directory's inode cannot answer this, which is what the first version used: Linux
+    filesystems (ext4, tmpfs) hand a deleted directory's inode number straight to the next one
+    created, so a recreated repository read as the old one, the old tracker never stood down,
+    and the test proving it hung CI until the job timed out. macOS does not reuse them, so it
+    passed there.
+
+    Returns the id, ``""`` for a git directory holding none (a different repository, unless
+    *create* writes one), or None when there is no git directory to read at all (``.git``
+    removed while the directory stays: callers treat that as "cannot tell")."""
+    from agitrack.git.hooks import hooks_dir_for_path
+
+    hooks = hooks_dir_for_path(root)
+    if hooks is None:
+        return None
+    path = hooks.parent / _REPO_ID_FILE
     try:
-        parts = [os.stat(root), os.stat(root / ".git")]
+        found = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        found = ""
     except OSError:
         return None
-    if not all(part.st_ino for part in parts):
+    if found or not create:
+        return found
+    try:
+        import uuid
+
+        token = uuid.uuid4().hex
+        path.write_text(token + "\n", encoding="utf-8")
+        return token
+    except OSError:
         return None
-    return tuple((part.st_dev, part.st_ino) for part in parts)
 
 
 def background_handshake_path(repo: GitRepo) -> Path:
@@ -1276,7 +1305,7 @@ class BackgroundRunner:
         self._lock = _lock
         # The repository this tracker was started on, and whether teardown must leave the
         # directory alone because it now belongs to someone else (see `_repo_still_ours`).
-        self._repo_identity = repo_identity(repo.repo)
+        self._repo_identity = repo_identity(repo.repo, create=True)
         self._hands_off = False
         self._stop = threading.Event()
         # Periodic self-update check (never auto-applies — installing a newer aGiTrack can't be
@@ -1962,15 +1991,15 @@ class BackgroundRunner:
 
         Two checks, both a couple of `stat` calls:
 
-        * The directory or its `.git` is a different one (`repo_identity`): this is a different
-          repository. Its history, refs and hooks were never this tracker's, so it stops and
+        * The `.git` no longer carries the id this tracker wrote at start (`repo_identity`): this
+          is a different repository. Its history, refs and hooks were never this tracker's, so it stops and
           leaves all of them alone.
         * The same repository, but the lock file at the path is no longer the one held
           (`RepoLock.still_guards_path`; `git clean -fdx` deletes the ignored `.agitrack/`):
           take the lock again at the path and keep tracking. If another aGiTrack has already
           taken it, that one is the writer now, and this one stops."""
         current = repo_identity(self.repo.repo)
-        if self._repo_identity is not None and current is not None and current != self._repo_identity:
+        if self._repo_identity and current is not None and current != self._repo_identity:
             return (
                 f"repository {self.repo.repo} was replaced by a new one at the same path; stopping. "
                 "Run `agitrack -b` there to track the new repository."
