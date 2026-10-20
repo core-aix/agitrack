@@ -106,6 +106,24 @@ def _runner(tmp_path, *, manual: bool):
 # --- manual mode ------------------------------------------------------------
 
 
+def _loop_until_it_stands_down(runner, *, deadline: float = 15.0) -> None:
+    """Run the tracker's poll loop, expecting the tracker to stop ITSELF.
+
+    A loop that never returns hung CI for the whole 45-minute job before this existed (the
+    recreated-repo test, on Linux, where a deleted directory's inode number is reused): the
+    deadline stops it and fails the test instead, naming it."""
+    import threading
+
+    timer = threading.Timer(deadline, runner._stop.set)
+    timer.daemon = True
+    timer.start()
+    try:
+        runner._loop()
+    finally:
+        timer.cancel()
+    assert runner._explicit_stop is True, "the tracker did not stand down; the deadline stopped it"
+
+
 def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
     # A tracker that outlives its repo has nothing to do and NO WAY to be told so: `-b stop` and
     # `agitrack stop` both work through files under `<repo>/.agitrack/`, which went with the
@@ -118,7 +136,7 @@ def test_a_tracker_stops_itself_once_its_repository_is_deleted(tmp_path):
     runner._explicit_stop = False
     _delete_tree(repo.repo)
 
-    runner._loop()  # returns rather than polling forever
+    _loop_until_it_stands_down(runner)  # returns rather than polling forever
 
     assert runner._stop.is_set()
     # `_explicit_stop` so the update-restart path does not resurrect a tracker for a repo that
@@ -155,6 +173,115 @@ def test_a_tracker_never_stops_because_the_check_itself_failed(tmp_path):
     runner.repo = types.SimpleNamespace(repo=_Unreachable())
 
     assert runner._repo_is_gone() is False
+
+
+def _reinit_repo(path: Path) -> None:
+    """A brand-new repository at *path*, as a re-clone or a script rebuilding a scratch repo makes."""
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+
+
+def test_a_tracker_stands_down_when_its_repository_is_recreated_at_the_same_path(tmp_path):
+    # The case `_repo_is_gone` cannot see: the directory was deleted and is THERE AGAIN by the
+    # next poll. The old tracker carried on, its lock held on a file that went with the old
+    # directory, and the next aGiTrack found the new `.agitrack/lock` free: two trackers wrote
+    # every turn (one turn appeared three times in one commit, with three such orphans live).
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    assert runner._repo_still_ours() is None  # untouched: nothing to say
+
+    _delete_tree(repo.repo)
+    _reinit_repo(repo.repo)
+
+    assert "replaced" in (runner._repo_still_ours() or "")
+    _loop_until_it_stands_down(runner)  # returns rather than tracking a repository that is not its own
+    assert runner._stop.is_set() and runner._explicit_stop is True
+
+
+def test_a_new_repository_is_told_apart_even_where_the_directory_inode_is_the_same(tmp_path):
+    # What Linux does to a deleted-and-recreated directory: the new one gets the old inode
+    # number, so an inode-based identity read the new repository as the old one and the tracker
+    # never stood down (it hung CI, where this runs on ext4). Replacing only `.git` keeps the
+    # directory's inode on EVERY filesystem, so it reproduces that case here too: the id kept in
+    # `.git` is what tells the two repositories apart.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    inode = os.stat(repo.repo).st_ino
+    _delete_tree(repo.repo / ".git")
+    subprocess.run(["git", "init", "-q", str(repo.repo)], check=True)
+    assert os.stat(repo.repo).st_ino == inode  # same directory, different repository
+
+    assert "replaced" in (runner._repo_still_ours() or "")
+    _loop_until_it_stands_down(runner)
+
+
+def test_a_tracker_standing_down_leaves_the_new_repositorys_files_alone(tmp_path):
+    # Teardown normally removes the handshake, the fold hooks and the session note. In a
+    # recreated repository those belong to whoever set it up next, often a new tracker, and
+    # removing them would uninstall the very tracking that replaced this one.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    runner._explicit_stop = False
+    _delete_tree(repo.repo)
+    _reinit_repo(repo.repo)
+    successor = background_handshake_path(repo)
+    successor.parent.mkdir(parents=True, exist_ok=True)
+    successor.write_text(json.dumps({"pid": 999999}), encoding="utf-8")
+    hook = repo.repo / ".git" / "hooks" / "prepare-commit-msg"
+    hook.write_text("#!/bin/sh\n# the new tracker's fold hook\n", encoding="utf-8")
+
+    _loop_until_it_stands_down(runner)
+    runner._teardown()
+
+    assert successor.exists(), "removed the new tracker's handshake"
+    assert hook.read_text(encoding="utf-8").endswith("the new tracker's fold hook\n")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to delete a file another handle has locked")
+def test_a_tracker_takes_its_lock_again_when_only_agitrack_state_was_deleted(tmp_path):
+    # Same repository, but `.agitrack/` is gone (`git clean -fdx` removes it: it is ignored).
+    # Without this the lock was held on a deleted file, and the next commit's auto-start hook
+    # found the path free and started a second tracker beside this one.
+    from agitrack.git.lock import RepoLock
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert lock.acquire()
+    runner._lock = lock
+
+    _delete_tree(repo.repo / ".agitrack")
+    assert not lock.still_guards_path()
+
+    assert runner._repo_still_ours() is None  # same repository: keep tracking...
+    assert lock.still_guards_path()  # ...holding the lock that is actually at the path now
+    assert not RepoLock(repo.repo / ".agitrack" / "lock").acquire()  # so a second tracker is refused
+    assert background_handshake_path(repo).exists()  # and `-b stop` can find it again
+    lock.release()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to delete a file another handle has locked")
+def test_a_tracker_stands_down_when_another_took_the_recreated_lock_first(tmp_path):
+    from agitrack.git.lock import RepoLock
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    runner, repo, _state, _backend = _runner(proj, manual=False)
+    lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert lock.acquire()
+    runner._lock = lock
+    _delete_tree(repo.repo / ".agitrack")
+    other = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert other.acquire()  # the second tracker got there first
+
+    assert "another aGiTrack" in (runner._repo_still_ours() or "")
+    other.release()
 
 
 def test_a_tracker_remembers_its_repo_for_the_dashboard_switcher(tmp_path, monkeypatch):

@@ -590,84 +590,137 @@ def _verification_gap(ctx: Context) -> Finding | None:
     return finding
 
 
+def _corrected_shas(ctx: Context) -> set[str]:
+    """Turns the user had to correct: the NEXT turn of the same session that carries a real
+    prompt is a correction (see :func:`_is_corrective`). This is the outcome signal the size and
+    duration categories are gated on — a big or long turn is only a problem when it landed wrong."""
+    by_session: dict[str, list[CommitStat]] = defaultdict(list)
+    for stat in ctx.turns:
+        by_session[_session_id(stat)].append(stat)
+    corrected: set[str] = set()
+    for session_turns in by_session.values():
+        prompted = [stat for stat in session_turns if _user_prompt(stat.prompt)]
+        for previous, current in zip(prompted, prompted[1:]):
+            if _is_corrective(_user_prompt(current.prompt)):
+                corrected.add(previous.sha)
+    return corrected
+
+
+# A big or long turn only counts as a problem when it is corrected noticeably more often than
+# the ordinary turns around it. State-of-the-art agents routinely run for an hour or sweep a
+# dozen files and get it right; flagging size or duration alone would scold exactly the
+# autonomy that works. These floors keep the comparison off a handful of turns.
+_OUTCOME_MIN_CORRECTED = 3
+_OUTCOME_MIN_RATE = 0.25
+_OUTCOME_MIN_LIFT = 1.5
+
+
+def _outcome_gap(big: list[CommitStat], small: list[CommitStat], corrected: set[str]) -> tuple[int, float, float]:
+    """``(corrected big turns, big-turn correction rate, small-turn correction rate)``."""
+    big_wrong = sum(1 for stat in big if stat.sha in corrected)
+    small_wrong = sum(1 for stat in small if stat.sha in corrected)
+    big_rate = big_wrong / len(big) if big else 0.0
+    small_rate = small_wrong / len(small) if small else 0.0
+    return big_wrong, big_rate, small_rate
+
+
+def _outcome_fires(big_wrong: int, big_rate: float, small_rate: float) -> bool:
+    return (
+        big_wrong >= _OUTCOME_MIN_CORRECTED
+        and big_rate >= _OUTCOME_MIN_RATE
+        and big_rate >= _OUTCOME_MIN_LIFT * small_rate
+    )
+
+
 def _wide_turns(ctx: Context) -> Finding | None:
-    """Turns that touch a very large number of files at once are hard to review, hard to
-    revert, and usually mean several tasks were bundled into one prompt."""
+    """Turns that touch many files AND then had to be corrected more often than narrow ones.
+
+    A wide turn on its own is not a problem: current agents carry a coherent change across a
+    dozen files (a rename, a refactor, a feature with its tests) without trouble. It becomes one
+    when wide turns are the ones that come back wrong, which says several asks were bundled into
+    one prompt and the agent could not hold all of them."""
     if not ctx.sha_paths:
         return None
-    sized = [len(ctx.sha_paths.get(stat.sha, ())) for stat in ctx.turns]
-    sized = [size for size in sized if size]
+    sized = [(stat, len(ctx.sha_paths.get(stat.sha, ()))) for stat in ctx.turns]
+    sized = [(stat, size) for stat, size in sized if size]
     if len(sized) < 10:
         return None
-    wide = [size for size in sized if size > 8]
-    fraction = len(wide) / len(sized)
+    wide = [stat for stat, size in sized if size > 8]
+    narrow = [stat for stat, size in sized if size <= 8]
+    corrected = _corrected_shas(ctx)
+    wide_wrong, wide_rate, narrow_rate = _outcome_gap(wide, narrow, corrected)
     finding = Finding(
         key="wide-turns",
-        title="Overloaded turns",
-        metric=fraction,
-        metric_label="share of turns touching more than 8 files",
+        title="Wide changes that needed fixing",
+        metric=wide_wrong / len(sized),
+        metric_label="share of turns touching more than 8 files that were then corrected",
     )
-    if len(wide) < 4 or fraction < 0.15:
+    if not _outcome_fires(wide_wrong, wide_rate, narrow_rate):
         return finding
+    largest = max(size for _stat, size in sized)
     finding.triggered = True
-    finding.excess = fraction / 0.15
+    finding.excess = wide_rate / _OUTCOME_MIN_RATE
     finding.severity = "medium"
-    finding.summary = f"{fraction:.0%} of turns change more than 8 files at once."
+    finding.summary = f"Turns touching more than 8 files are corrected {wide_rate:.0%} of the time."
     finding.evidence = [
-        f"{len(wide)} of {len(sized)} file-changing turns touched more than 8 files "
-        f"(largest: {max(wide)} files in a single turn).",
-        "A turn that spans that many files bundles several tasks, so its commit can't be reviewed "
-        "or reverted as one decision.",
+        f"{wide_wrong} of {len(wide)} turns that changed more than 8 files ({wide_rate:.0%}) were followed "
+        f"by a correction, against {narrow_rate:.0%} of narrower turns (largest turn: {largest} files).",
+        "Wide changes that land cleanly are not counted: only the ones that had to be redone.",
     ]
     finding.suggestion = (
-        "Split the ask — one prompt per behaviour change; say explicitly when a repo-wide sweep is intended."
+        "When a wide change keeps coming back wrong, ask for a plan of the files first, or split "
+        "unrelated asks into separate prompts."
     )
     return finding
 
 
 def _slow_turns(ctx: Context) -> Finding | None:
-    """Turns that ran for a very long wall-clock time. A long turn is a long feedback loop:
-    you cannot steer it, and when it lands wrong the whole run is wasted.
+    """Turns that ran over 30 minutes AND were then corrected more often than shorter ones.
+
+    Long autonomous runs are normal for current agents and usually the efficient choice, so
+    duration alone is not flagged. A long run that lands wrong is the costly case: its whole
+    run has to be redone, and it was too long to catch early.
 
     Turns that were WAITING on a background task (a build, a test run, a sub-agent) are excluded:
-    their wall-clock is idle time the user couldn't have steered anyway, so counting them would
-    flag a non-problem — see :func:`_involves_background_task`."""
+    see :func:`_involves_background_task`."""
     steerable = [stat for stat in ctx.turns if not _involves_background_task(stat)]
+    timed = [(stat, seconds) for stat in steerable if (seconds := _duration_seconds(stat)) is not None]
+    if len(timed) < 10:
+        return None
+    slow = [stat for stat, seconds in timed if seconds > 1800]
+    fast = [stat for stat, seconds in timed if seconds <= 1800]
+    corrected = _corrected_shas(ctx)
+    slow_wrong, slow_rate, fast_rate = _outcome_gap(slow, fast, corrected)
+    finding = Finding(
+        key="slow-turns",
+        title="Long runs that landed wrong",
+        metric=slow_wrong / len(timed),
+        metric_label="share of turns running over 30 minutes that were then corrected",
+    )
+    if not _outcome_fires(slow_wrong, slow_rate, fast_rate):
+        return finding
+    wasted = sum(seconds for stat, seconds in timed if stat.sha in corrected and seconds > 1800)
+    finding.triggered = True
+    finding.excess = slow_rate / _OUTCOME_MIN_RATE
+    finding.severity = "medium"
+    finding.summary = f"Runs over 30 minutes are corrected {slow_rate:.0%} of the time."
+    finding.evidence = [
+        f"{slow_wrong} of {len(slow)} turns that ran over 30 minutes ({slow_rate:.0%}) were followed by a "
+        f"correction, against {fast_rate:.0%} of shorter turns ({wasted / 3600:.1f} h of runs redone).",
+        "Long runs that land cleanly are not counted: only the ones that had to be redone.",
+    ]
     background_slow = sum(
         1
         for stat in ctx.turns
         if _involves_background_task(stat) and (seconds := _duration_seconds(stat)) is not None and seconds > 1800
     )
-    durations = [seconds for seconds in (_duration_seconds(stat) for stat in steerable) if seconds is not None]
-    if len(durations) < 10:
-        return None
-    slow = [seconds for seconds in durations if seconds > 1800]
-    fraction = len(slow) / len(durations)
-    finding = Finding(
-        key="slow-turns",
-        title="Long feedback loops",
-        metric=fraction,
-        metric_label="share of turns running over 30 minutes",
-    )
-    if len(slow) < 4 or fraction < 0.10:
-        return finding
-    finding.triggered = True
-    finding.excess = fraction / 0.10
-    finding.severity = "medium"
-    finding.summary = f"{fraction:.0%} of turns run longer than 30 minutes."
-    finding.evidence = [
-        f"{len(slow)} of {len(durations)} turns ran over 30 minutes "
-        f"(longest {max(slow) / 60:.0f} min; median turn {median(durations) / 60:.0f} min).",
-        "Nothing can be corrected mid-turn, so a long turn that lands wrong wastes its whole run.",
-    ]
     if background_slow:
         finding.evidence.append(
-            f"{background_slow} further long turn(s) were excluded as background-task waits — those "
-            "are fine, so this counts only turns you could have steered."
+            f"{background_slow} further long turn(s) were excluded as background-task waits, which are expected."
         )
     finding.suggestion = (
-        "Ask for a plan or a first slice before a long autonomous run; delegate long sweeps to "
-        "sub-agents that report back."
+        "Give long autonomous runs a way to check themselves (a test to make pass, a command to run) "
+        "and the acceptance criteria up front."
     )
     return finding
 

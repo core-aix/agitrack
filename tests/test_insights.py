@@ -313,12 +313,26 @@ def test_verification_gap_ignores_docs_only_turns():
     assert "verification-gap" not in _by_key(build_insights(turns, sha_paths=sha_paths))
 
 
-def test_wide_turns_detected():
+def _prompts_correcting(flagged):
+    """Prompts where the turn AFTER each flagged index is a correction."""
+    return lambda i: "no, that broke the build, fix it" if (i - 1) in flagged else f"work {i}"
+
+
+def test_wide_turns_that_land_cleanly_are_not_flagged():
+    # A capable agent sweeping a dozen files and getting it right is not a problem.
     turns = [_turn(i, prompt=f"work {i}") for i in range(20)]
     sha_paths = _paths(turns, lambda i: [f"f{i}_{n}.py" for n in range(12 if i % 2 == 0 else 2)])
+    assert "wide-turns" not in _by_key(build_insights(turns, sha_paths=sha_paths))
+
+
+def test_wide_turns_flagged_when_they_are_the_ones_corrected():
+    wide = {0, 4, 8, 12, 16}
+    prompt = _prompts_correcting(wide)
+    turns = [_turn(i, prompt=prompt(i)) for i in range(20)]
+    sha_paths = _paths(turns, lambda i: [f"f{i}_{n}.py" for n in range(12 if i in wide else 2)])
     insight = _by_key(build_insights(turns, sha_paths=sha_paths)).get("wide-turns")
     assert insight is not None
-    assert "more than 8 files" in insight["evidence"][0]
+    assert "followed by a correction" in insight["evidence"][0]
 
 
 def test_narrow_turns_stay_silent():
@@ -335,11 +349,20 @@ def _timed(index, minutes, **kw):
     return stat
 
 
-def test_slow_turns_detected():
+def test_long_turns_that_land_cleanly_are_not_flagged():
+    # Long autonomous runs are normal for current agents; duration alone is not a finding.
     turns = [_timed(i, 45 if i % 3 == 0 else 5, prompt=f"work {i}") for i in range(20)]
+    assert "slow-turns" not in _by_key(build_insights(turns))
+
+
+def test_slow_turns_flagged_when_long_runs_are_the_ones_corrected():
+    slow = {0, 3, 6, 9, 12}
+    prompt = _prompts_correcting(slow)
+    turns = [_timed(i, 45 if i in slow else 5, prompt=prompt(i)) for i in range(20)]
     insight = _by_key(build_insights(turns)).get("slow-turns")
     assert insight is not None
     assert "over 30 minutes" in insight["evidence"][0]
+    assert "followed by a correction" in insight["evidence"][0]
 
 
 def test_fast_turns_stay_silent():
@@ -361,9 +384,11 @@ def test_slow_turns_waiting_on_background_tasks_are_not_flagged():
 
 
 def test_slow_turns_notes_excluded_background_waits_alongside_real_ones():
-    # Genuine long autonomous turns still fire, and the card notes how many long turns were set
-    # aside as background-task waits so the number is transparent rather than silently different.
-    turns = [_timed(i, 45 if i % 3 == 0 else 5, prompt=f"work {i}") for i in range(20)]  # real slow turns
+    # Genuine long runs that landed wrong still fire, and the card notes how many long turns were
+    # set aside as background-task waits so the number is transparent rather than silently different.
+    slow = {0, 3, 6, 9, 12}
+    prompt = _prompts_correcting(slow)
+    turns = [_timed(i, 45 if i in slow else 5, prompt=prompt(i)) for i in range(20)]
     turns += [_timed(500 + i, 50, prompt="(background task completed)") for i in range(3)]  # excluded waits
     insight = _by_key(build_insights(turns)).get("slow-turns")
     assert insight is not None

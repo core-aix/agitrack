@@ -208,6 +208,33 @@ class RepoLock:
             pass
         self._fd = None
 
+    def still_guards_path(self) -> bool:
+        """Whether the file this lock is held on is still the one at :attr:`path`.
+
+        The lock guards a FILE, not a path. When ``.agitrack/`` is deleted (the repository
+        removed and recreated at the same path, or ``git clean -fdx``, which removes the ignored
+        state directory), the lock this process holds is on a file nothing can reach any more,
+        and the next aGiTrack to start takes a fresh one at the same path: two writers on one
+        repository, each sure it is alone. Only the holder can notice, by comparing the file it
+        holds with the one at the path. Unknowable answers (an ``fstat`` that fails, a platform
+        reporting no inode) count as "still guards": a tracker must never stand down over a
+        question it could not ask."""
+        if self._fd is None:
+            return False
+        try:
+            held = os.fstat(self._fd)
+        except OSError:
+            return True
+        try:
+            current = os.stat(self.path)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            return True
+        if not held.st_ino or not current.st_ino:
+            return True
+        return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
     def clear_owner_record(self) -> None:
         """Truncate the lock FILE without holding the lock — for a process that stopped another
         one and knows it is gone.

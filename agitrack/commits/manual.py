@@ -174,7 +174,7 @@ class ManualCommitTracker:
                 # `HEAD..ref` is not enough: after a fold the ref points at a real branch commit,
                 # so switching to another branch made that (already-folded) work look pending and
                 # it folded a second time — duplicating the trace and double-counting its tokens.
-                shas = self.repo.unlanded_commits(ref)
+                shas = self.repo.pending_latent_commits(ref)
             except Exception as error:
                 self._debug(f"manual pending walk failed for {ref}: {error!r}")
                 continue
@@ -295,6 +295,11 @@ class ManualCommitTracker:
             # latent commit, which is unreachable from any branch by design. Re-anchor at HEAD:
             # the chain restarts, and only the already-lost turns are lost.
             self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
+            tip = None
+        if tip is not None and not self.repo.pending_latent_commits(self.ref()):
+            # Nothing pending: the tip is the commit the last turns were folded into, possibly
+            # one a reset has since thrown away. Chained onto that, this turn would be dropped
+            # along with it (issue #303), so the chain restarts at HEAD.
             tip = None
         parent = tip or self.repo.rev_parse("HEAD")
         sha = self.repo.commit_tree(self.repo.rev_parse(f"{parent}^{{tree}}"), parents=[parent], message=message)
@@ -455,7 +460,7 @@ def age_out_pending(
     shortened = 0
     for ref in refs:
         try:
-            shas = repo.unlanded_commits(ref)
+            shas = repo.pending_latent_commits(ref)
             rewrites: dict[str, str] = {}
             for sha in shas:
                 message, count = redact_message(

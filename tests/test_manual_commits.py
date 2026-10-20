@@ -2788,3 +2788,87 @@ def test_the_proxys_own_record_ages_out_old_turns_the_same_way(tmp_path):
     messages = [repo.commit_message(sha) for sha in repo.unlanded_commits(runner._manual_ref())]
     assert "ancient prompt" not in messages[0] and "trace_aged_out:" in messages[0]
     assert "newest prompt" in messages[1]
+
+
+def test_a_commit_dropped_by_a_hard_reset_is_not_folded_into_the_next_one(tmp_path):
+    # Issue #303. After a fold the latent ref points at the folded commit. `git reset --hard
+    # HEAD~1` drops that commit from every branch, and "reachable from no branch" then read the
+    # abandoned commit itself (its whole message: trace, metadata, tokens) as a pending turn,
+    # so the next commit folded the work the user had just thrown away.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    state.ensure_local_ignore()
+    tracker = ManualCommitTracker(repo, repo, state)
+    tracker.setup()
+
+    (tmp_path / "x.py").write_text("X = 1\n", encoding="utf-8")
+    _record(tracker, "X", 100)
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "work to abandon")
+    assert "X prompt" in _git(repo, "log", "-1", "--format=%B")
+
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")
+    tracker.service()
+    assert tracker.pending_count() == 0
+    assert collect_manual_pending(repo) == []
+
+    (tmp_path / "y.py").write_text("Y = 1\n", encoding="utf-8")
+    _record(tracker, "Y", 200)
+    assert tracker.pending_count() == 1  # a turn recorded after the reset is still pending
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "fresh work")
+    message = _git(repo, "log", "-1", "--format=%B")
+    assert "Y prompt" in message
+    assert "X prompt" not in message
+    assert message.count("tokens_since_last_commit_output") == 1
+
+
+def _folded_commit_with_a_turn_on_top(tmp_path):
+    """A fold commit holding turn X, then turn Q recorded on top of it (a question asked after
+    the commit), still pending."""
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    state.ensure_local_ignore()
+    tracker = ManualCommitTracker(repo, repo, state)
+    tracker.setup()
+    (tmp_path / "x.py").write_text("X = 1\n", encoding="utf-8")
+    _record(tracker, "X", 100)
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "work")
+    tracker.service()
+    _record(tracker, "Q", 50)
+    assert tracker.pending_count() == 1
+    return repo, tracker
+
+
+def test_turns_said_about_a_commit_the_user_reset_away_are_dropped_with_it(tmp_path):
+    # Issue #303, the second half: the question asked after the commit was about the work the
+    # reset threw away, so it must not fold into the next, unrelated commit.
+    repo, tracker = _folded_commit_with_a_turn_on_top(tmp_path)
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")
+    tracker.service()
+    assert tracker.pending_count() == 0
+    assert collect_manual_pending(repo) == []
+
+    (tmp_path / "y.py").write_text("Y = 1\n", encoding="utf-8")
+    _record(tracker, "Y", 200)
+    assert tracker.pending_count() == 1
+    tracker.render_trailer()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "fresh work")
+    message = _git(repo, "log", "-1", "--format=%B")
+    assert "Y prompt" in message and "Q prompt" not in message and "X prompt" not in message
+
+
+def test_turns_on_a_commit_that_was_rewritten_not_reset_are_kept(tmp_path):
+    # An amend (or a rebase) also leaves the old commit on no branch, but the work was REWRITTEN,
+    # not abandoned: the pending question still belongs in the next commit.
+    repo, tracker = _folded_commit_with_a_turn_on_top(tmp_path)
+    no_hooks = tmp_path / "no-hooks"
+    no_hooks.mkdir()
+    _git(repo, "-c", f"core.hooksPath={no_hooks}", "commit", "-q", "--amend", "-m", "work, reworded")
+    tracker.service()
+    assert tracker.pending_count() == 1

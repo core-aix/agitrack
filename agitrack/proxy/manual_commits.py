@@ -174,7 +174,7 @@ class ManualCommitsMixin(RunnerHost):
         stamped: list[tuple[int, str]] = []
         for ref in self._manual_pending_refs():
             try:
-                shas = self.repo.unlanded_commits(ref)
+                shas = self.repo.pending_latent_commits(ref)
             except Exception as error:
                 self._debug(f"manual pending walk failed for {ref}: {error!r}")
                 continue
@@ -308,6 +308,11 @@ class ManualCommitsMixin(RunnerHost):
             # `git gc --prune` can collect a latent commit (unreachable from any branch by
             # design): re-anchor at HEAD, so only the already-lost turns are lost.
             self._debug(f"latent tip {tip} is missing from the object store; re-anchoring at HEAD")
+            tip = None
+        if tip is not None and not self.repo.pending_latent_commits(self._manual_ref()):
+            # Nothing pending: the tip is the commit the last turns were folded into, possibly
+            # one a reset has since thrown away. Chained onto that, this turn would be dropped
+            # along with it (issue #303), so the chain restarts at HEAD.
             tip = None
         parent = tip or self.repo.rev_parse("HEAD")
         sha = self.repo.commit_tree(self.repo.rev_parse(f"{parent}^{{tree}}"), parents=[parent], message=message)

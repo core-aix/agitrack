@@ -57,6 +57,11 @@ dev = [
     "mypy>=1.13",
     "mypy-baseline>=0.7",
     "pre-commit>=4.0",
+    # A per-test deadline (`--timeout` in CI and scripts/check.sh). A test that never returns
+    # otherwise prints nothing and holds the whole job until its 45-minute limit, with no name
+    # in the log; it was a tracker test waiting on a repository change that Linux's inode reuse
+    # hid. With the deadline the hung test fails on its own, named, with its stack.
+    "pytest-timeout>=2.3",
 ]
 build = [
     "pyinstaller>=6.0",

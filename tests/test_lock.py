@@ -230,32 +230,60 @@ def test_acquire_retries_for_a_lock_the_previous_holder_has_not_released_yet(tmp
     lock.release()
 
 
+class _FakeClock:
+    """Stands in for `agitrack.git.lock.time`: `sleep` advances `monotonic` instead of waiting.
+
+    The retry tests used to measure wall-clock time against a bound, and a loaded CI runner
+    breaks any such bound (Windows measured 0.61 s for an `acquire()` that never sleeps, against
+    a 0.5 s limit). Counting what `acquire` asks of the clock tests the same promise exactly."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def time(self) -> float:  # the owner record's timestamp
+        return self.now
+
+
 def test_acquire_without_retry_still_fails_fast(tmp_path, monkeypatch):
     """The default stays non-blocking: an ordinary second instance must be refused at once, not
     after a wait. Only the just-terminated-the-holder path asks for a retry."""
-    import time as _time
-
     from agitrack.git import lock as lock_mod
 
-    monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    attempts = {"n": 0}
+
+    def _held(fd):
+        attempts["n"] += 1
+        return False
+
+    clock = _FakeClock()
+    monkeypatch.setattr(lock_mod, "_try_lock", _held)
+    monkeypatch.setattr(lock_mod, "time", clock)
     lock = RepoLock(tmp_path / ".agitrack" / "lock")
 
-    started = _time.monotonic()
     assert lock.acquire() is False
-    assert _time.monotonic() - started < 0.5
+    assert attempts["n"] == 1  # asked once
+    assert clock.slept == []  # and never waited
 
 
 def test_acquire_gives_up_when_the_lock_is_genuinely_held(tmp_path, monkeypatch):
-    import time as _time
-
     from agitrack.git import lock as lock_mod
 
+    clock = _FakeClock()
     monkeypatch.setattr(lock_mod, "_try_lock", lambda fd: False)
+    monkeypatch.setattr(lock_mod, "time", clock)
     lock = RepoLock(tmp_path / ".agitrack" / "lock")
 
-    started = _time.monotonic()
     assert lock.acquire(retry_seconds=0.3) is False
-    assert 0.25 <= _time.monotonic() - started < 3.0
+    waited = sum(clock.slept)
+    assert 0.3 <= waited < 0.3 + 0.05  # retried for the whole window, then stopped
 
 
 def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
@@ -276,3 +304,25 @@ def test_clear_owner_record_makes_a_stopped_daemon_look_stopped(tmp_path):
 
 def test_clearing_a_missing_lock_file_is_harmless(tmp_path):
     RepoLock(tmp_path / "nope" / "lock").clear_owner_record()  # must not raise
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to delete a file another handle has locked")
+def test_a_lock_knows_when_its_file_is_no_longer_the_one_at_its_path(tmp_path):
+    # The lock guards a FILE. Once `.agitrack/` is deleted (the repo recreated at the same path,
+    # or `git clean -fdx`), the holder's lock is on a file nothing can reach, and the next process
+    # takes a fresh one at the same path. Only the holder can notice.
+    path = tmp_path / ".agitrack" / "lock"
+    lock = RepoLock(path)
+    assert lock.acquire()
+    assert lock.still_guards_path()
+
+    path.unlink()
+    assert not lock.still_guards_path()  # gone
+
+    other = RepoLock(path)
+    assert other.acquire()  # a second holder: exactly the state the check exists to catch
+    assert not lock.still_guards_path()  # a different file at the path
+    assert other.still_guards_path()
+    other.release()
+    lock.release()
+    assert not RepoLock(path).still_guards_path()  # a lock never acquired guards nothing

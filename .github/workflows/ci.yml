@@ -112,9 +112,11 @@ jobs:
       # by tmp_path and its own AGITRACK_CONFIG_DIR). `--cov` measures INSIDE the xdist workers,
       # which a wrapping `coverage run` cannot reach — that combination silently reported ~10%
       # coverage with every test passing. The run fails if coverage drops below the floor in
-      # pyproject.toml, so a regression can no longer slip through green.
+      # pyproject.toml, so a regression can no longer slip through green. `--timeout` fails a
+      # test that hangs, by name, instead of letting it hold the job silently until the
+      # 45-minute limit cancels it (it did, twice, for one test on Linux only).
       - name: Tests + coverage
-        run: uv run pytest -q -n auto --cov --cov-report=term:skip-covered
+        run: uv run pytest -q -n auto --timeout=300 --cov --cov-report=term:skip-covered
 
   # Native-Windows validation (#118): the package imports and runs natively on Windows
   # (ConPTY via pywinpty, Win32 console, msvcrt locking). Most of the suite is
