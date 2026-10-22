@@ -912,6 +912,52 @@ def test_the_timeline_shows_a_pending_turn_as_its_messages_alone(tmp_path):
     assert page["total"] == len(page["items"])
 
 
+def test_the_rest_of_a_turn_a_commit_captured_does_not_repeat_its_message_in_the_timeline(tmp_path):
+    # A commit made while a turn runs carries the turn as it stood; the rest of the turn is then
+    # recorded as its own record, carrying the same prompt. The timeline showed that message
+    # twice, once in the commit and once tagged "pending commit" (seen live). It is shown once,
+    # from the commit; the continuation then holds no message and leaves the timeline.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    def turn_body(reply: str, ended: int) -> str:
+        return build_agent_commit_message(
+            latest_prompt="Update the dataset description first",
+            trace=[
+                {"role": "user", "content": "Update the dataset description first"},
+                {"role": "agent", "content": reply},
+            ],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 10, "input": 5},
+            session_name="s",
+            started_at=1_792_685_007,
+            ended_at=ended,
+        )
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nA\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "My commit\n\n" + turn_body("working on it", 1_792_685_099))
+    head = repo.rev_parse("HEAD")
+    rest = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=turn_body("done", 1_792_685_120))
+    repo.update_ref("refs/agitrack/manual/sid", rest)
+
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    messages = [
+        (page["entries"][i].get("pending"), page["entries"][i]["turns"][-1]["prompts"][seq - 1])
+        for i, seq in page["items"]
+        if seq
+    ]
+    assert messages == [(False, "Update the dataset description first")]
+    assert not any(e.get("pending") for e in page["entries"])
+    commits = json.loads(RepoScope(repo).get("/log", {}).body)
+    assert any(e.get("pending") for e in commits["entries"])  # the record itself is still there
+
+
 # --- config toggle ----------------------------------------------------------
 
 

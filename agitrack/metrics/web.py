@@ -979,21 +979,61 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
     placed when its turn began); under another sort each commit is followed by its own messages,
     newest first. The page script draws the rows in exactly this order."""
     by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
+    repeats = _repeated_messages(stats)
     keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
         commit_time = stat.timestamp or 0
-        times = _prompt_times(stat)
         # A pending turn (recorded, not yet in a commit) is not a commit yet, so it gets no row
         # of its own: its messages are tagged "pending commit" instead. One that holds no message
         # (woken by a background event, nothing typed) has nothing for the timeline to show; the
         # commit list still lists it, and it folds into the next commit like the rest.
         if not stat.pending:
             keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
-        for seq, at in enumerate(times, start=1):
+        for seq, at in enumerate(_prompt_times(stat), start=1):
+            if (index, seq) in repeats:
+                continue
             when = at or commit_time
             keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
     keyed.sort(key=lambda pair: pair[0])
     return [row for _, row in keyed]
+
+
+def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
+    """The ``(index, seq)`` of every message the timeline already shows from an EARLIER record of
+    the same turn. A commit made while a turn is still running carries the turn as it stood, and
+    the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
+    spent after the commit, counted once between the two); both carry the turn's prompt, so the
+    timeline listed one message twice, usually a committed copy and a pending one (seen live). The
+    same turn is told by its start time and its text; the oldest record's copy is kept. A message
+    whose turn recorded no start cannot be placed and is never folded away."""
+    seen: set[tuple[float, str]] = set()
+    repeats: set[tuple[int, int]] = set()
+    for index in sorted(range(len(stats)), key=lambda k: (stats[k].pending, stats[k].timestamp or 0)):
+        for seq, key in enumerate(_prompt_keys(stats[index]), start=1):
+            if key is None:
+                continue
+            if key in seen:
+                repeats.add((index, seq))
+            else:
+                seen.add(key)
+    return repeats
+
+
+# The identity of each of a commit's messages, oldest first: when its turn began and what it said
+# (None where the turn recorded no start), by commit.
+_PROMPT_KEYS: dict[tuple[str, int], tuple[tuple[float, str] | None, ...]] = {}
+
+
+def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
+    key = (stat.sha, len(stat.message))
+    found = _PROMPT_KEYS.get(key)
+    if found is None:
+        if len(_PROMPT_KEYS) > 50_000:
+            _PROMPT_KEYS.clear()
+        found = _PROMPT_KEYS[key] = tuple(
+            (turn["at"], text) if turn["at"] else None for turn in _timeline_turns(stat) for text in turn["prompts"]
+        )
+    return found
 
 
 # When each of a commit's messages was sent, oldest first (None where its turn recorded no
