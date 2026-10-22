@@ -958,6 +958,60 @@ def test_the_rest_of_a_turn_a_commit_captured_does_not_repeat_its_message_in_the
     assert any(e.get("pending") for e in commits["entries"])  # the record itself is still there
 
 
+def test_the_timeline_places_each_message_when_it_was_sent_and_ignores_rewrapping(tmp_path):
+    # Two things seen live in one place: messages queued while the agent worked all showed the
+    # turn's start time, and a message shown both in a commit and in the pending record of the
+    # same turn because git stripped the space before each line break in the commit only.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    prompts = ["Run everything on the workstation", "Make sure it continues there and does not \nrerun"]
+
+    def turn_body(texts: list[str], ended: int) -> str:
+        trace = [{"role": "user", "content": texts[0], "at": 1_792_685_674}]
+        trace += [{"role": "user", "content": t, "at": 1_792_685_762, "starts_turn": False} for t in texts[1:]]
+        return build_agent_commit_message(
+            latest_prompt=texts[0],
+            trace=[*trace, {"role": "agent", "content": "on it"}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 10, "input": 5},
+            session_name="s",
+            started_at=1_792_685_674,
+            ended_at=ended,
+        )
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nA\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    # Committed through git, which strips the trailing space of each line.
+    _git(repo, "commit", "-q", "-m", "My commit\n\n" + turn_body(prompts, 1_792_685_700))
+    head = repo.rev_parse("HEAD")
+    rest = repo.commit_tree(
+        repo.comparable_tree("HEAD"),
+        parents=[head],
+        message=turn_body([*prompts, "How do the results look?"], 1_792_685_990),
+    )
+    repo.update_ref("refs/agitrack/manual/sid", rest)
+
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    shown = []
+    for i, seq in page["items"]:
+        if not seq:
+            continue
+        entry = page["entries"][i]
+        turn = entry["turns"][-1]
+        shown.append((entry.get("pending"), " ".join(turn["prompts"][seq - 1].split())[:20], turn["times"][seq - 1]))
+    assert sorted(shown, key=lambda r: r[1]) == [
+        (True, "How do the results l", 1_792_685_762.0),
+        (False, "Make sure it continu", 1_792_685_762.0),
+        (False, "Run everything on th", 1_792_685_674.0),
+    ]
+
+
 # --- config toggle ----------------------------------------------------------
 
 

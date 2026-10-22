@@ -590,6 +590,7 @@ def _new_turn() -> dict:
         "interrupted": False,
         "compaction_count": 0,
         "queued_followups": [],
+        "queued_followup_times": [],
         "edits": [],
         "last_message_index": 0,
     }
@@ -659,7 +660,7 @@ def parse_rows(
             continue
 
         if payload_kind == "user_message":
-            _add_user_message(current, _agent_message(payload), seen_messages)
+            _add_user_message(current, _agent_message(payload), seen_messages, stamp)
             continue
 
         if payload_kind == "agent_message":
@@ -671,7 +672,7 @@ def parse_rows(
             # rollout this DUPLICATES the event_msg above, so both paths dedupe on the text.
             role = str(payload.get("role") or "")
             if role == "user":
-                _add_user_message(current, _content_text(payload), seen_messages)
+                _add_user_message(current, _content_text(payload), seen_messages, stamp)
             elif role == "assistant":
                 _add_agent_message(current, _content_text(payload), seen_messages)
             # `developer` / `system` roles are harness scaffolding, never conversation.
@@ -740,7 +741,7 @@ def parse_rows(
     return turns
 
 
-def _add_user_message(turn: dict, text: str, seen: set[str]) -> None:
+def _add_user_message(turn: dict, text: str, seen: set[str], stamp: int | None = None) -> None:
     """Record a human prompt on the turn, ignoring harness injections and duplicates."""
     if not text or _is_harness_injection(text):
         return
@@ -752,6 +753,7 @@ def _add_user_message(turn: dict, text: str, seen: set[str]) -> None:
         # A second user message inside one task is a prompt the user QUEUED while the agent was
         # already working; it belongs to this turn but is its own message.
         turn["queued_followups"].append(text)
+        turn["queued_followup_times"].append(stamp)
     else:
         turn["user_prompt"] = text
 
@@ -848,6 +850,7 @@ def _finalize(
         backend_version=turn.get("backend_version"),
         compaction_count=turn["compaction_count"],
         queued_followups=turn["queued_followups"],
+        queued_followup_times=turn["queued_followup_times"],
         mcp_servers=capability.mcp_servers,
         mcp_tools=capability.mcp_tools,
         skills=capability.skills,

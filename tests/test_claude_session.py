@@ -2098,3 +2098,20 @@ def test_the_store_scan_checks_cheaply_before_reading_anything(tmp_path, monkeyp
     os.utime(project, (now - 1000, now - 1000))
     monkeypatch.setattr(claude_session, "_FOLDER_MTIME_UNRELIABLE", True)
     assert "newer" in ids()
+
+
+def test_a_queued_followup_keeps_when_it_was_sent():
+    # A message queued while the agent works is sent minutes after its turn began; the dashboard
+    # showed every one of them under the turn's start time (seen live).
+    rows = [
+        _user("u1", "Run everything on the workstation.", timestamp="2026-10-22T16:14:34Z"),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], stop_reason="tool_use"
+        ),
+        {**_queued("Make sure it continues there."), "timestamp": "2026-10-22T16:16:02Z"},
+        {**_queued("Also say how the results look."), "timestamp": "2026-10-22T16:19:40Z"},
+        _assistant("m2", "Done."),
+    ]
+    turn = parse_rows("sess-t", rows).turns[0]
+    assert turn.queued_followups == ["Make sure it continues there.", "Also say how the results look."]
+    assert turn.queued_followup_times == [1792685762, 1792685980]

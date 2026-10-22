@@ -859,16 +859,30 @@ def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
         found = _trace_user_sections(stat.message)
         if not found:
             return []
-        return [
-            {
-                "at": _iso_epoch(stat.started_at),
-                "prompts": [text for _, text in found],
-                "path": list(path),
-                "sections": [ordinal for ordinal, _ in found],
-            }
-        ]
+        at = _iso_epoch(stat.started_at)
+        turn: dict = {
+            "at": at,
+            "prompts": [text for _, text in found],
+            "path": list(path),
+            "sections": [ordinal for ordinal, _ in found],
+        }
+        sent = _user_message_times(stat)
+        if any(sent):
+            # When each message was SENT, where the commit records it (`user_message_times`, one
+            # per `## User` heading), else the turn's start. A message queued while the agent
+            # worked was sent minutes after the turn began.
+            turn["times"] = [(sent[k] if k < len(sent) else None) or at for k, _ in found]
+        return [turn]
     last = len(parts) - 1
     return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j))]
+
+
+def _user_message_times(stat: CommitStat) -> list[float | None]:
+    """The record's ``user_message_times``, one per ``## User`` heading (None for a ``-``)."""
+    raw = (stat.metadata or {}).get("user_message_times") or ""
+    if not raw:
+        return []
+    return [_iso_epoch(part.strip()) if part.strip() not in ("", "-") else None for part in raw.split(",")]
 
 
 def _trace_user_sections(message: str) -> list[tuple[int, str]]:
@@ -1004,7 +1018,8 @@ def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
     the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
     spent after the commit, counted once between the two); both carry the turn's prompt, so the
     timeline listed one message twice, usually a committed copy and a pending one (seen live). The
-    same turn is told by its start time and its text; the oldest record's copy is kept. A message
+    same turn is told by its start time and its text (whitespace aside); the oldest record's copy
+    is kept. A message
     whose turn recorded no start cannot be placed and is never folded away."""
     seen: set[tuple[float, str]] = set()
     repeats: set[tuple[int, int]] = set()
@@ -1031,7 +1046,12 @@ def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
         if len(_PROMPT_KEYS) > 50_000:
             _PROMPT_KEYS.clear()
         found = _PROMPT_KEYS[key] = tuple(
-            (turn["at"], text) if turn["at"] else None for turn in _timeline_turns(stat) for text in turn["prompts"]
+            # Whitespace does not count: a commit git wrote strips the space a hard-wrapped line
+            # ends with, and a pending record (written by `commit-tree`) keeps it, so the same
+            # message read differently in the two and was shown twice (seen live).
+            (turn["at"], " ".join(text.split())) if turn["at"] else None
+            for turn in _timeline_turns(stat)
+            for text in turn["prompts"]
         )
     return found
 
@@ -1048,7 +1068,11 @@ def _prompt_times(stat: CommitStat) -> tuple[float | None, ...]:
     if times is None:
         if len(_PROMPT_TIMES) > 50_000:
             _PROMPT_TIMES.clear()
-        times = _PROMPT_TIMES[key] = tuple(turn["at"] for turn in _timeline_turns(stat) for _ in turn["prompts"])
+        times = _PROMPT_TIMES[key] = tuple(
+            (turn.get("times") or [turn["at"]] * len(turn["prompts"]))[k]
+            for turn in _timeline_turns(stat)
+            for k in range(len(turn["prompts"]))
+        )
     return times
 
 
@@ -2747,7 +2771,8 @@ function timelineHtml(entries, commitRow){
     let seq = 0;
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
-        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text,
+        const sent = (turn.times || [])[k] || turn.at;
+        items.push({t: sent || c.ts || 0, approx: !sent, follow: k > 0, own: sent !== turn.at, seq: ++seq, i, text,
           path: turn.path || [], sec: (turn.sections || [])[k]});
       });
     }
@@ -2769,7 +2794,7 @@ function timelineHtml(entries, commitRow){
     const c = entries[it.i], w = commitWhen(it.t);
     const when = it.approx
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
-      : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
+      : `<span class="when" title="${esc((it.follow && !it.own ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
     // A pending turn has no commit to open yet: it folds into the next one.
     const target = c.pending

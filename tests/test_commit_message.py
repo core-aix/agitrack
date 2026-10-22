@@ -1112,3 +1112,31 @@ def test_the_commit_body_carries_the_same_change_list_as_the_summarizer_input():
     unwrapped = " ".join(message.replace("> ", "").split())
     assert "it changes a.txt, b.txt." in unwrapped
     assert message.index("a.txt, b.txt") < message.index("## User")
+
+
+def test_each_user_message_records_when_it_was_sent():
+    # A queued follow-up is sent after its turn began, so the commit records the time of every
+    # `## User` message; the dashboard places each by it. One message at the turn's start adds
+    # nothing, so that ordinary case writes no line.
+    base = dict(
+        latest_prompt="run it",
+        backend="claude",
+        backend_session_id="b",
+        agitrack_session_id="s",
+        model="m",
+        started_at=1_792_685_674,
+    )
+    queued = build_agent_commit_message(
+        trace=[
+            {"role": "user", "content": "run it", "at": 1_792_685_674},
+            {"role": "user", "content": "keep going there", "at": 1_792_685_762, "starts_turn": False},
+            {"role": "agent", "content": "ok"},
+        ],
+        **base,
+    )
+    assert "user_message_times: 2026-10-22T16:14:34Z, 2026-10-22T16:16:02Z" in queued
+    plain = build_agent_commit_message(
+        trace=[{"role": "user", "content": "run it", "at": 1_792_685_674}, {"role": "agent", "content": "ok"}],
+        **base,
+    )
+    assert "user_message_times" not in plain

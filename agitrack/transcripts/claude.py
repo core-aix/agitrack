@@ -1546,6 +1546,7 @@ def parse_rows(
                     # merging it into the base prompt — the user sent it after the agent had already
                     # said something.
                     current.setdefault("queued_followups", []).append(queued)
+                    current.setdefault("queued_followup_times", []).append(stamp)
                 else:
                     # Queued before any turn opened in this parse window — open one for it.
                     flush()
@@ -2024,6 +2025,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         backend_version=turn.get("backend_version"),
         agent_messages=list(turn.get("messages") or []),
         queued_followups=list(turn.get("queued_followups") or []),
+        queued_followup_times=list(turn.get("queued_followup_times") or []),
         mcp_servers=used.mcp_servers,
         mcp_tools=used.mcp_tools,
         skills=used.skills,
