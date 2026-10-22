@@ -162,8 +162,11 @@ def test_the_selector_only_ever_offers_a_branch_the_validator_accepts(tmp_path):
     repo, _origin = _origin_with_a_branch(tmp_path)
     live = RepoScope(repo)
 
+    # Every offered branch is accepted; the checked-out one is served as HEAD, which is what
+    # carries the pending (not yet committed) turns.
+    current = repo.current_branch()
     for branch in viewable_branches(repo):
-        assert live._ref(branch) == branch
+        assert live._ref(branch) == ("HEAD" if branch == current else branch)
     assert live._ref("no-such-branch") == "HEAD"
     assert live._ref("") == "HEAD"
 

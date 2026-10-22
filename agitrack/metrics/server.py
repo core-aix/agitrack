@@ -409,7 +409,15 @@ class RepoScope:
         # list the selector is built from — including remote-tracking branches, which is how a
         # branch the user has fetched but not checked out becomes viewable — so the selector can
         # never offer something this refuses.
-        return branch if branch and branch in viewable_branches(self.repo) else "HEAD"
+        #
+        # The checked-out branch named BY NAME is HEAD, and must be served as HEAD: the pending
+        # turns (recorded, not yet committed) are added only to the HEAD view, and the page names
+        # the branch on every request once /data has told it which one it is on. Served as a
+        # plain branch, the first page showed the pending turns and every later page dropped
+        # them (seen on a real repository: 544 timeline rows, then 533).
+        if not branch or branch not in viewable_branches(self.repo):
+            return "HEAD"
+        return "HEAD" if branch == self.repo.current_branch() else branch
 
     def _dashboard(self, ref: str = "HEAD") -> Dashboard:
         # cached_logins never blocks: it returns the cached GitHub identities (or {} when cold)

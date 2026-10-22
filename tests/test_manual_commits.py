@@ -851,6 +851,32 @@ def test_collect_manual_pending_surfaces_turns(tmp_path):
     assert any(s.pending for s in dash.stats)  # surfaced in the dashboard timeline
 
 
+def test_naming_the_checked_out_branch_still_shows_the_pending_turns(tmp_path):
+    # The dashboard names the current branch on every request once /data has said which one it
+    # is on. Pending turns are added to the HEAD view only, so a branch named by name dropped
+    # them: the first log page showed them and every later page did not (seen on a real
+    # repository, 544 timeline rows on page 1 and 533 after it).
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _init_repo(tmp_path)
+    head = repo.rev_parse("HEAD")
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=_agent_body("A", 70))
+    repo.update_ref("refs/agitrack/manual/sid", record)
+    scope = RepoScope(repo)
+
+    def log(**query):
+        return json.loads(scope.get("/log", {k: [v] for k, v in query.items()}).body)
+
+    branch = repo.current_branch()
+    assert branch
+    unnamed, named = log(view="timeline"), log(view="timeline", branch=branch)
+    assert any(e.get("pending") for e in unnamed["entries"])
+    assert any(e.get("pending") for e in named["entries"])
+    assert named["total"] == unnamed["total"]
+
+
 # --- config toggle ----------------------------------------------------------
 
 
