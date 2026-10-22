@@ -367,14 +367,18 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     if (name === "log") {{
       var sort = p.get("sort") || "date";
       if (["date","lines","tokens"].indexOf(sort) < 0) sort = "date";
-      if (p.get("view") === "timeline") {{
-        // Timeline pages are not all the same size, so an offset from the commit list may not
-        // start one; the first page answers then.
-        var start = "log-timeline-" + sort + "-";
-        return file(start + (parseInt(p.get("offset") || "0", 10) || 0) + ".json", function(){{ return file(start + "0.json", unavailable); }});
-      }}
       var page = {PAGE_SIZE};
       var offset = Math.max(0, Math.floor((parseInt(p.get("offset") || "0", 10) || 0) / page) * page);
+      if (p.get("view") === "timeline") {{
+        // Timeline pages count rows, commits and messages alike. `at` asks for the page holding a
+        // commit's own row, which the shipped map (commit index -> page offset) answers.
+        var start = "log-timeline-" + sort + "-";
+        var firstPage = function(){{ return file(start + "0.json", unavailable); }};
+        if (p.get("at") === null) return file(start + offset + ".json", firstPage);
+        return file(start + "at.json", function(){{ return asJson({{}}); }})
+          .then(function(r){{ return r.json(); }})
+          .then(function(at){{ return file(start + (at[p.get("at")] || 0) + ".json", firstPage); }}, firstPage);
+      }}
       return file("log-" + sort + "-" + offset + ".json", unavailable);
     }}
     if (name === "diff") return file("diff/" + (p.get("sha") || "").slice(0, 40) + ".json", function(){{ return asJson({{error: NOTE}}); }});
@@ -671,12 +675,19 @@ def export_static_demo(repo: GitRepo, out_dir: Path, *, force: bool = False) -> 
             _write_json(
                 demo / f"log-{sort}-{offset}.json", log_page(dash, repo=repo, frm=frm, offset=offset, sort=sort)
             )
+        # The timeline pages by rows (commits and messages alike), so it has its own pages, and
+        # a map from each commit to the page holding its row, for the tab switch and for a
+        # message whose commit is on another page.
         first = log_page(dash, repo=repo, frm=frm, sort=sort, view="timeline")
-        for offset in first["page_starts"]:
+        at: dict[str, int] = {}
+        for offset in range(0, max(first["total"], 1), PAGE_SIZE):
             timeline_page = (
                 first if offset == 0 else log_page(dash, repo=repo, frm=frm, offset=offset, sort=sort, view="timeline")
             )
             _write_json(demo / f"log-timeline-{sort}-{offset}.json", timeline_page)
+            for entry in timeline_page["entries"]:
+                at[str(entry["index"])] = entry["row"] // PAGE_SIZE * PAGE_SIZE
+        _write_json(demo / f"log-timeline-{sort}-at.json", at)
 
     # Every in-scope commit's diff (only they appear in the log), and the whole file
     # browser with each change's file diff (file history deliberately stays full-depth).

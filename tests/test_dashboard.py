@@ -1348,7 +1348,8 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     data = _embedded_data(html)
     assert "commits" not in data  # the full per-commit list is never embedded
     assert data["agg"]["total"] == 7
-    assert data["log"]["total"] == 7
+    # The first page is the timeline's, whose total counts rows: 7 commits and their 2 messages.
+    assert data["log"]["commits"] == 7 and data["log"]["total"] == 9
     assert data["log"]["offset"] == 0
     assert len(data["log"]["entries"]) == 7  # one small repo fits on the first page
     entry = data["log"]["entries"][-1]
@@ -3172,16 +3173,14 @@ def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tm
     assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
 
 
-def test_the_timeline_pages_by_entries_and_follows_a_rewrite(tmp_path):
-    # A timeline page holds at most `limit` entries, a commit and each of its messages counting as
-    # one (50 by default, like the commit list: pages of 50 commits held hundreds of messages and
-    # were slow to load). A commit is never split from its messages, so a page can end short and a
-    # commit with more than `limit` entries is a page of its own. Pages differ in size, so the
-    # payload names every page's start; an offset inside a page is moved back to its start. A
-    # rewritten commit has a new id, so the cached message counts can never answer for it: the same
-    # live scope re-pages after the rewrite by itself. Checked at full size on a 70-commit dummy
-    # repository rewritten by `git filter-branch` and by `agitrack redact`, and in Chrome on an
-    # open page that picked the rewrite up on its refresh.
+def test_the_timeline_pages_by_rows_and_follows_a_rewrite(tmp_path):
+    # A timeline page holds exactly `limit` rows, a commit and each message counting as one row
+    # whichever it is, and a commit's messages run on to the next page when they do not fit.
+    # Reported on a real repository: pages ended at a COMMIT boundary, so a first page whose second
+    # commit carried many messages showed only a handful of rows. The payload lists the page's rows
+    # in order (`items`) and every commit they belong to (`entries`, each saying where its own row
+    # is); `total` counts rows. A rewritten commit has a new id, so the cached message times can
+    # never answer for it: the same live scope re-pages after the rewrite by itself.
     import json as _json
     import subprocess
 
@@ -3199,25 +3198,33 @@ def test_the_timeline_pages_by_entries_and_follows_a_rewrite(tmp_path):
     def log(**query):
         return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
 
-    first = log(view="timeline", limit=5)
-    # Newest first, entries per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
-    # GitRepo.init makes (1). A commit that would take a page past 5 entries starts the next one:
-    # c7 (2) cannot take c6 (7), which is alone and over the limit, c5..c2 fill exactly 5, c1 and
-    # c0 fill 5 again, and the seed is left.
-    assert first["page_starts"] == [0, 1, 2, 6, 8]
-    assert [e["subject"] for e in first["entries"]] == ["<aGiTrack> c7"]
-    page = log(view="timeline", limit=5, offset=3)
-    assert [e["subject"] for e in page["entries"]] == [
-        "<aGiTrack> c5",
-        "<aGiTrack> c4",
-        "<aGiTrack> c3",
-        "<aGiTrack> c2",
-    ]  # moved back to its page's start
-    assert page["offset"] == 2
-    assert sum(1 + sum(len(t["prompts"]) for t in e["turns"]) for e in page["entries"]) == 5
-    assert "page_starts" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+    def rows(page):
+        out = []
+        for i, seq in page["items"]:
+            entry = page["entries"][i]
+            out.append(
+                entry["subject"].removeprefix("<aGiTrack> ") if seq == 0 else entry["turns"][0]["prompts"][seq - 1]
+            )
+        return out
 
-    # Rewrite the newest commit so it carries four messages (five items, a full page on its own).
+    # Nine commits (the eight above and the seed GitRepo.init makes) and eleven messages, newest
+    # first, each commit followed by its own messages newest first.
+    first = log(view="timeline", limit=5)
+    assert first["total"] == 20 and first["commits"] == 9
+    assert rows(first) == ["c7", "C7-0", "c6", "C6-5", "C6-4"]
+    second = log(view="timeline", limit=5, offset=7)  # an offset inside a page opens that page
+    assert second["offset"] == 5
+    assert rows(second) == ["C6-3", "C6-2", "C6-1", "C6-0", "c5"]
+    # c6's row is on the first page and only its messages are here; it says where its row is.
+    c6 = next(e for e in second["entries"] if e["subject"] == "<aGiTrack> c6")
+    assert c6["row"] == 2 and c6["index"] == 1
+    # The page holding a commit's own row, as switching from the commit list asks for it.
+    assert rows(log(view="timeline", limit=5, at=5)) == ["c4", "c3", "c2", "C2-0", "c1"]
+    last = log(view="timeline", limit=5, offset=15)
+    assert len(last["items"]) == 5 and rows(last) == ["C1-2", "C1-1", "C1-0", "c0", last["entries"][-1]["subject"]]
+    assert "items" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+
+    # Rewrite the newest commit so it carries four messages: the first page is that commit alone.
     message = subprocess.run(
         ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True
     ).stdout.replace("## Agent", "## User\n\nmore\n\n## User\n\nmore\n\n## User\n\nmore\n\n## Agent")
@@ -3225,8 +3232,8 @@ def test_the_timeline_pages_by_entries_and_follows_a_rewrite(tmp_path):
         ["git", "-C", str(repo.repo), "commit", "-q", "--amend", "--cleanup=whitespace", "-m", message], check=True
     )
     rewritten = log(view="timeline", limit=5)
-    assert rewritten["page_starts"] == [0, 1, 2, 6, 8]
-    assert sum(len(t["prompts"]) for t in rewritten["entries"][0]["turns"]) == 4
+    assert rewritten["total"] == 23
+    assert rows(rewritten) == ["c7", "more", "more", "more", "C7-0"]
     assert (
         rewritten["entries"][0]["sha"]
         == subprocess.run(

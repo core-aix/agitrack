@@ -24,7 +24,6 @@ and ad-hoc use; the live page does not embed it.
 
 from __future__ import annotations
 
-import bisect
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -914,15 +913,18 @@ def log_page(
     text: str = "",
     text_in: str = "subject",
     view: str = "commits",
+    at_commit: int | None = None,
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
 
-    ``view="timeline"`` pages the way the timeline shows the log: a page holds at most ``limit``
-    entries, commits and their messages counted alike. Pages then differ in size, so the payload carries ``page_starts``
-    (every page's offset) for the pager, and an ``offset`` inside a page is moved back to that
-    page's start (switching from the commit list keeps the reader where they were).
+    ``view="timeline"`` pages the way the timeline shows the log: ``offset`` and ``total`` count
+    ROWS, commits and messages alike (:func:`_timeline_rows`), so every page holds ``limit`` rows.
+    The payload's ``items`` lists the page's rows in order and ``entries`` the commits they
+    belong to, including one only its messages are on this page for; ``commits`` is how many
+    commits the filters left. ``at_commit`` (a commit's index among them) opens the page holding
+    that commit's own row, which is how switching from the commit list keeps the reader in place.
 
     ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
     word must appear, ignoring case, in the part ``text_in`` names: the subject, the user's
@@ -937,59 +939,71 @@ def log_page(
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
-    starts: list[int] | None = None
+    items: list[tuple[int, int]] | None = None
     if view == "timeline":
-        starts = _timeline_page_starts(stats, limit)
-        index = bisect.bisect_right(starts, offset) - 1
-        offset = starts[index]
-        end = starts[index + 1] if index + 1 < len(starts) else len(stats)
-        page = stats[offset:end]
+        rows = _timeline_rows(stats, sort)
+        if at_commit is not None:
+            offset = next((n for n, row in enumerate(rows) if row == (at_commit, 0)), 0)
+        offset = min(offset, max(len(rows) - 1, 0)) // limit * limit
+        items = rows[offset : offset + limit]
+        shown = sorted({index for index, _ in items})
+        page = [stats[index] for index in shown]
     else:
         page = stats[offset : offset + limit]
     if repo is not None and page:
         apply_numstat_for(repo, [stat.sha for stat in page], {stat.sha: stat for stat in page})
-    payload = {
-        "total": len(stats),
-        "offset": offset,
-        "limit": limit,
-        "entries": [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page],
-    }
-    if starts is not None:
-        payload["page_starts"] = starts
+    entries = [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page]
+    payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
+    if items is not None:
+        local = {index: k for k, index in enumerate(shown)}
+        # Every row of this page in display order: the entry it belongs to and which of it
+        # (0 the commit itself, n its n-th message, oldest first). Each entry also says where
+        # its own commit row is (`index` among the filtered commits, `row` among all rows), so a
+        # message whose commit is on another page can open it there.
+        payload["items"] = [[local[index], seq] for index, seq in items]
+        payload["total"] = len(rows)
+        payload["commits"] = len(stats)
+        commit_rows = {index: n for n, (index, seq) in enumerate(rows) if seq == 0}
+        for index, entry in zip(shown, entries):
+            entry["index"] = index
+            entry["row"] = commit_rows.get(index, 0)
     return payload
 
 
-def _timeline_page_starts(stats: list[CommitStat], limit: int) -> list[int]:
-    """Where each timeline page begins. A page holds at most ``limit`` entries, each commit and
-    each message shown with it counting as one: a commit whose entries would take the page past
-    that starts the next one. A commit is never split from its messages (hovering one lights the
-    other, and a message's link opens its commit), so a page can end a little short of ``limit``,
-    and a single commit with more entries than that is a page of its own."""
-    starts = [0]
-    items = 0
+def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
+    """Every row the timeline shows, in the order it shows them: ``(index, seq)`` with ``index``
+    the commit's place in ``stats`` and ``seq`` 0 for the commit itself, n for its n-th message
+    (oldest first). A page is a slice of these, so it holds exactly ``limit`` rows whether they
+    are commits or messages, and a commit's messages continue onto the next page when they do
+    not fit. Sorted by date, messages and commits interleave by time, newest first (a message is
+    placed when its turn began); under another sort each commit is followed by its own messages,
+    newest first. The page script draws the rows in exactly this order."""
+    by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
+    keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
-        size = 1 + _message_count(stat)
-        if items and items + size > limit:
-            starts.append(index)
-            items = 0
-        items += size
-    return starts
+        commit_time = stat.timestamp or 0
+        keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
+        for seq, at in enumerate(_prompt_times(stat), start=1):
+            when = at or commit_time
+            keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
+    keyed.sort(key=lambda pair: pair[0])
+    return [row for _, row in keyed]
 
 
-# How many messages each commit shows in the timeline, by commit. A commit's message never
-# changes, so the count is worked out once; every timeline page request needs the whole
-# filtered history's counts (24 ms for this repository's 1,151 commits, uncached).
-_MESSAGE_COUNTS: dict[tuple[str, int], int] = {}
+# When each of a commit's messages was sent, oldest first (None where its turn recorded no
+# start), by commit. A commit's message never changes, so this is worked out once; every
+# timeline page request needs it for the whole filtered history.
+_PROMPT_TIMES: dict[tuple[str, int], tuple[float | None, ...]] = {}
 
 
-def _message_count(stat: CommitStat) -> int:
+def _prompt_times(stat: CommitStat) -> tuple[float | None, ...]:
     key = (stat.sha, len(stat.message))
-    count = _MESSAGE_COUNTS.get(key)
-    if count is None:
-        if len(_MESSAGE_COUNTS) > 50_000:
-            _MESSAGE_COUNTS.clear()
-        count = _MESSAGE_COUNTS[key] = sum(len(turn["prompts"]) for turn in _timeline_turns(stat))
-    return count
+    times = _PROMPT_TIMES.get(key)
+    if times is None:
+        if len(_PROMPT_TIMES) > 50_000:
+            _PROMPT_TIMES.clear()
+        times = _PROMPT_TIMES[key] = tuple(turn["at"] for turn in _timeline_turns(stat) for _ in turn["prompts"])
+    return times
 
 
 def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
@@ -2207,9 +2221,10 @@ async function loadAgg(){
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
-async function loadLog(offset){
+async function loadLog(offset, atCommit){
   const extra = {offset:offset||0, limit:PAGE_SIZE, sort:state.sort};
-  if(LOGTAB === "timeline") extra.view = "timeline";  // pages by commits AND messages (log_page)
+  if(LOGTAB === "timeline") extra.view = "timeline";  // pages by rows, commits AND messages (log_page)
+  if(atCommit != null) extra.at = atCommit;  // the timeline page holding this commit's own row
   if(state.q){ extra.q = state.q; extra.qin = state.qin; }   // searches the log only, like the sort
   try{ const r = await fetch("log?"+qs(extra), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
@@ -2690,10 +2705,19 @@ function timelineHtml(entries, commitRow){
       });
     }
   });
-  const byTime = state.sort === "date";
-  items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
-    (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
-  return items.map(it => {
+  // The server pages the timeline by rows and says which rows this page holds, in order
+  // (log_page's `items`); a commit only some of whose messages are on this page is in `entries`
+  // without its own row. Without that list (an older server), every row is drawn and sorted here.
+  let rows = items;
+  if(Array.isArray(LOGPAGE.items)){
+    const byKey = new Map(items.map(it => [it.i + ":" + it.seq, it]));
+    rows = LOGPAGE.items.map(([i, seq]) => byKey.get(i + ":" + seq)).filter(Boolean);
+  } else {
+    const byTime = state.sort === "date";
+    items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
+      (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+  }
+  return rows.map(it => {
     if(it.commit) return commitRow(entries[it.i], it.i);
     const c = entries[it.i], w = commitWhen(it.t);
     const when = it.approx
@@ -2741,13 +2765,15 @@ function renderLog(){
   };
   const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
   $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
-  const from = total ? offset+1 : 0, to = offset+entries.length;
-  // The timeline's pages differ in size (at most 50 entries, a commit never split from its messages), so
-  // the server names where each one starts; the commit list's pages are all `limit` long.
-  const starts = LOGTAB === "timeline" ? LOGPAGE.page_starts : null;
-  const pages = starts ? Math.max(1, starts.length) : Math.max(1, Math.ceil(total/limit));
-  const cur = starts ? Math.max(1, starts.filter(s => s <= offset).length) : Math.min(pages, Math.floor(offset/limit)+1);
-  const pageOffset = p => starts ? (starts[p-1] || 0) : (p-1)*limit;
+  // The timeline pages by rows, commits and messages alike, so its offset and total count rows
+  // ("items"); the commit list's count commits.
+  const byRows = Array.isArray(LOGPAGE.items);
+  const shownCount = byRows ? LOGPAGE.items.length : entries.length;
+  const from = total ? offset+1 : 0, to = offset+shownCount;
+  const unit = byRows ? "items" : "commits";
+  const pages = Math.max(1, Math.ceil(total/limit));
+  const cur = Math.min(pages, Math.floor(offset/limit)+1);
+  const pageOffset = p => (p-1)*limit;
   // Numbered page buttons: all of them when few, otherwise first + a window around
   // the current page + last, with … gaps (0 marks a gap).
   let nums = [];
@@ -2765,7 +2791,7 @@ function renderLog(){
   const prevDis = cur<=1 ? "disabled" : "", nextDis = cur>=pages ? "disabled" : "";
   const gotoBox = pages>1 ? `<span class="pgoto">go to <input id="log-goto" type="number" inputmode="numeric" `+
     `min="1" max="${pages}" placeholder="${cur}"> / ${fmt(pages)}</span>` : "";
-  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
+  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} ${unit}</span>`+
     `<span class="pnav"><button id="log-first" title="first page" ${prevDis}>«</button>`+
     `<button id="log-prev" title="previous page" ${prevDis}>‹</button>${numBtns}`+
     `<button id="log-next" title="next page" ${nextDis}>›</button>`+
@@ -2894,8 +2920,22 @@ function toggleDetail(i){
 // parts to the one holding it (path: display indices, newest first, from the server), and mark
 // the message there. Without a place to mark (a hand-built entry, a part the page no longer
 // shows) it falls back to flashing the commit's row.
-function showMessageInCommit(i, path, sec, from){
-  const row = document.querySelector('#commitlog .entry[data-i="'+i+'"]'), detail = $("detail-"+i);
+async function showMessageInCommit(i, path, sec, from){
+  let row = document.querySelector('#commitlog .entry[data-i="'+i+'"]');
+  if(!row){
+    // The message's commit is on another timeline page (a page is a fixed number of rows, so a
+    // commit's messages can run on past it): go to the page holding the commit, then open it there.
+    const entry = (LOGPAGE.entries || [])[i];
+    if(!entry || entry.index == null) return;
+    showLoading(true);
+    try{ if(!(await loadLog(0, entry.index))) return; renderLog(); }
+    finally{ showLoading(false); }
+    i = (LOGPAGE.entries || []).findIndex(e => e.index === entry.index);
+    if(i < 0) return;
+    row = document.querySelector('#commitlog .entry[data-i="'+i+'"]');
+    from = null;
+  }
+  const detail = $("detail-"+i);
   if(!row || !detail) return;
   // What the link changes, so "back" can undo exactly that and nothing the reader opened.
   const undo = {i, from, scrollY: window.scrollY, openedDetail: detail.hidden, openedParts: []};
@@ -3408,10 +3448,15 @@ function showLogTab(tab){
   const commitish = tab === "commits" || tab === "timeline";
   if(commitish && tab !== LOGTAB){
     LOGTAB = tab; renderLog();
-    // The two views page differently (the timeline also counts messages), so fetch this view's
-    // page at the same place; the server moves the offset back to the start of its page.
+    // The two views page differently (the timeline counts messages as rows too), so fetch this
+    // view's page at the same place: the page holding the first commit the reader was looking at.
+    const firstShown = Array.isArray(LOGPAGE.items)
+      ? (LOGPAGE.entries || []).reduce((low, e) => Math.min(low, e.index ?? Infinity), Infinity)
+      : (LOGPAGE.offset || 0);
+    const at = Number.isFinite(firstShown) ? firstShown : 0;
     showLoading(true);
-    loadLog(LOGPAGE.offset||0).then(ok => { if(ok && LOGTAB === tab) renderLog(); }).finally(() => showLoading(false));
+    const fetched = tab === "timeline" ? loadLog(0, at) : loadLog(Math.floor(at / PAGE_SIZE) * PAGE_SIZE);
+    fetched.then(ok => { if(ok && LOGTAB === tab) renderLog(); }).finally(() => showLoading(false));
   }
   if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
   if(pc) pc.hidden = !commitish;
