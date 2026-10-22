@@ -982,8 +982,14 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
     keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
         commit_time = stat.timestamp or 0
-        keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
-        for seq, at in enumerate(_prompt_times(stat), start=1):
+        times = _prompt_times(stat)
+        # A pending turn (recorded, not yet in a commit) is not a commit yet, so it gets no row
+        # of its own: its messages are tagged "pending commit" instead. One that holds no message
+        # (woken by a background event, nothing typed) has nothing for the timeline to show; the
+        # commit list still lists it, and it folds into the next commit like the rest.
+        if not stat.pending:
+            keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
+        for seq, at in enumerate(times, start=1):
             when = at or commit_time
             keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
     keyed.sort(key=lambda pair: pair[0])
@@ -1637,6 +1643,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
 .entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
+.tprompt .tpending{margin-left:auto;white-space:nowrap;font-size:11px;color:var(--amber);border:1px dashed var(--amber-dim);border-radius:3px;padding:0 5px}
 .entry .badge.tracked{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.08)}
 .entry .badge.anomaly{color:var(--red);border-color:var(--red)}
 .entry.pending{opacity:.82}
@@ -2724,7 +2731,10 @@ function timelineHtml(entries, commitRow){
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
       : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
-    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
+    // A pending turn has no commit to open yet: it folds into the next one.
+    const target = c.pending
+      ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
+      : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;

@@ -877,6 +877,41 @@ def test_naming_the_checked_out_branch_still_shows_the_pending_turns(tmp_path):
     assert named["total"] == unnamed["total"]
 
 
+def test_the_timeline_shows_a_pending_turn_as_its_messages_alone(tmp_path):
+    # A pending turn is not a commit yet, so the timeline gives it no commit row: only its
+    # messages, which the page tags "pending commit". A committed turn keeps its row.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _init_repo(tmp_path)
+    head = repo.rev_parse("HEAD")
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=_agent_body("A pending ask", 70))
+    # And one woken by a background event: no message, so nothing for the timeline to show.
+    silent = build_agent_commit_message(
+        latest_prompt="",
+        trace=[{"role": "agent", "content": "did more"}],
+        backend="claude",
+        backend_session_id="bs",
+        agitrack_session_id="sid",
+        model="opus",
+        token_usage={"output": 3, "input": 1},
+        session_name="s",
+    )
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[record], message=silent)
+    repo.update_ref("refs/agitrack/manual/sid", record)
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    commits = json.loads(RepoScope(repo).get("/log", {}).body)
+    assert sum(1 for e in commits["entries"] if e.get("pending")) == 2  # both still in the commit list
+
+    pending = [k for k, e in enumerate(page["entries"]) if e.get("pending")]
+    assert len(pending) == 1  # the silent one is not in the timeline at all
+    rows = [seq for i, seq in page["items"] if i == pending[0]]
+    assert rows == [1]  # the message, and no commit row
+    assert any(seq == 0 for i, seq in page["items"] if i != pending[0])  # the real commit keeps its row
+    assert page["total"] == len(page["items"])
+
+
 # --- config toggle ----------------------------------------------------------
 
 
