@@ -1348,7 +1348,8 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     data = _embedded_data(html)
     assert "commits" not in data  # the full per-commit list is never embedded
     assert data["agg"]["total"] == 7
-    assert data["log"]["total"] == 7
+    # The first page is the timeline's, whose total counts rows: 7 commits and their 2 messages.
+    assert data["log"]["commits"] == 7 and data["log"]["total"] == 9
     assert data["log"]["offset"] == 0
     assert len(data["log"]["entries"]) == 7  # one small repo fits on the first page
     entry = data["log"]["entries"][-1]
@@ -2295,7 +2296,7 @@ def test_the_file_filter_is_hidden_outside_the_files_view():
     screen until the page grew a [hidden] rule of its own."""
     html = _rendered_dashboard()
 
-    assert '<div class="panehead" id="head-files" hidden>' in html
+    assert '<div class="panehead logpart" id="head-files" hidden>' in html
     assert 'if(hf) hf.hidden = tab !== "files";' in html  # ...and follows the tab
     assert "[hidden]{display:none !important}" in html  # ...and hiding actually hides
 
@@ -2703,10 +2704,112 @@ def test_the_page_answers_clicks_before_its_first_fetch_returns():
     wire = html.index("function wireControls(){")
     init = html.index("async function init(){")
     body = html[init : html.index("\n}\n", init)]
-    assert body.index("wireControls();") < body.index("await loadAgg()")
+    assert body.index("wireControls();") < body.index("loadAgg()")
     controls = html[wire:init]
     assert '$("commitlog").addEventListener("click"' in controls
     assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
+
+
+def _boot_the_page(tmp_path, *, answers: dict, then: str = "") -> dict:
+    """Boot the real dashboard script in shell mode (nothing embedded, as the server serves it),
+    with each request's answer chosen by its path: a dict is the JSON body, None never answers.
+    Returns the body's classes and the commit log's HTML once the answers have settled.
+
+    ``then`` is code run inside the page script's own scope after it, so a test can call the
+    page's functions; whatever it assigns to ``globalThis.out`` is returned as ``out``."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from agitrack.metrics.web import shell_html
+    from tests.test_story import _DOM_STUB
+
+    page = shell_html(_demo_repo(tmp_path / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = tmp_path / "boot.js"
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\nconst ANSWERS = "
+        + json.dumps(answers)
+        + ";\nconst THEN = "
+        + json.dumps(then)
+        + ";\n"
+        + stub
+        + """
+const els = {};
+const base = document.getElementById;
+document.getElementById = id => id === "agitrack-data" ? base(id) : (els[id] = els[id] || stubEl());
+const classes = new Set();
+document.body.classList = {add: c => classes.add(c), remove: c => classes.delete(c),
+                           toggle: noop, contains: c => classes.has(c)};
+global.localStorage = {getItem: () => null, setItem: noop};
+global.fetch = url => {
+  const path = String(url).split("?")[0];
+  const body = ANSWERS[path];
+  if (body === undefined || body === null) return new Promise(() => {});
+  return Promise.resolve({ok: true, json: async () => body});
+};
+new Function(SOURCE + "\\n;" + THEN)();
+setImmediate(() => setImmediate(() => {
+  console.log(JSON.stringify({classes: [...classes], log: els.commitlog ? els.commitlog.innerHTML : "",
+                              out: globalThis.out === undefined ? null : globalThis.out}));
+}));
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_the_log_is_drawn_without_waiting_for_the_panels(tmp_path):
+    # Reported on a real repository: after a refresh the log stayed blank for about five
+    # seconds. The page fetched /data, waited for it, and only then fetched the log, drawing
+    # nothing until both were in. The log needs 0.4 s there and /data took 5 s (the pending-work
+    # probe runs the OpenCode CLI, the insights read the whole file history), none of which
+    # the log depends on. With /data never answering at all, the log must still be on screen,
+    # with the panels' placeholder standing in above it.
+    from agitrack.metrics.web import log_page
+
+    log = log_page(build_dashboard(_demo_repo(tmp_path / "data")), view="timeline")
+    shown = _boot_the_page(tmp_path, answers={"log": log, "data": None})
+
+    assert "add the feature" in shown["log"]
+    assert "aggloading" in shown["classes"] and "booting" not in shown["classes"]
+
+
+def test_the_file_browser_draws_a_folder_only_when_it_is_opened(tmp_path):
+    # Reported as the dashboard staying blank for a while after a refresh. On a repository of
+    # 148,896 files the file browser built every file into the page behind its collapsed folders:
+    # a 61 MB string, 1.1 million elements and a four-second freeze after every load. Only the
+    # top level may be drawn; a folder fills in when opened, and a folder's files come in pages.
+    files = [
+        {"path": f"data/part{i:05d}.json", "changes": 1, "ins": 1, "del": 0, "last_ts": i} for i in range(1000)
+    ] + [{"path": "README.md", "changes": 2, "ins": 3, "del": 1, "last_ts": 5}]
+    shown = _boot_the_page(
+        tmp_path,
+        answers={"log": None, "data": None},
+        then="""
+FILES = %s;
+renderFiles();
+const top = $("filebrowse").innerHTML;
+const det = {open: true, dataset: {node: "0"}, querySelector: () => kids};
+const kids = {childElementCount: 0, innerHTML: ""};
+openTreeDir(det);
+globalThis.out = {top, opened: kids.innerHTML};
+"""
+        % json.dumps(files),
+    )
+
+    top, opened = shown["out"]["top"], shown["out"]["opened"]
+    assert "README.md" in top and "data/" in top and "1,000 files" in top
+    assert "part" not in top  # nothing inside the closed folder is in the page
+    assert opened.count('class="frow"') == 300  # one page of the folder's files
+    assert "show 300 more of 700" in opened
 
 
 def test_the_log_search_can_look_in_the_users_words_the_agents_words_or_the_whole_trace(tmp_path):
@@ -3070,21 +3173,19 @@ def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tm
     assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
 
 
-def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp_path, monkeypatch):
-    # A timeline page ends at `limit` commits or at TIMELINE_PAGE_ITEMS items (commits plus
-    # their messages), whichever comes first, and a commit is never split from its messages.
-    # Pages differ in size, so the payload names every page's start; an offset inside a page is
-    # moved back to its start. A rewritten commit has a new id, so the cached message counts
-    # can never answer for it: the same live scope re-pages after the rewrite by itself.
-    # Checked at full size on a 70-commit dummy repository rewritten by `git filter-branch` and by
-    # `agitrack redact`, and in Chrome on an open page that picked the rewrite up on its refresh.
+def test_the_timeline_pages_by_rows_and_follows_a_rewrite(tmp_path):
+    # A timeline page holds exactly `limit` rows, a commit and each message counting as one row
+    # whichever it is, and a commit's messages run on to the next page when they do not fit.
+    # Reported on a real repository: pages ended at a COMMIT boundary, so a first page whose second
+    # commit carried many messages showed only a handful of rows. The payload lists the page's rows
+    # in order (`items`) and every commit they belong to (`entries`, each saying where its own row
+    # is); `total` counts rows. A rewritten commit has a new id, so the cached message times can
+    # never answer for it: the same live scope re-pages after the rewrite by itself.
     import json as _json
     import subprocess
 
-    from agitrack.metrics import web
     from agitrack.metrics.server import RepoScope
 
-    monkeypatch.setattr(web, "TIMELINE_PAGE_ITEMS", 5)
     repo = GitRepo.init(tmp_path)
     for i, asked in enumerate([0, 3, 1, 0, 0, 0, 6, 1]):  # oldest first
         _write_lines(repo, "x.txt", i + 1)
@@ -3097,30 +3198,42 @@ def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp
     def log(**query):
         return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
 
-    first = log(view="timeline", limit=3)
-    # Newest first, items per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
-    # GitRepo.init makes (1). A commit that would take a page past 5 items, or past 3 commits,
-    # starts the next one: c6 alone exceeds 5, c5..c3 fill 3 commits, c1+c0 fill exactly 5.
-    assert first["page_starts"] == [0, 1, 2, 5, 6, 8]
-    assert [e["subject"] for e in first["entries"]] == ["<aGiTrack> c7"]
-    assert [e["subject"] for e in log(view="timeline", limit=3, offset=3)["entries"]] == [
-        "<aGiTrack> c5",
-        "<aGiTrack> c4",
-        "<aGiTrack> c3",
-    ]  # moved back to its page's start
-    assert log(view="timeline", limit=3, offset=3)["offset"] == 2
-    assert "page_starts" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+    def rows(page):
+        out = []
+        for i, seq in page["items"]:
+            entry = page["entries"][i]
+            out.append(
+                entry["subject"].removeprefix("<aGiTrack> ") if seq == 0 else entry["turns"][0]["prompts"][seq - 1]
+            )
+        return out
 
-    # Rewrite the newest commit so it carries four messages (five items, a full page on its own).
+    # Nine commits (the eight above and the seed GitRepo.init makes) and eleven messages, newest
+    # first, each commit followed by its own messages newest first.
+    first = log(view="timeline", limit=5)
+    assert first["total"] == 20 and first["commits"] == 9
+    assert rows(first) == ["c7", "C7-0", "c6", "C6-5", "C6-4"]
+    second = log(view="timeline", limit=5, offset=7)  # an offset inside a page opens that page
+    assert second["offset"] == 5
+    assert rows(second) == ["C6-3", "C6-2", "C6-1", "C6-0", "c5"]
+    # c6's row is on the first page and only its messages are here; it says where its row is.
+    c6 = next(e for e in second["entries"] if e["subject"] == "<aGiTrack> c6")
+    assert c6["row"] == 2 and c6["index"] == 1
+    # The page holding a commit's own row, as switching from the commit list asks for it.
+    assert rows(log(view="timeline", limit=5, at=5)) == ["c4", "c3", "c2", "C2-0", "c1"]
+    last = log(view="timeline", limit=5, offset=15)
+    assert len(last["items"]) == 5 and rows(last) == ["C1-2", "C1-1", "C1-0", "c0", last["entries"][-1]["subject"]]
+    assert "items" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
+
+    # Rewrite the newest commit so it carries four messages: the first page is that commit alone.
     message = subprocess.run(
         ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True
     ).stdout.replace("## Agent", "## User\n\nmore\n\n## User\n\nmore\n\n## User\n\nmore\n\n## Agent")
     subprocess.run(
         ["git", "-C", str(repo.repo), "commit", "-q", "--amend", "--cleanup=whitespace", "-m", message], check=True
     )
-    rewritten = log(view="timeline", limit=3)
-    assert rewritten["page_starts"] == [0, 1, 2, 5, 6, 8]
-    assert sum(len(t["prompts"]) for t in rewritten["entries"][0]["turns"]) == 4
+    rewritten = log(view="timeline", limit=5)
+    assert rewritten["total"] == 23
+    assert rows(rewritten) == ["c7", "more", "more", "more", "C7-0"]
     assert (
         rewritten["entries"][0]["sha"]
         == subprocess.run(

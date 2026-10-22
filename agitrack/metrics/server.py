@@ -124,6 +124,8 @@ class RepoScope:
         # reconstruction when there is one, for an exact count instead of the cheap estimate.
         self._pending_source = pending_source
         self._pending_cache: tuple[float, dict] | None = None
+        self._pending_lock = threading.Lock()
+        self._pending_thread: threading.Thread | None = None
         # Lowercased author email → GitHub login, supplementing `gh` for commits not yet pushed.
         self.email_logins: dict[str, str] = {k.lower(): v for k, v in (email_logins or {}).items()}
         # The file browser, keyed by (ref, head sha): building it scans `git log --numstat`, so it
@@ -228,6 +230,7 @@ class RepoScope:
                         text=_str(query, "q"),
                         text_in=_str(query, "qin") or "subject",
                         view=_str(query, "view") or "commits",
+                        at_commit=_int(query, "at", -1) if _int(query, "at", -1) >= 0 else None,
                     )
                 )
         if path == "/diff":
@@ -329,24 +332,44 @@ class RepoScope:
             )
         return None if payload is None else json_response(payload)
 
-    # How long a pending-work answer is reused. The probe is a directory listing plus one
-    # `git log`, which is cheap but not free, and this rides on every dashboard poll; the answer
-    # only changes when someone commits or the agent runs, so a minute is imperceptible.
+    # How long a pending-work answer is reused. The answer only changes when someone commits or
+    # the agent runs, so a minute is imperceptible.
     _PENDING_TTL_SECONDS = 60.0
 
     def _pending(self) -> dict:
-        """Agent work the backtrace can see and the tracked history cannot (see metrics.pending)."""
+        """Agent work the backtrace can see and the tracked history cannot (see metrics.pending).
+
+        Answered from the last result and refreshed on a BACKGROUND thread, never inside the
+        request. The probe is not the "directory listing plus one `git log`" it looks like: it
+        asks every installed backend's store, and for OpenCode that is a CLI call (measured at
+        2.65 s on a real repository). Inside `/data` that held the panels, and with them the log,
+        behind a notice. A refresh that found the minute expired paid it again: the page sat on
+        its loading screen for five seconds. The notice now appears on the poll after the answer
+        lands, and until the first one there is nothing to say, which the page shows as no notice."""
+        import time as _time
+
+        now = _time.monotonic()
+        cached = self._pending_cache
+        if cached is not None and now - cached[0] < self._PENDING_TTL_SECONDS:
+            return cached[1]
+        with self._pending_lock:
+            if self._pending_thread is None or not self._pending_thread.is_alive():
+                self._pending_thread = threading.Thread(
+                    target=self._refresh_pending, daemon=True, name="agit-pending-estimate"
+                )
+                self._pending_thread.start()
+        return cached[1] if cached is not None else {}
+
+    def _refresh_pending(self) -> None:
         import time as _time
 
         from agitrack.metrics.pending import notice_text, pending_work
 
-        now = _time.monotonic()
-        if self._pending_cache is not None and now - self._pending_cache[0] < self._PENDING_TTL_SECONDS:
-            return self._pending_cache[1]
-        work = self._pending_source() if self._pending_source is not None else pending_work(self.repo.repo)
-        payload = {**work.to_dict(), "notice": notice_text(work)}
-        self._pending_cache = (now, payload)
-        return payload
+        try:
+            work = self._pending_source() if self._pending_source is not None else pending_work(self.repo.repo)
+            self._pending_cache = (_time.monotonic(), {**work.to_dict(), "notice": notice_text(work)})
+        except Exception:
+            pass  # a decoration on the page: a failed probe leaves the previous answer standing
 
     def _empty_state(self, dash: Dashboard) -> dict:
         """What to say when this dashboard has no agent work in it (see metrics.pending)."""
@@ -386,7 +409,15 @@ class RepoScope:
         # list the selector is built from — including remote-tracking branches, which is how a
         # branch the user has fetched but not checked out becomes viewable — so the selector can
         # never offer something this refuses.
-        return branch if branch and branch in viewable_branches(self.repo) else "HEAD"
+        #
+        # The checked-out branch named BY NAME is HEAD, and must be served as HEAD: the pending
+        # turns (recorded, not yet committed) are added only to the HEAD view, and the page names
+        # the branch on every request once /data has told it which one it is on. Served as a
+        # plain branch, the first page showed the pending turns and every later page dropped
+        # them (seen on a real repository: 544 timeline rows, then 533).
+        if not branch or branch not in viewable_branches(self.repo):
+            return "HEAD"
+        return "HEAD" if branch == self.repo.current_branch() else branch
 
     def _dashboard(self, ref: str = "HEAD") -> Dashboard:
         # cached_logins never blocks: it returns the cached GitHub identities (or {} when cold)

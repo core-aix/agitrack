@@ -517,10 +517,11 @@ class CommitEngine:
                     self.state.append_trace(role, turn.user_prompt, at=at)
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
-                for followup in turn.queued_followups:
+                for followup, sent in _followups_with_times(turn):
                     if followup.strip():
                         # Its own heading, but NOT a new turn — see append_trace(starts_turn).
-                        self.state.append_trace("user", followup, starts_turn=False, at=at)
+                        # It carries when it was SENT, which the commit records per message.
+                        self.state.append_trace("user", followup, starts_turn=False, at=sent or at)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message, at=at)
                 self._add_turn_usage(turn)
@@ -570,11 +571,11 @@ class CommitEngine:
                         entries.append(("user", turn.user_prompt, True, at))
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
-                for followup in turn.queued_followups:
+                for followup, sent in _followups_with_times(turn):
                     if not followup.strip():
                         continue
                     subject_prompts.append(followup)
-                    entries.append(("user", followup, False, at))
+                    entries.append(("user", followup, False, sent or at))
                 for message in self._agent_messages_for(turn):
                     entries.append(("agent", message, True, at))
 
@@ -1523,3 +1524,11 @@ class CommitEngine:
         complete = [t for t in session.turns if t.assistant_message_id]
         self.state.last_backend_message_id = complete[-1].assistant_message_id if complete else None
         self.state.clear_trace()
+
+
+def _followups_with_times(turn) -> list[tuple[str, int | None]]:
+    """Each of a turn's queued follow-ups with when it was sent (None when the transcript gave no
+    time, or the turn predates the field)."""
+    followups = list(getattr(turn, "queued_followups", None) or [])
+    times = list(getattr(turn, "queued_followup_times", None) or [])
+    return [(text, times[k] if k < len(times) else None) for k, text in enumerate(followups)]

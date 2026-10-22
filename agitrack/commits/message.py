@@ -632,6 +632,7 @@ def _trace_and_metadata_lines(
         lines.append(f"agent_started_at: {_iso_utc(started_at)}")
     if ended_at is not None:
         lines.append(f"agent_ended_at: {_iso_utc(ended_at)}")
+    lines.extend(_user_message_time_lines(kept, started_at, repo_root))
     lines.extend(_token_metadata_lines(token_usage))
     lines.extend(_session_event_metadata_lines(compactions=compactions, origin_event=origin_event))
     if summary_metadata:
@@ -1253,6 +1254,28 @@ def _append_positive(lines: list[str], key: str, value: object) -> None:
 def _int_value(token_usage: dict[str, int | None], key: str) -> int:
     value = token_usage.get(key)
     return value if isinstance(value, int) else 0
+
+
+def _user_message_time_lines(kept: list[dict], started_at: int | None, repo_root: str | Path | None) -> list[str]:
+    """``user_message_times:`` — when each ``## User`` message of the trace was sent, in the order
+    they are written (``-`` for one with no time), so a reader can place each message rather than
+    every one at the turn's start. A message the user queued while the agent was working is sent
+    minutes after its turn began, and a commit holding several turns has one ``agent_started_at``
+    for all of them: the dashboard's timeline showed messages sent minutes apart under one time
+    (seen live). Counted exactly as the trace renders them (an empty entry writes no heading), and
+    omitted when it would say nothing ``agent_started_at`` does not, so an ordinary one-message
+    commit is unchanged."""
+    times: list[float | None] = []
+    for item in kept:
+        if str(item.get("role", "")).strip().lower() != "user" or not _trace_role_lines(item, repo_root):
+            continue
+        times.append(_entry_time(item))
+    if not any(t is not None for t in times):
+        return []
+    whole = {int(t) for t in times if t is not None}
+    if started_at is not None and whole == {int(started_at)} and None not in times:
+        return []
+    return ["user_message_times: " + ", ".join(_iso_utc(int(t)) if t is not None else "-" for t in times)]
 
 
 def _iso_utc(epoch_seconds: int) -> str:

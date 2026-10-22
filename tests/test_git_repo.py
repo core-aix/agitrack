@@ -748,3 +748,41 @@ def test_the_status_check_answers_what_the_snapshot_comparison_did(tmp_path, arr
 
     expected = repo.snapshot_worktree_tree() != repo.comparable_tree("HEAD")
     assert repo.worktree_differs_from_head() is expected
+
+
+def test_the_uncommitted_check_adds_paths_without_matching_them_as_pathspecs(tmp_path, monkeypatch):
+    # The candidates are handed to `git update-index --stdin` in one call, never to `git add`
+    # as pathspecs: `add -- <paths>` matches every pathspec against every index entry, and a
+    # commit of tens of thousands of new files made the tracker's commit-time flush run for
+    # minutes (it could not restart on an update meanwhile). Counted, not timed.
+    repo = _init_repo(tmp_path)
+    for i in range(40):
+        (tmp_path / f"n{i}.txt").write_text(f"{i}\n")
+    seen: list[list[str]] = []
+    real_run = repo._run
+
+    def spy(command, **kwargs):
+        seen.append(command)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(repo, "_run", spy)
+    assert len(repo.uncommitted_paths()) == 40
+    assert sum(1 for c in seen if c[1:2] == ["update-index"]) == 1
+    assert not any(c[1:2] == ["add"] for c in seen)
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), reason="needs POSIX permissions")
+def test_an_unreadable_new_file_still_gets_the_answer_the_snapshot_gives(tmp_path):
+    # `update-index` stops at a path it cannot read where `add --ignore-errors` carries on, so the
+    # check falls back to the add then: the answer must still be the snapshot comparison's.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "ok.txt").write_text("ok\n")
+    locked = tmp_path / "locked.txt"
+    locked.write_text("secret\n")
+    locked.chmod(0)
+    try:
+        expected = repo.snapshot_worktree_tree() != repo.comparable_tree("HEAD")
+        assert repo.worktree_differs_from_head() is expected
+        assert "ok.txt" in repo.uncommitted_paths()
+    finally:
+        locked.chmod(0o644)

@@ -985,3 +985,16 @@ def test_configured_model_reads_only_the_top_level_default(tmp_path, monkeypatch
     assert codex_transcripts.configured_model() == "gpt-6-astra"
     (tmp_path / "config.toml").write_text('[profiles.fast]\nmodel = "x"\n', encoding="utf-8")
     assert codex_transcripts.configured_model() is None
+
+
+def test_a_queued_followup_keeps_when_it_was_sent(codex_home):
+    rows = [
+        _meta(),
+        _row("event_msg", {"type": "task_started", "turn_id": "t1"}, stamp="2026-10-22T16:14:34Z"),
+        _row("event_msg", {"type": "user_message", "message": "first ask"}, stamp="2026-10-22T16:14:34Z"),
+        _row("event_msg", {"type": "user_message", "message": "also do this"}, stamp="2026-10-22T16:16:02Z"),
+        _row("event_msg", {"type": "task_complete", "turn_id": "t1", "last_agent_message": "both done"}),
+    ]
+    turn = codex.export_session_at(_write(codex_home, rows)).turns[0]
+    assert turn.queued_followups == ["also do this"]
+    assert turn.queued_followup_times == [1792685762]

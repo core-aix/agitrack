@@ -300,12 +300,33 @@ class GitRepo:
         if not candidates:
             return []
         with tempfile.TemporaryDirectory() as tmp:
-            env = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
-            self._run(["git", "read-tree", "HEAD"], env=env, check=False)
-            # In chunks, so a long list never exceeds the command line.
-            for start in range(0, len(candidates), 500):
-                chunk = candidates[start : start + 500]
-                self._run(["git", "add", "-A", "--ignore-errors", "--", *chunk], env=env, check=False)
+            index = os.path.join(tmp, "index")
+            env = {"GIT_INDEX_FILE": index}
+            # Seeded with the real index's stat cache, so an unchanged file is not hashed again.
+            self._seed_index_from_head(index, env)
+            # The candidates are PATHS, so they go in as paths (`update-index --stdin`), not as
+            # pathspecs: `add -- <paths>` matches every pathspec against every index entry, which
+            # is quadratic. A commit adding 20,000 files took 10 s here, and on a real repository
+            # with tens of thousands more the tracker's commit-time flush ran for many minutes,
+            # during which it could not get round to restarting on an update (seen live: the
+            # dashboard said it would pick the update up "shortly" for as long as the flush ran).
+            # `update-index` stops at a path it cannot add where `add --ignore-errors` carries on,
+            # so when it reports any error the old add answers instead.
+            paths = "\0".join(candidates)
+            listed = self._run(
+                ["git", "update-index", "--add", "--remove", "-z", "--stdin"],
+                input_text=paths,
+                env=env,
+                check=False,
+            )
+            if listed.returncode != 0:
+                self._seed_index_from_head(index, env)
+                self._run(
+                    ["git", "add", "-A", "--ignore-errors", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                    input_text=paths,
+                    env={**env, "GIT_LITERAL_PATHSPECS": "1"},
+                    check=False,
+                )
             output = self._run(
                 ["git", "diff-index", "--cached", "--name-only", "-z", "--no-renames", "HEAD"], env=env, check=False
             ).stdout

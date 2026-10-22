@@ -1265,6 +1265,7 @@ class BacktraceScope:
                     text=_str(query, "q"),
                     text_in=_str(query, "qin") or "subject",
                     view=_str(query, "view") or "commits",
+                    at_commit=_int(query, "at", -1) if _int(query, "at", -1) >= 0 else None,
                 )
             )
         if path == "/diff":

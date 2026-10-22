@@ -3336,3 +3336,25 @@ def test_the_driven_backend_is_asked_about_every_few_seconds_not_every_poll(tmp_
     (tmp_path / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
     runner._service_flush_requests()  # a commit asks at once
     assert len(asked) == 2
+
+
+def test_stopping_a_watch_never_waits_on_an_observer_that_will_not_stop(monkeypatch):
+    # watchdog's own stop() waits for its emitter threads with no timeout, and a macOS FSEvents
+    # emitter that never finished held a tracker's teardown until pytest-timeout killed the test
+    # at 300 s: in use, an `agitrack -b stop` that never returns. The stop is now bounded.
+    import threading
+
+    from agitrack.proxy import watch
+
+    monkeypatch.setattr(watch, "_STOP_WAIT_SECONDS", 0.1)
+    never = threading.Event()
+
+    class _Stuck:
+        def stop(self):
+            never.wait()  # what the FSEvents emitter did
+
+        def join(self, timeout=None):
+            pass
+
+    watch.stop_watching(_Stuck())  # returns: a hang here fails the test by its deadline
+    never.set()

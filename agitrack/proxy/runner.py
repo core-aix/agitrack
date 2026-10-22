@@ -6395,8 +6395,9 @@ class ProxyRunner(BranchWatchMixin, ManualCommitsMixin, SessionSharingMixin, Upd
         observer = self.file_observer
         if observer is None:
             return
-        observer.stop()
-        observer.join(timeout=2.0)
+        from agitrack.proxy import watch
+
+        watch.stop_watching(observer)  # bounded: watchdog's own stop() can wait forever
         self.file_observer = None
 
     def _start_git_worker(self) -> None:

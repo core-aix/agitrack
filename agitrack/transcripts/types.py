@@ -74,6 +74,11 @@ class SessionTurn:
     # already said something, so the trace renders each as its OWN ``## User`` heading (rather than
     # merged into ``user_prompt``). Empty for a plain single-prompt turn.
     queued_followups: list[str] = field(default_factory=list)
+    # When each of ``queued_followups`` was sent (epoch seconds, None where the transcript gives no
+    # time), index for index. A queued message is sent while the turn RUNS, so the turn's own
+    # start is the wrong time for it: the dashboard's timeline showed three messages sent minutes
+    # apart under one time (seen live).
+    queued_followup_times: list[int | None] = field(default_factory=list)
     # The capabilities BEYOND the backend's built-in toolset that this turn actually used —
     # MCP server tools, skills, and sub-agent types. A repo can hand the agent extra tools via
     # MCP servers or plugins, and those shape the change as much as the model does, so the commit

@@ -851,6 +851,167 @@ def test_collect_manual_pending_surfaces_turns(tmp_path):
     assert any(s.pending for s in dash.stats)  # surfaced in the dashboard timeline
 
 
+def test_naming_the_checked_out_branch_still_shows_the_pending_turns(tmp_path):
+    # The dashboard names the current branch on every request once /data has said which one it
+    # is on. Pending turns are added to the HEAD view only, so a branch named by name dropped
+    # them: the first log page showed them and every later page did not (seen on a real
+    # repository, 544 timeline rows on page 1 and 533 after it).
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _init_repo(tmp_path)
+    head = repo.rev_parse("HEAD")
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=_agent_body("A", 70))
+    repo.update_ref("refs/agitrack/manual/sid", record)
+    scope = RepoScope(repo)
+
+    def log(**query):
+        return json.loads(scope.get("/log", {k: [v] for k, v in query.items()}).body)
+
+    branch = repo.current_branch()
+    assert branch
+    unnamed, named = log(view="timeline"), log(view="timeline", branch=branch)
+    assert any(e.get("pending") for e in unnamed["entries"])
+    assert any(e.get("pending") for e in named["entries"])
+    assert named["total"] == unnamed["total"]
+
+
+def test_the_timeline_shows_a_pending_turn_as_its_messages_alone(tmp_path):
+    # A pending turn is not a commit yet, so the timeline gives it no commit row: only its
+    # messages, which the page tags "pending commit". A committed turn keeps its row.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    repo = _init_repo(tmp_path)
+    head = repo.rev_parse("HEAD")
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=_agent_body("A pending ask", 70))
+    # And one woken by a background event: no message, so nothing for the timeline to show.
+    silent = build_agent_commit_message(
+        latest_prompt="",
+        trace=[{"role": "agent", "content": "did more"}],
+        backend="claude",
+        backend_session_id="bs",
+        agitrack_session_id="sid",
+        model="opus",
+        token_usage={"output": 3, "input": 1},
+        session_name="s",
+    )
+    record = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[record], message=silent)
+    repo.update_ref("refs/agitrack/manual/sid", record)
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    commits = json.loads(RepoScope(repo).get("/log", {}).body)
+    assert sum(1 for e in commits["entries"] if e.get("pending")) == 2  # both still in the commit list
+
+    pending = [k for k, e in enumerate(page["entries"]) if e.get("pending")]
+    assert len(pending) == 1  # the silent one is not in the timeline at all
+    rows = [seq for i, seq in page["items"] if i == pending[0]]
+    assert rows == [1]  # the message, and no commit row
+    assert any(seq == 0 for i, seq in page["items"] if i != pending[0])  # the real commit keeps its row
+    assert page["total"] == len(page["items"])
+
+
+def test_the_rest_of_a_turn_a_commit_captured_does_not_repeat_its_message_in_the_timeline(tmp_path):
+    # A commit made while a turn runs carries the turn as it stood; the rest of the turn is then
+    # recorded as its own record, carrying the same prompt. The timeline showed that message
+    # twice, once in the commit and once tagged "pending commit" (seen live). It is shown once,
+    # from the commit; the continuation then holds no message and leaves the timeline.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    def turn_body(reply: str, ended: int) -> str:
+        return build_agent_commit_message(
+            latest_prompt="Update the dataset description first",
+            trace=[
+                {"role": "user", "content": "Update the dataset description first"},
+                {"role": "agent", "content": reply},
+            ],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 10, "input": 5},
+            session_name="s",
+            started_at=1_792_685_007,
+            ended_at=ended,
+        )
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nA\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "My commit\n\n" + turn_body("working on it", 1_792_685_099))
+    head = repo.rev_parse("HEAD")
+    rest = repo.commit_tree(repo.comparable_tree("HEAD"), parents=[head], message=turn_body("done", 1_792_685_120))
+    repo.update_ref("refs/agitrack/manual/sid", rest)
+
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    messages = [
+        (page["entries"][i].get("pending"), page["entries"][i]["turns"][-1]["prompts"][seq - 1])
+        for i, seq in page["items"]
+        if seq
+    ]
+    assert messages == [(False, "Update the dataset description first")]
+    assert not any(e.get("pending") for e in page["entries"])
+    commits = json.loads(RepoScope(repo).get("/log", {}).body)
+    assert any(e.get("pending") for e in commits["entries"])  # the record itself is still there
+
+
+def test_the_timeline_places_each_message_when_it_was_sent_and_ignores_rewrapping(tmp_path):
+    # Two things seen live in one place: messages queued while the agent worked all showed the
+    # turn's start time, and a message shown both in a commit and in the pending record of the
+    # same turn because git stripped the space before each line break in the commit only.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    prompts = ["Run everything on the workstation", "Make sure it continues there and does not \nrerun"]
+
+    def turn_body(texts: list[str], ended: int) -> str:
+        trace = [{"role": "user", "content": texts[0], "at": 1_792_685_674}]
+        trace += [{"role": "user", "content": t, "at": 1_792_685_762, "starts_turn": False} for t in texts[1:]]
+        return build_agent_commit_message(
+            latest_prompt=texts[0],
+            trace=[*trace, {"role": "agent", "content": "on it"}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 10, "input": 5},
+            session_name="s",
+            started_at=1_792_685_674,
+            ended_at=ended,
+        )
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nA\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    # Committed through git, which strips the trailing space of each line.
+    _git(repo, "commit", "-q", "-m", "My commit\n\n" + turn_body(prompts, 1_792_685_700))
+    head = repo.rev_parse("HEAD")
+    rest = repo.commit_tree(
+        repo.comparable_tree("HEAD"),
+        parents=[head],
+        message=turn_body([*prompts, "How do the results look?"], 1_792_685_990),
+    )
+    repo.update_ref("refs/agitrack/manual/sid", rest)
+
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    shown = []
+    for i, seq in page["items"]:
+        if not seq:
+            continue
+        entry = page["entries"][i]
+        turn = entry["turns"][-1]
+        shown.append((entry.get("pending"), " ".join(turn["prompts"][seq - 1].split())[:20], turn["times"][seq - 1]))
+    assert sorted(shown, key=lambda r: r[1]) == [
+        (True, "How do the results l", 1_792_685_762.0),
+        (False, "Make sure it continu", 1_792_685_762.0),
+        (False, "Run everything on th", 1_792_685_674.0),
+    ]
+
+
 # --- config toggle ----------------------------------------------------------
 
 

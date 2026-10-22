@@ -24,7 +24,6 @@ and ad-hoc use; the live page does not embed it.
 
 from __future__ import annotations
 
-import bisect
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -428,12 +427,10 @@ def _effective(stat: CommitStat, covers: dict[str, CommitStat]) -> tuple[str | N
 # commit's full message / trace / squash constituents).
 # ---------------------------------------------------------------------------
 
+# Entries per page of the commit log, and per page of the timeline, where a commit and each
+# message the user sent count as one entry each. The timeline used to end a page at 50 COMMITS
+# (or 250 entries), so one page could hold hundreds of messages and was slow to load and draw.
 PAGE_SIZE = 50
-# The timeline shows each commit's messages beside it, so a page of 50 commits can hold hundreds
-# of items. A timeline page therefore also ends once it holds this many items, commits and
-# messages together (a commit is never split from its messages, so one commit with more
-# messages than this is a page of its own).
-TIMELINE_PAGE_ITEMS = 250
 _KINDS = ("agent", "covered", "agent-merge", "user", "agitrack-ops", "untracked")
 
 
@@ -862,16 +859,30 @@ def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
         found = _trace_user_sections(stat.message)
         if not found:
             return []
-        return [
-            {
-                "at": _iso_epoch(stat.started_at),
-                "prompts": [text for _, text in found],
-                "path": list(path),
-                "sections": [ordinal for ordinal, _ in found],
-            }
-        ]
+        at = _iso_epoch(stat.started_at)
+        turn: dict = {
+            "at": at,
+            "prompts": [text for _, text in found],
+            "path": list(path),
+            "sections": [ordinal for ordinal, _ in found],
+        }
+        sent = _user_message_times(stat)
+        if any(sent):
+            # When each message was SENT, where the commit records it (`user_message_times`, one
+            # per `## User` heading), else the turn's start. A message queued while the agent
+            # worked was sent minutes after the turn began.
+            turn["times"] = [(sent[k] if k < len(sent) else None) or at for k, _ in found]
+        return [turn]
     last = len(parts) - 1
     return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j))]
+
+
+def _user_message_times(stat: CommitStat) -> list[float | None]:
+    """The record's ``user_message_times``, one per ``## User`` heading (None for a ``-``)."""
+    raw = (stat.metadata or {}).get("user_message_times") or ""
+    if not raw:
+        return []
+    return [_iso_epoch(part.strip()) if part.strip() not in ("", "-") else None for part in raw.split(",")]
 
 
 def _trace_user_sections(message: str) -> list[tuple[int, str]]:
@@ -916,16 +927,18 @@ def log_page(
     text: str = "",
     text_in: str = "subject",
     view: str = "commits",
+    at_commit: int | None = None,
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
 
-    ``view="timeline"`` pages the way the timeline shows the log: a page ends at ``limit``
-    commits or at :data:`TIMELINE_PAGE_ITEMS` items, commits and their messages together,
-    whichever comes first. Pages then differ in size, so the payload carries ``page_starts``
-    (every page's offset) for the pager, and an ``offset`` inside a page is moved back to that
-    page's start (switching from the commit list keeps the reader where they were).
+    ``view="timeline"`` pages the way the timeline shows the log: ``offset`` and ``total`` count
+    ROWS, commits and messages alike (:func:`_timeline_rows`), so every page holds ``limit`` rows.
+    The payload's ``items`` lists the page's rows in order and ``entries`` the commits they
+    belong to, including one only its messages are on this page for; ``commits`` is how many
+    commits the filters left. ``at_commit`` (a commit's index among them) opens the page holding
+    that commit's own row, which is how switching from the commit list keeps the reader in place.
 
     ``text`` narrows the LOG only (like the sort, it never changes the panels above it): every
     word must appear, ignoring case, in the part ``text_in`` names: the subject, the user's
@@ -940,59 +953,127 @@ def log_page(
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
-    starts: list[int] | None = None
+    items: list[tuple[int, int]] | None = None
     if view == "timeline":
-        starts = _timeline_page_starts(stats, limit)
-        index = bisect.bisect_right(starts, offset) - 1
-        offset = starts[index]
-        end = starts[index + 1] if index + 1 < len(starts) else len(stats)
-        page = stats[offset:end]
+        rows = _timeline_rows(stats, sort)
+        if at_commit is not None:
+            offset = next((n for n, row in enumerate(rows) if row == (at_commit, 0)), 0)
+        offset = min(offset, max(len(rows) - 1, 0)) // limit * limit
+        items = rows[offset : offset + limit]
+        shown = sorted({index for index, _ in items})
+        page = [stats[index] for index in shown]
     else:
         page = stats[offset : offset + limit]
     if repo is not None and page:
         apply_numstat_for(repo, [stat.sha for stat in page], {stat.sha: stat for stat in page})
-    payload = {
-        "total": len(stats),
-        "offset": offset,
-        "limit": limit,
-        "entries": [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page],
-    }
-    if starts is not None:
-        payload["page_starts"] = starts
+    entries = [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page]
+    payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
+    if items is not None:
+        local = {index: k for k, index in enumerate(shown)}
+        # Every row of this page in display order: the entry it belongs to and which of it
+        # (0 the commit itself, n its n-th message, oldest first). Each entry also says where
+        # its own commit row is (`index` among the filtered commits, `row` among all rows), so a
+        # message whose commit is on another page can open it there.
+        payload["items"] = [[local[index], seq] for index, seq in items]
+        payload["total"] = len(rows)
+        payload["commits"] = len(stats)
+        commit_rows = {index: n for n, (index, seq) in enumerate(rows) if seq == 0}
+        for index, entry in zip(shown, entries):
+            entry["index"] = index
+            entry["row"] = commit_rows.get(index, 0)
     return payload
 
 
-def _timeline_page_starts(stats: list[CommitStat], limit: int) -> list[int]:
-    """Where each timeline page begins. A page holds at most ``limit`` commits and at most
-    :data:`TIMELINE_PAGE_ITEMS` items (each commit plus the messages shown with it): a commit
-    that would take it past either starts the next page. A commit is never split from its
-    messages, so the one exception is a single commit with more than that many, alone on its page."""
-    starts = [0]
-    commits = items = 0
+def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
+    """Every row the timeline shows, in the order it shows them: ``(index, seq)`` with ``index``
+    the commit's place in ``stats`` and ``seq`` 0 for the commit itself, n for its n-th message
+    (oldest first). A page is a slice of these, so it holds exactly ``limit`` rows whether they
+    are commits or messages, and a commit's messages continue onto the next page when they do
+    not fit. Sorted by date, messages and commits interleave by time, newest first (a message is
+    placed when its turn began); under another sort each commit is followed by its own messages,
+    newest first. The page script draws the rows in exactly this order."""
+    by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
+    repeats = _repeated_messages(stats)
+    keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
-        size = 1 + _message_count(stat)
-        if commits and (commits >= limit or items + size > TIMELINE_PAGE_ITEMS):
-            starts.append(index)
-            commits = items = 0
-        commits += 1
-        items += size
-    return starts
+        commit_time = stat.timestamp or 0
+        # A pending turn (recorded, not yet in a commit) is not a commit yet, so it gets no row
+        # of its own: its messages are tagged "pending commit" instead. One that holds no message
+        # (woken by a background event, nothing typed) has nothing for the timeline to show; the
+        # commit list still lists it, and it folds into the next commit like the rest.
+        if not stat.pending:
+            keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
+        for seq, at in enumerate(_prompt_times(stat), start=1):
+            if (index, seq) in repeats:
+                continue
+            when = at or commit_time
+            keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
+    keyed.sort(key=lambda pair: pair[0])
+    return [row for _, row in keyed]
 
 
-# How many messages each commit shows in the timeline, by commit. A commit's message never
-# changes, so the count is worked out once; every timeline page request needs the whole
-# filtered history's counts (24 ms for this repository's 1,151 commits, uncached).
-_MESSAGE_COUNTS: dict[tuple[str, int], int] = {}
+def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
+    """The ``(index, seq)`` of every message the timeline already shows from an EARLIER record of
+    the same turn. A commit made while a turn is still running carries the turn as it stood, and
+    the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
+    spent after the commit, counted once between the two); both carry the turn's prompt, so the
+    timeline listed one message twice, usually a committed copy and a pending one (seen live). The
+    same turn is told by its start time and its text (whitespace aside); the oldest record's copy
+    is kept. A message
+    whose turn recorded no start cannot be placed and is never folded away."""
+    seen: set[tuple[float, str]] = set()
+    repeats: set[tuple[int, int]] = set()
+    for index in sorted(range(len(stats)), key=lambda k: (stats[k].pending, stats[k].timestamp or 0)):
+        for seq, key in enumerate(_prompt_keys(stats[index]), start=1):
+            if key is None:
+                continue
+            if key in seen:
+                repeats.add((index, seq))
+            else:
+                seen.add(key)
+    return repeats
 
 
-def _message_count(stat: CommitStat) -> int:
+# The identity of each of a commit's messages, oldest first: when its turn began and what it said
+# (None where the turn recorded no start), by commit.
+_PROMPT_KEYS: dict[tuple[str, int], tuple[tuple[float, str] | None, ...]] = {}
+
+
+def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
     key = (stat.sha, len(stat.message))
-    count = _MESSAGE_COUNTS.get(key)
-    if count is None:
-        if len(_MESSAGE_COUNTS) > 50_000:
-            _MESSAGE_COUNTS.clear()
-        count = _MESSAGE_COUNTS[key] = sum(len(turn["prompts"]) for turn in _timeline_turns(stat))
-    return count
+    found = _PROMPT_KEYS.get(key)
+    if found is None:
+        if len(_PROMPT_KEYS) > 50_000:
+            _PROMPT_KEYS.clear()
+        found = _PROMPT_KEYS[key] = tuple(
+            # Whitespace does not count: a commit git wrote strips the space a hard-wrapped line
+            # ends with, and a pending record (written by `commit-tree`) keeps it, so the same
+            # message read differently in the two and was shown twice (seen live).
+            (turn["at"], " ".join(text.split())) if turn["at"] else None
+            for turn in _timeline_turns(stat)
+            for text in turn["prompts"]
+        )
+    return found
+
+
+# When each of a commit's messages was sent, oldest first (None where its turn recorded no
+# start), by commit. A commit's message never changes, so this is worked out once; every
+# timeline page request needs it for the whole filtered history.
+_PROMPT_TIMES: dict[tuple[str, int], tuple[float | None, ...]] = {}
+
+
+def _prompt_times(stat: CommitStat) -> tuple[float | None, ...]:
+    key = (stat.sha, len(stat.message))
+    times = _PROMPT_TIMES.get(key)
+    if times is None:
+        if len(_PROMPT_TIMES) > 50_000:
+            _PROMPT_TIMES.clear()
+        times = _PROMPT_TIMES[key] = tuple(
+            (turn.get("times") or [turn["at"]] * len(turn["prompts"]))[k]
+            for turn in _timeline_turns(stat)
+            for k in range(len(turn["prompts"]))
+        )
+    return times
 
 
 def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
@@ -1237,6 +1318,11 @@ a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
 #booting{display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:18px;padding:110px 0 130px;text-align:center}
 body.booting #booting{display:flex}
+/* The log arrives before the panels (/data asks more of the history), so it is shown as soon as it
+   lands, with this line standing in for everything above it until the panels follow. */
+.aggloading{display:none;align-items:center;gap:10px;margin:18px 0 6px;color:var(--fg-dim);font-size:13px}
+body.aggloading .aggloading{display:flex}
+body.aggloading .wrap>*:not(header):not(.aggloading):not(.logpart):not(footer){display:none}
 body.booting .wrap>*:not(header):not(#booting){display:none}
 #booting .spin{width:48px;height:48px;border:3px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .8s linear infinite;box-shadow:0 0 18px rgba(61,255,160,.25)}
@@ -1621,6 +1707,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
 .entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
+.tprompt .tpending{margin-left:auto;white-space:nowrap;font-size:11px;color:var(--amber);border:1px dashed var(--amber-dim);border-radius:3px;padding:0 5px}
 .entry .badge.tracked{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.08)}
 .entry .badge.anomaly{color:var(--red);border-color:var(--red)}
 .entry.pending{opacity:.82}
@@ -1791,6 +1878,8 @@ mark.hit{background:var(--amber);color:var(--ink);border-radius:2px;padding:0 1p
 /* Look: shared (see ui.COMMIT_CSS). Only its spacing here belongs to this list. */
 .fchange .fdifftoggle{margin-bottom:8px}
 .fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
+.fmorebtn{display:block;width:100%;text-align:left;background:none;border:none;border-bottom:1px dashed var(--line);font:inherit;font-size:12.5px;cursor:pointer;color:var(--ops)}
+.fmorebtn:hover{background:rgba(103,184,214,.05)}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 footer .flink{color:var(--accent,#6be);text-decoration:none}
@@ -1866,6 +1955,7 @@ __UPDATE_BANNER__
        it knows it is missing is reporting "this is everything" when it is not. -->
   <!-- Why this dashboard is empty, when it is. Three different reasons need three different
        answers, and none of them is a blank page (see agitrack/metrics/pending.py). -->
+  <div class="aggloading" id="aggloading"><span class="spin"></span>loading the panels: the log below is ready</div>
   <div class="emptystate" id="emptystate" hidden>
     <div class="es-title" id="emptystate-title"></div>
     <div class="es-text" id="emptystate-text"></div>
@@ -1926,7 +2016,7 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <div class="logsection-head">
+  <div class="logsection-head logpart">
     <h2 class="section">log</h2>
     <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
       <span class="lc-icon">&#128214;</span>
@@ -1936,7 +2026,7 @@ __UPDATE_BANNER__
       <span class="lc-btn">open story &rarr;</span>
     </a>
   </div>
-  <div class="panebar">
+  <div class="panebar logpart">
     <div class="logtabs">
       <button class="logtab active" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
       <button class="logtab" data-tab="commits">commits</button>
@@ -1948,16 +2038,16 @@ __UPDATE_BANNER__
       <option value="tokens">most output tokens</option>
     </select></div>
   </div>
-  <div class="panehead" id="head-commits"><div class="logsort logsearch"><span class="searchbox"><input id="f-text" class="filesearch" type="search" placeholder="search…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><button type="button" id="f-text-clear" class="sclear" title="clear the search" aria-label="clear the search" hidden>×</button></span><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
+  <div class="panehead logpart" id="head-commits"><div class="logsort logsearch"><span class="searchbox"><input id="f-text" class="filesearch" type="search" placeholder="search…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><button type="button" id="f-text-clear" class="sclear" title="clear the search" aria-label="clear the search" hidden>×</button></span><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
       <option value="subject">subject</option>
       <option value="user">user messages</option>
       <option value="agent">agent messages</option>
       <option value="trace">interaction trace</option>
       <option value="all">full message</option>
     </select></div></div>
-  <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
+  <div class="panehead logpart" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
 
-  <div class="logpane" id="pane-commits">
+  <div class="logpane logpart" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
     commit. The <b>subject line of each entry is the user prompt</b> that started that turn of the conversation
@@ -1966,7 +2056,7 @@ __UPDATE_BANNER__
     on a new branch.</div>
     <div class="log" id="commitlog"></div>
   </div>
-  <div class="logpane" id="pane-files" hidden>
+  <div class="logpane logpart" id="pane-files" hidden>
     <div class="filebrowse" id="filebrowse"></div>
   </div>
 
@@ -2202,9 +2292,10 @@ async function loadAgg(){
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
-async function loadLog(offset){
+async function loadLog(offset, atCommit){
   const extra = {offset:offset||0, limit:PAGE_SIZE, sort:state.sort};
-  if(LOGTAB === "timeline") extra.view = "timeline";  // pages by commits AND messages (log_page)
+  if(LOGTAB === "timeline") extra.view = "timeline";  // pages by rows, commits AND messages (log_page)
+  if(atCommit != null) extra.at = atCommit;  // the timeline page holding this commit's own row
   if(state.q){ extra.q = state.q; extra.qin = state.qin; }   // searches the log only, like the sort
   try{ const r = await fetch("log?"+qs(extra), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
@@ -2680,22 +2771,35 @@ function timelineHtml(entries, commitRow){
     let seq = 0;
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
-        items.push({t: turn.at || c.ts || 0, approx: !turn.at, follow: k > 0, seq: ++seq, i, text,
+        const sent = (turn.times || [])[k] || turn.at;
+        items.push({t: sent || c.ts || 0, approx: !sent, follow: k > 0, own: sent !== turn.at, seq: ++seq, i, text,
           path: turn.path || [], sec: (turn.sections || [])[k]});
       });
     }
   });
-  const byTime = state.sort === "date";
-  items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
-    (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
-  return items.map(it => {
+  // The server pages the timeline by rows and says which rows this page holds, in order
+  // (log_page's `items`); a commit only some of whose messages are on this page is in `entries`
+  // without its own row. Without that list (an older server), every row is drawn and sorted here.
+  let rows = items;
+  if(Array.isArray(LOGPAGE.items)){
+    const byKey = new Map(items.map(it => [it.i + ":" + it.seq, it]));
+    rows = LOGPAGE.items.map(([i, seq]) => byKey.get(i + ":" + seq)).filter(Boolean);
+  } else {
+    const byTime = state.sort === "date";
+    items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
+      (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+  }
+  return rows.map(it => {
     if(it.commit) return commitRow(entries[it.i], it.i);
     const c = entries[it.i], w = commitWhen(it.t);
     const when = it.approx
       ? `<span class="when" title="this turn recorded no start time; shown at its commit's time">≈ ${esc(w.text)}</span>`
-      : `<span class="when" title="${esc((it.follow ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
+      : `<span class="when" title="${esc((it.follow && !it.own ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
-    const target = BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
+    // A pending turn has no commit to open yet: it folds into the next one.
+    const target = c.pending
+      ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
+      : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
@@ -2736,13 +2840,15 @@ function renderLog(){
   };
   const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
   $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
-  const from = total ? offset+1 : 0, to = offset+entries.length;
-  // The timeline's pages differ in size (a page ends at 50 commits or 250 items, see log_page), so
-  // the server names where each one starts; the commit list's pages are all `limit` long.
-  const starts = LOGTAB === "timeline" ? LOGPAGE.page_starts : null;
-  const pages = starts ? Math.max(1, starts.length) : Math.max(1, Math.ceil(total/limit));
-  const cur = starts ? Math.max(1, starts.filter(s => s <= offset).length) : Math.min(pages, Math.floor(offset/limit)+1);
-  const pageOffset = p => starts ? (starts[p-1] || 0) : (p-1)*limit;
+  // The timeline pages by rows, commits and messages alike, so its offset and total count rows
+  // ("items"); the commit list's count commits.
+  const byRows = Array.isArray(LOGPAGE.items);
+  const shownCount = byRows ? LOGPAGE.items.length : entries.length;
+  const from = total ? offset+1 : 0, to = offset+shownCount;
+  const unit = byRows ? "items" : "commits";
+  const pages = Math.max(1, Math.ceil(total/limit));
+  const cur = Math.min(pages, Math.floor(offset/limit)+1);
+  const pageOffset = p => (p-1)*limit;
   // Numbered page buttons: all of them when few, otherwise first + a window around
   // the current page + last, with … gaps (0 marks a gap).
   let nums = [];
@@ -2760,7 +2866,7 @@ function renderLog(){
   const prevDis = cur<=1 ? "disabled" : "", nextDis = cur>=pages ? "disabled" : "";
   const gotoBox = pages>1 ? `<span class="pgoto">go to <input id="log-goto" type="number" inputmode="numeric" `+
     `min="1" max="${pages}" placeholder="${cur}"> / ${fmt(pages)}</span>` : "";
-  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
+  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} ${unit}</span>`+
     `<span class="pnav"><button id="log-first" title="first page" ${prevDis}>«</button>`+
     `<button id="log-prev" title="previous page" ${prevDis}>‹</button>${numBtns}`+
     `<button id="log-next" title="next page" ${nextDis}>›</button>`+
@@ -2889,8 +2995,22 @@ function toggleDetail(i){
 // parts to the one holding it (path: display indices, newest first, from the server), and mark
 // the message there. Without a place to mark (a hand-built entry, a part the page no longer
 // shows) it falls back to flashing the commit's row.
-function showMessageInCommit(i, path, sec, from){
-  const row = document.querySelector('#commitlog .entry[data-i="'+i+'"]'), detail = $("detail-"+i);
+async function showMessageInCommit(i, path, sec, from){
+  let row = document.querySelector('#commitlog .entry[data-i="'+i+'"]');
+  if(!row){
+    // The message's commit is on another timeline page (a page is a fixed number of rows, so a
+    // commit's messages can run on past it): go to the page holding the commit, then open it there.
+    const entry = (LOGPAGE.entries || [])[i];
+    if(!entry || entry.index == null) return;
+    showLoading(true);
+    try{ if(!(await loadLog(0, entry.index))) return; renderLog(); }
+    finally{ showLoading(false); }
+    i = (LOGPAGE.entries || []).findIndex(e => e.index === entry.index);
+    if(i < 0) return;
+    row = document.querySelector('#commitlog .entry[data-i="'+i+'"]');
+    from = null;
+  }
+  const detail = $("detail-"+i);
   if(!row || !detail) return;
   // What the link changes, so "back" can undo exactly that and nothing the reader opened.
   const undo = {i, from, scrollY: window.scrollY, openedDetail: detail.hidden, openedParts: []};
@@ -3326,7 +3446,8 @@ function fileRowHtml(f){
     `<span class="fc">${kfmt(f.output_tokens||0)} out</span></div>`;
 }
 // Group the flat file list into a folder tree so a big repo's file list is browsable
-// (folders collapse/expand) instead of one very long flat list.
+// (folders collapse/expand) instead of one very long flat list. Each folder's totals are
+// worked out once here, bottom up.
 function buildFileTree(rows){
   const root = { dirs:{}, files:[] };
   for(const f of rows){
@@ -3335,23 +3456,50 @@ function buildFileTree(rows){
     for(let i=0;i<parts.length-1;i++){ node.dirs[parts[i]] = node.dirs[parts[i]] || { dirs:{}, files:[] }; node = node.dirs[parts[i]]; }
     node.files.push(f);
   }
+  (function tally(node){
+    node.nfiles = node.files.length; node.nchanges = node.files.reduce((a,f)=>a+f.changes,0);
+    for(const k in node.dirs){ tally(node.dirs[k]); node.nfiles += node.dirs[k].nfiles; node.nchanges += node.dirs[k].nchanges; }
+  })(root);
   return root;
 }
-function folderStats(node){
-  let files = node.files.length, changes = node.files.reduce((a,f)=>a+f.changes,0);
-  for(const k in node.dirs){ const s = folderStats(node.dirs[k]); files += s.files; changes += s.changes; }
-  return { files, changes };
-}
-function renderTree(node, forceOpen, depth){
+// A folder's contents are drawn when it is OPENED, never up front. Drawing the whole tree
+// behind collapsed folders put every file of the repository in the page: 148,896 files on one
+// real repository, a 61 MB string and 1.1 million elements, which froze the page for four
+// seconds after every load. Files are drawn in pages of FILE_PAGE for the same reason, since
+// one folder can hold most of a repository.
+const FILE_PAGE = 300, SEARCH_OPEN_LIMIT = 300;
+let TREE_NODES = [];
+function renderTree(node, forceOpen){
   let html = "";
   for(const d of Object.keys(node.dirs).sort()){
-    const child = node.dirs[d], st = folderStats(child), open = forceOpen;  // collapsed by default; a search expands matches
-    html += `<details class="ftree-dir"${open?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
+    const child = node.dirs[d], st = { files: child.nfiles, changes: child.nchanges };
+    const id = TREE_NODES.push(child) - 1;
+    html += `<details class="ftree-dir" data-node="${id}"${forceOpen?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
       `<span class="fdircount">${fmt(st.files)} file${st.files===1?"":"s"} · ${fmt(st.changes)} change${st.changes===1?"":"s"}</span></summary>`+
-      `<div class="ftree-children">${renderTree(child, forceOpen, depth+1)}</div></details>`;
+      `<div class="ftree-children">${forceOpen ? renderTree(child, forceOpen) : ""}</div></details>`;
   }
-  for(const f of node.files.slice().sort((a,b)=> (b.last_ts-a.last_ts) || (b.changes-a.changes))) html += fileRowHtml(f);
+  return html + fileRowsHtml(node, 0);
+}
+function fileRowsHtml(node, from){
+  if(!node.sorted) node.sorted = node.files.slice().sort((a,b)=> (b.last_ts-a.last_ts) || (b.changes-a.changes));
+  const page = node.sorted.slice(from, from + FILE_PAGE);
+  let html = page.map(fileRowHtml).join("");
+  const rest = node.sorted.length - from - page.length;
+  if(rest > 0){
+    const id = TREE_NODES.push(node) - 1;
+    html += `<button class="fmore fmorebtn" data-node="${id}" data-from="${from + page.length}">show ${fmt(Math.min(rest, FILE_PAGE))} more of ${fmt(rest)}</button>`;
+  }
   return html;
+}
+function openTreeDir(det){
+  const kids = det.querySelector(":scope > .ftree-children");
+  if(!det.open || !kids || kids.childElementCount) return;
+  const node = TREE_NODES[+det.dataset.node];
+  if(node) kids.innerHTML = renderTree(node, false);
+}
+function moreFileRows(btn){
+  const node = TREE_NODES[+btn.dataset.node];
+  if(node) btn.outerHTML = fileRowsHtml(node, +btn.dataset.from);
 }
 function renderFiles(){
   const host = $("filebrowse"), btn = $("tab-files-btn");
@@ -3360,8 +3508,12 @@ function renderFiles(){
   if(btn) btn.style.display = "";
   const q = FILEQ.trim().toLowerCase();
   const rows = q ? FILES.filter(f => f.path.toLowerCase().includes(q)) : FILES;
-  // A search expands every matching folder so hits aren't hidden; otherwise only the top level is open.
-  host.innerHTML = rows.length ? renderTree(buildFileTree(rows), !!q, 0) : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
+  TREE_NODES = [];
+  // A search expands every matching folder so hits aren't hidden, unless it matches so much that
+  // opening everything would be the whole tree again; otherwise only the top level is open.
+  const open = !!q && rows.length <= SEARCH_OPEN_LIMIT;
+  const note = q && !open ? `<div class="fmore">${fmt(rows.length)} files match; open a folder to see them, or narrow the search</div>` : "";
+  host.innerHTML = rows.length ? note + renderTree(buildFileTree(rows), open) : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
 }
 function showLogTab(tab){
   document.querySelectorAll(".logtab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
@@ -3371,10 +3523,15 @@ function showLogTab(tab){
   const commitish = tab === "commits" || tab === "timeline";
   if(commitish && tab !== LOGTAB){
     LOGTAB = tab; renderLog();
-    // The two views page differently (the timeline also counts messages), so fetch this view's
-    // page at the same place; the server moves the offset back to the start of its page.
+    // The two views page differently (the timeline counts messages as rows too), so fetch this
+    // view's page at the same place: the page holding the first commit the reader was looking at.
+    const firstShown = Array.isArray(LOGPAGE.items)
+      ? (LOGPAGE.entries || []).reduce((low, e) => Math.min(low, e.index ?? Infinity), Infinity)
+      : (LOGPAGE.offset || 0);
+    const at = Number.isFinite(firstShown) ? firstShown : 0;
     showLoading(true);
-    loadLog(LOGPAGE.offset||0).then(ok => { if(ok && LOGTAB === tab) renderLog(); }).finally(() => showLoading(false));
+    const fetched = tab === "timeline" ? loadLog(0, at) : loadLog(Math.floor(at / PAGE_SIZE) * PAGE_SIZE);
+    fetched.then(ok => { if(ok && LOGTAB === tab) renderLog(); }).finally(() => showLoading(false));
   }
   if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
   if(pc) pc.hidden = !commitish;
@@ -3464,7 +3621,10 @@ function wireFileBrowser(){
   const search = $("file-search");
   if(search) search.addEventListener("input", e => { FILEQ = e.target.value; renderFiles(); });
   const host = $("filebrowse");
+  // "toggle" does not bubble, so it is caught on the way down.
+  if(host) host.addEventListener("toggle", e => { if(e.target.matches && e.target.matches(".ftree-dir")) openTreeDir(e.target); }, true);
   if(host) host.addEventListener("click", e => {
+    const more = e.target.closest(".fmorebtn"); if(more){ moreFileRows(more); return; }
     const tgl = e.target.closest(".fdifftoggle"); if(tgl){ toggleFileBody(tgl); return; }
     const head = e.target.closest(".fchead"); if(head){ toggleFileChange(head); return; }
     if(e.target.closest(".fdetail")) return;  // other clicks inside a file's change list: ignore
@@ -3644,8 +3804,26 @@ async function init(){
       showLoading(true);
     }
     bootProgress(!restored);
-    try{ await loadAgg(); await loadLog(0); }
-    finally{ bootProgress(false); if(restored) showLoading(false); }
+    // Both at once, and the log drawn the moment it is in. They used to run one after the other,
+    // panels first, and nothing was shown until both were back: the log needs a fraction of a
+    // second, the panels can take several (insights over the whole file history, the shared
+    // sessions), so the log sat blank behind work it does not depend on.
+    let aggDone = false;
+    const agg = loadAgg().finally(() => { aggDone = true; });
+    const log = loadLog(0).then(ok => {
+      if(ok && !restored && !aggDone){
+        document.body.classList.remove("booting");
+        document.body.classList.add("aggloading");
+        renderLog(); shownLog = JSON.stringify(LOGPAGE);
+        showLogTab(LOGTAB);
+      }
+      return ok;
+    });
+    try{ await Promise.all([agg, log]); }
+    finally{
+      bootProgress(false); if(restored) showLoading(false);
+      document.body.classList.remove("aggloading");
+    }
     document.body.classList.remove("booting");
   }
   // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
@@ -3660,7 +3838,7 @@ async function init(){
     renderAgg();
     // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
     // log that came back unchanged is left exactly as it is.
-    if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
   }
   // The log was drawn in its tab already; this only lights that tab, without waiting for the
   // file browser below.
