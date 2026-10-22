@@ -2709,10 +2709,13 @@ def test_the_page_answers_clicks_before_its_first_fetch_returns():
     assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
 
 
-def _boot_the_page(tmp_path, *, answers: dict) -> dict:
+def _boot_the_page(tmp_path, *, answers: dict, then: str = "") -> dict:
     """Boot the real dashboard script in shell mode (nothing embedded, as the server serves it),
     with each request's answer chosen by its path: a dict is the JSON body, None never answers.
-    Returns the body's classes and the commit log's HTML once the answers have settled."""
+    Returns the body's classes and the commit log's HTML once the answers have settled.
+
+    ``then`` is code run inside the page script's own scope after it, so a test can call the
+    page's functions; whatever it assigns to ``globalThis.out`` is returned as ``out``."""
     import shutil
     import subprocess
 
@@ -2731,6 +2734,8 @@ def _boot_the_page(tmp_path, *, answers: dict) -> dict:
         + json.dumps(source)
         + ";\nconst ANSWERS = "
         + json.dumps(answers)
+        + ";\nconst THEN = "
+        + json.dumps(then)
         + ";\n"
         + stub
         + """
@@ -2747,9 +2752,10 @@ global.fetch = url => {
   if (body === undefined || body === null) return new Promise(() => {});
   return Promise.resolve({ok: true, json: async () => body});
 };
-new Function(SOURCE)();
+new Function(SOURCE + "\\n;" + THEN)();
 setImmediate(() => setImmediate(() => {
-  console.log(JSON.stringify({classes: [...classes], log: els.commitlog ? els.commitlog.innerHTML : ""}));
+  console.log(JSON.stringify({classes: [...classes], log: els.commitlog ? els.commitlog.innerHTML : "",
+                              out: globalThis.out === undefined ? null : globalThis.out}));
 }));
 """,
         encoding="utf-8",
@@ -2773,6 +2779,36 @@ def test_the_log_is_drawn_without_waiting_for_the_panels(tmp_path):
 
     assert "add the feature" in shown["log"]
     assert "aggloading" in shown["classes"] and "booting" not in shown["classes"]
+
+
+def test_the_file_browser_draws_a_folder_only_when_it_is_opened(tmp_path):
+    # Reported as the dashboard staying blank for a while after a refresh. On a repository of
+    # 148,896 files the file browser built every file into the page behind its collapsed folders:
+    # a 61 MB string, 1.1 million elements and a four-second freeze after every load. Only the
+    # top level may be drawn; a folder fills in when opened, and a folder's files come in pages.
+    files = [
+        {"path": f"data/part{i:05d}.json", "changes": 1, "ins": 1, "del": 0, "last_ts": i} for i in range(1000)
+    ] + [{"path": "README.md", "changes": 2, "ins": 3, "del": 1, "last_ts": 5}]
+    shown = _boot_the_page(
+        tmp_path,
+        answers={"log": None, "data": None},
+        then="""
+FILES = %s;
+renderFiles();
+const top = $("filebrowse").innerHTML;
+const det = {open: true, dataset: {node: "0"}, querySelector: () => kids};
+const kids = {childElementCount: 0, innerHTML: ""};
+openTreeDir(det);
+globalThis.out = {top, opened: kids.innerHTML};
+"""
+        % json.dumps(files),
+    )
+
+    top, opened = shown["out"]["top"], shown["out"]["opened"]
+    assert "README.md" in top and "data/" in top and "1,000 files" in top
+    assert "part" not in top  # nothing inside the closed folder is in the page
+    assert opened.count('class="frow"') == 300  # one page of the folder's files
+    assert "show 300 more of 700" in opened
 
 
 def test_the_log_search_can_look_in_the_users_words_the_agents_words_or_the_whole_trace(tmp_path):

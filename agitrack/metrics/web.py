@@ -1793,6 +1793,8 @@ mark.hit{background:var(--amber);color:var(--ink);border-radius:2px;padding:0 1p
 /* Look: shared (see ui.COMMIT_CSS). Only its spacing here belongs to this list. */
 .fchange .fdifftoggle{margin-bottom:8px}
 .fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
+.fmorebtn{display:block;width:100%;text-align:left;background:none;border:none;border-bottom:1px dashed var(--line);font:inherit;font-size:12.5px;cursor:pointer;color:var(--ops)}
+.fmorebtn:hover{background:rgba(103,184,214,.05)}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 footer .flink{color:var(--accent,#6be);text-decoration:none}
@@ -3329,7 +3331,8 @@ function fileRowHtml(f){
     `<span class="fc">${kfmt(f.output_tokens||0)} out</span></div>`;
 }
 // Group the flat file list into a folder tree so a big repo's file list is browsable
-// (folders collapse/expand) instead of one very long flat list.
+// (folders collapse/expand) instead of one very long flat list. Each folder's totals are
+// worked out once here, bottom up.
 function buildFileTree(rows){
   const root = { dirs:{}, files:[] };
   for(const f of rows){
@@ -3338,23 +3341,50 @@ function buildFileTree(rows){
     for(let i=0;i<parts.length-1;i++){ node.dirs[parts[i]] = node.dirs[parts[i]] || { dirs:{}, files:[] }; node = node.dirs[parts[i]]; }
     node.files.push(f);
   }
+  (function tally(node){
+    node.nfiles = node.files.length; node.nchanges = node.files.reduce((a,f)=>a+f.changes,0);
+    for(const k in node.dirs){ tally(node.dirs[k]); node.nfiles += node.dirs[k].nfiles; node.nchanges += node.dirs[k].nchanges; }
+  })(root);
   return root;
 }
-function folderStats(node){
-  let files = node.files.length, changes = node.files.reduce((a,f)=>a+f.changes,0);
-  for(const k in node.dirs){ const s = folderStats(node.dirs[k]); files += s.files; changes += s.changes; }
-  return { files, changes };
-}
-function renderTree(node, forceOpen, depth){
+// A folder's contents are drawn when it is OPENED, never up front. Drawing the whole tree
+// behind collapsed folders put every file of the repository in the page: 148,896 files on one
+// real repository, a 61 MB string and 1.1 million elements, which froze the page for four
+// seconds after every load. Files are drawn in pages of FILE_PAGE for the same reason, since
+// one folder can hold most of a repository.
+const FILE_PAGE = 300, SEARCH_OPEN_LIMIT = 300;
+let TREE_NODES = [];
+function renderTree(node, forceOpen){
   let html = "";
   for(const d of Object.keys(node.dirs).sort()){
-    const child = node.dirs[d], st = folderStats(child), open = forceOpen;  // collapsed by default; a search expands matches
-    html += `<details class="ftree-dir"${open?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
+    const child = node.dirs[d], st = { files: child.nfiles, changes: child.nchanges };
+    const id = TREE_NODES.push(child) - 1;
+    html += `<details class="ftree-dir" data-node="${id}"${forceOpen?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
       `<span class="fdircount">${fmt(st.files)} file${st.files===1?"":"s"} · ${fmt(st.changes)} change${st.changes===1?"":"s"}</span></summary>`+
-      `<div class="ftree-children">${renderTree(child, forceOpen, depth+1)}</div></details>`;
+      `<div class="ftree-children">${forceOpen ? renderTree(child, forceOpen) : ""}</div></details>`;
   }
-  for(const f of node.files.slice().sort((a,b)=> (b.last_ts-a.last_ts) || (b.changes-a.changes))) html += fileRowHtml(f);
+  return html + fileRowsHtml(node, 0);
+}
+function fileRowsHtml(node, from){
+  if(!node.sorted) node.sorted = node.files.slice().sort((a,b)=> (b.last_ts-a.last_ts) || (b.changes-a.changes));
+  const page = node.sorted.slice(from, from + FILE_PAGE);
+  let html = page.map(fileRowHtml).join("");
+  const rest = node.sorted.length - from - page.length;
+  if(rest > 0){
+    const id = TREE_NODES.push(node) - 1;
+    html += `<button class="fmore fmorebtn" data-node="${id}" data-from="${from + page.length}">show ${fmt(Math.min(rest, FILE_PAGE))} more of ${fmt(rest)}</button>`;
+  }
   return html;
+}
+function openTreeDir(det){
+  const kids = det.querySelector(":scope > .ftree-children");
+  if(!det.open || !kids || kids.childElementCount) return;
+  const node = TREE_NODES[+det.dataset.node];
+  if(node) kids.innerHTML = renderTree(node, false);
+}
+function moreFileRows(btn){
+  const node = TREE_NODES[+btn.dataset.node];
+  if(node) btn.outerHTML = fileRowsHtml(node, +btn.dataset.from);
 }
 function renderFiles(){
   const host = $("filebrowse"), btn = $("tab-files-btn");
@@ -3363,8 +3393,12 @@ function renderFiles(){
   if(btn) btn.style.display = "";
   const q = FILEQ.trim().toLowerCase();
   const rows = q ? FILES.filter(f => f.path.toLowerCase().includes(q)) : FILES;
-  // A search expands every matching folder so hits aren't hidden; otherwise only the top level is open.
-  host.innerHTML = rows.length ? renderTree(buildFileTree(rows), !!q, 0) : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
+  TREE_NODES = [];
+  // A search expands every matching folder so hits aren't hidden, unless it matches so much that
+  // opening everything would be the whole tree again; otherwise only the top level is open.
+  const open = !!q && rows.length <= SEARCH_OPEN_LIMIT;
+  const note = q && !open ? `<div class="fmore">${fmt(rows.length)} files match; open a folder to see them, or narrow the search</div>` : "";
+  host.innerHTML = rows.length ? note + renderTree(buildFileTree(rows), open) : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
 }
 function showLogTab(tab){
   document.querySelectorAll(".logtab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
@@ -3467,7 +3501,10 @@ function wireFileBrowser(){
   const search = $("file-search");
   if(search) search.addEventListener("input", e => { FILEQ = e.target.value; renderFiles(); });
   const host = $("filebrowse");
+  // "toggle" does not bubble, so it is caught on the way down.
+  if(host) host.addEventListener("toggle", e => { if(e.target.matches && e.target.matches(".ftree-dir")) openTreeDir(e.target); }, true);
   if(host) host.addEventListener("click", e => {
+    const more = e.target.closest(".fmorebtn"); if(more){ moreFileRows(more); return; }
     const tgl = e.target.closest(".fdifftoggle"); if(tgl){ toggleFileBody(tgl); return; }
     const head = e.target.closest(".fchead"); if(head){ toggleFileChange(head); return; }
     if(e.target.closest(".fdetail")) return;  // other clicks inside a file's change list: ignore

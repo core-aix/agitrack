@@ -149,6 +149,10 @@ def _never_spawn_the_real_dashboard(monkeypatch):
 # held open. The leak this exists to fix is daemons surviving the whole RUN, so session end is
 # both sufficient and the only safe moment.
 _LEAKED_DAEMON_PIDS: set[int] = set()
+# Every test's config dir, read again at session end: a daemon a test starts INDIRECTLY (a git
+# hook the test's commit ran, auto-starting a tracker, which then starts a dashboard hub) can
+# register itself after that test's own teardown has already looked, and survived every run.
+_TEST_CONFIG_DIRS: set[str] = set()
 
 
 def collect_registered_daemons(config_dir: str | os.PathLike[str]) -> list[int]:
@@ -271,6 +275,7 @@ def _note_daemons_a_test_started():
 
     config_dir = getenv_compat("CONFIG_DIR")
     if config_dir:
+        _TEST_CONFIG_DIRS.add(str(config_dir))
         _LEAKED_DAEMON_PIDS.update(collect_registered_daemons(config_dir))
 
 
@@ -278,6 +283,8 @@ def _note_daemons_a_test_started():
 def _kill_leaked_daemons_at_the_end():
     """One sweep, after every test has finished. See ``_LEAKED_DAEMON_PIDS``."""
     yield
+    for config_dir in _TEST_CONFIG_DIRS:
+        _LEAKED_DAEMON_PIDS.update(collect_registered_daemons(config_dir))
     reap_daemon_pids(_LEAKED_DAEMON_PIDS)
 
 
