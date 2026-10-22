@@ -428,12 +428,10 @@ def _effective(stat: CommitStat, covers: dict[str, CommitStat]) -> tuple[str | N
 # commit's full message / trace / squash constituents).
 # ---------------------------------------------------------------------------
 
+# Entries per page of the commit log, and per page of the timeline, where a commit and each
+# message the user sent count as one entry each. The timeline used to end a page at 50 COMMITS
+# (or 250 entries), so one page could hold hundreds of messages and was slow to load and draw.
 PAGE_SIZE = 50
-# The timeline shows each commit's messages beside it, so a page of 50 commits can hold hundreds
-# of items. A timeline page therefore also ends once it holds this many items, commits and
-# messages together (a commit is never split from its messages, so one commit with more
-# messages than this is a page of its own).
-TIMELINE_PAGE_ITEMS = 250
 _KINDS = ("agent", "covered", "agent-merge", "user", "agitrack-ops", "untracked")
 
 
@@ -921,9 +919,8 @@ def log_page(
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is.
 
-    ``view="timeline"`` pages the way the timeline shows the log: a page ends at ``limit``
-    commits or at :data:`TIMELINE_PAGE_ITEMS` items, commits and their messages together,
-    whichever comes first. Pages then differ in size, so the payload carries ``page_starts``
+    ``view="timeline"`` pages the way the timeline shows the log: a page holds at most ``limit``
+    entries, commits and their messages counted alike. Pages then differ in size, so the payload carries ``page_starts``
     (every page's offset) for the pager, and an ``offset`` inside a page is moved back to that
     page's start (switching from the commit list keeps the reader where they were).
 
@@ -963,18 +960,18 @@ def log_page(
 
 
 def _timeline_page_starts(stats: list[CommitStat], limit: int) -> list[int]:
-    """Where each timeline page begins. A page holds at most ``limit`` commits and at most
-    :data:`TIMELINE_PAGE_ITEMS` items (each commit plus the messages shown with it): a commit
-    that would take it past either starts the next page. A commit is never split from its
-    messages, so the one exception is a single commit with more than that many, alone on its page."""
+    """Where each timeline page begins. A page holds at most ``limit`` entries, each commit and
+    each message shown with it counting as one: a commit whose entries would take the page past
+    that starts the next one. A commit is never split from its messages (hovering one lights the
+    other, and a message's link opens its commit), so a page can end a little short of ``limit``,
+    and a single commit with more entries than that is a page of its own."""
     starts = [0]
-    commits = items = 0
+    items = 0
     for index, stat in enumerate(stats):
         size = 1 + _message_count(stat)
-        if commits and (commits >= limit or items + size > TIMELINE_PAGE_ITEMS):
+        if items and items + size > limit:
             starts.append(index)
-            commits = items = 0
-        commits += 1
+            items = 0
         items += size
     return starts
 
@@ -2737,7 +2734,7 @@ function renderLog(){
   const rows = LOGTAB === "timeline" ? timelineHtml(entries, commitRow) : entries.map(commitRow).join("");
   $("commitlog").classList.toggle("timeline", LOGTAB === "timeline");
   const from = total ? offset+1 : 0, to = offset+entries.length;
-  // The timeline's pages differ in size (a page ends at 50 commits or 250 items, see log_page), so
+  // The timeline's pages differ in size (at most 50 entries, a commit never split from its messages), so
   // the server names where each one starts; the commit list's pages are all `limit` long.
   const starts = LOGTAB === "timeline" ? LOGPAGE.page_starts : null;
   const pages = starts ? Math.max(1, starts.length) : Math.max(1, Math.ceil(total/limit));

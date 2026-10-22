@@ -14,7 +14,7 @@ Layout of the exported directory::
     demo/                 the pre-rendered responses the shims serve:
       data-<granularity>.json     /data for hour/day/week/month (last-30-days scope)
       log-<sort>-<offset>.json    every /log page for every sort order (same scope)
-      log-timeline-<sort>-<offset>.json  every timeline page (they end at 50 commits or 250 items)
+      log-timeline-<sort>-<offset>.json  every timeline page (at most 50 entries each)
       diff/<sha>.json             every commit's /diff
       files.json                  /files
       filelog/<n>.json            /filelog per file (n = index in files.json order)

@@ -3070,21 +3070,21 @@ def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tm
     assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
 
 
-def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp_path, monkeypatch):
-    # A timeline page ends at `limit` commits or at TIMELINE_PAGE_ITEMS items (commits plus
-    # their messages), whichever comes first, and a commit is never split from its messages.
-    # Pages differ in size, so the payload names every page's start; an offset inside a page is
-    # moved back to its start. A rewritten commit has a new id, so the cached message counts
-    # can never answer for it: the same live scope re-pages after the rewrite by itself.
-    # Checked at full size on a 70-commit dummy repository rewritten by `git filter-branch` and by
-    # `agitrack redact`, and in Chrome on an open page that picked the rewrite up on its refresh.
+def test_the_timeline_pages_by_entries_and_follows_a_rewrite(tmp_path):
+    # A timeline page holds at most `limit` entries, a commit and each of its messages counting as
+    # one (50 by default, like the commit list: pages of 50 commits held hundreds of messages and
+    # were slow to load). A commit is never split from its messages, so a page can end short and a
+    # commit with more than `limit` entries is a page of its own. Pages differ in size, so the
+    # payload names every page's start; an offset inside a page is moved back to its start. A
+    # rewritten commit has a new id, so the cached message counts can never answer for it: the same
+    # live scope re-pages after the rewrite by itself. Checked at full size on a 70-commit dummy
+    # repository rewritten by `git filter-branch` and by `agitrack redact`, and in Chrome on an
+    # open page that picked the rewrite up on its refresh.
     import json as _json
     import subprocess
 
-    from agitrack.metrics import web
     from agitrack.metrics.server import RepoScope
 
-    monkeypatch.setattr(web, "TIMELINE_PAGE_ITEMS", 5)
     repo = GitRepo.init(tmp_path)
     for i, asked in enumerate([0, 3, 1, 0, 0, 0, 6, 1]):  # oldest first
         _write_lines(repo, "x.txt", i + 1)
@@ -3097,18 +3097,22 @@ def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp
     def log(**query):
         return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
 
-    first = log(view="timeline", limit=3)
-    # Newest first, items per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
-    # GitRepo.init makes (1). A commit that would take a page past 5 items, or past 3 commits,
-    # starts the next one: c6 alone exceeds 5, c5..c3 fill 3 commits, c1+c0 fill exactly 5.
-    assert first["page_starts"] == [0, 1, 2, 5, 6, 8]
+    first = log(view="timeline", limit=5)
+    # Newest first, entries per commit: c7=2, c6=7, c5..c3=1, c2=2, c1=4, c0=1, then the seed commit
+    # GitRepo.init makes (1). A commit that would take a page past 5 entries starts the next one:
+    # c7 (2) cannot take c6 (7), which is alone and over the limit, c5..c2 fill exactly 5, c1 and
+    # c0 fill 5 again, and the seed is left.
+    assert first["page_starts"] == [0, 1, 2, 6, 8]
     assert [e["subject"] for e in first["entries"]] == ["<aGiTrack> c7"]
-    assert [e["subject"] for e in log(view="timeline", limit=3, offset=3)["entries"]] == [
+    page = log(view="timeline", limit=5, offset=3)
+    assert [e["subject"] for e in page["entries"]] == [
         "<aGiTrack> c5",
         "<aGiTrack> c4",
         "<aGiTrack> c3",
+        "<aGiTrack> c2",
     ]  # moved back to its page's start
-    assert log(view="timeline", limit=3, offset=3)["offset"] == 2
+    assert page["offset"] == 2
+    assert sum(1 + sum(len(t["prompts"]) for t in e["turns"]) for e in page["entries"]) == 5
     assert "page_starts" not in log(limit=3) and len(log(limit=3)["entries"]) == 3  # commit list
 
     # Rewrite the newest commit so it carries four messages (five items, a full page on its own).
@@ -3118,8 +3122,8 @@ def test_the_timeline_pages_by_commits_and_by_messages_and_follows_a_rewrite(tmp
     subprocess.run(
         ["git", "-C", str(repo.repo), "commit", "-q", "--amend", "--cleanup=whitespace", "-m", message], check=True
     )
-    rewritten = log(view="timeline", limit=3)
-    assert rewritten["page_starts"] == [0, 1, 2, 5, 6, 8]
+    rewritten = log(view="timeline", limit=5)
+    assert rewritten["page_starts"] == [0, 1, 2, 6, 8]
     assert sum(len(t["prompts"]) for t in rewritten["entries"][0]["turns"]) == 4
     assert (
         rewritten["entries"][0]["sha"]
