@@ -1234,6 +1234,11 @@ a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
 #booting{display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:18px;padding:110px 0 130px;text-align:center}
 body.booting #booting{display:flex}
+/* The log arrives before the panels (/data asks more of the history), so it is shown as soon as it
+   lands, with this line standing in for everything above it until the panels follow. */
+.aggloading{display:none;align-items:center;gap:10px;margin:18px 0 6px;color:var(--fg-dim);font-size:13px}
+body.aggloading .aggloading{display:flex}
+body.aggloading .wrap>*:not(header):not(.aggloading):not(.logpart):not(footer){display:none}
 body.booting .wrap>*:not(header):not(#booting){display:none}
 #booting .spin{width:48px;height:48px;border:3px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .8s linear infinite;box-shadow:0 0 18px rgba(61,255,160,.25)}
@@ -1863,6 +1868,7 @@ __UPDATE_BANNER__
        it knows it is missing is reporting "this is everything" when it is not. -->
   <!-- Why this dashboard is empty, when it is. Three different reasons need three different
        answers, and none of them is a blank page (see agitrack/metrics/pending.py). -->
+  <div class="aggloading" id="aggloading"><span class="spin"></span>loading the panels: the log below is ready</div>
   <div class="emptystate" id="emptystate" hidden>
     <div class="es-title" id="emptystate-title"></div>
     <div class="es-text" id="emptystate-text"></div>
@@ -1923,7 +1929,7 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <div class="logsection-head">
+  <div class="logsection-head logpart">
     <h2 class="section">log</h2>
     <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
       <span class="lc-icon">&#128214;</span>
@@ -1933,7 +1939,7 @@ __UPDATE_BANNER__
       <span class="lc-btn">open story &rarr;</span>
     </a>
   </div>
-  <div class="panebar">
+  <div class="panebar logpart">
     <div class="logtabs">
       <button class="logtab active" data-tab="timeline" title="What was asked, and when, between the commits it led to">timeline</button>
       <button class="logtab" data-tab="commits">commits</button>
@@ -1945,16 +1951,16 @@ __UPDATE_BANNER__
       <option value="tokens">most output tokens</option>
     </select></div>
   </div>
-  <div class="panehead" id="head-commits"><div class="logsort logsearch"><span class="searchbox"><input id="f-text" class="filesearch" type="search" placeholder="search…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><button type="button" id="f-text-clear" class="sclear" title="clear the search" aria-label="clear the search" hidden>×</button></span><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
+  <div class="panehead logpart" id="head-commits"><div class="logsort logsearch"><span class="searchbox"><input id="f-text" class="filesearch" type="search" placeholder="search…" autocomplete="off" title="Show only the commits whose subject (or whole message) contains every word typed here"><button type="button" id="f-text-clear" class="sclear" title="clear the search" aria-label="clear the search" hidden>×</button></span><label for="f-textin">in</label><select id="f-textin" title="Search the subject only, or the whole message, including what was asked in its trace">
       <option value="subject">subject</option>
       <option value="user">user messages</option>
       <option value="agent">agent messages</option>
       <option value="trace">interaction trace</option>
       <option value="all">full message</option>
     </select></div></div>
-  <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
+  <div class="panehead logpart" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
 
-  <div class="logpane" id="pane-commits">
+  <div class="logpane logpart" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
     commit. The <b>subject line of each entry is the user prompt</b> that started that turn of the conversation
@@ -1963,7 +1969,7 @@ __UPDATE_BANNER__
     on a new branch.</div>
     <div class="log" id="commitlog"></div>
   </div>
-  <div class="logpane" id="pane-files" hidden>
+  <div class="logpane logpart" id="pane-files" hidden>
     <div class="filebrowse" id="filebrowse"></div>
   </div>
 
@@ -3641,8 +3647,26 @@ async function init(){
       showLoading(true);
     }
     bootProgress(!restored);
-    try{ await loadAgg(); await loadLog(0); }
-    finally{ bootProgress(false); if(restored) showLoading(false); }
+    // Both at once, and the log drawn the moment it is in. They used to run one after the other,
+    // panels first, and nothing was shown until both were back: the log needs a fraction of a
+    // second, the panels can take several (insights over the whole file history, the shared
+    // sessions), so the log sat blank behind work it does not depend on.
+    let aggDone = false;
+    const agg = loadAgg().finally(() => { aggDone = true; });
+    const log = loadLog(0).then(ok => {
+      if(ok && !restored && !aggDone){
+        document.body.classList.remove("booting");
+        document.body.classList.add("aggloading");
+        renderLog(); shownLog = JSON.stringify(LOGPAGE);
+        showLogTab(LOGTAB);
+      }
+      return ok;
+    });
+    try{ await Promise.all([agg, log]); }
+    finally{
+      bootProgress(false); if(restored) showLoading(false);
+      document.body.classList.remove("aggloading");
+    }
     document.body.classList.remove("booting");
   }
   // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
@@ -3657,7 +3681,7 @@ async function init(){
     renderAgg();
     // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
     // log that came back unchanged is left exactly as it is.
-    if(!restored || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
   }
   // The log was drawn in its tab already; this only lights that tab, without waiting for the
   // file browser below.

@@ -86,11 +86,29 @@ def start_watching(path, changed: threading.Event, wake: threading.Event | None 
         return None
 
 
+# How long stopping a watch may take before the caller moves on without it.
+_STOP_WAIT_SECONDS = 3.0
+
+
 def stop_watching(observer) -> None:
+    """Stop ``observer`` without ever waiting on it for more than :data:`_STOP_WAIT_SECONDS`.
+
+    watchdog's own ``stop()`` waits for its emitter threads WITHOUT a timeout, and on macOS the
+    FSEvents emitter can fail to finish (seen under a loaded test run: a tracker's teardown sat in
+    that wait until pytest-timeout killed it at 300 s, which in use would be an `agitrack -b
+    stop` that never returns, or an interactive session that cannot exit). So the stop runs on
+    a helper thread and is given a bounded time; an observer still stopping after that is a
+    daemon thread and dies with the process."""
     if observer is None:
         return
-    try:
-        observer.stop()
-        observer.join(timeout=2.0)
-    except Exception:
-        pass
+
+    def stop() -> None:
+        try:
+            observer.stop()
+            observer.join(timeout=2.0)
+        except Exception:
+            pass
+
+    helper = threading.Thread(target=stop, daemon=True, name="agit-watch-stop")
+    helper.start()
+    helper.join(timeout=_STOP_WAIT_SECONDS)

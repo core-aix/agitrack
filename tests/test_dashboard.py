@@ -2295,7 +2295,7 @@ def test_the_file_filter_is_hidden_outside_the_files_view():
     screen until the page grew a [hidden] rule of its own."""
     html = _rendered_dashboard()
 
-    assert '<div class="panehead" id="head-files" hidden>' in html
+    assert '<div class="panehead logpart" id="head-files" hidden>' in html
     assert 'if(hf) hf.hidden = tab !== "files";' in html  # ...and follows the tab
     assert "[hidden]{display:none !important}" in html  # ...and hiding actually hides
 
@@ -2703,10 +2703,76 @@ def test_the_page_answers_clicks_before_its_first_fetch_returns():
     wire = html.index("function wireControls(){")
     init = html.index("async function init(){")
     body = html[init : html.index("\n}\n", init)]
-    assert body.index("wireControls();") < body.index("await loadAgg()")
+    assert body.index("wireControls();") < body.index("loadAgg()")
     controls = html[wire:init]
     assert '$("commitlog").addEventListener("click"' in controls
     assert "showLoading(true);" in body and "if(restored) showLoading(false);" in body
+
+
+def _boot_the_page(tmp_path, *, answers: dict) -> dict:
+    """Boot the real dashboard script in shell mode (nothing embedded, as the server serves it),
+    with each request's answer chosen by its path: a dict is the JSON body, None never answers.
+    Returns the body's classes and the commit log's HTML once the answers have settled."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    from agitrack.metrics.web import shell_html
+    from tests.test_story import _DOM_STUB
+
+    page = shell_html(_demo_repo(tmp_path / "r"))
+    source = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+    stub = _DOM_STUB.split("try { new Function(SOURCE)")[0]
+    script = tmp_path / "boot.js"
+    script.write_text(
+        "const SOURCE = "
+        + json.dumps(source)
+        + ";\nconst ANSWERS = "
+        + json.dumps(answers)
+        + ";\n"
+        + stub
+        + """
+const els = {};
+const base = document.getElementById;
+document.getElementById = id => id === "agitrack-data" ? base(id) : (els[id] = els[id] || stubEl());
+const classes = new Set();
+document.body.classList = {add: c => classes.add(c), remove: c => classes.delete(c),
+                           toggle: noop, contains: c => classes.has(c)};
+global.localStorage = {getItem: () => null, setItem: noop};
+global.fetch = url => {
+  const path = String(url).split("?")[0];
+  const body = ANSWERS[path];
+  if (body === undefined || body === null) return new Promise(() => {});
+  return Promise.resolve({ok: true, json: async () => body});
+};
+new Function(SOURCE)();
+setImmediate(() => setImmediate(() => {
+  console.log(JSON.stringify({classes: [...classes], log: els.commitlog ? els.commitlog.innerHTML : ""}));
+}));
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_the_log_is_drawn_without_waiting_for_the_panels(tmp_path):
+    # Reported on a real repository: after a refresh the log stayed blank for about five
+    # seconds. The page fetched /data, waited for it, and only then fetched the log, drawing
+    # nothing until both were in. The log needs 0.4 s there and /data took 5 s (the pending-work
+    # probe runs the OpenCode CLI, the insights read the whole file history), none of which
+    # the log depends on. With /data never answering at all, the log must still be on screen,
+    # with the panels' placeholder standing in above it.
+    from agitrack.metrics.web import log_page
+
+    log = log_page(build_dashboard(_demo_repo(tmp_path / "data")), view="timeline")
+    shown = _boot_the_page(tmp_path, answers={"log": log, "data": None})
+
+    assert "add the feature" in shown["log"]
+    assert "aggloading" in shown["classes"] and "booting" not in shown["classes"]
 
 
 def test_the_log_search_can_look_in_the_users_words_the_agents_words_or_the_whole_trace(tmp_path):
