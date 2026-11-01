@@ -44,7 +44,7 @@ from pathlib import Path
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import is_fully_tracked_message
-from agitrack.commits.message import mask_paths
+from agitrack.commits.message import mask_paths, strip_pasted_content_tags
 from agitrack.git import GitRepo
 from agitrack.metrics import progress
 
@@ -1024,7 +1024,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
     # each squash constituent) derives from `body`, so one call covers them all. Metadata values
     # are backends/models/ids/token counts and contain no paths, so parsing is unaffected; the
     # masking is deterministic, so metadata_block duplicate detection still matches.
-    body = mask_paths(body)
+    body = strip_pasted_content_tags(mask_paths(body))
     subject = body.splitlines()[0] if body.splitlines() else ""
     timestamp = int(committed_at) if committed_at.isdigit() else 0
     co_authors = _parse_co_authors(body)

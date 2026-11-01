@@ -146,6 +146,22 @@ _PATH_TRAILING_PUNCT = ".,;:!?)]}\"'"
 # to end in M/m.
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
 MOUSE_REPORT_FRAGMENT_RE = re.compile(r"(?:\x1b)?\[<\d+(?:;\d+){1,2}[Mm]?")
+# The markup Claude Code wraps around text the user PASTED into a prompt: `<pasted_content
+# id="c563">` before it and `</pasted_content id="c563">` after it. It is the harness's own
+# bookkeeping, not anything the user wrote, and it read as noise in commit subjects, traces and
+# the dashboard (seen live, mid-sentence in a subject). The pasted text itself is kept. `\s`
+# also spans a line break, so a tag a hard wrap already split (older commits) still matches.
+PASTED_CONTENT_TAG_RE = re.compile(r"([ \t]?)</?pasted_content\b[^<>]*>([ \t]?)")
+
+
+def strip_pasted_content_tags(text: str) -> str:
+    """Remove the harness's `<pasted_content>` markers, keeping one space where the tag sat
+    between two words so the text either side does not run together."""
+    if "pasted_content" not in text:
+        return text
+    return PASTED_CONTENT_TAG_RE.sub(lambda m: " " if (m.group(1) or m.group(2)) else "", text)
+
+
 # Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).
 #
 # The `[P-_]` and `[@-Z\-_]` ranges look like typos and are not: they are CODE-POINT ranges from
@@ -1226,6 +1242,7 @@ def _mask_secrets(text: object, repo_root: str | Path | None = None) -> str:
     value = str(text or "")
     value = MOUSE_REPORT_RE.sub("", value)
     value = MOUSE_REPORT_FRAGMENT_RE.sub("", value)
+    value = strip_pasted_content_tags(value)
     value = ANSI_SEQUENCE_RE.sub("", value)
     value = CONTROL_CHAR_RE.sub("", value)
     value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)
