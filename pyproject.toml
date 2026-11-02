@@ -143,3 +143,10 @@ ignore_missing_imports = true
 # package, surface real issues, but don't require full strictness yet. The
 # pre-existing errors are held in a baseline (see CI) and burned down separately.
 files = ["agitrack"]
+
+[tool.uv]
+# Every filelock release that fixes its 2026 advisories needs Python >= 3.11, so
+# on 3.10 (pulled in only by pre-commit's virtualenv) keep the version already
+# locked. Without this pin uv picks a newer, equally vulnerable 4.1.0, which the
+# dependency review reads as a newly added vulnerable package.
+constraint-dependencies = ["filelock==3.29.3; python_version < '3.11'"]
