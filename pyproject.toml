@@ -56,7 +56,9 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.13",
     "mypy-baseline>=0.7",
-    "pre-commit>=4.0",
+    # pre-commit only installs the local git hooks. On Python 3.10 it would pull in a
+    # filelock with open advisories: every fixed filelock release needs Python >= 3.11.
+    "pre-commit>=4.0; python_version >= '3.11'",
     # A per-test deadline (`--timeout` in CI and scripts/check.sh). A test that never returns
     # otherwise prints nothing and holds the whole job until its 45-minute limit, with no name
     # in the log; it was a tracker test waiting on a repository change that Linux's inode reuse
@@ -144,9 +146,3 @@ ignore_missing_imports = true
 # pre-existing errors are held in a baseline (see CI) and burned down separately.
 files = ["agitrack"]
 
-[tool.uv]
-# Every filelock release that fixes its 2026 advisories needs Python >= 3.11, so
-# on 3.10 (pulled in only by pre-commit's virtualenv) keep the version already
-# locked. Without this pin uv picks a newer, equally vulnerable 4.1.0, which the
-# dependency review reads as a newly added vulnerable package.
-constraint-dependencies = ["filelock==3.29.3; python_version < '3.11'"]
