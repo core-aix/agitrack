@@ -2106,6 +2106,25 @@ def test_cli_dashboard_missing_directory_fails_cleanly(tmp_path, monkeypatch):
     assert cli.main(["--dashboard", "--repo", str(tmp_path / "nowhere")]) == 1
 
 
+def test_dashboard_drops_pasted_content_markers_from_existing_commits():
+    # Commits already written carry the harness's paste markers, including a closing tag a hard
+    # wrap split across two lines; the dashboard shows them without it.
+    from agitrack.metrics.collect import _parse_commit
+
+    body = (
+        '<aGiTrack> Once done, <pasted_content id="c563"> start four subagents\n\n'
+        "# Interaction Trace\n\n## User\n\nOnce done,\n\n"
+        '<pasted_content id="c563">\nstart four subagents. </pasted_content\n id="c563">\n\n'
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: m1\n"
+    )
+    stat = _parse_commit("abc1234", "A", "a@example.com", "1700000000", body)
+
+    assert "pasted_content" not in stat.message
+    assert stat.subject == "<aGiTrack> Once done, start four subagents"
+    assert "start four subagents." in stat.message
+    assert stat.kind == "agent"
+
+
 def test_dashboard_masks_paths_in_historical_commit_messages(tmp_path):
     # History is never rewritten, so commits written BEFORE path masking existed still carry
     # raw paths in git. The dashboard masks at render time, so the old ones are covered too.

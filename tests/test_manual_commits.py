@@ -1012,6 +1012,64 @@ def test_the_timeline_places_each_message_when_it_was_sent_and_ignores_rewrappin
     ]
 
 
+def test_a_queued_followup_that_opens_the_next_turn_is_shown_once(tmp_path):
+    # Seen live on most queued follow-ups: a message queued while a turn ran is recorded inside
+    # that turn (which began earlier), and the next record carries it again as the start of its
+    # own turn. Matched on the TURN's start the two copies never agreed and the timeline showed
+    # the message twice; the message's own send time is the same in both.
+    import json
+
+    from agitrack.metrics.server import RepoScope
+
+    first, followup = "Did we decide to add any new baselines?", "Once done, start four subagents"
+
+    def body(trace: list[dict], started: int, ended: int) -> str:
+        return build_agent_commit_message(
+            latest_prompt=trace[0]["content"],
+            trace=[*trace, {"role": "agent", "content": "done"}],
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 10, "input": 5},
+            session_name="s",
+            started_at=started,
+            ended_at=ended,
+        )
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nA\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(
+        repo,
+        "commit",
+        "-q",
+        "-m",
+        "First\n\n"
+        + body(
+            [
+                {"role": "user", "content": first, "at": 1_793_535_643},
+                {"role": "user", "content": followup, "at": 1_793_535_802, "starts_turn": False},
+            ],
+            1_793_535_643,
+            1_793_536_306,
+        ),
+    )
+    (tmp_path / "a.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(
+        repo,
+        "commit",
+        "-q",
+        "-m",
+        "Second\n\n" + body([{"role": "user", "content": followup, "at": 1_793_535_802}], 1_793_535_802, 1_793_537_783),
+    )
+
+    page = json.loads(RepoScope(repo).get("/log", {"view": ["timeline"]}).body)
+    shown = [[p for t in page["entries"][i]["turns"] for p in t["prompts"]][seq - 1] for i, seq in page["items"] if seq]
+    assert sorted(shown) == sorted([first, followup])
+
+
 # --- config toggle ----------------------------------------------------------
 
 

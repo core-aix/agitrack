@@ -1017,9 +1017,10 @@ def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
     the same turn. A commit made while a turn is still running carries the turn as it stood, and
     the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
     spent after the commit, counted once between the two); both carry the turn's prompt, so the
-    timeline listed one message twice, usually a committed copy and a pending one (seen live). The
-    same turn is told by its start time and its text (whitespace aside); the oldest record's copy
-    is kept. A message
+    timeline listed one message twice, usually a committed copy and a pending one (seen live). A
+    follow-up queued during a turn repeats the same way: the record of that turn carries it, and
+    so does the next one, where it opens a turn of its own. The same message is told by when it
+    was sent and its text (whitespace aside); the oldest record's copy is kept. A message
     whose turn recorded no start cannot be placed and is never folded away."""
     seen: set[tuple[float, str]] = set()
     repeats: set[tuple[int, int]] = set()
@@ -1034,8 +1035,8 @@ def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
     return repeats
 
 
-# The identity of each of a commit's messages, oldest first: when its turn began and what it said
-# (None where the turn recorded no start), by commit.
+# The identity of each of a commit's messages, oldest first: when it was SENT and what it said
+# (None where its turn recorded no start), by commit.
 _PROMPT_KEYS: dict[tuple[str, int], tuple[tuple[float, str] | None, ...]] = {}
 
 
@@ -1049,9 +1050,15 @@ def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
             # Whitespace does not count: a commit git wrote strips the space a hard-wrapped line
             # ends with, and a pending record (written by `commit-tree`) keeps it, so the same
             # message read differently in the two and was shown twice (seen live).
-            (turn["at"], " ".join(text.split())) if turn["at"] else None
-            for turn in _timeline_turns(stat)
-            for text in turn["prompts"]
+            # And the time is the MESSAGE's own, not its turn's start: a follow-up queued while a
+            # turn ran is recorded inside that turn (which began earlier) and then opens its own
+            # turn in the next record, so keyed on the turn's start the two copies never matched
+            # and the message was shown twice (seen live, on most queued follow-ups).
+            (at, " ".join(text.split())) if at else None
+            for at, text in zip(
+                _prompt_times(stat),
+                (text for turn in _timeline_turns(stat) for text in turn["prompts"]),
+            )
         )
     return found
 

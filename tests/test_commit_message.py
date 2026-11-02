@@ -381,6 +381,24 @@ def test_commit_message_removes_mouse_coordinate_reports():
     assert "keep text" in message
 
 
+def test_commit_message_drops_the_pasted_content_markers_but_keeps_the_paste():
+    # Claude Code wraps pasted text in `<pasted_content id=...>` markers; they landed verbatim,
+    # mid-sentence, in a real commit subject. The pasted text itself is the user's and stays.
+    prompt = 'Once done, <pasted_content id="c563"> start four subagents.\nThen review. </pasted_content id="c563">'
+    message = build_agent_commit_message(
+        latest_prompt=prompt,
+        trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "ok"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="m",
+    )
+
+    assert "pasted_content" not in message
+    assert message.splitlines()[0].startswith("<aGiTrack> Once done, start four subagents.")
+    assert "Then review." in message
+
+
 def test_commit_message_removes_a_malformed_mouse_report_too():
     """Real bug: a mouse report the proxy's own capture failed to recognize as complete (cut
     off before its M/m terminator, or otherwise corrupted in flight) left a raw fragment like
