@@ -347,14 +347,23 @@ def record_elsewhere(
         seen_key = (root, candidate.backend, candidate.session_id)
         # A commit is never skipped this way: a conversation whose recording was deferred (its
         # sub-agents still running, which write to their own files) looks unchanged here.
-        if not at_commit and candidate.updated and _PROCESSED.get(seen_key) == candidate.updated:
+        seen = _PROCESSED.get(seen_key)
+        if not at_commit and candidate.updated and seen is not None and seen[0] == candidate.updated:
+            # Skipped, but what it said last time still stands: a turn that was running here
+            # and has written nothing since is still running, and the auto-fold must still wait.
+            running_here = running_here or seen[1]
             continue
         exported = export_candidate(candidate)
-        if exported is None or not exported.turns:
+        if exported is None:
+            continue  # the read failed; try again next time
+        if not exported.turns:
+            # Nothing to record until it changes. Not remembering this re-exported every empty
+            # OpenCode conversation in the window on every pass, by subprocess, in every tracker.
+            _PROCESSED[seen_key] = (candidate.updated, False)
             continue
         last = exported.turns[-1]
-        if not _finished(last) and router.foreign_filter(candidate.cwd, floor=floor)(last):
-            running_here = True
+        running_this = not _finished(last) and router.foreign_filter(candidate.cwd, floor=floor)(last)
+        running_here = running_here or running_this
         # Session sets its per-session fields dynamically, so it is used untyped here (as the
         # background runner's _bare_session does).
         session: Any = Session.bare()
@@ -398,13 +407,19 @@ def record_elsewhere(
         if committed:
             debug_fn(f"recorded turns from a {candidate.backend} conversation started in {candidate.cwd}")
             recorded = True
-        if not getattr(exported, "live_subagent_ids", None) and not any(not _finished(turn) for turn in exported.turns):
-            # Only once nothing in it is still running: a running turn is placed when it ends,
-            # and that end is itself a change, so the conversation is read again then.
-            _PROCESSED[seen_key] = candidate.updated
+        if not getattr(exported, "live_subagent_ids", None):
+            # A running turn is placed when it ends, and that end is itself a change, so the
+            # conversation is read again then; its "running here" verdict is kept meanwhile.
+            # This used to wait until EVERY turn had finished, and a conversation holding one
+            # interrupted turn anywhere in its history never qualified: it was re-exported on
+            # every pass for the whole recency window. Live sub-agents are the exception: they
+            # write their own files, so the conversation looks unchanged while they work.
+            _PROCESSED[seen_key] = (candidate.updated, running_this)
     if note_running_fn is not None:
         note_running_fn(running_here)
     return recorded
 
 
-_PROCESSED: dict[tuple[str, str, str], float] = {}
+# (root, backend, session id) -> (its ``updated`` when last read, whether a turn of it was
+# running in this repository then).
+_PROCESSED: dict[tuple[str, str, str], tuple[float, bool]] = {}

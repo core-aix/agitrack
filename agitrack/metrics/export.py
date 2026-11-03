@@ -550,7 +550,8 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
       }});
     }}
     // Deep link from the main page's "Turns become commits" card: #trace opens the
-    // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
+    // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading, opening
+    // the squashed part that holds it when the commit folds several turns (manual mode).
     // The log arrives asynchronously, so poll: first click the entry open (its detail
     // renders a frame later). Then PIN the heading just below the sticky chrome and keep
     // correcting while late layout (the chart canvas, web fonts, other entries) shifts the
@@ -569,6 +570,12 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
           if (!target && /interaction trace/i.test(h.textContent)) target = h;
         }});
         if (target) {{
+          // A manual-mode commit folds its turns in as squashed PARTS, each a closed
+          // <details>, so its trace heading is in the document but not on screen: open every
+          // part around it (the newest turn is the first one listed) before scrolling to it.
+          for (var d = target.parentElement; d && d !== detail; d = d.parentElement) {{
+            if (d.tagName === "DETAILS" && !d.open) d.open = true;
+          }}
           clearInterval(tick);
           // Only chrome that is ACTUALLY pinned to the top can cover the target. The filter
           // bar is sticky on a desktop but scrolls away on a phone, where reserving its

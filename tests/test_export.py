@@ -320,6 +320,9 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert 'location.hash === "#trace"' in index
     assert "box.scrollTop" not in index  # no inner scroll region left to chase
     assert "target.getBoundingClientRect().top - inset()" in index
+    # A manual-mode commit folds its turns in as closed squashed parts: the link opens the part
+    # holding the newest trace, or it scrolls to a heading that is not on screen.
+    assert 'if (d.tagName === "DETAILS" && !d.open) d.open = true;' in index
     # The inset counts only chrome that is ACTUALLY stuck: the filter bar is sticky on a
     # desktop but scrolls away on a phone, where reserving its height parked the entry a
     # screenful too low. And corrections scroll INSTANTLY — with the page's default smooth

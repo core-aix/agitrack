@@ -1032,6 +1032,27 @@ in the background: the first paint labels people from their email and their IDs 
 later. Someone whose commit email is linked to no GitHub account keeps their git name, which is
 all there is to know about them.
 
+**Run in a folder that is not a repository.** `agitrack -d` there shows the folder's BACKTRACE
+when coding agents have worked in it, because a reconstruction needs no git. One case asks first:
+a folder that HOLDS repositories (running it one directory too high, in `~/Code` rather than in a
+project). Its backtrace would be every project's agent history at once, read from hundreds of
+conversations, so aGiTrack names the repositories inside, asks `[y/N]` at a terminal, and does
+nothing without one. `agitrack stop` and `agitrack -d stop` work there too: `stop` takes the folder
+off the dashboard (its backtrace and the watch on its transcripts end within seconds), and
+`-d stop` stops the dashboard, as it does anywhere.
+
+```mermaid
+flowchart TD
+  plain(["agitrack -d in a folder that is not a repository"]) --> holds{"Does it hold repositories?"}
+  holds -->|"Yes: one directory too high"| note[["Name the repositories inside; cd into one"]]
+  note --> ask{"At a terminal, with agent sessions here:<br/>reconstruct everything under it as ONE backtrace? [y/N]"}
+  ask -->|"y"| btplain["/b/&lt;slug&gt;/ backtrace view"]
+  ask -->|"Enter / n / no terminal"| quit(["Exit, nothing started"])
+  holds -->|No| sess{"Agent sessions ran here?"}
+  sess -->|Yes| btplain
+  sess -->|No| nothing(["Say there is nothing to show; git init, then agitrack"])
+```
+
 ```mermaid
 flowchart TD
   any(["agitrack -i / -b / -d / --backtrace,<br/>or Ctrl-G → dashboard"]) --> remember[["Remember this repo in ~/.agitrack/repos.json<br/>(path, display name, derived slug)"]]

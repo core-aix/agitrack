@@ -734,17 +734,36 @@ def test_opencode_session_list_is_bounded_and_safe_on_timeout(monkeypatch):
 # --- cross-backend activity probe -------------------------------------------
 
 
-def _fake_store(tmp_path, monkeypatch, rows):
-    """An OpenCode data directory holding just enough database to answer the probe."""
+def _fake_store(tmp_path, monkeypatch, rows, *, messages=None, children=()):
+    """An OpenCode data directory holding just enough database to answer the probe. ``rows``
+    are ``(id, directory, session.time_updated)``; ``messages`` maps a session id to the
+    ``time_updated`` of the one message written to it (default: its session stamp);
+    ``children`` are ``(child id, parent id, message time)`` sub-agent sessions."""
     import sqlite3
 
+    from agitrack.transcripts import opencode as opencode_session
+
+    opencode_session._CONTENT_ACTIVITY.clear()
     monkeypatch.setenv("AGITRACK_XDG_DATA_HOME", str(tmp_path / "share"))
     database = tmp_path / "share" / "opencode" / "opencode.db"
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
+    messages = dict(messages or {})
     try:
-        connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER)")
-        connection.executemany("INSERT INTO session VALUES (?, ?, ?)", rows)
+        connection.execute(
+            "CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER, parent_id TEXT, title TEXT, "
+            "time_archived INTEGER)"
+        )
+        connection.execute("CREATE TABLE message (id TEXT, session_id TEXT, time_updated INTEGER)")
+        connection.execute("CREATE TABLE part (id TEXT, session_id TEXT, time_updated INTEGER)")
+        for sid, directory, stamp in rows:
+            connection.execute("INSERT INTO session VALUES (?, ?, ?, NULL, ?, NULL)", (sid, directory, stamp, sid))
+            written = messages.get(sid, stamp)
+            if written is not None:
+                connection.execute("INSERT INTO message VALUES (?, ?, ?)", ("msg-" + sid, sid, written))
+        for child, parent, written in children:
+            connection.execute("INSERT INTO session VALUES (?, '', ?, ?, ?, NULL)", (child, written, parent, child))
+            connection.execute("INSERT INTO part VALUES (?, ?, ?)", ("prt-" + child, child, written))
         connection.commit()
     finally:
         connection.close()
@@ -780,6 +799,139 @@ def test_repo_activity_answers_from_the_database_without_spawning_the_cli(tmp_pa
     # A repo OpenCode has never been opened in says so, rather than reporting a time of 0 that
     # would read as "used, long ago" and take part in the comparison.
     assert repo_activity(tmp_path / "never-used") is None
+
+
+def test_a_session_stamp_that_moved_with_nothing_written_is_not_activity(tmp_path, monkeypatch):
+    """``session.time_updated`` can move with nothing said: on one machine every OpenCode
+    conversation had it rewritten within half a minute, their newest messages months old, and
+    every background tracker then exported all of them by subprocess every ten seconds for six
+    hours. Activity is when a message or part was last WRITTEN, in the conversation or in a
+    sub-agent session it spawned."""
+    import time as _time
+
+    from agitrack.transcripts import opencode as opencode_session
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    now_ms = int(_time.time() * 1000)
+    months_ago = now_ms - 200 * 24 * 3600 * 1000
+    _fake_store(
+        tmp_path,
+        monkeypatch,
+        [
+            ("ses_stale", str(repo), now_ms),  # stamp rewritten just now...
+            ("ses_live", str(tmp_path / "other"), now_ms),
+            ("ses_delegating", str(tmp_path / "third"), now_ms),
+        ],
+        messages={"ses_stale": months_ago, "ses_live": now_ms - 5_000, "ses_delegating": months_ago},
+        children=[("ses_child", "ses_delegating", now_ms - 2_000)],  # ...its sub-agent is working
+    )
+
+    recent = {ref.id: ref.updated for ref, _directory in opencode_session.recent_sessions(_time.time() - 3600)}
+    assert set(recent) == {"ses_live", "ses_delegating"}
+    assert recent["ses_live"] == (now_ms - 5_000) / 1000
+    assert recent["ses_delegating"] == (now_ms - 2_000) / 1000
+    assert repo_activity(repo) == months_ago / 1000  # when it was last really used
+
+
+def test_the_conversation_to_follow_is_read_from_the_database_not_the_cli(tmp_path, monkeypatch):
+    """A background tracker asks this on every poll. Through the CLI it was a ~0.5 s subprocess
+    every three seconds for as long as the tracker ran, with nothing happening (measured live
+    on OpenCode 1.19.5). The newest WRITTEN conversation here wins; a scripted run, an archived
+    conversation and one in another folder never do."""
+    import sqlite3
+
+    from agitrack.transcripts import opencode as opencode_session
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = _fake_store(
+        tmp_path,
+        monkeypatch,
+        [
+            ("ses_older", str(repo), 1_700_000_900_000),
+            ("ses_newer", str(repo), 1_700_000_100_000),  # stamp older, but written to last
+            ("ses_script", str(repo), 1_700_000_990_000),
+            ("ses_archived", str(repo), 1_700_000_980_000),
+            ("ses_elsewhere", str(tmp_path / "other"), 1_800_000_000_000),
+        ],
+        messages={"ses_older": 1_700_000_000_000, "ses_newer": 1_700_000_500_000},
+    )
+    connection = sqlite3.connect(database)
+    connection.execute("UPDATE session SET time_archived = 1 WHERE id = 'ses_archived'")
+    connection.commit()
+    connection.close()
+    opencode_session.mark_programmatic("ses_script")
+    monkeypatch.setattr(
+        opencode_session, "_opencode_session_list", lambda *a, **k: pytest.fail("must not shell out to the CLI")
+    )
+
+    assert opencode_session.latest_session_id(repo) == "ses_newer"
+    assert opencode_session.latest_session_id(tmp_path / "never-used") is None
+
+
+def test_an_unchanged_conversation_is_not_exported_again(tmp_path, monkeypatch):
+    """Each export is a CLI call, and a tracker exports its own conversation on every poll.
+    While nothing in it (or in a sub-agent session it spawned) has been written, the last export
+    is reused; a new message, or a sub-agent writing, makes the next poll export again."""
+    import sqlite3
+
+    from agitrack.transcripts import opencode as opencode_session
+    from agitrack.transcripts.types import ExportedSession
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = _fake_store(tmp_path, monkeypatch, [("ses_a", str(repo), 1_700_000_000_000)])
+    calls: list[str] = []
+
+    def export(_repo, session_id, *, collect_edits=False):
+        calls.append(session_id)
+        return ExportedSession(session_id, "m", None, [])
+
+    monkeypatch.setattr(opencode_session, "_export_session_uncached", export)
+    first = opencode_session.export_session(repo, "ses_a")
+    assert opencode_session.export_session(repo, "ses_a") is first
+    assert calls == ["ses_a"]
+
+    connection = sqlite3.connect(database)
+    connection.execute("INSERT INTO message VALUES ('msg-2', 'ses_a', 1700000001000)")
+    connection.commit()
+    opencode_session.export_session(repo, "ses_a")
+    assert calls == ["ses_a", "ses_a"]
+
+    connection.execute("INSERT INTO session VALUES ('ses_child', '', 1, 'ses_a', 'child', NULL)")
+    connection.execute("INSERT INTO part VALUES ('prt-1', 'ses_child', 1700000002000)")
+    connection.commit()
+    connection.close()
+    opencode_session.export_session(repo, "ses_a")
+    assert calls == ["ses_a", "ses_a", "ses_a"]
+
+
+def test_sessions_under_a_folder_are_read_from_the_database_not_the_cli(tmp_path, monkeypatch):
+    """The dashboard asks this every minute for each repository it shows. The CLI cost ~0.5 s
+    each time whether or not OpenCode was in use, and only listed the OpenCode project of the
+    folder it ran in, so conversations in subfolders of a plain folder went missing."""
+    from agitrack.transcripts import opencode as opencode_session
+
+    top = tmp_path / "top"
+    (top / "a").mkdir(parents=True)
+    (top / "b" / "deep").mkdir(parents=True)
+    _fake_store(
+        tmp_path,
+        monkeypatch,
+        [
+            ("ses_a", str(top / "a"), 1_700_000_100_000),
+            ("ses_deep", str(top / "b" / "deep"), 1_700_000_200_000),
+            ("ses_outside", str(tmp_path / "elsewhere"), 1_700_000_300_000),
+        ],
+    )
+    monkeypatch.setattr(
+        opencode_session, "_opencode_session_list", lambda *a, **k: pytest.fail("must not shell out to the CLI")
+    )
+
+    found = opencode_session.sessions_under(top)
+    assert [ref.id for ref, _directory in found] == ["ses_deep", "ses_a"]  # newest written first
+    assert found[0][1] == str((top / "b" / "deep").resolve())
 
 
 def test_repo_activity_ignores_sessions_no_human_drove(tmp_path, monkeypatch):

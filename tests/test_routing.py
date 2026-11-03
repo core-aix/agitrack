@@ -298,7 +298,7 @@ def test_a_commit_rereads_a_conversation_that_looks_unchanged(layout, tmp_path, 
     )
     monkeypatch.setattr(routing, "is_tracked", lambda root: True)
     tracker = _tracker(inner, tmp_path)
-    routing._PROCESSED[(str(inner), "claude", "33333333-3333-3333-3333-333333333333")] = path.stat().st_mtime
+    routing._PROCESSED[(str(inner), "claude", "33333333-3333-3333-3333-333333333333")] = (path.stat().st_mtime, False)
     assert not tracker._process_elsewhere(require_complete=False)  # an ordinary poll skips it
     assert tracker._process_once(require_complete=False, at_commit=True)
     assert "fix the nested library" in _pending(tracker)
@@ -331,3 +331,43 @@ def test_a_turn_from_elsewhere_still_running_in_this_repository_is_reported(layo
     running_elsewhere.complete = False
     assert run(running_elsewhere) is False
     assert run(_turn("edit the nested library", inner / "lib.py")) is False  # finished
+
+
+def test_an_unchanged_conversation_is_read_once_whatever_its_history_holds(layout, monkeypatch):
+    """A tracker passes over every recently active conversation elsewhere every few seconds, and
+    reading an OpenCode one is a CLI call. One that has not changed must not be read again: not
+    one with an interrupted turn somewhere in its history, not one with no turns at all (both
+    were re-exported on every pass, by every tracker, for six hours). A turn that was running
+    here when last read is still reported as running while nothing has changed."""
+    from agitrack.transcripts.types import ExportedSession
+
+    parent, inner, _sibling, _scratch = layout
+    repo, state = GitRepo(inner), AgitrackState(inner, default_backend="opencode")
+    routing.routing_floor(state)
+    updated = time.time()
+    aborted = _turn("an interrupted request", inner / "a.py")
+    aborted.complete = False
+    running = _turn("still working on it", inner / "b.py")
+    running.complete = False
+    conversations = {
+        "s-empty": [],
+        "s-aborted-earlier": [aborted, _turn("then a finished one", inner / "c.py")],
+        "s-running": [running],
+    }
+    reads: list[str] = []
+
+    def export(candidate):
+        reads.append(candidate.session_id)
+        return ExportedSession(candidate.session_id, "m", None, conversations[candidate.session_id])
+
+    found = [routing.Candidate("opencode", sid, str(parent), None, updated) for sid in conversations]
+    monkeypatch.setattr(routing, "candidates", lambda root, since, full=False: found)
+    monkeypatch.setattr(routing, "export_candidate", export)
+    routing._PROCESSED.clear()
+    seen: list[bool] = []
+    for _ in range(3):
+        routing.record_elsewhere(
+            repo, state, commit_fn=lambda **_k: None, debug_fn=lambda _m: None, note_running_fn=seen.append
+        )
+    assert sorted(reads) == sorted(conversations)  # each read exactly once
+    assert seen == [True, True, True]  # the running turn is still reported while unchanged

@@ -1540,3 +1540,37 @@ def test_a_late_successor_makes_the_old_hub_stand_down(tmp_path, monkeypatch, ca
 
     assert len(binds) == 1
     assert "exiting rather than serving beside it" in capsys.readouterr().out
+
+
+def test_a_folder_taken_off_the_served_list_stops_being_watched(tmp_path, monkeypatch):
+    """A built backtrace keeps a thread re-reading its folder's transcripts. Nothing ever stopped
+    it: a folder opened once (a whole ~/Code, by mistake) was watched until the hub restarted,
+    whatever the user then stopped. `agitrack stop` records the stop in the registry; the mount
+    notices, drops the view and ends the watcher."""
+    import threading
+
+    from agitrack import repos as repo_registry
+    from agitrack.metrics import hub
+
+    monkeypatch.setattr(hub, "_UNSERVED_CHECK_SECONDS", 0.01)
+    mounts = hub._Mounts()
+    stop = threading.Event()
+    mounts._backtrace["slug"] = object()
+    mounts._backtrace_live["slug"] = {"view": None, "stop": stop}
+    served = {"value": True}
+
+    class Entry:
+        @property
+        def served(self):
+            return served["value"]
+
+    monkeypatch.setattr(repo_registry, "entry_for", lambda _d: Entry())
+    watcher = threading.Thread(target=mounts._drop_once_unserved, args=("slug", tmp_path, stop))
+    watcher.start()
+    stop.wait(0.1)
+    assert not stop.is_set() and mounts.is_open("slug")  # still served: left alone
+
+    served["value"] = False
+    watcher.join(timeout=5)
+    assert not watcher.is_alive()
+    assert stop.is_set() and not mounts.is_open("slug")

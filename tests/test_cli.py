@@ -403,6 +403,70 @@ def test_no_repo_message_leaves_an_ordinary_failure_alone(tmp_path):
     assert cli._no_repo_message(tmp_path, GitError("Not a Git repository: .")) == "Not a Git repository: ."
 
 
+def _no_dashboard(monkeypatch):
+    import agitrack.metrics.hub as hub
+
+    opened: list = []
+    monkeypatch.setattr(hub, "open_dashboard", lambda *a, **k: opened.append((a, k)) or 0)
+    return opened
+
+
+def test_dashboard_stop_in_a_folder_that_is_not_a_repository_stops_it(tmp_path, monkeypatch):
+    """`agitrack -d stop` in a plain folder fell through to the "no repository here" path, which
+    OPENED the dashboard (a folder of projects got its whole backtrace): the stop command
+    restarted what it was asked to stop."""
+    import agitrack.metrics.hub as hub
+    import agitrack.metrics.suggest as suggest
+
+    _folder_of_repos(tmp_path)
+    opened = _no_dashboard(monkeypatch)
+    monkeypatch.setattr(suggest, "has_backtrace_history", lambda _d: True)
+    stopped: list = []
+    monkeypatch.setattr(hub, "stop_hub", lambda **_k: stopped.append(True) or 0)
+
+    assert cli.main(["-d", "stop", "--repo", str(tmp_path)]) == 0
+    assert stopped == [True] and opened == []
+
+
+def test_stop_in_a_folder_the_dashboard_serves_stops_serving_it(tmp_path, monkeypatch, capsys):
+    """`agitrack stop` refused outright outside a repository, leaving a backtrace of that folder
+    (opened by `agitrack -d` there) served with no command able to end it."""
+    import agitrack.metrics.hub as hub
+
+    unmounted: list = []
+    monkeypatch.setattr(hub, "unmount_repo", lambda d: unmounted.append(d) or True)
+
+    assert cli.main(["stop", "--repo", str(tmp_path)]) == 0
+    assert unmounted == [tmp_path.resolve()]
+    assert "no longer serves" in capsys.readouterr().out
+
+
+def test_the_dashboard_asks_before_reconstructing_a_whole_folder_of_projects(tmp_path, monkeypatch, capsys):
+    """`agitrack -d` one directory too high (the folder that holds the projects) went straight
+    into reconstructing every project's agent history at once, with no question. It now explains,
+    asks at a terminal (defaulting to no), and does nothing without one."""
+    import agitrack.metrics.suggest as suggest
+
+    _folder_of_repos(tmp_path)
+    opened = _no_dashboard(monkeypatch)
+    monkeypatch.setattr(suggest, "has_backtrace_history", lambda _d: True)
+
+    _force_tty(monkeypatch, stdin=False)
+    assert cli.main(["-d", "--repo", str(tmp_path)]) == 1
+    assert "3 folders inside it are" in capsys.readouterr().out
+    assert opened == []
+
+    _force_tty(monkeypatch, stdin=True)
+    prompts: list = []
+    monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or "")  # bare Enter
+    assert cli.main(["-d", "--repo", str(tmp_path)]) == 1
+    assert "[y/N]" in prompts[0] and opened == []
+
+    monkeypatch.setattr("builtins.input", lambda p="": "y")
+    assert cli.main(["-d", "--repo", str(tmp_path)]) == 0
+    assert len(opened) == 1
+
+
 # --- backend passthrough args (#32) -----------------------------------------
 
 
