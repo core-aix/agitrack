@@ -2,9 +2,9 @@
 
 Every aGiTrack commit records exact token counts per category, but the number a reader acts on
 is money. This module turns a commit's tokens into an INDICATIVE US-dollar figure from a dated
-price reference bundled with aGiTrack (``price_table.py``: models.dev, the catalog OpenCode
-prices with, plus Anthropic's first-party prices; regenerate it with
-``scripts/update_model_prices.py``). It is the list price of the same tokens, not the user's
+price reference bundled with aGiTrack, ``price_table.py``: models.dev's prices for the OpenAI
+models Codex uses, Anthropic and other providers, plus Anthropic's first-party prices. Regenerate
+it with ``scripts/update_model_prices.py``. It is the list price of the same tokens, not the user's
 bill: a subscription, a batch discount, a negotiated rate or a long-context surcharge all make
 the real figure differ, and the dashboard says so beside the number with the reference's
 source and date.

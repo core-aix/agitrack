@@ -5,8 +5,10 @@
     python scripts/update_model_prices.py models.json  # or read a saved copy (OpenCode keeps
                                                         # one at ~/.cache/opencode/models.json)
 
-models.dev is the catalog OpenCode itself prices with. Anthropic's first-party prices are
-written over its entries from ``ANTHROPIC`` below (checked against Anthropic's pricing page),
+models.dev lists every provider aGiTrack's backends use: the OpenAI models Codex uses,
+the Anthropic models Claude uses and the providers OpenCode routes to; it is also OpenCode's
+own catalog. Anthropic's first-party prices are written over its entries from ``ANTHROPIC``
+below, checked against Anthropic's pricing page,
 and the date the table was generated is recorded as the date it was added to aGiTrack, which
 the dashboard shows beside every cost. Review the diff before committing it.
 """
@@ -18,6 +20,12 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
+
+SOURCE = (
+    "models.dev's published API prices for the OpenAI models Codex uses, the Anthropic models "
+    "Claude uses and the other providers OpenCode reaches, with Anthropic's own price list for "
+    "Claude models"
+)
 
 PROVIDERS = (
     "anthropic",
@@ -97,7 +105,7 @@ def main() -> int:
         "None means the source lists no separate rate (see metrics/pricing.py for the fallback).",
         '"""',
         "",
-        'SOURCE = "models.dev (the price catalog OpenCode uses) and Anthropic\'s published API pricing"',
+        f"SOURCE = {SOURCE!r}",
         f'ADDED = "{added}"',
         "",
         "PRICES: dict[str, dict[str, tuple[float | None, ...]]] = {",
