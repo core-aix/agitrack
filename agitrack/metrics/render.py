@@ -72,6 +72,20 @@ def format_dashboard(dash: Dashboard) -> str:
         lines.append("  (no token metadata recorded)")
     lines.append("")
 
+    cost = dash.cost_summary
+    if cost["priced"]:
+        # Only when a price is known: a local model has none, and $0 would be a false claim.
+        ref = cost["reference"]
+        lines.append(f"Cost (indicative: published API list prices from {ref['source']}, added {ref['added']})")
+        lines.append(f"  total: {_usd(cost['total'])} ({_usd(cost['total'] / cost['priced'])} per priced commit)")
+        if cost["summarizer"]:
+            lines.append(f"    of which summarizer (aGiTrack's own calls): {_usd(cost['summarizer'])}")
+        if cost["estimated"]:
+            lines.append(f"  {cost['estimated']:,} commit(s) priced like the newest known model of their family")
+        if cost["unpriced"]:
+            lines.append(f"  {cost['unpriced']:,} commit(s) used a model with no published price and are left out")
+        lines.append("")
+
     lines.extend(_group_section("By backend", dash.by_backend))
     lines.extend(_group_section("By model", dash.by_model))
 
@@ -86,6 +100,14 @@ def format_dashboard(dash: Dashboard) -> str:
     return "\n".join(lines)
 
 
+def _usd(value: float) -> str:
+    if value >= 100:
+        return f"${value:,.0f}"
+    if value >= 0.01:
+        return f"${value:,.2f}"
+    return "<$0.01" if value > 0 else "$0.00"
+
+
 def _share(part: int, total: int) -> str:
     return f"  ({part / total:.1%})" if total else ""
 
@@ -98,6 +120,8 @@ def _group_section(title: str, groups: dict[str, dict[str, int]]) -> list[str]:
         tokens = ""
         if stats.get("output_tokens"):
             tokens = f", {stats['output_tokens']:,} output tokens"
+        if stats.get("cost") is not None:
+            tokens += f", {_usd(stats['cost'])}"
         lines.append(
             f"  {label}: {stats['commits']:,} commits, +{stats['insertions']:,} / -{stats['deletions']:,}{tokens}"
         )
