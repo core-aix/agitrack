@@ -1930,7 +1930,7 @@ __UPDATE_BANNER__
     <span class="spin"></span>
     <div class="bmsg">reading commit history<span class="bdots"></span></div>
     <div class="bbar" id="bbar" hidden><i id="bfill"></i></div>
-    <div class="bsub" id="bsub">crunching the git log: a large repo can take a few seconds</div>
+    <div class="bsub" id="bsub">crunching the git log: on a large repository the first load can take a minute or more</div>
   </div>
 
   <div class="controls">
@@ -3892,7 +3892,19 @@ async function init(){
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).
-  if(LIVE) setInterval(refresh, REFRESH_MS);
+  //
+  // A HIDDEN tab does not refresh. Every dashboard tab shares one origin, the hub's port, and a
+  // browser opens at most six connections per origin: a background tab's /data, slow on a big
+  // history, took one of them for nobody, and enough of them left a newly opened dashboard
+  // waiting in the browser's queue for its HTML, a blank page with no spinner because nothing
+  // of it had arrived. It catches up once when it is shown again.
+  if(LIVE){
+    let missed = false;
+    setInterval(() => { if(document.hidden) missed = true; else refresh(); }, REFRESH_MS);
+    document.addEventListener("visibilitychange", () => {
+      if(!document.hidden && missed){ missed = false; refresh(); }
+    });
+  }
 }
 init();
 initHubBar();

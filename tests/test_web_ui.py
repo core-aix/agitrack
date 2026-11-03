@@ -506,3 +506,51 @@ def test_a_page_left_open_reloads_itself_when_the_daemon_updates_under_it(pages)
         assert 'sessionStorage.setItem("agitrack.reloadedFor"' in html, f"{name} reloads without a reason"
         assert "aGiTrack was updated to" in html, f"{name} does not tell the reader why it reloaded"
         assert 'id="reloadnotice"' in html, f"{name} has nowhere to show it"
+
+
+def _run_version_reload(hidden: bool, *, then_show: bool) -> dict:
+    """Drive the shared `noteVersion` under node against a stub document and report what it did."""
+    import json
+    import shutil
+    import subprocess
+
+    from agitrack.metrics import ui
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node to evaluate the page script")
+    src = ui.HUBBAR_JS
+    start = src.index("let servedVersion = null;")
+    end = src.index("\n}\n", src.index("function reloadWhenSeen(){")) + 3
+    script = (
+        "const listeners = [];\n"
+        f"const document = {{hidden: {json.dumps(hidden)}, addEventListener: (n, f) => listeners.push([n, f])}};\n"
+        "let reloads = 0;\n"
+        "const location = {reload: () => { reloads++; }};\n"
+        "const sessionStorage = {setItem(){}};\n" + src[start:end] + "\nnoteVersion('1'); noteVersion('2');\n"
+        "const before = reloads;\n"
+        f"if({json.dumps(then_show)}){{ document.hidden = false; for(const [n, f] of listeners) if(n === 'visibilitychange') f(); }}\n"
+        "console.log(JSON.stringify({before, after: reloads, listeners: listeners.length}));\n"
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_a_hidden_tab_postpones_its_version_reload_until_it_is_shown():
+    """One update restarts every daemon and every open dashboard tab noticed it at once. All of
+    them reloading together filled the hub origin's six browser connections with slow boot
+    fetches, and the page the reader had just opened sat blank in the browser's queue. A tab in
+    the background reloads when it is shown instead, once."""
+    assert _run_version_reload(False, then_show=False) == {"before": 1, "after": 1, "listeners": 0}
+    assert _run_version_reload(True, then_show=False) == {"before": 0, "after": 0, "listeners": 1}
+    assert _run_version_reload(True, then_show=True) == {"before": 0, "after": 1, "listeners": 1}
+
+
+def test_a_hidden_dashboard_does_not_refresh_until_it_is_shown():
+    """A background tab's periodic /data took one of the origin's few connections for nobody."""
+    from agitrack.metrics.web import _TEMPLATE
+
+    tail = _TEMPLATE[_TEMPLATE.index("if(LIVE){") :]
+    assert "if(document.hidden) missed = true; else refresh();" in tail
+    assert "if(!document.hidden && missed){ missed = false; refresh(); }" in tail
