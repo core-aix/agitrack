@@ -105,6 +105,24 @@ def _isolate_global_config(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_opencode_store(request, tmp_path_factory, monkeypatch):
+    """Point aGiTrack's view of OpenCode's database at an empty directory for every test.
+
+    aGiTrack reads OpenCode's SQLite store directly (which conversation is newest, whether one
+    changed since it was last exported). Without this, a test that fakes the OpenCode CLI got its
+    answer from the developer's REAL store instead, and passed or failed by what happened to be
+    in it. A test that needs a store builds one and points ``AGITRACK_XDG_DATA_HOME`` at it
+    (that wins, as it runs after this fixture). Live tests drive the real CLI and keep the real
+    store. The module's memos are cleared too, since they are keyed on session ids."""
+    from agitrack.transcripts import opencode
+
+    if request.node.get_closest_marker("live") is None:
+        monkeypatch.setenv("AGITRACK_XDG_DATA_HOME", str(tmp_path_factory.mktemp("opencode-store")))
+    opencode._EXPORTS.clear()
+    opencode._CONTENT_ACTIVITY.clear()
+
+
+@pytest.fixture(autouse=True)
 def _never_touch_real_daemons(monkeypatch):
     """No test may see (or signal!) the developer's real daemons.
 

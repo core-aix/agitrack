@@ -186,6 +186,12 @@ def list_sessions(repo: Path) -> list[SessionRef]:
 
 def latest_session_id(repo: Path) -> str | None:
     # Only real conversations. Resuming a machine-driven one silently replaces the user's chat.
+    # Asked by a background tracker on every poll, so it is answered from the database when it
+    # can be: `opencode session list` is a ~0.5 s subprocess, every three seconds, for as long as
+    # the tracker runs, even with nothing happening (measured live on OpenCode 1.19.5).
+    answer = _latest_from_database(repo)
+    if answer is not _NO_DATABASE:
+        return answer  # type: ignore[return-value]
     refs = [ref for ref in list_sessions(repo) if not ref.programmatic]
     if not refs:
         return None
@@ -226,6 +232,11 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
     Uses ``opencode session list`` (the sanctioned export path) and filters by directory,
     so it needs no git and catches sessions run in subdirectories or worktrees."""
     directory = directory.resolve()
+    # The dashboard asks this every minute for each repository it shows; from the database it
+    # costs milliseconds, through the CLI ~0.5 s whether or not OpenCode is used at all.
+    from_database = _sessions_under_from_database(directory)
+    if from_database is not _NO_DATABASE:
+        return from_database  # type: ignore[return-value]
     cwd = next((p for p in [directory, *directory.parents] if safe_is_dir(p)), Path.home())
     out: list[tuple[SessionRef, str]] = []
     for session in _opencode_session_list(cwd, 500):
@@ -249,6 +260,49 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
     return out
 
 
+def _sessions_under_from_database(directory: Path) -> object:
+    """:func:`sessions_under` from OpenCode's own store (top-level, unarchived conversations,
+    newest first, each dated by when it was last WRITTEN to, see :func:`_content_activity`), or
+    ``_NO_DATABASE`` when the store cannot answer and the CLI must."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return _NO_DATABASE
+    out: list[tuple[SessionRef, str]] = []
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            rows = connection.execute(
+                "SELECT id, directory, title, time_updated FROM session "
+                "WHERE parent_id IS NULL AND time_archived IS NULL ORDER BY time_updated DESC LIMIT 500"
+            ).fetchall()
+            for sid, sdir, title, stamp in rows:
+                if not sid or not isinstance(sdir, str):
+                    continue
+                try:
+                    dpath = Path(sdir).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if dpath != directory and directory not in dpath.parents:
+                    continue
+                if paths.in_nested_repo(directory, dpath):
+                    continue  # a nested repository's session is that repository's to track
+                activity = _content_activity(connection, str(sid))
+                ref = SessionRef(
+                    id=str(sid),
+                    updated=_to_seconds(activity if activity is not None else stamp),
+                    label=title if isinstance(title, str) and title else None,
+                )
+                out.append((ref, str(dpath)))
+        finally:
+            connection.close()
+    except Exception:
+        return _NO_DATABASE
+    out.sort(key=lambda item: item[0].updated, reverse=True)
+    return out
+
+
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:
     sessions = _opencode_session_list(repo, 50)
     resolved = repo.resolve()
@@ -266,7 +320,94 @@ def _same_repo(directory: object, repo: Path) -> bool:
         return directory == str(repo)
 
 
+_NO_DATABASE = object()
+
+
+def _latest_from_database(repo: Path) -> object:
+    """:func:`latest_session_id` from OpenCode's own store: the top-level, unarchived,
+    human-driven conversation recorded for ``repo`` that was most recently WRITTEN to (see
+    :func:`_content_activity`). ``_NO_DATABASE`` when the store cannot answer, so the caller
+    falls back to the CLI; None when it answers that there is no such conversation."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not database.exists():
+        return _NO_DATABASE
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            rows = connection.execute(
+                "SELECT id, directory FROM session WHERE parent_id IS NULL AND time_archived IS NULL "
+                f"ORDER BY time_updated DESC LIMIT {_ACTIVITY_ROW_LIMIT}"
+            ).fetchall()
+            machine_driven = programmatic_session_ids()
+            resolved = repo.resolve()
+            best: tuple[int, str] | None = None
+            for session_id, directory in rows:
+                if not session_id or str(session_id) in machine_driven or not _same_repo(directory, resolved):
+                    continue
+                activity = _content_activity(connection, str(session_id))
+                if activity is not None and (best is None or activity > best[0]):
+                    best = (activity, str(session_id))
+        finally:
+            connection.close()
+    except Exception:
+        return _NO_DATABASE  # wrong schema, locked, corrupt, no sqlite3: ask the CLI instead
+    return best[1] if best else None
+
+
+def _content_signature(session_id: str) -> tuple | None:
+    """What a conversation holds, cheaply: for it and each sub-agent session it spawned, how
+    many messages and parts it has and when they were last written. Equal signatures mean an
+    export would read the same thing again. None when the store cannot say."""
+    database = _opencode_data_root() / _OPENCODE_DB_NAME
+    if not session_id or not database.exists():
+        return None
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
+        try:
+            ids = [session_id] + sorted(
+                str(row[0]) for row in connection.execute("SELECT id FROM session WHERE parent_id = ?", (session_id,))
+            )
+            signature: list = []
+            for sid in ids:
+                for table in ("message", "part"):
+                    row = connection.execute(
+                        f"SELECT COUNT(*), MAX(time_updated) FROM {table} WHERE session_id = ?", (sid,)
+                    ).fetchone()
+                    signature.append((sid, table, *(row or (None, None))))
+        finally:
+            connection.close()
+    except Exception:
+        return None
+    return tuple(signature)
+
+
+# (repo, session id, collect_edits) -> (content signature, the export it produced). A background
+# tracker exports its own conversation on every poll; each export is a CLI call, and the
+# conversation is usually unchanged. Bounded: a tracker follows one conversation at a time.
+_EXPORTS: dict[tuple[str, str, bool], tuple[tuple, ExportedSession]] = {}
+_EXPORTS_LIMIT = 8
+
+
 def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
+    key = (str(repo), session_id, collect_edits)
+    signature = _content_signature(session_id)
+    known = _EXPORTS.get(key)
+    if signature is not None and known is not None and known[0] == signature:
+        return known[1]
+    exported = _export_session_uncached(repo, session_id, collect_edits=collect_edits)
+    if exported is not None and signature is not None:
+        _EXPORTS.pop(key, None)
+        while len(_EXPORTS) >= _EXPORTS_LIMIT:
+            _EXPORTS.pop(next(iter(_EXPORTS)))
+        _EXPORTS[key] = (signature, exported)
+    return exported
+
+
+def _export_session_uncached(repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
     data = _export_data(repo, session_id)
     if data is None:
         return None
