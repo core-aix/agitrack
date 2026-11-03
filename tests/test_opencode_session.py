@@ -734,17 +734,35 @@ def test_opencode_session_list_is_bounded_and_safe_on_timeout(monkeypatch):
 # --- cross-backend activity probe -------------------------------------------
 
 
-def _fake_store(tmp_path, monkeypatch, rows):
-    """An OpenCode data directory holding just enough database to answer the probe."""
+def _fake_store(tmp_path, monkeypatch, rows, *, messages=None, children=()):
+    """An OpenCode data directory holding just enough database to answer the probe. ``rows``
+    are ``(id, directory, session.time_updated)``; ``messages`` maps a session id to the
+    ``time_updated`` of the one message written to it (default: its session stamp);
+    ``children`` are ``(child id, parent id, message time)`` sub-agent sessions."""
     import sqlite3
 
+    from agitrack.transcripts import opencode as opencode_session
+
+    opencode_session._CONTENT_ACTIVITY.clear()
     monkeypatch.setenv("AGITRACK_XDG_DATA_HOME", str(tmp_path / "share"))
     database = tmp_path / "share" / "opencode" / "opencode.db"
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
+    messages = dict(messages or {})
     try:
-        connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER)")
-        connection.executemany("INSERT INTO session VALUES (?, ?, ?)", rows)
+        connection.execute(
+            "CREATE TABLE session (id TEXT, directory TEXT, time_updated INTEGER, parent_id TEXT, title TEXT)"
+        )
+        connection.execute("CREATE TABLE message (id TEXT, session_id TEXT, time_updated INTEGER)")
+        connection.execute("CREATE TABLE part (id TEXT, session_id TEXT, time_updated INTEGER)")
+        for sid, directory, stamp in rows:
+            connection.execute("INSERT INTO session VALUES (?, ?, ?, NULL, ?)", (sid, directory, stamp, sid))
+            written = messages.get(sid, stamp)
+            if written is not None:
+                connection.execute("INSERT INTO message VALUES (?, ?, ?)", ("msg-" + sid, sid, written))
+        for child, parent, written in children:
+            connection.execute("INSERT INTO session VALUES (?, '', ?, ?, ?)", (child, written, parent, child))
+            connection.execute("INSERT INTO part VALUES (?, ?, ?)", ("prt-" + child, child, written))
         connection.commit()
     finally:
         connection.close()
@@ -780,6 +798,39 @@ def test_repo_activity_answers_from_the_database_without_spawning_the_cli(tmp_pa
     # A repo OpenCode has never been opened in says so, rather than reporting a time of 0 that
     # would read as "used, long ago" and take part in the comparison.
     assert repo_activity(tmp_path / "never-used") is None
+
+
+def test_a_session_stamp_that_moved_with_nothing_written_is_not_activity(tmp_path, monkeypatch):
+    """``session.time_updated`` can move with nothing said: on one machine every OpenCode
+    conversation had it rewritten within half a minute, their newest messages months old, and
+    every background tracker then exported all of them by subprocess every ten seconds for six
+    hours. Activity is when a message or part was last WRITTEN, in the conversation or in a
+    sub-agent session it spawned."""
+    import time as _time
+
+    from agitrack.transcripts import opencode as opencode_session
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    now_ms = int(_time.time() * 1000)
+    months_ago = now_ms - 200 * 24 * 3600 * 1000
+    _fake_store(
+        tmp_path,
+        monkeypatch,
+        [
+            ("ses_stale", str(repo), now_ms),  # stamp rewritten just now...
+            ("ses_live", str(tmp_path / "other"), now_ms),
+            ("ses_delegating", str(tmp_path / "third"), now_ms),
+        ],
+        messages={"ses_stale": months_ago, "ses_live": now_ms - 5_000, "ses_delegating": months_ago},
+        children=[("ses_child", "ses_delegating", now_ms - 2_000)],  # ...its sub-agent is working
+    )
+
+    recent = {ref.id: ref.updated for ref, _directory in opencode_session.recent_sessions(_time.time() - 3600)}
+    assert set(recent) == {"ses_live", "ses_delegating"}
+    assert recent["ses_live"] == (now_ms - 5_000) / 1000
+    assert recent["ses_delegating"] == (now_ms - 2_000) / 1000
+    assert repo_activity(repo) == months_ago / 1000  # when it was last really used
 
 
 def test_repo_activity_ignores_sessions_no_human_drove(tmp_path, monkeypatch):

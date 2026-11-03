@@ -1292,6 +1292,43 @@ def session_last_activity(session_id: str) -> float | None:
 _ACTIVITY_ROW_LIMIT = 200
 
 
+def _content_activity(connection, session_id: str) -> int | None:
+    """When something was last WRITTEN to a conversation (a message or a part of one, in it or in
+    a sub-agent session it spawned), in OpenCode's milliseconds, or None if it holds nothing.
+
+    ``session.time_updated`` is not this. It moves without anyone saying anything: on
+    2026-11-03 every OpenCode conversation on one machine had it rewritten within half a minute,
+    their newest messages being seven to nine months old, and every background tracker then took
+    all of them for live conversations and exported each one by subprocess every ten seconds.
+    So the session stamp only narrows the search (anything really written to has it moved too)
+    and the messages decide. Both reads use OpenCode's own indexes on ``session_id``, and the
+    answer is remembered until the session's own stamp moves again, since a tracker asks every
+    few seconds about the same rows."""
+    row = connection.execute("SELECT time_updated FROM session WHERE id = ?", (session_id,)).fetchone()
+    stamp = row[0] if row else None
+    known = _CONTENT_ACTIVITY.get(session_id)
+    if known is not None and stamp is not None and known[0] == stamp:
+        return known[1]
+    ids = [session_id] + [
+        str(row[0]) for row in connection.execute("SELECT id FROM session WHERE parent_id = ?", (session_id,))
+    ]
+    newest: int | None = None
+    for sid in ids:
+        for table in ("message", "part"):
+            row = connection.execute(f"SELECT MAX(time_updated) FROM {table} WHERE session_id = ?", (sid,)).fetchone()
+            if row and row[0] is not None and (newest is None or row[0] > newest):
+                newest = int(row[0])
+    if stamp is not None:
+        if len(_CONTENT_ACTIVITY) > 4096:
+            _CONTENT_ACTIVITY.clear()
+        _CONTENT_ACTIVITY[session_id] = (stamp, newest)
+    return newest
+
+
+# session id -> (its session.time_updated, _content_activity's answer at that stamp).
+_CONTENT_ACTIVITY: dict[str, tuple[int, int | None]] = {}
+
+
 def repo_activity(repo: Path) -> float | None:
     """Epoch seconds of the newest HUMAN-driven activity recorded for ``repo`` on this backend,
     or None when OpenCode holds no conversation for it (or its store cannot be read).
@@ -1314,21 +1351,27 @@ def repo_activity(repo: Path) -> float | None:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
         try:
             rows = connection.execute(
-                f"SELECT id, directory, time_updated FROM session ORDER BY time_updated DESC LIMIT {_ACTIVITY_ROW_LIMIT}"
+                "SELECT id, directory FROM session WHERE parent_id IS NULL "
+                f"ORDER BY time_updated DESC LIMIT {_ACTIVITY_ROW_LIMIT}"
             ).fetchall()
+            machine_driven = programmatic_session_ids()
+            resolved = repo.resolve()
+            newest: int | None = None
+            for session_id, directory in rows:
+                if str(session_id) in machine_driven:
+                    continue  # a scripted `opencode run` (aGiTrack's own summarizer included), not a conversation
+                if not _same_repo(directory, resolved):
+                    continue
+                # Not the first match: the session stamp that orders these rows can move with
+                # nothing said (see _content_activity), so the newest WRITE among them decides.
+                activity = _content_activity(connection, str(session_id))
+                if activity is not None and (newest is None or activity > newest):
+                    newest = activity
         finally:
             connection.close()
     except Exception:
         return None  # wrong schema, locked, corrupt, no sqlite3 — all mean "no signal"
-    machine_driven = programmatic_session_ids()
-    resolved = repo.resolve()
-    for session_id, directory, updated in rows:
-        if str(session_id) in machine_driven:
-            continue  # a scripted `opencode run` (aGiTrack's own summarizer included), not a conversation
-        if not _same_repo(directory, resolved):
-            continue
-        return _to_seconds(updated)  # rows are newest-first, so the first match for this repo is the answer
-    return None
+    return _to_seconds(newest) if newest is not None else None
 
 
 def session_activity_mtime(session_id: str) -> float | None:
@@ -1397,18 +1440,24 @@ def recent_sessions(since: float) -> list[tuple[SessionRef, str]]:
 
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.2)
         try:
+            floor = int(since * 1000)
             rows = connection.execute(
-                "SELECT id, directory, time_updated, title FROM session "
+                "SELECT id, directory, title FROM session "
                 "WHERE parent_id IS NULL AND time_updated > ? ORDER BY time_updated DESC LIMIT ?",
-                (int(since * 1000), _ACTIVITY_ROW_LIMIT),
+                (floor, _ACTIVITY_ROW_LIMIT),
             ).fetchall()
+            out: list[tuple[SessionRef, str]] = []
+            for sid, directory, title in rows:
+                if not sid or not isinstance(directory, str):
+                    continue
+                # The session stamp only says it MAY have moved; nothing new written means
+                # nothing to read (see _content_activity).
+                activity = _content_activity(connection, str(sid))
+                if activity is None or activity <= floor:
+                    continue
+                out.append((SessionRef(id=str(sid), updated=_to_seconds(activity), label=title or None), directory))
         finally:
             connection.close()
     except Exception:
         return []  # wrong schema, locked, corrupt, no sqlite3: no signal
-    out: list[tuple[SessionRef, str]] = []
-    for sid, directory, updated, title in rows:
-        if not sid or not isinstance(directory, str):
-            continue
-        out.append((SessionRef(id=str(sid), updated=_to_seconds(updated), label=title or None), directory))
     return out
