@@ -497,7 +497,21 @@ function noteVersion(version){
   // restarted daemon reads the history again. Nobody asked for this reload: it is not the
   // "re-read everything" a person pressing refresh means.
   try{ sessionStorage.setItem("agitrack.versionReload", String(Date.now())); }catch(e){}
-  location.reload();
+  reloadWhenSeen();
+}
+
+// A tab nobody is looking at waits until it is shown. One update restarts every daemon, and
+// every open page noticed it within one poll and reloaded at once: each reload fires the page's
+// boot requests, which on a big history take seconds, and all of it on the hub's ONE origin,
+// where a browser opens at most six connections. The tabs in the background used them up and
+// the page the reader had just opened waited in the browser's queue for its HTML, blank, with
+// not even the loading overlay to show. A hidden page loses nothing by reloading later.
+let reloadPending = false;
+function reloadWhenSeen(){
+  if(!document.hidden){ location.reload(); return; }
+  if(reloadPending) return;
+  reloadPending = true;
+  document.addEventListener("visibilitychange", () => { if(!document.hidden) location.reload(); });
 }
 
 // Shown once, on the page that comes back up. The box is `RELOAD_NOTICE_HTML`, which every

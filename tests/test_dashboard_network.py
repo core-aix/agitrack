@@ -8,6 +8,7 @@ copy-pasteable `ssh -L` command. Ports are handed out consecutively so a second 
 lands on a neighbouring, predictable URL instead of a random ephemeral one.
 """
 
+import os
 import socket
 
 import pytest
@@ -218,7 +219,24 @@ class _Listener:
 # `bind_scanning` correctly skipped to 49685 while the test insisted on 49684. Down here the OS
 # never assigns a port on its own, so only a service explicitly listening can be in the way —
 # and the scan below steps over those.
-_PORT_SEARCH_WINDOW = range(20000, 32000)
+#
+# Each pytest-xdist worker searches its OWN slice of that range. Every test here starts its
+# search at the bottom of the window, so two workers running these tests at the same moment
+# found the same run: one test held 20000 and bound 20001 while another, which had just checked
+# 20000-20002 were free, got 20000 and then 20002. That failed CI on macOS and Windows as
+# `20002 == 20001`. Tests within one worker run one at a time, so a slice per worker is enough.
+_PORT_WINDOW_LOW, _PORT_WINDOW_HIGH, _PORT_SLICE = 20000, 32000, 400
+
+
+def _port_search_window() -> range:
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    index = int(worker[2:]) if worker[2:].isdigit() else 0
+    slices = (_PORT_WINDOW_HIGH - _PORT_WINDOW_LOW) // _PORT_SLICE
+    low = _PORT_WINDOW_LOW + (index % slices) * _PORT_SLICE
+    return range(low, low + _PORT_SLICE)
+
+
+_PORT_SEARCH_WINDOW = _port_search_window()
 
 
 def _free_ports(count: int) -> int:

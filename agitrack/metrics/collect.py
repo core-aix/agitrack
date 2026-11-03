@@ -46,7 +46,7 @@ from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import is_fully_tracked_message
 from agitrack.commits.message import mask_paths, strip_pasted_content_tags
 from agitrack.git import GitRepo
-from agitrack.metrics import progress
+from agitrack.metrics import pricing, progress
 
 _NUMSTAT_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
 _TOKEN_KEY_PREFIX = "tokens_since_last_commit_"
@@ -195,6 +195,12 @@ class CommitStat:
 # of forming an "unknown"/"<synthetic>" bucket. (The transcript parser now also avoids
 # recording ``<synthetic>`` going forward; this keeps already-committed history clean.)
 _METADATA_PLACEHOLDERS = {"unknown", "<synthetic>"}
+
+
+def _add_cost(bucket: dict, cost: pricing.Cost) -> None:
+    """Fold one turn's cost into a by-backend / by-model bucket (priced work only)."""
+    if cost.priced:
+        bucket["cost"] = round(bucket.get("cost", 0) + cost.total, 6)
 
 
 def _real_metadata_label(value: str | None) -> str | None:
@@ -358,6 +364,7 @@ class Dashboard:
                     bucket["commits"] += 1
                     bucket["output_tokens"] += part.tokens.get("output", 0)
                     bucket["input_tokens"] += part.tokens.get("input", 0)
+                    _add_cost(bucket, pricing.commit_cost(part))
                 dominant = max(ai_parts, key=lambda p: p.tokens.get("output", 0), default=None)
                 dominant_label = label_fn(dominant) if dominant is not None else None
                 if dominant_label:
@@ -377,7 +384,39 @@ class Dashboard:
             bucket["deletions"] += dels
             bucket["output_tokens"] += stat.tokens.get("output", 0)
             bucket["input_tokens"] += stat.tokens.get("input", 0)
+            _add_cost(bucket, pricing.commit_cost(stat))
         return {label: dict(bucket) for label, bucket in groups.items()}
+
+    @property
+    def cost_summary(self) -> dict:
+        """What the recorded tokens cost at published API prices (see metrics/pricing.py).
+
+        An INDICATIVE figure: the list price of the recorded tokens, not the user's bill.
+        ``priced`` counts commits with a cost, ``unpriced`` commits whose tokens (or some of
+        them) have no known price, so a reader can tell a complete total from a partial one.
+        All zero/None when nothing could be priced: the page then shows no cost at all."""
+        agent = summarizer = 0.0
+        priced = unpriced = estimated = 0
+        for stat in self.stats:
+            cost = pricing.commit_cost(stat)
+            if cost.priced:
+                priced += 1
+                agent += cost.agent
+                summarizer += cost.summarizer
+            if cost.unpriced:
+                unpriced += 1
+            if cost.estimated:
+                estimated += 1
+        return {
+            "total": round(agent + summarizer, 6) if priced else None,
+            "agent": round(agent, 6) if priced else None,
+            "summarizer": round(summarizer, 6) if priced else None,
+            "priced": priced,
+            "unpriced": unpriced,
+            # Commits priced from an older model of the same family (newer than the reference).
+            "estimated": estimated,
+            "reference": pricing.reference(),
+        }
 
     @property
     def by_backend(self) -> dict[str, dict[str, int]]:
@@ -1087,7 +1126,7 @@ def _parse_tokens(metadata: dict[str, str]) -> dict[str, int]:
     for key, value in metadata.items():
         if key.startswith(_TOKEN_KEY_PREFIX) and value.isdigit():
             tokens[key.removeprefix(_TOKEN_KEY_PREFIX)] = int(value)
-        elif key in ("summary_tokens_input", "summary_tokens_output") and value.isdigit():
+        elif key in ("summary_tokens_input", "summary_tokens_output", "summary_tokens_cache_read") and value.isdigit():
             tokens["summary_" + key.removeprefix("summary_tokens_")] = int(value)
     # Heal pre-issue-#14 metadata at read time: commits from before 2026-06-12 recorded
     # ``input`` as the RAW uncached count, so input < cache_write there — impossible under

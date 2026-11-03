@@ -56,7 +56,9 @@ dev = [
     "ruff>=0.9",
     "mypy>=1.13",
     "mypy-baseline>=0.7",
-    "pre-commit>=4.0",
+    # pre-commit only installs the local git hooks. On Python 3.10 it would pull in a
+    # filelock with open advisories: every fixed filelock release needs Python >= 3.11.
+    "pre-commit>=4.0; python_version >= '3.11'",
     # A per-test deadline (`--timeout` in CI and scripts/check.sh). A test that never returns
     # otherwise prints nothing and holds the whole job until its 45-minute limit, with no name
     # in the log; it was a tracker test waiting on a repository change that Linux's inode reuse
@@ -143,3 +145,4 @@ ignore_missing_imports = true
 # package, surface real issues, but don't require full strictness yet. The
 # pre-existing errors are held in a baseline (see CI) and burned down separately.
 files = ["agitrack"]
+

@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
+from agitrack.metrics import pricing
 from agitrack.metrics.collect import (
     CommitStat,
     Dashboard,
@@ -399,6 +400,7 @@ def _part_payload(part: CommitStat) -> dict:
         "backend": part.backend,
         "model": part.model,
         "tokens": part.tokens,
+        "cost": pricing.cost_payload(part),
         "started": part.started_at,
         "ended": part.ended_at,
         # When the part's turn ended (else began), for the date on its row; None leaves it out.
@@ -644,6 +646,7 @@ def _aggregates(fd: Dashboard) -> dict:
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
         "by_committer": fd.by_author,
+        "cost": fd.cost_summary,
     }
 
 
@@ -824,6 +827,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "kind": stat.kind,
         "pending": stat.pending,
         "token_anomaly": stat.token_anomaly,  # tokens excluded: re-exported history (lost watermark)
+        "cost": pricing.cost_payload(stat),  # USD at published API prices, None when unknown
         "tracked": stat.tracked,  # backtrace: already committed with aGiTrack metadata
         "eff_backend": eff_backend,
         "eff_model": eff_model,
@@ -1926,7 +1930,7 @@ __UPDATE_BANNER__
     <span class="spin"></span>
     <div class="bmsg">reading commit history<span class="bdots"></span></div>
     <div class="bbar" id="bbar" hidden><i id="bfill"></i></div>
-    <div class="bsub" id="bsub">crunching the git log: a large repo can take a few seconds</div>
+    <div class="bsub" id="bsub">crunching the git log: on a large repository the first load can take a minute or more</div>
   </div>
 
   <div class="controls">
@@ -2363,6 +2367,17 @@ function sci(n){
   const mant = (n/Math.pow(10,exp)).toFixed(2).replace(/\.?0+$/,"");  // 1.01, 1.2, 5, …
   return mant + "×10<sup>" + exp + "</sup>";                          // e.g. 1.01×10⁸ (exp in a <sup>)
 }
+// A dollar amount at published API prices (metrics/pricing.py). Shown only where the server sent
+// a number: a commit or panel with no known price gets nothing, never "$0".
+function usd(v){
+  if(v==null || !isFinite(v)) return "";
+  if(v >= 100) return "$" + Math.round(v).toLocaleString("en-US");
+  if(v >= 0.01) return "$" + v.toFixed(2);
+  return v > 0 ? "<$0.01" : "$0.00";
+}
+function costBrief(v){
+  return v==null ? "" : `<span class="lc cost" title="what these tokens cost at the provider's published API prices">${usd(v)}</span>`;
+}
 function tokenBrief(t){
   if(!t) return "";
   const parts=[];
@@ -2455,6 +2470,24 @@ function renderPending(){
   box.hidden = false;
 }
 
+// The cost card appears only when some commit in view could be priced (see metrics/pricing.py):
+// a repo driven by a local model has no published price, and shows no cost at all.
+function costCard(c){
+  if(!c || !c.priced || c.total==null) return "";
+  const note = `${usd(c.total / c.priced)} per commit · indicative` + (c.unpriced ? ` · ${fmt(c.unpriced)} unpriced` : "");
+  return card("API cost", usd(c.total), note, false, costNote(c));
+}
+// Where the prices come from, and what the figure is (and is not). Shown under the token panel
+// and as the cost card's tooltip, so every cost on the page names its reference and its date.
+function costNote(c){
+  const ref = c.reference || {};
+  return `Indicative: the recorded tokens at published API list prices (${ref.source || "bundled price table"}, `+
+    `added to aGiTrack on ${ref.added || "?"}), each token kind at its own rate. Not your bill: `+
+    `subscriptions, batch or negotiated pricing and long-context surcharges are not reflected.` +
+    (c.summarizer ? ` Includes ${usd(c.summarizer)} for aGiTrack's own summary calls.` : "") +
+    (c.estimated ? ` ${fmt(c.estimated)} commit(s) used a model newer than the reference, priced like the newest model of its family in it.` : "") +
+    (c.unpriced ? ` ${fmt(c.unpriced)} commit(s) used a model with no published price (e.g. a local model) and are left out.` : "");
+}
 function renderAgg(){
   renderInsights();
   const total = AGG.total, tracked = AGG.tracked;
@@ -2487,6 +2520,7 @@ function renderAgg(){
     BACKTRACE ? "" : card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt((tok.output||0)+(tok.subagent_output||0)), `${fmt((tok.input||0)+(tok.subagent_input||0))} input`),
     card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
+    costCard(AGG.cost),
   ].join("");
 
   const lineRow = (label, sub, v, amber) =>
@@ -2548,7 +2582,8 @@ function renderAgg(){
     : "";
   // Notes sit BELOW the bars so the bars lead the panel and the annotations follow.
   $("tokens").innerHTML = rows.length
-    ? rows.join("") + `<div class="hint">Note: bar widths are log-scaled; indented rows are a subset of the line above</div>` + cacheNote
+    ? rows.join("") + `<div class="hint">Note: bar widths are log-scaled; indented rows are a subset of the line above</div>` + cacheNote +
+      (AGG.cost && AGG.cost.priced ? `<div class="hint">cost: ${esc(costNote(AGG.cost))}</div>` : "")
     : `<div class="empty">no token metadata recorded</div>`;
 
   $("by-backend").innerHTML = groupPanel(AGG.by_backend);
@@ -2593,7 +2628,7 @@ function groupPanel(groups){
   const max = Math.max(1, ...entries.map(([,b])=>b.insertions+b.deletions));
   return entries.map(([label,b]) =>
     barRow(label, `${b.commits} commits`, b.insertions+b.deletions, max,
-      `+${fmt(b.insertions)}/−${fmt(b.deletions)}${b.output_tokens?` · <b>${fmt(b.output_tokens)}</b> tok`:""}`)).join("");
+      `+${fmt(b.insertions)}/−${fmt(b.deletions)}${b.output_tokens?` · <b>${fmt(b.output_tokens)}</b> tok`:""}${b.cost!=null?` · ${usd(b.cost)}`:""}`)).join("");
 }
 
 // --- activity-over-time plot (multi-series, per-period, normalised, toggleable) ---
@@ -2838,7 +2873,7 @@ function renderLog(){
     // The right-hand column: lines, tokens and model on top, and under them when the commit
     // was made, so the date sits with the commit's other facts rather than in front of its subject.
     const w = commitWhen(c.ts);
-    const facts = `${lc}${tokenBrief(c.tokens)}${m}`;
+    const facts = `${lc}${tokenBrief(c.tokens)}${costBrief(c.cost)}${m}`;
     const whenTag = w.text ? `<span class="when" title="${esc(w.title)}">${esc(w.text)}</span>` : "";
     const meta = (facts || whenTag) ? `<span class="emeta">${facts ? `<span class="erow">${facts}</span>` : ""}${whenTag}</span>` : "";
     return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
@@ -2926,7 +2961,7 @@ function partsHtml(parts){
   // itself (its covered_commits), which are real commits with real diffs.
   const items = parts.map(p => {
     const pcls = AI_KINDS.has(p.kind) ? "ai" : (p.kind==="user" ? "user" : "nt");
-    const facts = [p.model ? esc(p.model) : "", (p.tokens&&p.tokens.output) ? `${kfmt(p.tokens.output)} out` : ""].filter(Boolean).join(" · ");
+    const facts = [p.model ? esc(p.model) : "", (p.tokens&&p.tokens.output) ? `${kfmt(p.tokens.output)} out` : "", p.cost==null ? "" : usd(p.cost)].filter(Boolean).join(" · ");
     // On the right, like a log row: the part's model and tokens, its date/time below them
     // (only when the part recorded one).
     const w = commitWhen(p.ts);
@@ -3857,7 +3892,19 @@ async function init(){
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).
-  if(LIVE) setInterval(refresh, REFRESH_MS);
+  //
+  // A HIDDEN tab does not refresh. Every dashboard tab shares one origin, the hub's port, and a
+  // browser opens at most six connections per origin: a background tab's /data, slow on a big
+  // history, took one of them for nobody, and enough of them left a newly opened dashboard
+  // waiting in the browser's queue for its HTML, a blank page with no spinner because nothing
+  // of it had arrived. It catches up once when it is shown again.
+  if(LIVE){
+    let missed = false;
+    setInterval(() => { if(document.hidden) missed = true; else refresh(); }, REFRESH_MS);
+    document.addEventListener("visibilitychange", () => {
+      if(!document.hidden && missed){ missed = false; refresh(); }
+    });
+  }
 }
 init();
 initHubBar();
