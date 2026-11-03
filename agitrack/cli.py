@@ -929,6 +929,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         try:
             stop_repo = GitRepo.discover(Path(args.repo).expanduser())
         except (GitError, OSError) as error:
+            # Not a repository, so nothing here can be TRACKED, but the dashboard can still be
+            # showing it (`agitrack -d` in a plain folder serves its backtrace). Refusing left
+            # that view running with no command that could end it.
+            from agitrack.metrics.hub import unmount_repo
+
+            if unmount_repo(Path(args.repo).expanduser().resolve()):
+                print(f"Stopped: the dashboard no longer serves {_display_path(Path(args.repo).expanduser())}.")
+                return 0
             print(_no_repo_message(Path(args.repo).expanduser(), error))
             return 1
         from agitrack.stop import stop_everything
@@ -1199,6 +1207,30 @@ def _dispatch(argv: list[str] | None = None) -> int:
             )
         return run_dashboard_daemon(serve_repo, owner_pid=args.dashboard_owner_pid, email_logins=email_logins)
 
+    if args.dashboard in ("stop", "status"):
+        # One dashboard serves every repository, so neither needs THIS folder to be one. They used
+        # to look for a repository first, and in a plain folder `-d stop` fell through to the
+        # "no repository here" path, which OPENED the dashboard again: the stop command restarted
+        # the thing it was asked to stop.
+        from agitrack.metrics.hub import hub_status, stop_hub
+
+        if args.dashboard == "status":
+            return hub_status()
+        try:
+            import contextlib
+            import io
+
+            from agitrack.metrics import stop_dashboard_daemon
+
+            # A pre-hub per-repo daemon, if one survived an upgrade. Silenced: its "no dashboard
+            # daemon is running for this repository" is about a thing that no longer exists, and
+            # printed next to the hub's own answer it reads as a contradiction.
+            with contextlib.redirect_stdout(io.StringIO()):
+                stop_dashboard_daemon(GitRepo.discover(Path(args.repo).expanduser()))
+        except (GitError, OSError):
+            pass
+        return stop_hub()
+
     if args.dashboard:
         # Read-only: nothing is logged or committed, so no privacy
         # acknowledgment and no repo initialization offer.
@@ -1228,26 +1260,6 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     "did here, without waiting."
                 )
             return 0
-        if args.dashboard == "stop":
-            # One dashboard serves every repository, so `-d stop` stops the whole thing — which
-            # is what the flag has always meant, and is now visibly wider than it was. Use
-            # `agitrack stop` to drop only this repository from it.
-            import contextlib
-            import io
-
-            from agitrack.metrics import stop_dashboard_daemon
-            from agitrack.metrics.hub import stop_hub
-
-            # A pre-hub per-repo daemon, if one survived an upgrade. Silenced: its "no dashboard
-            # daemon is running for this repository" is about a thing that no longer exists, and
-            # printed next to the hub's own answer it reads as a contradiction.
-            with contextlib.redirect_stdout(io.StringIO()):
-                stop_dashboard_daemon(dashboard_repo)
-            return stop_hub()
-        if args.dashboard == "status":
-            from agitrack.metrics.hub import hub_status
-
-            return hub_status()
         if args.dashboard == "export":
             from agitrack.metrics.export import ExportTargetError, export_static_demo
 
@@ -2131,19 +2143,43 @@ def _dashboard_without_a_repo(directory: Path, error: Exception, *, mode: str) -
     from agitrack.metrics.suggest import has_backtrace_history
 
     where = _display_path(directory)
-    if has_backtrace_history(directory):
+    inside = _repositories_inside(directory)
+    if inside:
+        # One directory too high: the folder that HOLDS the projects. Its backtrace is every
+        # project's agent history at once, read from every transcript on this machine that ran
+        # under it (hundreds, in a typical ~/Code), which takes minutes, keeps a watch on all of
+        # them for as long as it is open, and is almost never what was meant. Say so, and only
+        # go on when someone at a terminal asks for it.
+        print(_folder_of_repositories_note(directory, inside))
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return 1
+        if not has_backtrace_history(directory):
+            return 1
+        try:
+            answer = input(
+                "Reconstruct the agent history of everything under it as ONE backtrace instead? "
+                "This reads every coding-agent conversation that ran there and can take minutes. "
+                "[y/N] "
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if answer.strip().lower() not in {"y", "yes"}:
+            return 1
+    if inside or has_backtrace_history(directory):
         # The reconstruction reads the agents' own transcripts, so it works in a directory that
         # was never a repository. Refusing to show it here would be withholding the one view that
         # CAN answer the question.
-        print(
-            f"{where} is not a Git repository, so there are no tracked commits to chart.\n"
-            "Coding-agent sessions HAVE run here though, so showing the BACKTRACE view instead: "
-            "what those past conversations did to these files, reconstructed from the transcripts "
-            "on this machine.\n"
-            "To track new work here properly:\n"
-            "  git init          then commit your files\n"
-            "  agitrack          and pick a mode"
-        )
+        if not inside:
+            print(
+                f"{where} is not a Git repository, so there are no tracked commits to chart.\n"
+                "Coding-agent sessions HAVE run here though, so showing the BACKTRACE view instead: "
+                "what those past conversations did to these files, reconstructed from the transcripts "
+                "on this machine.\n"
+                "To track new work here properly:\n"
+                "  git init          then commit your files\n"
+                "  agitrack          and pick a mode"
+            )
         if mode == "text":
             from agitrack.metrics.backtrace import render_backtrace_text
 

@@ -571,6 +571,10 @@ a URL. Every row here is about that record staying honest — a stale one makes 
 | The preferred port being held by something else scans forward instead of failing | `test_the_daemon_binds_past_a_port_something_else_already_holds` | real-net |
 | Two directories track their daemons (and logs) independently | `test_the_daemon_log_path_is_scoped_to_the_directory`, `test_two_directories_track_their_daemons_independently` | mock |
 
+| `agitrack -d` in a folder that HOLDS repositories (one directory too high) names them and asks `[y/N]` before reconstructing everything under it as one backtrace; Enter or no terminal starts nothing | `tests/test_cli.py::test_the_dashboard_asks_before_reconstructing_a_whole_folder_of_projects` | mock |
+| `agitrack -d stop` outside a repository stops the dashboard instead of opening the folder's backtrace; `agitrack stop` there takes the folder off the dashboard instead of refusing | `tests/test_cli.py::test_dashboard_stop_in_a_folder_that_is_not_a_repository_stops_it`, `::test_stop_in_a_folder_the_dashboard_serves_stops_serving_it` | mock |
+| A folder taken off the served list (`agitrack stop`, from another process) has its hub backtrace dropped and its transcript watcher ended | `tests/test_hub.py::test_a_folder_taken_off_the_served_list_stops_being_watched` | mock |
+
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
 |---|---|---|

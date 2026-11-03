@@ -155,6 +155,11 @@ def _has_backtrace(directory: Path) -> bool:
 # --------------------------------------------------------------------------- mounted scopes
 
 
+# How often a built backtrace checks that its folder is still served (see
+# `_Mounts._drop_once_unserved`).
+_UNSERVED_CHECK_SECONDS = 5.0
+
+
 class _Mounts:
     """The scopes the hub is serving, built on demand and kept.
 
@@ -241,16 +246,38 @@ class _Mounts:
             progress=lambda done, total, phase: _write_progress(directory, done, total, phase),
         )
         _clear_progress(directory)
-        live: dict = {"view": view, "sources": sources}
-        self._backtrace_live[slug] = live
         stop = threading.Event()
+        live: dict = {"view": view, "sources": sources, "stop": stop}
+        self._backtrace_live[slug] = live
         threading.Thread(
             target=_watch_transcripts,
             args=(directory, live, memo, stop),
             daemon=True,
             name=f"agitrack-backtrace-watch-{slug}",
         ).start()
+        threading.Thread(
+            target=self._drop_once_unserved,
+            args=(slug, directory, stop),
+            daemon=True,
+            name=f"agitrack-backtrace-served-{slug}",
+        ).start()
         return BacktraceScope(lambda: live["view"])
+
+    def _drop_once_unserved(self, slug: str, directory: Path, stop: threading.Event) -> None:
+        """End this backtrace once `agitrack stop` takes its folder off the served list.
+
+        The watcher re-reads the folder's transcripts for as long as it runs, and nothing ever
+        stopped it: a folder opened once (a whole ~/Code, by mistake) was watched, with all of its
+        conversations, until the hub itself restarted, whatever the user then stopped. The stop
+        is recorded in the registry by another process, so it is read from there."""
+        while not stop.wait(_UNSERVED_CHECK_SECONDS):
+            try:
+                entry = repo_registry.entry_for(directory)
+            except Exception:
+                continue  # an unreadable registry is not a request to stop
+            if entry is None or not entry.served:
+                self.drop(slug)
+                return
 
     def scope(self, view: str, slug: str):
         return self.active(slug) if view == repo_registry.ACTIVE else self.backtrace(slug)
@@ -259,7 +286,10 @@ class _Mounts:
         with self._lock:
             self._active.pop(slug, None)
             self._backtrace.pop(slug, None)
-            self._backtrace_live.pop(slug, None)
+            live = self._backtrace_live.pop(slug, None)
+        stop = (live or {}).get("stop")
+        if stop is not None:
+            stop.set()  # the transcript watcher behind it ends too
 
     def is_open(self, slug: str) -> bool:
         """Whether this hub has actually built a view for ``slug`` — i.e. someone opened this
