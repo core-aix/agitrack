@@ -72,7 +72,7 @@ from typing import Callable
 
 from agitrack import tracking_gap
 from agitrack.commits import build_agent_commit_message, render_interaction_trace
-from agitrack.commits.message import TRACE_EVENT_ROLE
+from agitrack.commits.message import TRACE_EVENT_ROLE, TRACE_NOTE_ROLE
 from agitrack.git import GitRepo
 from agitrack.transcripts.opencode import SessionTurn
 from agitrack.transcripts import capabilities
@@ -505,37 +505,18 @@ class CommitEngine:
                 # commit's single parent (#35).
                 cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
-            for turn in turns:
+            prompts: list[str] = []
+            for index, turn in enumerate(turns):
                 if redacted(turn):
                     self._add_turn_usage(turn)
                     continue
-                # Every entry carries when its turn began, so the trace's age cap can place it.
-                at = getattr(turn, "started_at", None)
-                if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    # A background wake-up is an EVENT, not something the user said.
-                    role = TRACE_EVENT_ROLE if _is_background_event(turn.user_prompt) else "user"
-                    self.state.append_trace(role, turn.user_prompt, at=at)
-                # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
-                # after the agent had already said something), not merged into the base prompt.
-                for followup, sent in _followups_with_times(turn):
-                    if followup.strip():
-                        # Its own heading, but NOT a new turn — see append_trace(starts_turn).
-                        # It carries when it was SENT, which the commit records per message.
-                        self.state.append_trace("user", followup, starts_turn=False, at=sent or at)
-                for message in self._agent_messages_for(turn):
-                    self.state.append_trace("agent", message, at=at)
+                turn_entries, turn_subjects = self._turn_trace(
+                    turn, partial=self._captured_part_of(turn), last=index == len(turns) - 1
+                )
+                for role, text, starts_turn, at in turn_entries:
+                    self.state.append_trace(role, text, starts_turn=starts_turn, at=at)
+                prompts.extend(turn_subjects)
                 self._add_turn_usage(turn)
-            # The subject describes what was ASKED FOR, so a synthetic wake-up label is not a
-            # candidate: a commit whose turns were all background-driven falls back to
-            # "<backend> changes" rather than claiming the user asked for "(background task
-            # completed)".
-            prompts = [
-                p
-                for turn in turns
-                if not redacted(turn)
-                for p in ([turn.user_prompt, *turn.queued_followups])
-                if p and not _is_background_event(p)
-            ]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
@@ -556,28 +537,14 @@ class CommitEngine:
             # (role, content, starts_turn, at): `at` is when the turn began, so the trace's age
             # cap can place the entry (see message._limit_trace_age).
             entries: list[tuple[str, str, bool, float | None]] = []
-            for turn in turns:
+            for index, turn in enumerate(turns):
                 if redacted(turn):
                     continue
-                at = getattr(turn, "started_at", None)
-                if turn.user_prompt and not _is_dialog_keystroke(turn):
-                    if _is_background_event(turn.user_prompt):
-                        # An EVENT woke the agent; nobody asked for anything. It belongs in the
-                        # trace (it explains a turn with no prompt) but never under the user's
-                        # name, and never as the commit's subject.
-                        entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True, at))
-                    else:
-                        subject_prompts.append(turn.user_prompt)
-                        entries.append(("user", turn.user_prompt, True, at))
-                # A mid-turn queued message gets its own ## User heading (sent after the agent
-                # already responded), rather than being merged into the base prompt.
-                for followup, sent in _followups_with_times(turn):
-                    if not followup.strip():
-                        continue
-                    subject_prompts.append(followup)
-                    entries.append(("user", followup, False, sent or at))
-                for message in self._agent_messages_for(turn):
-                    entries.append(("agent", message, True, at))
+                turn_entries, turn_subjects = self._turn_trace(
+                    turn, partial=self._captured_part_of(turn), last=index == len(turns) - 1
+                )
+                entries.extend(turn_entries)
+                subject_prompts.extend(turn_subjects)
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. a follow-up note typed mid-turn) are still added to the
@@ -836,6 +803,94 @@ class CommitEngine:
             on_commit_fn(commit_sha, trace_text, cover_backend_head or cover_with_staged)
 
         return True
+
+    def _captured_part_of(self, turn: SessionTurn) -> dict | None:
+        """The record a previous commit left of *turn* when it captured the turn mid-flight, or
+        None. Read BEFORE the turn's usage is added, which clears it."""
+        record = self.state.partial_turn_usage()
+        if not record or record.get("user_id") != turn.user_message_id:
+            return None
+        session = record.get("session_id")
+        if session and self.state.backend_session_id and session != self.state.backend_session_id:
+            return None
+        return record
+
+    def _turn_trace(
+        self, turn: SessionTurn, *, partial: dict | None = None, last: bool = False
+    ) -> tuple[list[tuple[str, str, bool, float | None]], list[str]]:
+        """One turn's trace entries ``(role, content, starts_turn, at)`` and the prompts it offers
+        the subject.
+
+        A turn a commit already captured while it ran (*partial*) is the REST of an interaction
+        that commit holds: it opens with a note saying so instead of the user's prompt again
+        (both commit messages carried the same ``## User`` block while the timeline showed it
+        once), and quotes only what the agent said after the capture. A turn the backend ended
+        with an error and no reply says why, so the agent's last "I'll do X" is not read as the
+        answer. The LAST turn of a commit that is still running says the rest comes later."""
+        entries: list[tuple[str, str, bool, float | None]] = []
+        subjects: list[str] = []
+        # Every entry carries when its turn began, so the trace's age cap can place it.
+        at = getattr(turn, "started_at", None)
+        if partial is not None:
+            entries.append(
+                (
+                    TRACE_NOTE_ROLE,
+                    "Continued from the interaction recorded in the previous commit, which the "
+                    "agent made while this turn was still running. What follows is what the "
+                    "agent did and said after that commit.",
+                    True,
+                    at,
+                )
+            )
+            if turn.user_prompt and not _is_background_event(turn.user_prompt):
+                subjects.append(f"(continued) {turn.user_prompt}")
+        elif turn.user_prompt and not _is_dialog_keystroke(turn):
+            if _is_background_event(turn.user_prompt):
+                # An EVENT woke the agent; nobody asked for anything. It belongs in the trace (it
+                # explains a turn with no prompt) but never under the user's name, and never as
+                # the commit's subject.
+                entries.append((TRACE_EVENT_ROLE, turn.user_prompt, True, at))
+            else:
+                subjects.append(turn.user_prompt)
+                entries.append(("user", turn.user_prompt, True, at))
+        # A mid-turn queued message gets its own ## User heading (sent after the agent already
+        # responded), rather than being merged into the base prompt. Its own heading, but NOT a
+        # new turn (see append_trace(starts_turn)), carrying when it was SENT. One the capture
+        # already recorded is not repeated.
+        followups = _followups_with_times(turn)
+        skip = int((partial or {}).get("followups") or 0)
+        for followup, sent in followups[skip:]:
+            if not followup.strip():
+                continue
+            subjects.append(followup)
+            entries.append(("user", followup, False, sent or at))
+        messages = self._agent_messages_for(turn)
+        if partial is not None:
+            already = {" ".join(m.split()) for m in partial.get("messages") or []}
+            messages = [m for m in messages if " ".join(m.split()) not in already]
+        error = (getattr(turn, "error", "") or "").strip()
+        for message in messages:
+            entries.append(("agent", message, True, at))
+        if error:
+            entries.append(
+                (
+                    TRACE_NOTE_ROLE,
+                    f"The turn ended without a final reply from the agent. The backend reported: {error}",
+                    False,
+                    at,
+                )
+            )
+        elif last and partial is None and not turn_is_finished(turn):
+            entries.append(
+                (
+                    TRACE_NOTE_ROLE,
+                    "This turn was still running when this commit was made. The rest of it is "
+                    "recorded in a later commit.",
+                    False,
+                    at,
+                )
+            )
+        return entries, subjects
 
     def _agent_messages_for(self, turn: SessionTurn) -> list[str]:
         """The agent's user-facing message(s) to record in the trace for *turn*.
@@ -1252,7 +1307,12 @@ class CommitEngine:
                 # second force-capture of the same still-running turn updates it) and
                 # _add_turn_usage adds only the delta on the re-commit.
                 self.state.set_partial_turn_usage(
-                    self.state.backend_session_id, watermark.user_message_id, watermark.tokens.to_dict()
+                    self.state.backend_session_id,
+                    watermark.user_message_id,
+                    watermark.tokens.to_dict(),
+                    messages=list(watermark.agent_messages or [])
+                    + ([watermark.final_response] if watermark.final_response else []),
+                    followups=len(_followups_with_times(watermark)),
                 )
             debug_fn(
                 f"agent commit created session_id={self.state.backend_session_id} "

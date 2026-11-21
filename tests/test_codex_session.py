@@ -998,3 +998,40 @@ def test_a_queued_followup_keeps_when_it_was_sent(codex_home):
     turn = codex.export_session_at(_write(codex_home, rows)).turns[0]
     assert turn.queued_followups == ["also do this"]
     assert turn.queued_followup_times == [1792685762]
+
+
+def test_a_turn_ended_by_an_error_carries_the_reason():
+    """Codex closes a turn that hit a usage limit with ``task_complete`` holding an ``error`` and
+    no final message; the turn records why it stopped."""
+    from agitrack.transcripts import codex
+
+    rows = [
+        {
+            "timestamp": "2026-11-20T23:34:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t1"},
+        },
+        {
+            "timestamp": "2026-11-20T23:34:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "revise it"},
+        },
+        {
+            "timestamp": "2026-11-20T23:34:05Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "message": "I'll revise it."},
+        },
+        {
+            "timestamp": "2026-11-20T23:36:34Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "t1",
+                "last_agent_message": None,
+                "error": {"message": "You've hit   your usage limit."},
+            },
+        },
+    ]
+    (turn,) = codex.parse_rows(rows)
+    assert turn.error == "You've hit your usage limit."
+    assert turn.final_response == "I'll revise it."

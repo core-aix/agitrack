@@ -495,6 +495,17 @@ indistinguishable from something they typed — and that trace is the summarizer
 the summary read the wake-up as a request. It is an event; it renders as one."""
 
 
+TRACE_NOTE_ROLE = "note"
+
+"""Trace role for aGiTrack's own remark about the trace itself, rendered verbatim as a note.
+
+Used where a turn is split across two records: a commit made while the turn was still running
+carries it as it stood, and the record of the turn's REST opens with a note saying it continues
+the interaction recorded in the previous commit, instead of repeating the user's prompt (which
+read as the user asking the same thing twice, and the timeline listed it once while both commit
+messages carried it). Like an event it opens a turn for the age cap, and it is never a speaker."""
+
+
 def _trace_role_lines(item: dict, repo_root: str | Path | None = None) -> list[str]:
     """The rendered lines for one trace entry — its "## User"/"## Agent" role heading plus the
     masked, heading-nested body — or an EMPTY list when the entry has no textual content. A
@@ -517,6 +528,8 @@ def _trace_role_lines(item: dict, repo_root: str | Path | None = None) -> list[s
             "a user message. What follows is its response to that event."
         )
         return [*_note_block(note), ""]
+    if role == TRACE_NOTE_ROLE:
+        return [*_note_block(" ".join(content.split())), ""]
     label = "User" if role == "user" else "Agent"
     return [f"## {label}", "", *_body_lines(content), ""]
 
@@ -1166,7 +1179,7 @@ def _limit_trace_age(trace: list[dict], max_age_hours: float | None) -> tuple[li
     answered = True  # nothing is in flight yet, so the first thing said opens a turn
     for index, item in enumerate(trace):
         role = str(item.get("role", "")).strip().lower()
-        if role not in ("user", TRACE_EVENT_ROLE):
+        if role not in ("user", TRACE_EVENT_ROLE, TRACE_NOTE_ROLE):
             answered = True  # the agent replied: whatever is said next begins a new exchange
             continue
         if answered and item.get("starts_turn", True) is not False:
