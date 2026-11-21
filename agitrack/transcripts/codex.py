@@ -731,6 +731,10 @@ def parse_rows(
             last = payload.get("last_agent_message")
             if isinstance(last, str) and last.strip() and last.strip() not in current["agent_messages"]:
                 current["agent_messages"].append(last.strip())
+            failure = payload.get("error")
+            reason = failure.get("message") if isinstance(failure, dict) else failure
+            if isinstance(reason, str) and reason.strip():
+                current["error"] = " ".join(reason.split())
             current["ended_at"] = stamp or current["ended_at"]
             close(current, complete=True)
             current = None
@@ -851,6 +855,7 @@ def _finalize(
         compaction_count=turn["compaction_count"],
         queued_followups=turn["queued_followups"],
         queued_followup_times=turn["queued_followup_times"],
+        error=turn.get("error") or "",
         mcp_servers=capability.mcp_servers,
         mcp_tools=capability.mcp_tools,
         skills=capability.skills,

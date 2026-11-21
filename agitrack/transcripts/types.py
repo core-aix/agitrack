@@ -102,6 +102,12 @@ class SessionTurn:
     # (the ``--backtrace`` feature): it reconstructs how a past conversation changed files
     # without any git history. Empty for ordinary exports and for turns that edited nothing.
     edits: list[FileEdit] = field(default_factory=list)
+    # Why the turn ENDED without the agent finishing, when the backend says so: Codex closes a
+    # turn with ``task_complete`` carrying an ``error`` (a usage limit, a failed request) and no
+    # final reply. Without it the trace's last ``## Agent`` block is whatever the agent said
+    # BEFORE it stopped ("I'll revise the figure..."), which reads as the turn's answer. Empty
+    # when the turn ended normally or the backend records no reason.
+    error: str = ""
 
 
 @dataclass

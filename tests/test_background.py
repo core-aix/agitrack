@@ -1541,7 +1541,9 @@ def test_a_manual_commit_carries_the_turns_that_changed_nothing_since_the_last_r
     for prompt in ("add a line", "why that line?", "now commit it please"):
         assert prompt in msg
     assert msg.count("## User\n\nadd a line") == 1  # the earlier record is not folded twice
-    assert msg.split("# aGiTrack Metadata")[-2].rstrip().endswith("now commit it please")  # ends on the ask
+    # Ends on the ask, then the note that the turn was still running (its rest comes later).
+    tail = msg.split("# aGiTrack Metadata")[-2].rstrip()
+    assert tail.split("> This turn was still running")[0].rstrip().endswith("now commit it please")
 
 
 def test_a_second_commit_with_nothing_new_said_records_nothing(tmp_path):
@@ -2972,6 +2974,93 @@ def test_the_rest_of_a_turn_captured_mid_flight_is_recorded_when_it_ends(tmp_pat
     recorded = "\n".join(runner._manual.pending_bodies())
     assert "Built it." in recorded
     assert "tokens_since_last_commit_output: 3" in recorded  # 10 spent, 7 already in the commit
+
+
+def _commit_mid_turn_then_finish(tmp_path, running, done):
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    backend.set_session("s1", [running])
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()  # the agent's `git commit` fires the pre-commit flush
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    first = _git(repo, "log", "-1", "--format=%B")
+    backend.set_session("s1", [done])
+    runner._process_once()
+    (tmp_path / "a.txt").write_text("one\nagent\nuser\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "next commit")
+    return first, _git(repo, "log", "-1", "--format=%B")
+
+
+def test_the_rest_of_a_turn_says_it_continues_the_previous_commit_and_does_not_repeat_it(tmp_path):
+    """A commit the agent made mid-turn carries the turn as it stood; the rest of the turn lands
+    in the next commit. That second record used to repeat the user's prompt and the agent's
+    message from before the capture, so both commit messages carried the same interaction (with
+    different token counts) while the timeline showed it once. It now opens with a note that it
+    continues the previous commit's interaction and quotes only what came after, ending on the
+    final reply."""
+    running = SessionTurn(
+        "u1",
+        "m1",
+        "revise the figure",
+        "I'll revise the figure now.",
+        TokenUsage(total=7, output=7),
+        "m",
+        agent_messages=["I'll revise the figure now."],
+        complete=False,
+    )
+    done = SessionTurn(
+        "u1",
+        "m2",
+        "revise the figure",
+        "The figure is revised.",
+        TokenUsage(total=10, output=10),
+        "m",
+        agent_messages=["I'll revise the figure now.", "The figure is revised."],
+    )
+    first, second = _commit_mid_turn_then_finish(tmp_path, running, done)
+    assert "## User\n\nrevise the figure" in first
+    assert "> This turn was still running when this commit was made" in first
+
+    trace = second.split("# Interaction Trace")[1]
+    assert "## User" not in trace  # the prompt is not repeated
+    assert "I'll revise the figure now." not in trace  # nor what the first commit already holds
+    assert "> Continued from the interaction recorded in the previous commit" in trace
+    assert "## Agent\n\nThe figure is revised." in trace  # the final reply is captured
+    assert "tokens_since_last_commit_output: 3" in second  # 10 spent, 7 already counted
+
+
+def test_a_turn_the_backend_ended_on_an_error_says_so(tmp_path):
+    """Codex can end a turn with an error (a usage limit) and no final reply. The record of its
+    rest then had nothing new to say and repeated the agent's "I'll do X" as if it answered."""
+    running = SessionTurn(
+        "u1",
+        "m1",
+        "revise the figure",
+        "I'll revise the figure now.",
+        TokenUsage(total=7, output=7),
+        "m",
+        agent_messages=["I'll revise the figure now."],
+        complete=False,
+    )
+    done = SessionTurn(
+        "u1",
+        "m1",
+        "revise the figure",
+        "I'll revise the figure now.",
+        TokenUsage(total=9, output=9),
+        "m",
+        agent_messages=["I'll revise the figure now."],
+        error="You've hit your usage limit.",
+    )
+    _first, second = _commit_mid_turn_then_finish(tmp_path, running, done)
+    trace = second.split("# Interaction Trace")[1]
+    assert "I'll revise the figure now." not in trace
+    flat = " ".join(trace.replace("> ", " ").split())
+    assert "The backend reported: You've hit your usage limit." in flat
 
 
 def test_a_recorded_turn_leaves_no_prompts_behind(tmp_path):

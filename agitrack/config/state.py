@@ -800,8 +800,23 @@ class AgitrackState:
         record = self.data.get("partial_turn_tokens")
         return record if isinstance(record, dict) else None
 
-    def set_partial_turn_usage(self, session_id: str | None, user_id: str, usage: dict) -> None:
-        self.data["partial_turn_tokens"] = {"session_id": session_id, "user_id": user_id, "usage": usage}
+    def set_partial_turn_usage(
+        self,
+        session_id: str | None,
+        user_id: str,
+        usage: dict,
+        messages: list[str] | None = None,
+        followups: int | None = None,
+    ) -> None:
+        """Remember what a commit captured of a still-running turn: its tokens so far (counted
+        once, see CommitEngine._add_turn_usage) and the agent messages it had sent so far, so
+        the record of the turn's REST quotes only what the agent said after the capture."""
+        record: dict = {"session_id": session_id, "user_id": user_id, "usage": usage}
+        if messages is not None:
+            record["messages"] = [m for m in messages if isinstance(m, str)]
+        if followups is not None:
+            record["followups"] = followups
+        self.data["partial_turn_tokens"] = record
         self.save()
 
     def clear_partial_turn_usage(self) -> None:
