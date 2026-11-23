@@ -99,7 +99,7 @@ def main() -> None:
         for line in res["child_log"].splitlines():
             emit(f"    {line}")
         log = res["child_log"]
-        recv = "\n".join(l for l in log.splitlines() if l.startswith("recv"))
+        recv = "\n".join(ln for ln in log.splitlines() if ln.startswith("recv"))
         hexcat = recv.replace(" ", "").lower()
         if "REC MOUSE" in log:
             emit("  >>> conhost produced a MOUSE_EVENT_RECORD  [MOUSE DELIVERED via ReadConsoleInput]")
