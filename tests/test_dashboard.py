@@ -3063,6 +3063,11 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     assert out.count("alice-gh</b> asked") == 2 and out.count("alice-gh</b> followed up") == 1
     assert out.count("bob-gh</b> asked") == 1 and "you asked" not in out
 
+    # Oldest first, the same rows run forwards: each message before the commit it went into.
+    rev = _render_log([older, newer], tmp_path, setup='LOGTAB = "timeline"; state.sort = "oldest"; ')
+    order = [rev.index(word) for word in ("ORANGE", "KIWI", "middle commit", "LEMON", "LIME", "fold commit")]
+    assert order == sorted(order)
+
     commits = _render_log([newer, older], tmp_path, setup='LOGTAB = "commits"; ')
     assert "ORANGE" not in commits and "fold commit" in commits
     # The timeline is what a reader sees first; the plain commit list is the next tab.
@@ -3190,6 +3195,45 @@ def test_a_timeline_message_sits_on_the_rail_beside_the_commits_not_under_one(tm
     assert '.tprompt::before{content:"";position:absolute;left:-30px;' in html
     assert ".entry::before,.tprompt::before{left:-17.5px}" in html
     assert ".tprompt .tgo{margin-left:auto;white-space:nowrap;" in html
+
+
+def test_the_timeline_and_commit_list_can_run_oldest_first(tmp_path):
+    # `sort=oldest` runs the log forwards in time: the commit list oldest first, and the timeline
+    # with each message BEFORE the commit it went into (asked, then committed), messages in the
+    # order they were sent. Paging still counts rows.
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+    from agitrack.metrics.web import LOG_SORTS, shell_html
+
+    repo = GitRepo.init(tmp_path)
+    for i, asked in enumerate([0, 3, 1]):  # oldest first
+        _write_lines(repo, "x.txt", i + 1)
+        users = "".join(f"## User\n\nC{i}-{k}\n\n" for k in range(asked))
+        repo.commit(
+            f"<aGiTrack> c{i}\n\n# Interaction Trace\n\n{users}## Agent\n\nok\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+        )
+    scope = RepoScope(repo)
+
+    def log(**query):
+        return _json.loads(scope.get("/log", {k: [str(v)] for k, v in query.items()}).body)
+
+    def rows(page):
+        return [
+            page["entries"][i]["subject"].removeprefix("<aGiTrack> ")
+            if seq == 0
+            else page["entries"][i]["turns"][0]["prompts"][seq - 1]
+            for i, seq in page["items"]
+        ]
+
+    first = log(view="timeline", sort="oldest", limit=5)
+    assert first["total"] == 8
+    assert rows(first)[1:] == ["c0", "C1-0", "C1-1", "C1-2"]  # after the seed commit GitRepo.init makes
+    assert rows(log(view="timeline", sort="oldest", limit=5, offset=5)) == ["c1", "C2-0", "c2"]
+    commits = log(sort="oldest", limit=10)["entries"]
+    assert [e["subject"] for e in commits][1:] == ["<aGiTrack> c0", "<aGiTrack> c1", "<aGiTrack> c2"]
+    assert "oldest" in LOG_SORTS  # the static export ships it like every other sort
+    assert '<option value="oldest">oldest first</option>' in shell_html(_seeded(tmp_path / "s"))
 
 
 def test_the_timeline_pages_by_rows_and_follows_a_rewrite(tmp_path):
