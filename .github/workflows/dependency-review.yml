@@ -43,7 +43,7 @@ jobs:
       # NOTE the exact tag: this action publishes `v5.0.0` but has not pushed a moving `v5`
       # major tag, so `@v5` — which dependabot proposed in PR #243 — does not resolve at all
       # and would fail the workflow with "Unable to resolve action".
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
         with:
           # On a push there is no PR context to infer the two sides from. `event.before` is the
           # commit dev pointed at before this push, so the diff is exactly what the push added.
