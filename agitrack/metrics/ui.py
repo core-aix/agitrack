@@ -579,12 +579,12 @@ let hubNavigating = false;
 // browser also says "Chrome".
 function hubBrowserFamily(){
   const ua = navigator.userAgent || "";
-  if(/Edg\//.test(ua)) return "edge";
-  if(/OPR\//.test(ua)) return "opera";
+  if(/Edg\\//.test(ua)) return "edge";
+  if(/OPR\\//.test(ua)) return "opera";
   if(/Vivaldi/.test(ua)) return "vivaldi";
-  if(/Firefox\//.test(ua)) return "firefox";
-  if(/Chrome\//.test(ua)) return "chrome";
-  if(/Safari\//.test(ua)) return "safari";
+  if(/Firefox\\//.test(ua)) return "firefox";
+  if(/Chrome\\//.test(ua)) return "chrome";
+  if(/Safari\\//.test(ua)) return "safari";
   return "";
 }
 

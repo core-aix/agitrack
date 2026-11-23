@@ -801,18 +801,20 @@ def aggregates_payload(
 
 
 # Commit-log sort orders the user can choose (applied after the filter scope).
-LOG_SORTS = ("date", "lines", "tokens")
+LOG_SORTS = ("date", "oldest", "lines", "tokens")
 DEFAULT_LOG_SORT = "date"
 
 
 def _sorted_for_log(stats: list[CommitStat], sort: str) -> list[CommitStat]:
-    """Order the filtered commits for the log. ``date`` (default) is newest-first;
-    ``lines`` and ``tokens`` rank by magnitude (most changed lines / most output
+    """Order the filtered commits for the log. ``date`` (default) is newest-first, ``oldest``
+    oldest-first; ``lines`` and ``tokens`` rank by magnitude (most changed lines / most output
     tokens) with the newest commit breaking ties. ``stats`` arrives oldest-first."""
     if sort == "lines":
         return sorted(stats, key=lambda s: (s.insertions + s.deletions, s.timestamp), reverse=True)
     if sort == "tokens":
         return sorted(stats, key=lambda s: (s.tokens.get("output", 0), s.timestamp), reverse=True)
+    if sort == "oldest":
+        return list(stats)
     return list(reversed(stats))  # "date": newest first
 
 
@@ -995,8 +997,10 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
     are commits or messages, and a commit's messages continue onto the next page when they do
     not fit. Sorted by date, messages and commits interleave by time, newest first (a message is
     placed when its turn began); under another sort each commit is followed by its own messages,
-    newest first. The page script draws the rows in exactly this order."""
+    newest first. Sorted ``oldest`` first the same rows run forwards in time, so each message
+    comes before the commit it went into. The page script draws the rows in exactly this order."""
     by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
+    oldest = sort == "oldest"
     repeats = _repeated_messages(stats)
     keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
@@ -1006,12 +1010,18 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
         # (woken by a background event, nothing typed) has nothing for the timeline to show; the
         # commit list still lists it, and it folds into the next commit like the rest.
         if not stat.pending:
-            keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
+            if oldest:
+                keyed.append(((commit_time, index, 1, 0), (index, 0)))
+            else:
+                keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
         for seq, at in enumerate(_prompt_times(stat), start=1):
             if (index, seq) in repeats:
                 continue
             when = at or commit_time
-            keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
+            if oldest:
+                keyed.append(((when, index, 0, seq), (index, seq)))
+            else:
+                keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
     keyed.sort(key=lambda pair: pair[0])
     return [row for _, row in keyed]
 
@@ -2045,6 +2055,7 @@ __UPDATE_BANNER__
     </div>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
+      <option value="oldest">oldest first</option>
       <option value="lines">most lines changed</option>
       <option value="tokens">most output tokens</option>
     </select></div>
@@ -2827,9 +2838,14 @@ function timelineHtml(entries, commitRow){
     const byKey = new Map(items.map(it => [it.i + ":" + it.seq, it]));
     rows = LOGPAGE.items.map(([i, seq]) => byKey.get(i + ":" + seq)).filter(Boolean);
   } else {
-    const byTime = state.sort === "date";
-    items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
-      (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+    if(state.sort === "oldest"){
+      items.sort((a, b) => (a.t - b.t) || (a.i - b.i) ||
+        (a.commit === b.commit ? a.seq - b.seq : (a.commit ? 1 : -1)));
+    } else {
+      const byTime = state.sort === "date";
+      items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
+        (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+    }
   }
   return rows.map(it => {
     if(it.commit) return commitRow(entries[it.i], it.i);
