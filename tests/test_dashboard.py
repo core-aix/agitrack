@@ -3367,6 +3367,19 @@ def test_a_cut_off_filter_value_scrolls_on_hover_with_no_browser_tooltip(tmp_pat
     assert ".field select.selscrolling{color:transparent}" in html
 
 
+def test_the_filter_bar_stays_below_notices_that_appear_later_and_names_the_repo(tmp_path):
+    # The sticky filter bar sits just below the frozen notice strip. The strip's contents change
+    # after load (the "reloaded" notice, the live update banner, the offline notice), and with
+    # the offset measured only once, a second notice covered the bar: it is re-measured whenever
+    # the strip changes size. The bar also names the repository it filters (display only).
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "new ResizeObserver(restackControls).observe(strip)" in html
+    controls = html.split('<div class="controls">', 1)[1].split('<span class="prompt">', 1)[0]
+    assert '<span class="ctlrepo">repo <b>' in controls and "__REPO__" not in controls
+
+
 def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
     # The branch being viewed stays on screen while the page scrolls: its picker is the first
     # field of the sticky filter bar, not a select on the line under the title.

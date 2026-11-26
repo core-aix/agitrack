@@ -1730,6 +1730,11 @@ header{padding:26px 0 18px}
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
   border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:12px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
+/* Which repository the filters apply to, kept on screen with the sticky bar (switching it is the
+   hub bar's job, at the top of the page). Top right, above the buttons, which carry no label. */
+.ctlrepo{position:absolute;top:5px;right:16px;max-width:240px;font-size:11px;color:var(--fg-dim);
+  letter-spacing:.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.ctlrepo b{color:var(--fg);font-weight:600}
 /* "loading…" badge shown while a filter change re-fetches the data. It FLOATS just below
    the bar's right corner (absolute against the sticky bar), so appearing and disappearing
    never moves the reset button or anything else in the row. */
@@ -2241,6 +2246,7 @@ __UPDATE_BANNER__
   </div>
 
   <div class="controls">
+    <span class="ctlrepo">repo <b>__REPO__</b></span>
     <span class="prompt">&gt; filter</span>
     <div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
@@ -4145,6 +4151,11 @@ function stackStickyBanner(){
   restackControls = () => { ctl.style.top = strip.offsetHeight + "px"; };
   restackControls();
   window.addEventListener("resize", restackControls);
+  // The strip's contents change AFTER this runs: the "reloaded" notice, the live update banner
+  // (re-rendered from the poll) and the offline notice all come and go. Measured only once, a
+  // second notice made the strip taller than the offset and covered the filter bar. Re-measure
+  // whenever the strip changes size.
+  if(typeof ResizeObserver === "function") new ResizeObserver(restackControls).observe(strip);
 }
 // Every control is wired BEFORE any data is awaited. A restored view (returning from story/learn,
 // or the reload aGiTrack does after an update) is on screen at once, and the refresh behind it
