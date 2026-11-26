@@ -1805,8 +1805,16 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .teng{color:var(--ops);border:1px solid var(--ops);border-radius:2px;padding:0 5px;font-size:11px;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
-.tprompt .tans{white-space:nowrap;font:inherit;font-size:11.5px;color:var(--ops);background:none;border:0;padding:0;cursor:pointer}
-.tprompt .tans:hover{text-decoration:underline}
+/* "show answer" sits at the bottom right of the message, styled as the page's links are (green,
+   underlined, inverting on hover) so it reads as something to click. */
+.tprompt .tfoot{display:flex;justify-content:flex-end;margin-top:6px}
+/* While a long message is cut short its "show all" sits at the bottom left: share that row
+   rather than adding one below it. (Once opened, "collapse" is sticky and keeps its own row.) */
+.tprompt.clamp.long .tfoot{margin-top:-19px;pointer-events:none}
+.tprompt.clamp.long .tfoot .tans{pointer-events:auto}
+.tprompt .tans{white-space:nowrap;font:inherit;font-size:12px;color:var(--phosphor);background:none;border:0;
+  border-bottom:1px solid var(--phosphor-dim);padding:0 1px;cursor:pointer}
+.tprompt .tans:hover{color:var(--ink);background:var(--phosphor)}
 .tprompt .tanswer{margin-top:8px;padding:8px 10px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06);
   max-height:30em;overflow:auto;overflow-wrap:anywhere}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
@@ -3044,8 +3052,9 @@ function timelineHtml(entries, commitRow){
     // The agent's reply, opened in place: no need to open the (possibly squashed) commit.
     const ans = it.sec == null ? "" : `<button class="tans" data-ans="${it.i}" ${where} aria-expanded="false" title="show what the agent answered, here">show answer</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
-      `${eng}${when}${ans}${target}</div><div class="tbody md">${md(it.text)}</div>`+
-      `<button class="tmore" title="show the whole message">show all</button></div>`;
+      `${eng}${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
+      `<button class="tmore" title="show the whole message">show all</button>`+
+      (ans ? `<div class="tfoot">${ans}</div>` : "") + `</div>`;
   }).join("");
 }
 function renderLog(){
