@@ -1566,16 +1566,6 @@ header{padding:26px 0 18px}
 .meta{margin-top:12px;color:var(--fg-dim);font-size:13.5px}
 .meta b{color:var(--fg);font-weight:600}
 .meta .tag{color:var(--amber)}
-/* Branch picker lives inline on the meta line (next to the repo path), styled to
-   read as part of the text rather than as a bulky filter control. */
-.meta select.branchsel{appearance:none;background:var(--ink);color:var(--fg);font-weight:600;vertical-align:baseline;
-  border:1px solid var(--line);font-family:var(--mono);font-size:13px;padding:2px 22px 2px 8px;max-width:min(60vw,520px);cursor:pointer;
-  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
-  background-position:calc(100% - 12px) 50%,calc(100% - 8px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
-.meta select.branchsel:focus{outline:none;border-color:var(--phosphor)}
-/* A file:// snapshot (or a single-branch repo) can't switch: render it as plain
-   inline text — no arrow, no box affordance. */
-.meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
 /* One row while sticky: the FIELDS shrink (min-width:0 below) rather than the row
@@ -1584,7 +1574,7 @@ header{padding:26px 0 18px}
    (max-width:760px below) is where the bar finally wraps into a grid. (No overflow
    clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:12px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
 /* "loading…" badge shown while a filter change re-fetches the data. It FLOATS just below
    the bar's right corner (absolute against the sticky bar), so appearing and disappearing
@@ -1602,10 +1592,15 @@ header{padding:26px 0 18px}
 .field{display:flex;flex-direction:column;gap:4px;flex:0 1 165px;min-width:0}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:0;width:100%;
+  font-family:var(--mono);font-size:13.5px;padding:7px 25px 7px 9px;cursor:pointer;min-width:0;width:100%;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
-  background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
+/* The branch picker sits in the sticky filter bar, so the branch being viewed stays on screen
+   while the page scrolls. A file:// snapshot or a one-branch repo cannot switch: it then reads
+   as a label, with no arrow to suggest otherwise. */
+.field select:disabled{cursor:default;background-image:none;padding-right:9px;color:var(--fg);opacity:1}
+#branchfield{flex-basis:120px}
 __UI_RANGE_CSS__
 /* The advanced filter. It hangs BELOW the sticky bar rather than expanding it: growing the bar
    pushes the whole page down every time it opens, and on a phone a bar tall enough to hold three
@@ -1810,6 +1805,15 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .teng{color:var(--ops);border:1px solid var(--ops);border-radius:2px;padding:0 5px;font-size:11px;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
+.tprompt .tans{white-space:nowrap;font:inherit;font-size:11.5px;color:var(--ops);background:none;border:0;padding:0;cursor:pointer}
+.tprompt .tans:hover{text-decoration:underline}
+.tprompt .tanswer{margin-top:8px;padding:8px 10px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06);
+  max-height:30em;overflow:auto;overflow-wrap:anywhere}
+.tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
+.tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
+.tprompt .tanswer .abody{color:var(--fg)}
+.tprompt .tanswer .abody > :first-child{margin-top:0}
+.tprompt .tanswer .abody > :last-child{margin-bottom:0}
 .tprompt .tgo .tsha{font-variant-numeric:tabular-nums}
 .tprompt .tbody{color:var(--fg);overflow-wrap:anywhere}
 .tprompt .tbody > :first-child{margin-top:0}
@@ -2044,7 +2048,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">
@@ -2056,6 +2060,7 @@ __UPDATE_BANNER__
 
   <div class="controls">
     <span class="prompt">&gt; filter</span>
+    <div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch" title="View statistics and the commit log for a single branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
@@ -2928,6 +2933,68 @@ function setMessageToggle(el){
   more.textContent = cut ? "show all" : "collapse";
   more.title = cut ? "show the whole message" : "cut the message short again";
 }
+// The message a timeline row's link points into: the commit's own (path []) or, down the parts
+// tree (each index as _display_parts orders them), a squashed part's.
+function messageAtPath(c, path){
+  let node = c;
+  for(const k of (path || [])){
+    const next = (node.parts || [])[k];
+    if(!next) return "";
+    node = next;
+  }
+  return node.message || "";
+}
+// What the agent answered to the `sec`-th "## User" of a message's interaction trace (empty ones
+// counted, as the server counts them): every "## Agent" section after it, up to the next
+// "## User". Fence-aware like the server's reading, so a heading QUOTED in a code block is not a
+// role. A message answered together with the one after it (queued while the agent worked, so no
+// reply sits between them) borrows the next reply, and says so.
+function traceAnswer(text, sec){
+  const sections = [];
+  let inTrace = false, fence = false, cur = null;
+  for(const line of (text || "").split("\n")){
+    const s = line.trim();
+    if(/^(```|~~~)/.test(s)){ fence = !fence; if(cur) cur.lines.push(line); continue; }
+    if(!fence && line.startsWith("# ")){ inTrace = s === "# Interaction Trace"; cur = null; continue; }
+    if(!fence && inTrace && line.startsWith("## ")){ cur = {role: s.slice(3).trim(), lines: []}; sections.push(cur); continue; }
+    if(inTrace && cur) cur.lines.push(line);
+  }
+  let user = -1, start = -1;
+  sections.forEach((x, k) => { if(x.role === "User" && ++user === sec && start < 0) start = k; });
+  if(start < 0) return null;
+  const replies = [];
+  let later = false;
+  for(let k = start + 1; k < sections.length; k++){
+    const x = sections[k];
+    if(x.role === "User"){ if(replies.length) break; later = true; continue; }
+    if(x.role === "Agent"){ const t = x.lines.join("\n").trim(); if(t) replies.push(t); }
+  }
+  return {text: replies.join("\n\n"), later};
+}
+function toggleAnswer(btn){
+  const el = btn.closest(".tprompt");
+  const open = el.querySelector(".tanswer");
+  if(open){ open.remove(); btn.textContent = "show answer"; btn.setAttribute("aria-expanded", "false"); return; }
+  const c = (LOG_ENTRIES || [])[+btn.dataset.ans];
+  const path = btn.dataset.path ? btn.dataset.path.split(".").map(Number) : [];
+  const found = c ? traceAnswer(messageAtPath(c, path), +btn.dataset.sec) : null;
+  const box = document.createElement("div");
+  box.className = "tanswer";
+  if(found && found.text){
+    box.innerHTML = `<div class="alabel">agent replied${found.later ? " (to this and the message that followed it)" : ""}</div>`+
+      `<div class="abody dmsg md">${md(found.text)}</div>`;
+  } else {
+    box.innerHTML = `<div class="anote">${c && c.pending
+      ? "no reply recorded yet: the agent may still be working on it"
+      : "no reply to this message is recorded in its trace"}</div>`;
+  }
+  el.querySelector(".tbody").after(box);
+  const body = box.querySelector(".abody");
+  if(body) reflowParagraphs(body);
+  highlightIn(box);
+  btn.textContent = "hide answer";
+  btn.setAttribute("aria-expanded", "true");
+}
 function timelineHtml(entries, commitRow){
   const items = [];
   entries.forEach((c, i) => {
@@ -2974,8 +3041,10 @@ function timelineHtml(entries, commitRow){
       ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
       : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     const eng = it.eng ? `<span class="teng" title="asked of the backend / model you filtered by">${esc(it.eng)}</span>` : "";
+    // The agent's reply, opened in place: no need to open the (possibly squashed) commit.
+    const ans = it.sec == null ? "" : `<button class="tans" data-ans="${it.i}" ${where} aria-expanded="false" title="show what the agent answered, here">show answer</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
-      `${eng}${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
+      `${eng}${when}${ans}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
   }).join("");
 }
@@ -3319,8 +3388,8 @@ function fillSelect(id, values, allLabel, keep){
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
-// The branch picker doubles as the branch label on the meta line: keep its shown
-// value in sync with the branch actually being viewed.
+// The branch picker (first field of the sticky filter bar) is also where the page says which
+// branch is being viewed: keep its shown value in sync with that branch.
 function setBranchLabel(name){ const el=$("f-branch"); if(el && name && [...el.options].some(o=>o.value===name)) el.value = name; }
 // The branch picker is a view switch, not a subset filter, so it has no "all"
 // option — exactly one branch is shown at a time. A file:// snapshot can't reach
@@ -3332,6 +3401,8 @@ function fillBranches(){
   sel.value = list.includes(state.branch) ? state.branch : (list[0] || "");
   state.branch = sel.value;
   sel.disabled = !LIVE || list.length <= 1;
+  // The field is narrow in the sticky bar, so a long branch name is cut: its title says it whole.
+  sel.title = (sel.value ? sel.value + " · " : "") + "view statistics and the commit log for a single branch";
 }
 function syncFilters(){
   fillBranches();
@@ -3817,7 +3888,7 @@ function hideFabricatedChrome(){
   const fa = $("f-author"); if(fa && fa.closest(".field")) fa.closest(".field").style.display = "none";
   const bc = $("by-committer");
   if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }
-  const bm = $("branchmeta"); if(bm) bm.style.display = "none";  // no "branch …" in the header
+  const bf = $("branchfield"); if(bf) bf.style.display = "none";  // a reconstruction has no branches
   const sh = $("shared");
   if(sh){ sh.style.display = "none"; if(sh.previousElementSibling) sh.previousElementSibling.style.display = "none"; }
 }
@@ -3841,7 +3912,7 @@ function stackStickyBanner(){
 function wireControls(){
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
-  $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
+  $("f-branch").onchange = e => { state.branch = e.target.value; e.target.title = e.target.value + " · view statistics and the commit log for a single branch"; state.author=state.backend=state.model=""; applyFilters(); };
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
@@ -3896,6 +3967,8 @@ function wireControls(){
     if(dbtn && dbtn.dataset.psha){ e.preventDefault(); togglePartDiff(dbtn); return; }
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
+    const ansBtn = e.target.closest(".tans");
+    if(ansBtn){ toggleAnswer(ansBtn); return; }
     const more = e.target.closest(".tmore");
     if(more){
       const el = more.closest(".tprompt");

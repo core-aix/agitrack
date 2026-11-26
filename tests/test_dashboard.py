@@ -3256,6 +3256,81 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     assert "ORANGE" in _render_log([newer, older], tmp_path)
 
 
+def test_a_timeline_message_shows_the_agents_answer_without_opening_the_commit(tmp_path):
+    # Each timeline message carries a "show answer" button that opens the agent's reply under
+    # it, read from the trace the page already holds (the commit's own message, or a squashed
+    # part's), so the reader need not open a possibly squashed commit to see it. A message
+    # queued while the agent worked has no reply of its own between it and the next message:
+    # it borrows the next reply and says so.
+    from agitrack.commits import build_auto_fold_message
+    from agitrack.metrics.web import log_page
+
+    def body(trace):
+        return build_agent_commit_message(
+            latest_prompt=trace[0]["content"],
+            trace=trace,
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 3},
+        )
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 1)
+    repo.commit(
+        body(
+            [
+                {"role": "user", "content": "PLAIN question"},
+                {"role": "agent", "content": "PLAIN answer with ## User quoted\n\n```\n## Agent fake\n```"},
+            ]
+        )
+    )
+    _write_lines(repo, "a.txt", 2)
+    repo.commit(
+        build_auto_fold_message(
+            [
+                body([{"role": "user", "content": "FIRST ask"}, {"role": "agent", "content": "FIRST reply"}]),
+                body(
+                    [
+                        {"role": "user", "content": "SECOND ask"},
+                        {"role": "user", "content": "QUEUED follow-up", "starts_turn": False},
+                        {"role": "agent", "content": "SECOND reply"},
+                    ]
+                ),
+            ]
+        )
+    )
+    entries = log_page(build_dashboard(repo), view="timeline")["entries"]
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); const out = {};"
+        " for(const c of LOGPAGE.entries) for(const t of (c.turns || [])) t.prompts.forEach((p, k) =>"
+        " { out[p] = traceAnswer(messageAtPath(c, t.path), t.sections[k]); });"
+        " $('commitlog').innerHTML += '@@' + JSON.stringify(out); };"
+    )
+    drawn = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ' + probe)
+    answers = json.loads(drawn.split("@@", 1)[1])
+    assert answers["FIRST ask"] == {"text": "FIRST reply", "later": False}
+    assert answers["SECOND ask"] == {"text": "SECOND reply", "later": True}  # answered with the follow-up
+    assert answers["QUEUED follow-up"] == {"text": "SECOND reply", "later": False}
+    plain = answers["PLAIN question"]
+    assert plain["text"].startswith("PLAIN answer") and "## Agent fake" in plain["text"]  # a quoted heading is no role
+    assert drawn.count('class="tans"') == 4  # one button per message
+
+
+def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
+    # The branch being viewed stays on screen while the page scrolls: its picker is the first
+    # field of the sticky filter bar, not a select on the line under the title.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    controls = html.split('<div class="controls">', 1)[1].split('<div class="advpanel"', 1)[0]
+    assert '<div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch"' in controls
+    assert controls.index('id="f-branch"') < controls.index('id="f-author"')
+    meta = html.split('<div class="meta">', 1)[1].split("</div>", 1)[0]
+    assert "f-branch" not in meta
+
+
 def _two_people_merged(repo_dir) -> dict[str, str]:
     """Alice and Bob each drive an agent on their own branch at the same time; both branches
     are merged into main with merge commits. Bob's second commit folds two turns. Returns the
