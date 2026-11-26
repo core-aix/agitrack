@@ -1833,9 +1833,9 @@ h2.section::before{content:"# ";color:var(--amber)}
 .loghead h2.section{margin:0}
 .logsort{display:flex;align-items:center;gap:8px}
 /* Opens (or closes) every "show answer" on the timeline page at once. Link-styled like them. */
-.allans{font:inherit;font-size:12.5px;color:var(--phosphor);background:none;border:0;border-bottom:1px solid var(--phosphor-dim);
+.allans{font:inherit;font-size:12.5px;color:var(--ops);background:none;border:0;border-bottom:1px solid rgba(103,184,214,.35);
   padding:0 1px;cursor:pointer;margin-left:auto;white-space:nowrap}
-.allans:hover{color:var(--ink);background:var(--phosphor)}
+.allans:hover{color:var(--ink);background:var(--ops)}
 .logsort label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
 .logsort select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:13px;padding:5px 26px 5px 10px;cursor:pointer;
@@ -1979,8 +1979,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .teng{color:var(--ops);border:1px solid var(--ops);border-radius:2px;padding:0 5px;font-size:11px;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
-/* "show answer" sits at the bottom right of the message, styled as the page's links are (green,
-   underlined, inverting on hover) so it reads as something to click. */
+/* "show answer" reads as a link (underlined, inverting on hover) but in the page's muted blue,
+   not the bright green of the main links, so it does not compete with the messages. */
 .tprompt .tfoot{display:flex;justify-content:flex-end;margin-top:6px}
 .tprompt .tfoot:empty{display:none}
 /* In a message shown whole, the button floats to the right of its LAST line (placeAnswerButton),
@@ -1990,9 +1990,9 @@ h2.section::before{content:"# ";color:var(--amber)}
    rather than adding one below it. (Once opened, "collapse" is sticky and keeps its own row.) */
 .tprompt.clamp.long .tfoot{margin-top:-19px;pointer-events:none}
 .tprompt.clamp.long .tfoot .tans{pointer-events:auto}
-.tprompt .tans{white-space:nowrap;font:inherit;font-size:12px;color:var(--phosphor);background:none;border:0;
-  border-bottom:1px solid var(--phosphor-dim);padding:0 1px;cursor:pointer}
-.tprompt .tans:hover{color:var(--ink);background:var(--phosphor)}
+.tprompt .tans{white-space:nowrap;font:inherit;font-size:12px;color:var(--ops);background:none;border:0;
+  border-bottom:1px solid rgba(103,184,214,.35);padding:0 1px;cursor:pointer}
+.tprompt .tans:hover{color:var(--ink);background:var(--ops)}
 .tprompt .tanswer{margin-top:8px;padding:8px 10px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06);
   max-height:30em;overflow:auto;overflow-wrap:anywhere}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
@@ -2238,7 +2238,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
+    <div class="meta"><span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">
