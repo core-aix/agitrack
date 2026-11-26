@@ -748,6 +748,58 @@ def test_a_filtered_timeline_shows_only_what_was_asked_of_the_matching_parts(tmp
     )
 
 
+def test_a_subagent_block_an_older_version_repeated_on_every_turn_is_counted_once(tmp_path):
+    # Before nested sub-agents were followed to their delegating turn, one nested tree's tokens
+    # were written into every turn recorded after it (102 records in a real conversation, so
+    # every commit read about $23). The dashboard counts the block once per conversation: the
+    # first record keeps it, later copies keep only their own turn's tokens, a fold's total is
+    # recomputed, and a different conversation's identical-looking block is left alone.
+    def block(session: str, output: int, sub: bool) -> str:
+        lines = [
+            "# aGiTrack Metadata",
+            "commit_type: agent",
+            "backend: claude",
+            "model: claude-opus-4-8",
+            f"backend_session_id: {session}",
+            f"tokens_since_last_commit_output: {output}",
+        ]
+        if sub:
+            lines += [
+                "tokens_since_last_commit_subagent_input: 1333359",
+                "tokens_since_last_commit_subagent_cache_read: 25576357",
+                "tokens_since_last_commit_subagent_output: 565540",
+            ]
+        return "\n".join(lines) + "\n"
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 1)
+    repo.commit("<aGiTrack> delegated\n\n" + block("s1", 10, True))
+    _write_lines(repo, "a.txt", 2)
+    repo.commit("<aGiTrack> next\n\n" + block("s1", 20, True))
+    _write_lines(repo, "a.txt", 3)
+    repo.commit(
+        "my fold\n\n"
+        + block("s1", 1, False).replace("commit_type: agent", "commit_type: user")
+        + "\n<aGiTrack> one\n\n"
+        + block("s1", 30, True)
+        + "\n<aGiTrack> two\n\n"
+        + block("s1", 40, True)
+    )
+    _write_lines(repo, "a.txt", 4)
+    repo.commit("<aGiTrack> elsewhere\n\n" + block("s2", 50, True))
+
+    stats = {s.subject: s for s in build_dashboard(repo).stats}
+    assert stats["<aGiTrack> delegated"].tokens["subagent_output"] == 565540  # the first keeps it
+    assert stats["<aGiTrack> next"].tokens.get("subagent_output", 0) == 0
+    assert stats["<aGiTrack> next"].tokens["output"] == 20  # its own turn's tokens stay
+    fold = stats["my fold"]
+    assert fold.tokens.get("subagent_output", 0) == 0 and fold.tokens["output"] == 71
+    assert stats["<aGiTrack> elsewhere"].tokens["subagent_output"] == 565540  # another conversation
+    totals = build_dashboard(repo).token_totals
+    assert totals["output"] == 10 + 20 + 71 + 50
+    assert totals["subagent_output"] == 2 * 565540  # once per conversation
+
+
 def test_same_commit_in_multiple_squashes_counts_tokens_once(tmp_path):
     # An original commit can be rolled into more than one squash (a branch is
     # squash-merged, then that result squashed again). Its metadata block — and so

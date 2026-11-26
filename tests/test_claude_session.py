@@ -1409,6 +1409,55 @@ def test_export_session_accounts_separate_file_subagents_end_to_end(tmp_path, mo
     assert turn.tokens.output == 25  # main-line output unaffected (20 + 5)
 
 
+def test_a_nested_subagent_belongs_to_the_turn_that_delegated_its_parent(tmp_path, monkeypatch):
+    # A sub-agent spawned BY a sub-agent (spawnDepth 2, parentAgentId) names a launching call
+    # inside its parent's transcript, which no turn of the main conversation holds. It matched
+    # no turn and fell through to "the latest turn", so every parse put the nested tree's tokens
+    # on whatever turn was newest and every commit counted them again (seen live: ~565k output
+    # tokens in 102 records of one conversation). It belongs to the turn that delegated the tree.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    rows = [
+        _user("u1", "delegate a big job"),
+        _assistant(
+            "m1",
+            "delegating",
+            usage={"output_tokens": 5},
+            content=[{"type": "tool_use", "id": "toolu_TOP", "name": "Agent", "input": {}}],
+        ),
+        _assistant("m1b", "started it", usage={"output_tokens": 5}, stop_reason="end_turn"),
+        _user("u2", "something else"),
+        _assistant("m2", "done", usage={"output_tokens": 7}, stop_reason="end_turn"),
+    ]
+    (project_dir / "abc.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    sub_dir = project_dir / "abc" / "subagents"
+    sub_dir.mkdir(parents=True)
+
+    def agent(agent_id: str, meta: dict, output: int) -> None:
+        (sub_dir / f"agent-{agent_id}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        row = {
+            "type": "assistant",
+            "isSidechain": True,
+            "message": {"id": agent_id, "usage": {"output_tokens": output}},
+        }
+        (sub_dir / f"agent-{agent_id}.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    agent("top", {"toolUseId": "toolu_TOP", "spawnDepth": 1}, 100)
+    agent("child", {"toolUseId": "toolu_IN_TOP", "parentAgentId": "top", "spawnDepth": 2}, 40)
+    agent("grandchild", {"toolUseId": "toolu_IN_CHILD", "parentAgentId": "child", "spawnDepth": 3}, 2)
+    agent("orphan", {"toolUseId": "toolu_GONE", "parentAgentId": "missing", "spawnDepth": 2}, 1)
+
+    first, second = export_session(repo, "abc").turns
+    assert first.tokens.subagent_output == 142  # the whole tree, on the turn that delegated it
+    # The newest turn carries none of it. (A spawner whose record is gone leaves the agent on
+    # its own id, which matches no turn, so it keeps the old fallback rather than being lost.)
+    assert second.tokens.subagent_output == 1
+    assert claude_session._subagent_tool_use_id(sub_dir / "agent-grandchild.jsonl") == "toolu_TOP"
+
+
 def test_subagent_tokens_since_counts_only_new_files(tmp_path, monkeypatch):
     # The headless run() path snapshots sub-agent files before a turn and counts only the
     # ones the turn adds, so a resumed session's prior sub-agents aren't double-counted.

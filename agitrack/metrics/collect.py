@@ -750,6 +750,7 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
     stats.reverse()  # oldest first
     _dedupe_squash_constituents(stats)
     _suppress_copied_turns(stats)
+    _suppress_repeated_subagent_tokens(stats)
     _flag_token_anomalies(stats)
     return stats
 
@@ -868,6 +869,49 @@ def _suppress_copied_turns(stats: list[CommitStat]) -> None:
                 target.token_copy = True
             else:
                 seen.add(block)
+
+
+_SUBAGENT_TOKEN_KEYS = (
+    "subagent_input",
+    "subagent_output",
+    "subagent_reasoning",
+    "subagent_cache_read",
+    "subagent_cache_write",
+)
+
+
+def _suppress_repeated_subagent_tokens(stats: list[CommitStat]) -> None:
+    """Count a sub-agent's tokens ONCE when an older aGiTrack wrote them into many turns.
+
+    A sub-agent spawned by another sub-agent (Claude Code's nested ``spawnDepth`` 2+) names a
+    launching call no turn of the main conversation holds, so before
+    ``transcripts.claude._subagent_tool_use_id`` followed the parent chain it was attributed to
+    whatever turn was newest at each parse, and every record took the whole nested tree's
+    tokens again (seen live: one block of ~565k output and ~25.6M cache-read tokens written into
+    102 records of one conversation, so every commit read about $23). Those commits are history
+    now; this reads them correctly.
+
+    The identity is the conversation plus the exact sub-agent counts (input, output, reasoning,
+    cache read, cache write): two different delegations do not spend identical totals in every
+    category, so a repeat within one conversation is a copy. The FIRST occurrence in history
+    order keeps the figures; later copies keep their own turn's tokens and lose only the
+    sub-agent counts. A squash's total is recomputed from its parts."""
+    seen: set[tuple] = set()
+    for stat in stats:
+        targets = list(stat.constituents) or [stat]
+        changed = False
+        for target in targets:
+            counts = tuple(int(target.tokens.get(key) or 0) for key in _SUBAGENT_TOKEN_KEYS)
+            if not any(counts):
+                continue
+            identity = ((target.metadata or {}).get("backend_session_id") or "", counts)
+            if identity in seen:
+                target.tokens = {k: v for k, v in target.tokens.items() if k not in _SUBAGENT_TOKEN_KEYS}
+                changed = True
+            else:
+                seen.add(identity)
+        if changed and stat.constituents:
+            stat.tokens = _sum_tokens(stat.constituents)
 
 
 def _neutralize_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -> None:
@@ -1012,6 +1056,9 @@ def collect_dashboard_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat
     # entries (only when showing HEAD — the live working branch — not a historical ref).
     if ref == "HEAD":
         stats = stats + collect_manual_pending(repo)
+        # A pending turn written by an older aGiTrack can repeat a committed turn's sub-agent
+        # tokens too; judged against the whole history, oldest first (idempotent).
+        _suppress_repeated_subagent_tokens(stats)
     return stats
 
 

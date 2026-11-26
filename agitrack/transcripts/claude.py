@@ -1176,15 +1176,39 @@ def _subagent_activity(session_path: Path) -> dict[str, int]:
     return out
 
 
-def _subagent_tool_use_id(agent_path: Path) -> str | None:
-    # The Task tool_use id that spawned this sub-agent, read from its sibling
-    # `agent-*.meta.json`. None when the meta is missing/unreadable.
+def _subagent_meta(agent_path: Path) -> dict | None:
     meta_path = agent_path.with_name(agent_path.name[: -len(".jsonl")] + ".meta.json")
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    tool_id = meta.get("toolUseId") if isinstance(meta, dict) else None
+    return meta if isinstance(meta, dict) else None
+
+
+def _subagent_tool_use_id(agent_path: Path) -> str | None:
+    """The main-transcript Task tool_use id this sub-agent's work belongs to, read from its
+    sibling ``agent-*.meta.json``. None when the meta is missing/unreadable.
+
+    A sub-agent can itself spawn sub-agents (``spawnDepth`` 2+, ``parentAgentId`` naming the
+    spawner). Such a NESTED sub-agent's own ``toolUseId`` is the call inside its PARENT
+    sub-agent's transcript, which no turn of the main conversation holds, so it matched no
+    turn and fell through to "the latest turn": on every parse it re-attached to whatever turn
+    was newest, and each commit counted the whole nested tree again (seen live: one tree of 18
+    nested sub-agents, ~565k output tokens, written into nearly every commit for two days, so
+    every commit read about $23). It is resolved through the parent chain to the top-level
+    sub-agent's id, so the work is attributed to the turn that delegated the whole tree."""
+    meta = _subagent_meta(agent_path)
+    seen: set[str] = set()
+    while meta is not None:
+        parent = meta.get("parentAgentId")
+        if not isinstance(parent, str) or not parent or parent in seen:
+            break
+        seen.add(parent)
+        parent_meta = _subagent_meta(agent_path.with_name(f"agent-{parent}.jsonl"))
+        if parent_meta is None:
+            break  # the spawner's record is gone: fall back to this agent's own id
+        meta = parent_meta
+    tool_id = meta.get("toolUseId") if meta is not None else None
     return tool_id if isinstance(tool_id, str) and tool_id else None
 
 
