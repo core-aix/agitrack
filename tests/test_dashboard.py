@@ -3530,6 +3530,31 @@ def test_an_opened_answer_grows_with_the_page_and_has_no_scroll_bar_of_its_own(t
     assert "max-height" not in rule and "overflow:auto" not in rule
 
 
+def test_a_new_commit_redraws_the_log_without_closing_what_the_reader_opened(tmp_path):
+    # When new commits land the log is redrawn, and the redraw used to close every expanded
+    # commit and opened answer. What is open is remembered by commit id (a new commit shifts
+    # every row) and reopened, with the parts open inside a squash, a file diff that was showing,
+    # long messages expanded with "show all", and the scroll position on the row being read.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    refresh = html.split("async function refresh(){", 1)[1].split("\n}\n", 1)[0]
+    assert "const kept = captureLogState();" in refresh
+    assert refresh.index("captureLogState()") < refresh.index("renderLog()") < refresh.index("restoreLogState(kept)")
+    # The refresh behind a restored view keeps it too.
+    assert "{ const kept = captureLogState(); renderLog(); restoreLogState(kept); }" in html
+    restore = html.split("function restoreLogState(st){", 1)[1].split("\nasync function refresh", 1)[0]
+    for reopened in (
+        "toggleDetail(i)",
+        "parts[k].open = true",
+        "toggleDiff(i)",
+        "toggleAnswer(btn)",
+        'classList.remove("clamp")',
+        "window.scrollBy",
+    ):
+        assert reopened in restore
+
+
 def test_the_timeline_has_one_button_to_show_every_answer_on_the_page(tmp_path):
     # "show all answers" opens every answer on the timeline page at once; while any answer is open
     # it reads "hide all answers"; it lives in the log's tab row, on the timeline tab only.

@@ -3891,6 +3891,77 @@ async function applyFilters(){
     syncFilters(); renderAgg(); renderLog();
   } finally { showLoading(false); }  // always clear the spinner, even on a fetch failure
 }
+// A new commit redraws the log, and a redraw used to close everything the reader had open. What is
+// open is remembered by COMMIT ID (a new commit shifts every row's position) and reopened after
+// the redraw: expanded commits (with the parts open inside them, and the file diff if that was
+// showing), opened answers, and long messages expanded with "show all". The scroll position is
+// kept on the row the reader was looking at, so new rows above it do not push it away.
+function logMessageKey(c, el){
+  const btn = el.querySelector(".tans") || el.querySelector(".tgo");
+  return btn ? (c && (c.sha || c.short) || "") + "|" + (btn.dataset.path || "") + "|" + (btn.dataset.sec || "") : null;
+}
+function logAnchorKey(el, entries){
+  if(el.classList.contains("entry")){ const c = entries[+el.dataset.i]; return c && c.sha ? "c:" + c.sha : null; }
+  const key = logMessageKey(entries[+el.dataset.c], el);
+  return key ? "m:" + key : null;
+}
+function captureLogState(){
+  const entries = LOG_ENTRIES || [], log = $("commitlog");
+  if(!log) return null;
+  const st = {details: [], answers: new Set(), expanded: new Set(), anchor: null};
+  log.querySelectorAll('.detail').forEach(d => {
+    if(d.hidden) return;
+    const c = entries[+d.id.replace("detail-", "")];
+    if(!c || !c.sha) return;
+    const parts = [...d.querySelectorAll("details.part")].map((x, k) => x.open ? k : -1).filter(k => k >= 0);
+    const body = d.querySelector(".dmsg[data-mode]");
+    st.details.push({sha: c.sha, parts, diff: !!(body && body.dataset.mode === "diff")});
+  });
+  log.querySelectorAll(".tprompt").forEach(el => {
+    const key = logMessageKey(entries[+el.dataset.c], el);
+    if(!key) return;
+    if(el.querySelector(".tanswer")) st.answers.add(key);
+    if(el.classList.contains("long") && !el.classList.contains("clamp")) st.expanded.add(key);
+  });
+  const ctl = document.querySelector(".controls");
+  const top = ctl ? ctl.getBoundingClientRect().bottom : 0;
+  for(const el of log.querySelectorAll(".entry, .tprompt")){
+    const r = el.getBoundingClientRect();
+    if(r.bottom > top){ const key = logAnchorKey(el, entries); if(key) st.anchor = {key, top: r.top}; break; }
+  }
+  return st;
+}
+function restoreLogState(st){
+  if(!st) return;
+  const entries = LOG_ENTRIES || [], log = $("commitlog");
+  if(!log) return;
+  const reanchor = () => {
+    if(!st.anchor) return;
+    const el = [...log.querySelectorAll(".entry, .tprompt")].find(x => logAnchorKey(x, entries) === st.anchor.key);
+    if(el) window.scrollBy(0, el.getBoundingClientRect().top - st.anchor.top);
+  };
+  const bySha = new Map(entries.map((c, i) => [c.sha, i]));
+  for(const d of st.details){
+    const i = bySha.get(d.sha), detail = i == null ? null : $("detail-" + i);
+    if(!detail || !detail.hidden) continue;
+    toggleDetail(i);  // builds on the next frame; this frame callback runs after it
+    requestAnimationFrame(() => {
+      const parts = [...detail.querySelectorAll("details.part")];
+      d.parts.forEach(k => { if(parts[k]) parts[k].open = true; });
+      if(d.diff) toggleDiff(i);
+      reanchor();
+    });
+  }
+  log.querySelectorAll(".tprompt").forEach(el => {
+    const key = logMessageKey(entries[+el.dataset.c], el);
+    if(!key) return;
+    if(st.expanded.has(key) && el.classList.contains("clamp")){ el.classList.remove("clamp"); setMessageToggle(el); placeAnswerButton(el); }
+    const btn = el.querySelector(".tans");
+    if(st.answers.has(key) && btn && btn.getAttribute("aria-expanded") !== "true") toggleAnswer(btn);
+  });
+  syncAllAnswers();
+  reanchor();
+}
 async function refresh(){
   const prev = HEAD;
   // Whether aGiTrack is running here changes for the same reasons new commits appear (a tracker
@@ -3902,7 +3973,9 @@ async function refresh(){
     resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
     setDateBounds(); syncPeriodDates();  // extend the shown range to new commits
     await loadLog(LOGPAGE.offset||0);
+    const kept = captureLogState();  // what the reader has open survives the redraw
     syncFilters(); renderAgg(); renderLog();  // renderAgg() also repaints shared sessions
+    restoreLogState(kept);
     // Refresh the file list too — but only when no file is expanded, so a poll never
     // yanks a change the user is reading out from under them.
     if(!document.querySelector(".fdetail")){ await loadFiles(); renderFiles(); }
@@ -4388,7 +4461,7 @@ async function init(){
     renderAgg();
     // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
     // log that came back unchanged is left exactly as it is.
-    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog){ const kept = captureLogState(); renderLog(); restoreLogState(kept); }
   }
   // The log was drawn in its tab already; this only lights that tab, without waiting for the
   // file browser below.
