@@ -1598,11 +1598,12 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
 
 def test_filter_bar_keeps_one_row_by_shrinking_fields(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # The bar stays a single row on any desktop window: the FIELDS are shrinkable
-    # (min-width:0, no fixed select width), so a narrower window compresses the selects
-    # instead of dropping the reset button to a second line or forcing a horizontal
-    # page scroll. Only the phone layout wraps (test_dashboard_is_usable_at_phone_width).
-    assert "flex:0 1 165px;min-width:0" in html
+    # The bar stays a single row on any desktop window: the FIELDS take equal shares of the
+    # row and are shrinkable (flex 1 1 0, min-width:0, no fixed select width), so every
+    # dropdown is the same width and a narrower window compresses them instead of dropping
+    # the reset button to a second line or forcing a horizontal page scroll. Only the phone
+    # layout wraps (test_dashboard_is_usable_at_phone_width).
+    assert ".field{display:flex;flex-direction:column;gap:4px;flex:1 1 0;min-width:0}" in html
     assert "min-width:150px" not in html
     # The loading badge floats below the bar (absolute against it): showing and hiding
     # it must never move the reset button.
@@ -3351,6 +3352,19 @@ def test_the_commit_renderer_draws_tables_lists_and_quotes(tmp_path):
     assert "<td>a | b</td>" in html
     assert '<ol start="3"><li>three</li><li>four wraps onto a second line</li></ol>' in html
     assert '<blockquote class="md-q">a quoted note</blockquote>' in html
+
+
+def test_a_cut_off_filter_value_scrolls_on_hover_with_no_browser_tooltip(tmp_path):
+    # A filter dropdown whose value is cut off slides the value across while hovered (a native
+    # select cannot scroll its own text); the browser's grey title tooltip is not used. Built on
+    # hover from the value shown then, so a value set from code never leaves it out of step.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    controls = html.split('<div class="controls">', 1)[1].split('<div class="advpanel"', 1)[0]
+    assert "title=" not in "".join(part.split(">", 1)[0] for part in controls.split("<select")[1:])
+    assert 'document.querySelectorAll(".controls .field select").forEach(hoverScrollSelect);' in html
+    assert ".field select.selscrolling{color:transparent}" in html
 
 
 def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):

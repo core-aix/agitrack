@@ -1598,6 +1598,13 @@ header{padding:26px 0 18px}
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
+/* A filter value too long for its box scrolls to its end while hovered (hoverScrollSelect):
+   the select's own text is hidden and this overlay, laid exactly over it, slides instead. */
+.field{position:relative}
+.field select.selscrolling{color:transparent}
+.selview{position:absolute;overflow:hidden;white-space:nowrap;pointer-events:none;box-sizing:border-box;
+  font-family:var(--mono);font-size:12.5px;color:var(--fg);padding-left:9px}
+.selview span{display:inline-block;transition:transform linear}
 /* The branch picker sits in the sticky filter bar, so the branch being viewed stays on screen
    while the page scrolls. A file:// snapshot or a one-branch repo cannot switch: it then reads
    as a label, with no arrow to suggest otherwise. */
@@ -2075,7 +2082,7 @@ __UPDATE_BANNER__
 
   <div class="controls">
     <span class="prompt">&gt; filter</span>
-    <div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch" title="View statistics and the commit log for a single branch"></select></div>
+    <div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
@@ -3440,8 +3447,6 @@ function fillBranches(){
   sel.value = list.includes(state.branch) ? state.branch : (list[0] || "");
   state.branch = sel.value;
   sel.disabled = !LIVE || list.length <= 1;
-  // The field is narrow in the sticky bar, so a long branch name is cut: its title says it whole.
-  sel.title = (sel.value ? sel.value + " · " : "") + "view statistics and the commit log for a single branch";
 }
 function syncFilters(){
   fillBranches();
@@ -3948,10 +3953,43 @@ function stackStickyBanner(){
 // can take a while: a restarted daemon re-reads the history first. Wiring after that await left
 // a page that looked ready and ignored every click, expanding a commit included, for as long as
 // the read took. The page must answer from its first paint, with a spinner for what is pending.
+// Hovering a filter dropdown whose value is cut off slides the value across so all of it can be
+// read (a native select cannot scroll its own text, and its title tooltip is the browser's grey
+// box): an overlay is laid exactly over the select's text, moved at a steady reading speed, and
+// removed when the pointer leaves or the menu opens. Built on hover, from the value shown at
+// that moment, so it can never fall out of step with a value set from code.
+function hoverScrollSelect(sel){
+  let view = null;
+  const stop = () => { if(view){ view.remove(); view = null; } sel.classList.remove("selscrolling"); };
+  sel.addEventListener("mouseenter", () => {
+    stop();
+    const opt = sel.options[sel.selectedIndex];
+    if(!opt) return;
+    view = document.createElement("span");
+    view.className = "selview";
+    const inner = document.createElement("span");
+    inner.textContent = opt.text;
+    view.appendChild(inner);
+    const arrow = 25;  // the select's right padding, where its arrow is drawn
+    Object.assign(view.style, {left: sel.offsetLeft + "px", top: sel.offsetTop + "px",
+      width: Math.max(0, sel.offsetWidth - arrow) + "px", height: sel.offsetHeight + "px",
+      lineHeight: sel.offsetHeight + "px"});
+    sel.parentNode.appendChild(view);
+    const over = inner.offsetWidth - (view.clientWidth - 9);
+    if(over <= 1){ stop(); return; }  // it fits: nothing to scroll
+    sel.classList.add("selscrolling");
+    inner.style.transitionDuration = Math.max(0.6, over / 45) + "s";
+    inner.style.transitionDelay = "0.25s";
+    void inner.getBoundingClientRect();  // settle the starting position, so the move animates
+    inner.style.transform = `translateX(${-over - 4}px)`;
+  });
+  for(const ev of ["mouseleave", "mousedown", "focus", "change", "keydown"]) sel.addEventListener(ev, stop);
+}
 function wireControls(){
+  document.querySelectorAll(".controls .field select").forEach(hoverScrollSelect);
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
-  $("f-branch").onchange = e => { state.branch = e.target.value; e.target.title = e.target.value + " · view statistics and the commit log for a single branch"; state.author=state.backend=state.model=""; applyFilters(); };
+  $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
