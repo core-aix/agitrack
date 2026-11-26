@@ -732,24 +732,41 @@ COMMIT_JS = """function commitMd(src){
     }
     if(inCode){ code.push(raw); continue; }
     if(isRow(raw)){
-      // Rows an older aGiTrack hard-wrapped are joined first: a row that does not end in "|"
-      // continues on the following lines that do not start one.
-      const rows = [];
+      // The table's lines: consecutive non-blank lines that start a row, end in a pipe, or carry
+      // on a line that did not end in one. An older aGiTrack hard-wrapped long rows anywhere: in
+      // the middle of a cell, right after a pipe ("| a | b |" then "c |"), or right before one
+      // ("| a | long text" then " | c |"), so the lines are re-assembled by COUNTING CELLS: the
+      // delimiter row says how many columns the table has, and lines are joined until a row has
+      // that many.
+      const block = [];
       let j = i;
-      while(j < lines.length && isRow(lines[j])){
-        let row = lines[j];
-        while(!/\\|\\s*$/.test(row) && j + 1 < lines.length && lines[j+1].trim() !== "" && !isRow(lines[j+1])){
-          j++; row += " " + lines[j].trim();
-        }
-        rows.push(row); j++;
+      while(j < lines.length && lines[j].trim() !== "" &&
+            (isRow(lines[j]) || /\\|\\s*$/.test(lines[j]) || (block.length && !/\\|\\s*$/.test(block[block.length - 1])))){
+        block.push(lines[j]); j++;
       }
-      if(rows.length >= 2 && isDelim(rows[1])){
+      const d = block.findIndex(isDelim);
+      if(d > 0){
         flushAll(); closeList();
-        const align = cells(rows[1]).map(c => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+        const n = cells(block[d]).length;
+        const join = (a, b) => a + (/^\\s*\\|/.test(b) ? "" : " ") + b.trim();
+        const head = cells(block.slice(0, d).reduce(join));
+        const rows = [];
+        let acc = "";
+        const body = block.slice(d + 1);
+        body.forEach((line, k) => {
+          acc = acc ? join(acc, line) : line;
+          // Complete once it has every cell AND is closed: it ends in a pipe, or the next line
+          // starts a row of its own (a table written without trailing pipes). A last cell split
+          // in two already counts as a cell, so the count alone closed the row a line early.
+          const next = body[k + 1];
+          const closed = /\\|\\s*$/.test(acc) || next === undefined || (isRow(next) && !/^\\s+\\|/.test(next));
+          if(cells(acc).length >= n && closed){ rows.push(acc); acc = ""; }
+        });
+        if(acc) rows.push(acc);
+        const align = cells(block[d]).map(c => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
         const cell = (tag, text, k) => `<${tag}${align[k] ? ` style="text-align:${align[k]}"` : ""}>${inline(text || "")}</${tag}>`;
-        const head = cells(rows[0]);
         html += '<div class="md-tablewrap"><table class="md-table"><thead><tr>' + head.map((c, k) => cell("th", c, k)).join("") + "</tr></thead><tbody>" +
-          rows.slice(2).map(r => { const cs = cells(r); return "<tr>" + head.map((_, k) => cell("td", cs[k], k)).join("") + "</tr>"; }).join("") +
+          rows.map(r => { const cs = cells(r); return "<tr>" + head.map((_, k) => cell("td", cs[k], k)).join("") + "</tr>"; }).join("") +
           "</tbody></table></div>";
         i = j - 1;
         continue;

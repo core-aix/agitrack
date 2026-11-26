@@ -3197,20 +3197,22 @@ function placeAnswerButton(el){
   if(!el.classList.contains("clamp") && last){ if(btn.parentNode !== last) last.append(btn); }
   else if(foot && btn.parentNode !== foot) foot.append(btn);
 }
-// The page-wide toggle: "show all answers" opens every answer on this timeline page; once all of
-// them are open it reads "hide all answers" and closes them. Visible on the timeline tab only.
+// The page-wide toggle: while ANY answer on this timeline page is open it reads "hide all
+// answers" and closes them all; with none open it reads "show all answers" and opens every one.
+// Visible on the timeline tab only.
 function syncAllAnswers(){
   const all = $("allanswers");
   if(!all) return;
   const buttons = [...document.querySelectorAll("#commitlog .tans")];
   all.hidden = LOGTAB !== "timeline" || !buttons.length || !$("pane-files") || !$("pane-files").hidden;
-  const allOpen = buttons.length && buttons.every(b => b.getAttribute("aria-expanded") === "true");
-  all.textContent = allOpen ? "hide all answers" : "show all answers";
+  const anyOpen = buttons.some(b => b.getAttribute("aria-expanded") === "true");
+  all.textContent = anyOpen ? "hide all answers" : "show all answers";
 }
 function toggleAllAnswers(){
   const buttons = [...document.querySelectorAll("#commitlog .tans")];
-  const allOpen = buttons.every(b => b.getAttribute("aria-expanded") === "true");
-  for(const b of buttons) if((b.getAttribute("aria-expanded") === "true") === allOpen) toggleAnswer(b);
+  const anyOpen = buttons.some(b => b.getAttribute("aria-expanded") === "true");
+  // Any open: close the open ones. None open: open them all.
+  for(const b of buttons) if((b.getAttribute("aria-expanded") === "true") === anyOpen) toggleAnswer(b);
   syncAllAnswers();
 }
 function toggleAnswer(btn){

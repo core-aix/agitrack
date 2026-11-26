@@ -3392,6 +3392,57 @@ def test_the_shared_sessions_panel_says_how_to_share_from_the_command_line(tmp_p
     assert script.count("+ how") == 2  # shown when the list is empty AND under a list
 
 
+def test_a_table_row_wrapped_right_after_a_pipe_is_joined_back(tmp_path):
+    # An older aGiTrack hard-wrapped long table rows, and the wrap often fell right AFTER a cell's
+    # pipe ("| a | b |" then "c |"): the row above ends in "|", so joining only rows that do not
+    # was not enough, and the header was cut off from its table (seen live, a results table with
+    # an ε column header). A non-row line ending in "|" continues the row above.
+    source = "\n".join(
+        [
+            "| Build and setup | ε | Automation | Incorrect | Correct automation |",
+            "Incorrect on hidden tasks |",
+            "|---|---|---|---|---|---|",
+            "| fb1, Jev, layer | 0 | 0.350 ± 0.044 | 0.075 | 0.325 | 0.200 |",
+            "| fb1 | airline | frozen builder 1 (template v9, safety layer) | Jev |",
+            "yes, with Jev and with Qwen |",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert html.count("<th>") == 6 and "<th>Incorrect on hidden tasks</th>" in html and "<th>ε</th>" in html
+    assert "<td>yes, with Jev and with Qwen</td>" in html
+    assert "mdp" not in html  # nothing of the table is left as loose text
+
+    # The two other shapes the old wrap produced, all from the same real commit: a header split
+    # right BEFORE a pipe (the continuation starts " | ", so it looked like a row of its own),
+    # and a row whose LAST cell was split (its first line already counts every cell). Rows are
+    # re-assembled by counting cells against the delimiter row, and only close on a pipe.
+    source = "\n".join(
+        [
+            "| Build | Routed at ε0 because the checker couldn't confirm the decision",
+            " | Correct automation, ε0 → ε1 |",
+            "|---|---|---|",
+            "| fb1 | 21 | 0.325 → 0.333 |",
+            "| fb1 | retail | partly, stopped at your",
+            "request |",
+            "| qs1 | 50 | 0.150 → 0.325 |",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert html.count("<th>") == 3 and "the decision</th><th>Correct automation, ε0 → ε1</th>" in html
+    assert "<td>partly, stopped at your request</td>" in html
+    assert html.count("<tr>") == 4 and "mdp" not in html  # header + three rows, nothing loose
+
+
 def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
     # The branch being viewed stays on screen while the page scrolls: its picker is the first
     # field of the sticky filter bar, not a select on the line under the title.
@@ -3480,14 +3531,17 @@ def test_an_opened_answer_grows_with_the_page_and_has_no_scroll_bar_of_its_own(t
 
 
 def test_the_timeline_has_one_button_to_show_every_answer_on_the_page(tmp_path):
-    # "show all answers" opens every answer on the timeline page at once, then reads "hide all
-    # answers"; it lives in the log's tab row and is shown on the timeline tab only.
+    # "show all answers" opens every answer on the timeline page at once; while any answer is open
+    # it reads "hide all answers"; it lives in the log's tab row, on the timeline tab only.
     from agitrack.metrics.web import shell_html
 
     html = shell_html(_seeded(tmp_path))
     bar = html.split('<div class="panebar logpart">', 1)[1].split('<div class="logsort">', 1)[0]
     assert '<button class="allans" id="allanswers" type="button" hidden>show all answers</button>' in bar
     assert '$("allanswers").onclick = toggleAllAnswers;' in html
+    # "hide all answers" while ANY answer is open (closing them all), "show all answers" only when
+    # none is.
+    assert 'all.textContent = anyOpen ? "hide all answers" : "show all answers";' in html
     assert 'all.hidden = LOGTAB !== "timeline"' in html
 
 
