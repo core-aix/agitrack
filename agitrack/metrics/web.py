@@ -1589,10 +1589,12 @@ header{padding:26px 0 18px}
 /* Fields SHRINK (flex-basis with no fixed min-width) so the bar keeps everything on one
    line on a desktop window instead of wrapping just the reset button to a second row;
    below 760px the phone grid takes over. */
-.field{display:flex;flex-direction:column;gap:4px;flex:0 1 165px;min-width:0}
+/* Every filter field is the SAME width (flex 1 1 0: equal shares of the row, none sized by its
+   text), so the bar reads as one row of equal controls. */
+.field{display:flex;flex-direction:column;gap:4px;flex:1 1 0;min-width:0}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 25px 7px 9px;cursor:pointer;min-width:0;width:100%;
+  font-family:var(--mono);font-size:12.5px;padding:7px 25px 7px 9px;cursor:pointer;min-width:0;width:100%;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
@@ -1600,7 +1602,6 @@ header{padding:26px 0 18px}
    while the page scrolls. A file:// snapshot or a one-branch repo cannot switch: it then reads
    as a label, with no arrow to suggest otherwise. */
 .field select:disabled{cursor:default;background-image:none;padding-right:9px;color:var(--fg);opacity:1}
-#branchfield{flex-basis:120px}
 __UI_RANGE_CSS__
 /* The advanced filter. It hangs BELOW the sticky bar rather than expanding it: growing the bar
    pushes the whole page down every time it opens, and on a phone a bar tall enough to hold three
@@ -1823,6 +1824,8 @@ h2.section::before{content:"# ";color:var(--amber)}
   max-height:30em;overflow:auto;overflow-wrap:anywhere}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
 .tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
+.tprompt .tanswer .awarn{font-size:11.5px;color:var(--amber);margin:0 0 6px}
+.tprompt .tanswer .awarn::before{content:"⚠ "}
 .tprompt .tanswer .abody{color:var(--fg)}
 .tprompt .tanswer .abody > :first-child{margin-top:0}
 .tprompt .tanswer .abody > :last-child{margin-bottom:0}
@@ -2959,8 +2962,10 @@ function messageAtPath(c, path){
 // What the agent answered to the `sec`-th "## User" of a message's interaction trace (empty ones
 // counted, as the server counts them): every "## Agent" section after it, up to the next
 // "## User". Fence-aware like the server's reading, so a heading QUOTED in a code block is not a
-// role. A message answered together with the one after it (queued while the agent worked, so no
-// reply sits between them) borrows the next reply, and says so.
+// role. Messages sent back to back with no reply between them (a follow-up queued while the
+// agent worked, or a question sent before the previous one was answered) share ONE reply: a
+// message borrows the next reply, and `before`/`after` count the other messages that reply also
+// answers, so the page can warn that it may not match this message exactly.
 function traceAnswer(text, sec){
   const sections = [];
   let inTrace = false, fence = false, cur = null;
@@ -2974,14 +2979,18 @@ function traceAnswer(text, sec){
   let user = -1, start = -1;
   sections.forEach((x, k) => { if(x.role === "User" && ++user === sec && start < 0) start = k; });
   if(start < 0) return null;
+  const hasText = x => x.lines.join("").trim() !== "";
+  // Messages just before this one that got no reply of their own: the reply covers them too.
+  let before = 0;
+  for(let k = start - 1; k >= 0 && sections[k].role === "User"; k--) if(hasText(sections[k])) before++;
   const replies = [];
-  let later = false;
+  let after = 0;
   for(let k = start + 1; k < sections.length; k++){
     const x = sections[k];
-    if(x.role === "User"){ if(replies.length) break; later = true; continue; }
+    if(x.role === "User"){ if(replies.length) break; if(hasText(x)) after++; continue; }
     if(x.role === "Agent"){ const t = x.lines.join("\n").trim(); if(t) replies.push(t); }
   }
-  return {text: replies.join("\n\n"), later};
+  return {text: replies.join("\n\n"), before, after};
 }
 // "show answer" takes no line of its own: in a message shown whole it floats at the right of the
 // message's last line; while a long message is cut short (its end hidden) it shares the bottom
@@ -3004,8 +3013,13 @@ function toggleAnswer(btn){
   const box = document.createElement("div");
   box.className = "tanswer";
   if(found && found.text){
-    box.innerHTML = `<div class="alabel">agent replied${found.later ? " (to this and the message that followed it)" : ""}</div>`+
-      `<div class="abody dmsg md">${md(found.text)}</div>`;
+    const others = found.before + found.after;
+    const when = found.before && found.after ? "sent just before and after it"
+      : found.before ? `sent just before it` : `sent just after it`;
+    const warn = others
+      ? `<div class="awarn">answers this message together with ${others} other${others === 1 ? "" : "s"} ${when}, so it may not match this question exactly</div>`
+      : "";
+    box.innerHTML = `<div class="alabel">agent replied</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>`;
   } else {
     box.innerHTML = `<div class="anote">${c && c.pending
       ? "no reply recorded yet: the agent may still be working on it"

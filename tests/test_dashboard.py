@@ -3261,7 +3261,7 @@ def test_a_timeline_message_shows_the_agents_answer_without_opening_the_commit(t
     # it, read from the trace the page already holds (the commit's own message, or a squashed
     # part's), so the reader need not open a possibly squashed commit to see it. A message
     # queued while the agent worked has no reply of its own between it and the next message:
-    # it borrows the next reply and says so.
+    # it borrows the next reply, and both messages warn that the reply may not match exactly.
     from agitrack.commits import build_auto_fold_message
     from agitrack.metrics.web import log_page
 
@@ -3310,9 +3310,10 @@ def test_a_timeline_message_shows_the_agents_answer_without_opening_the_commit(t
     )
     drawn = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ' + probe)
     answers = json.loads(drawn.split("@@", 1)[1])
-    assert answers["FIRST ask"] == {"text": "FIRST reply", "later": False}
-    assert answers["SECOND ask"] == {"text": "SECOND reply", "later": True}  # answered with the follow-up
-    assert answers["QUEUED follow-up"] == {"text": "SECOND reply", "later": False}
+    assert answers["FIRST ask"] == {"text": "FIRST reply", "before": 0, "after": 0}
+    # One reply answers both of two messages sent back to back: each says how many others share it.
+    assert answers["SECOND ask"] == {"text": "SECOND reply", "before": 0, "after": 1}
+    assert answers["QUEUED follow-up"] == {"text": "SECOND reply", "before": 1, "after": 0}
     plain = answers["PLAIN question"]
     assert plain["text"].startswith("PLAIN answer") and "## Agent fake" in plain["text"]  # a quoted heading is no role
     assert drawn.count('class="tans"') == 4  # one button per message
