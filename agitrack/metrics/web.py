@@ -988,8 +988,150 @@ def _trace_user_sections(message: str) -> list[tuple[int, str]]:
             continue
         if in_trace and in_user:
             messages[-1].append(line)
-    found = ((k, "\n".join(lines).strip()) for k, lines in enumerate(messages))
+    found = ((k, _strip_running_note("\n".join(lines)).strip()) for k, lines in enumerate(messages))
     return [(k, text) for k, text in found if text]
+
+
+# The note a commit made while its turn was still running ends the trace with. It follows the last
+# message with no heading of its own, so a plain reading takes it as part of that message (the
+# timeline showed it as the user's words); and it is what says the reply comes in a later commit.
+_STILL_RUNNING_NOTE = "This turn was still running when this commit was made"
+_CONTINUED_NOTE = "Continued from the interaction recorded in the previous commit"
+
+
+def _strip_running_note(text: str) -> str:
+    """*text* without a trailing "this turn was still running" note (a blockquote)."""
+    lines = text.rstrip().splitlines()
+    end = len(lines)
+    while end and lines[end - 1].lstrip().startswith(">"):
+        end -= 1
+    quote = " ".join(line.lstrip()[1:].strip() for line in lines[end:])
+    return "\n".join(lines[:end]) if quote.startswith(_STILL_RUNNING_NOTE) else text
+
+
+def _trace_roles(message: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """A message's interaction trace as (the lines before its first role heading, then each
+    ``## <Role>`` section with its lines). Fence-aware, like :func:`_trace_user_sections`."""
+    lead: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    in_trace = in_fence = False
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            sections.append((stripped[3:].strip(), []))
+            continue
+        if in_trace:
+            (sections[-1][1] if sections else lead).append(line)
+    return lead, sections
+
+
+def _reply_after(sections: list[tuple[str, list[str]]], start: int) -> tuple[str, bool]:
+    """The agent's reply to the user section at index *start* (borrowing the next reply when
+    messages were sent back to back, as the page does), and whether the record stops with the
+    turn still running, its reply to come in a later commit."""
+    replies: list[str] = []
+    for role, lines in sections[start + 1 :]:
+        if role == "User":
+            if replies:
+                break
+            continue
+        if role == "Agent":
+            text = _strip_running_note("\n".join(lines)).strip()
+            if text:
+                replies.append(text)
+    tail = "\n".join(sections[-1][1]) if sections else ""
+    running = _STILL_RUNNING_NOTE in " ".join(tail.replace(">", " ").split())
+    return "\n\n".join(replies), running
+
+
+def _part_at(stat: CommitStat, path: list[int]) -> CommitStat | None:
+    """The record a timeline turn's *path* names (the parts tree, newest first, as
+    :func:`_display_parts` orders it)."""
+    node = stat
+    for index in path:
+        parts = list(node.constituents)
+        if parts and _is_own_lead(parts[0], node):
+            parts = parts[1:]
+        if not 0 <= index < len(parts):
+            return None
+        node = parts[len(parts) - 1 - index]
+    return node
+
+
+def _records(stats: list[CommitStat]) -> list[CommitStat]:
+    """Every turn record in history order: each commit, or each part of a squash or fold."""
+    out: list[CommitStat] = []
+    for stat in stats:
+        parts = list(stat.constituents)
+        if parts and _is_own_lead(parts[0], stat):
+            parts = parts[1:]
+        if parts:
+            out.extend(_records(parts))
+        else:
+            out.append(stat)
+    return out
+
+
+def _later_reply(records: list[CommitStat], owner: CommitStat, record: CommitStat, prompt: str) -> dict | None:
+    """The agent's reply to *prompt* from a LATER record of the same conversation, when its own
+    record has none or stopped with the turn still running: the record of the turn's rest (it
+    opens with the "continued from the previous commit" note), or, as an older aGiTrack wrote
+    it, a later record repeating the same message. ``{"text", "short", "sha"}`` of the commit
+    holding it (the record's own, for a pending turn: empty sha), or None."""
+    session = (record.metadata or {}).get("backend_session_id")
+    if not session:
+        return None
+    try:
+        position = next(k for k, r in enumerate(records) if r is record)
+    except StopIteration:
+        return None
+    want = " ".join(prompt.split())
+    for later in records[position + 1 :]:
+        if (later.metadata or {}).get("backend_session_id") != session:
+            continue
+        lead, sections = _trace_roles(later.message)
+        reply = ""
+        if _CONTINUED_NOTE in " ".join(" ".join(lead).replace(">", " ").split()):
+            first_user = next((k for k, (role, _) in enumerate(sections) if role == "User"), len(sections))
+            reply = "\n\n".join(
+                text
+                for role, lines in sections[:first_user]
+                if role == "Agent" and (text := _strip_running_note("\n".join(lines)).strip())
+            )
+        else:
+            for k, (role, lines) in enumerate(sections):
+                if role == "User" and " ".join(_strip_running_note("\n".join(lines)).split()) == want:
+                    reply, _ = _reply_after(sections, k)
+                    break
+        if reply:
+            return {"text": reply, "short": later.short, "sha": later.sha}
+    return None
+
+
+def _with_later_replies(entry: dict, stat: CommitStat, records_fn) -> dict:
+    """Attach, per timeline message whose own record carries no complete reply, the reply a
+    later commit holds (``turn["later"][<section>]``). Only those messages pay for the search."""
+    for turn in entry.get("turns") or []:
+        record = _part_at(stat, turn.get("path") or [])
+        if record is None:
+            continue
+        _, sections = _trace_roles(record.message)
+        users = [k for k, (role, _) in enumerate(sections) if role == "User"]
+        for prompt, sec in zip(turn.get("prompts") or [], turn.get("sections") or []):
+            if not 0 <= sec < len(users):
+                continue
+            own, running = _reply_after(sections, users[sec])
+            if own and not running:
+                continue
+            found = _later_reply(records_fn(), stat, record, prompt)
+            if found:
+                turn.setdefault("later", {})[str(sec)] = found
+    return entry
 
 
 def log_page(
@@ -1054,6 +1196,18 @@ def log_page(
     if backend or model:
         for stat, entry in zip(page, entries):
             entry["turns"] = _timeline_turns(stat, engine=(backend, model))
+    # "show answer" for a message whose reply landed in a LATER commit (one made while the turn
+    # was still running carries the question, the next one the reply). Searched over the whole
+    # history, not the filtered slice, and only for messages missing a complete reply.
+    cached: list[list[CommitStat]] = []
+
+    def records() -> list[CommitStat]:
+        if not cached:
+            cached.append(_records(dash.stats))
+        return cached[0]
+
+    for stat, entry in zip(page, entries):
+        _with_later_replies(entry, stat, records)
     payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
     if items is not None:
         local = {index: k for k, index in enumerate(shown)}
@@ -1832,6 +1986,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
 .tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
 .tprompt .tanswer .awarn{font-size:11.5px;color:var(--amber);margin:0 0 6px}
+.tprompt .tanswer .alater{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)}
+.tprompt .tanswer .tsha{color:var(--amber);font-variant-numeric:tabular-nums}
 .tprompt .tanswer .awarn::before{content:"⚠ "}
 .tprompt .tanswer .abody{color:var(--fg)}
 .tprompt .tanswer .abody > :first-child{margin-top:0}
@@ -2995,9 +3151,18 @@ function traceAnswer(text, sec){
   for(let k = start + 1; k < sections.length; k++){
     const x = sections[k];
     if(x.role === "User"){ if(replies.length) break; if(hasText(x)) after++; continue; }
-    if(x.role === "Agent"){ const t = x.lines.join("\n").trim(); if(t) replies.push(t); }
+    if(x.role === "Agent"){ const t = stripRunningNote(x.lines.join("\n")).trim(); if(t) replies.push(t); }
   }
   return {text: replies.join("\n\n"), before, after};
+}
+// The note a commit made mid-turn ends its trace with ("this turn was still running…") is
+// aGiTrack's, not the agent's words: the reply it promises is shown from the later commit.
+function stripRunningNote(text){
+  const lines = (text || "").replace(/\s+$/, "").split("\n");
+  let end = lines.length;
+  while(end && lines[end-1].trimStart().startsWith(">")) end--;
+  const quote = lines.slice(end).map(l => l.trimStart().slice(1).trim()).join(" ");
+  return quote.startsWith("This turn was still running when this commit was made") ? lines.slice(0, end).join("\n") : text;
 }
 // "show answer" takes no line of its own: in a message shown whole it floats at the right of the
 // message's last line; while a long message is cut short (its end hidden) it shares the bottom
@@ -3016,9 +3181,16 @@ function toggleAnswer(btn){
   if(open){ open.remove(); btn.textContent = "show answer"; btn.setAttribute("aria-expanded", "false"); return; }
   const c = (LOG_ENTRIES || [])[+btn.dataset.ans];
   const path = btn.dataset.path ? btn.dataset.path.split(".").map(Number) : [];
-  const found = c ? traceAnswer(messageAtPath(c, path), +btn.dataset.sec) : null;
+  const sec = +btn.dataset.sec;
+  const found = c ? traceAnswer(messageAtPath(c, path), sec) : null;
+  // A reply that landed in a LATER commit (this one was made while the turn was still running):
+  // the server attaches it per message (`turn.later`), naming the commit that holds it.
+  const turn = c ? (c.turns || []).find(t => (t.path || []).join(".") === (btn.dataset.path || "") && (t.sections || []).includes(sec)) : null;
+  const later = turn && turn.later ? turn.later[String(sec)] : null;
   const box = document.createElement("div");
   box.className = "tanswer";
+  const laterHtml = later ? `<div class="alabel">${found && found.text ? "the rest of the reply, " : "agent replied "}in a later commit${later.short ? ` <span class="tsha">${esc(later.short)}</span>` : ""}</div>`+
+    `<div class="abody dmsg md">${md(later.text)}</div>` : "";
   if(found && found.text){
     const others = found.before + found.after;
     const when = found.before && found.after ? "sent just before and after it"
@@ -3026,7 +3198,10 @@ function toggleAnswer(btn){
     const warn = others
       ? `<div class="awarn">answers this message together with ${others} other${others === 1 ? "" : "s"} ${when}, so it may not match this question exactly</div>`
       : "";
-    box.innerHTML = `<div class="alabel">agent replied</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>`;
+    box.innerHTML = `<div class="alabel">agent replied</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
+      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "");
+  } else if(later){
+    box.innerHTML = laterHtml;
   } else {
     box.innerHTML = `<div class="anote">${c && c.pending
       ? "no reply recorded yet: the agent may still be working on it"

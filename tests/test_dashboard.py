@@ -3380,6 +3380,69 @@ def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
     assert "f-branch" not in meta
 
 
+def test_show_answer_finds_the_reply_a_later_commit_holds(tmp_path):
+    # A commit made while a turn is still running carries the question and the agent's early
+    # words, then the "still running" note; the reply lands in the NEXT record (opening with the
+    # "continued from the previous commit" note). An older aGiTrack instead repeated the question
+    # in the later record. Either way the message's answer is attached from the later commit,
+    # and the note is never shown as part of the user's message.
+    from agitrack.commits.message import TRACE_NOTE_ROLE
+    from agitrack.metrics.web import log_page
+
+    def commit(n, trace, session="s1"):
+        _write_lines(repo, "a.txt", n)
+        repo.commit(
+            build_agent_commit_message(
+                latest_prompt="x",
+                trace=trace,
+                backend="claude",
+                backend_session_id=session,
+                agitrack_session_id="sid",
+                model="opus",
+                token_usage={"output": 1},
+            )
+        )
+
+    running = "This turn was still running when this commit was made. The rest of it is recorded in a later commit."
+    repo = GitRepo.init(tmp_path)
+    commit(
+        1,
+        [
+            {"role": "user", "content": "FIX the figure"},
+            {"role": "agent", "content": "I'll fix it now."},
+            {"role": TRACE_NOTE_ROLE, "content": running},
+        ],
+    )
+    commit(
+        2,
+        [{"role": "user", "content": "unrelated, other conversation"}, {"role": "agent", "content": "nope"}],
+        session="s2",
+    )
+    commit(
+        3,
+        [
+            {
+                "role": TRACE_NOTE_ROLE,
+                "content": "Continued from the interaction recorded in the previous commit, which the agent made while this turn was still running.",
+            },
+            {"role": "agent", "content": "FIXED: the figure now shows both paths."},
+        ],
+    )
+    commit(4, [{"role": "user", "content": "OLD style question"}, {"role": TRACE_NOTE_ROLE, "content": running}])
+    commit(5, [{"role": "user", "content": "OLD style question"}, {"role": "agent", "content": "OLD style answer"}])
+
+    entries = log_page(build_dashboard(repo), view="timeline", limit=50)["entries"]
+    turns = {t["prompts"][0]: (e, t) for e in entries for t in e.get("turns", [])}
+    fix_entry, fix = turns["FIX the figure"]
+    assert fix["later"]["0"]["text"] == "FIXED: the figure now shows both paths."
+    assert fix["later"]["0"]["short"] == next(e["short"] for e in entries if "FIXED" in e["message"])
+    assert "still running" not in fix["prompts"][0]  # the note is not the user's words
+    old = [t for e in entries for t in e.get("turns", []) if t["prompts"] == ["OLD style question"]]
+    assert any(t.get("later", {}).get("0", {}).get("text") == "OLD style answer" for t in old)
+    other = turns["unrelated, other conversation"][1]
+    assert "later" not in other  # a complete reply of its own needs no search
+
+
 def _two_people_merged(repo_dir) -> dict[str, str]:
     """Alice and Bob each drive an agent on their own branch at the same time; both branches
     are merged into main with merge commits. Bob's second commit folds two turns. Returns the
