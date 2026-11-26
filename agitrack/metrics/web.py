@@ -1993,8 +1993,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .tans{white-space:nowrap;font:inherit;font-size:12px;color:var(--ops);background:none;border:0;
   border-bottom:1px solid rgba(103,184,214,.35);padding:0 1px;cursor:pointer}
 .tprompt .tans:hover{color:var(--ink);background:var(--ops)}
+/* An opened answer grows with the page, as an expanded commit does: no height cap and no
+   scroll bar of its own, so every opened answer reads in the one page scroll. */
 .tprompt .tanswer{margin-top:8px;padding:8px 10px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06);
-  max-height:30em;overflow:auto;overflow-wrap:anywhere}
+  overflow-wrap:anywhere}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
 .tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
 .tprompt .tanswer .awarn{font-size:11.5px;color:var(--amber);margin:0 0 6px}

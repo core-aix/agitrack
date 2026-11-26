@@ -3468,6 +3468,17 @@ def test_show_answer_finds_the_reply_a_later_commit_holds(tmp_path):
     assert "later" not in other  # a complete reply of its own needs no search
 
 
+def test_an_opened_answer_grows_with_the_page_and_has_no_scroll_bar_of_its_own(tmp_path):
+    # Like an expanded commit, an opened answer is laid out in full in the page: no height cap
+    # and no inner scroll bar, so every opened answer reads in the one page scroll.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    rule = next(line for line in html.splitlines() if line.startswith(".tprompt .tanswer{"))
+    rule += next(line for line in html.split(rule, 1)[1].splitlines() if line.strip())
+    assert "max-height" not in rule and "overflow:auto" not in rule
+
+
 def test_the_timeline_has_one_button_to_show_every_answer_on_the_page(tmp_path):
     # "show all answers" opens every answer on the timeline page at once, then reads "hide all
     # answers"; it lives in the log's tab row and is shown on the timeline tab only.
