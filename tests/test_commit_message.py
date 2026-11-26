@@ -1158,3 +1158,25 @@ def test_each_user_message_records_when_it_was_sent():
         **base,
     )
     assert "user_message_times" not in plain
+
+
+def test_a_table_row_and_a_code_line_are_never_hard_wrapped():
+    # The body wraps at 72 columns for plain-text `git log`, but a Markdown table row is one line
+    # by definition and a code line's breaks are meaning: splitting either turned a reply's
+    # results table into a broken row plus a stray line of text in every commit and dashboard.
+    row = "| qs1 | 0.319 | 0.167 | first build session, no checker freeze applied yet, rate 1 |"
+    code = "    result = compute_the_thing(alpha, beta, gamma, delta, epsilon, zeta, eta, theta)"
+    prose = "word " * 30
+    reply = f"{prose}\n\n| a | b | c | d |\n|---|---|---|---|\n{row}\n\n```python\n{code}\n```"
+    message = build_agent_commit_message(
+        latest_prompt="x",
+        trace=[{"role": "user", "content": "x"}, {"role": "agent", "content": reply}],
+        backend="claude",
+        backend_session_id="b",
+        agitrack_session_id="s",
+        model="m",
+        token_usage={"output": 1},
+    )
+    lines = message.splitlines()
+    assert row in lines and code in lines
+    assert max(len(line) for line in lines if line.startswith("word")) <= 72  # prose still wraps

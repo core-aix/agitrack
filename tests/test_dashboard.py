@@ -3318,6 +3318,40 @@ def test_a_timeline_message_shows_the_agents_answer_without_opening_the_commit(t
     assert drawn.count('class="tans"') == 4  # one button per message
 
 
+def test_the_commit_renderer_draws_tables_lists_and_quotes(tmp_path):
+    # The renderer behind an opened commit and "show answer" draws GitHub-style tables (column
+    # alignment from the delimiter row, an escaped "|" inside a cell), joins a row an older
+    # aGiTrack hard-wrapped, numbers a list from where it starts, keeps a wrapped list item in
+    # its item, and draws a blockquote (the trace's notes) as one passage.
+    source = "\n".join(
+        [
+            "| Run | Correct | Notes |",
+            "|---|---:|:-:|",
+            "| qs1 | 0.319 | first build session, no checker",
+            "freeze yet |",
+            r"| a \| b | 0.5 | `x` |",
+            "",
+            "3. three",
+            "4. four wraps",
+            "onto a second line",
+            "",
+            "> a quoted",
+            "> note",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert '<table class="md-table"><thead><tr><th>Run</th><th style="text-align:right">Correct</th>' in html
+    assert "<td>first build session, no checker freeze yet</td>" in html.replace(' style="text-align:center"', "")
+    assert "<td>a | b</td>" in html
+    assert '<ol start="3"><li>three</li><li>four wraps onto a second line</li></ol>' in html
+    assert '<blockquote class="md-q">a quoted note</blockquote>' in html
+
+
 def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
     # The branch being viewed stays on screen while the page scrolls: its picker is the first
     # field of the sticky filter bar, not a select on the line under the title.

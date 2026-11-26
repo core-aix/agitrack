@@ -1808,6 +1808,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* "show answer" sits at the bottom right of the message, styled as the page's links are (green,
    underlined, inverting on hover) so it reads as something to click. */
 .tprompt .tfoot{display:flex;justify-content:flex-end;margin-top:6px}
+.tprompt .tfoot:empty{display:none}
+/* In a message shown whole, the button floats to the right of its LAST line (placeAnswerButton),
+   taking no line of its own unless that line is full. */
+.tprompt .tbody .tans{float:right;margin:2px 0 0 14px}
 /* While a long message is cut short its "show all" sits at the bottom left: share that row
    rather than adding one below it. (Once opened, "collapse" is sticky and keeps its own row.) */
 .tprompt.clamp.long .tfoot{margin-top:-19px;pointer-events:none}
@@ -2979,6 +2983,17 @@ function traceAnswer(text, sec){
   }
   return {text: replies.join("\n\n"), later};
 }
+// "show answer" takes no line of its own: in a message shown whole it floats at the right of the
+// message's last line; while a long message is cut short (its end hidden) it shares the bottom
+// row with "show all"; where the message ends in a list, a table or code it stays below.
+function placeAnswerButton(el){
+  const btn = el.querySelector(".tans");
+  if(!btn) return;
+  const foot = el.querySelector(".tfoot");
+  const last = el.querySelector(".tbody > p.mdp:last-child");
+  if(!el.classList.contains("clamp") && last){ if(btn.parentNode !== last) last.append(btn); }
+  else if(foot && btn.parentNode !== foot) foot.append(btn);
+}
 function toggleAnswer(btn){
   const el = btn.closest(".tprompt");
   const open = el.querySelector(".tanswer");
@@ -3144,6 +3159,7 @@ function renderLog(){
     if(el.querySelector("mark.hit")) el.classList.remove("clamp");
     setMessageToggle(el);
   });
+  document.querySelectorAll("#commitlog .tprompt").forEach(placeAnswerButton);
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -3983,6 +3999,7 @@ function wireControls(){
       const el = more.closest(".tprompt");
       el.classList.toggle("clamp");
       setMessageToggle(el);
+      placeAnswerButton(el);
       // Collapsing a message read to its end leaves its start above the screen; bring it back.
       if(el.classList.contains("clamp") && el.getBoundingClientRect().top < 0) el.scrollIntoView({block:"start", behavior:"smooth"});
       return;
