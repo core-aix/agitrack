@@ -58,7 +58,7 @@ def test_a_model_newer_than_the_reference_borrows_its_familys_newest_price():
     assert pricing.rates_for("claude", "claude-opus-4-9").estimated_from == "claude-opus-4-8"
     # The same rule for other providers' naming.
     sol = pricing.rates_for("codex", "gpt-6.9-sol")
-    assert sol is not None and sol.estimated_from == "gpt-6.1-sol"
+    assert sol is not None and sol.estimated_from == "gpt-6.2-sol"  # the newest Sol in the reference
 
 
 def test_an_older_unknown_model_is_not_guessed_at():

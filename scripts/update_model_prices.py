@@ -46,6 +46,8 @@ PROVIDERS = (
 
 # (input, output, cache read, 5-minute cache write), US dollars per million tokens.
 ANTHROPIC = {
+    "claude-fable-5-2": (8.0, 40.0, 0.2, 10.0),
+    "claude-mythos-5-2": (8.0, 40.0, 0.2, 10.0),
     "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5),
     "claude-mythos-5-1": (10.0, 50.0, 0.25, 12.5),
     "claude-fable-5": (10.0, 50.0, 1.0, 12.5),
@@ -58,7 +60,7 @@ ANTHROPIC = {
     "claude-opus-4-5": (5.0, 25.0, 0.5, 6.25),
     "claude-opus-4-1": (15.0, 75.0, 1.5, 18.75),
     "claude-opus-4": (15.0, 75.0, 1.5, 18.75),
-    "claude-sonnet-5-5": (2.0, 10.0, 0.2, 2.5),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.1, 2.5),
     "claude-sonnet-5": (2.0, 10.0, 0.2, 2.5),
     "claude-sonnet-4-6": (3.0, 15.0, 0.3, 3.75),
     "claude-sonnet-4-5": (3.0, 15.0, 0.3, 3.75),
@@ -72,6 +74,17 @@ ANTHROPIC = {
 def _num(cost: dict, key: str) -> float | None:
     value = cost.get(key)
     return round(float(value), 6) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _previous_prices(path: Path) -> dict[str, dict[str, tuple]]:
+    """The PRICES of the table being replaced (empty when there is none or it cannot be read)."""
+    namespace: dict = {}
+    try:
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)  # noqa: S102 - our own generated file
+    except (OSError, SyntaxError):
+        return {}
+    prices = namespace.get("PRICES")
+    return prices if isinstance(prices, dict) else {}
 
 
 def main() -> int:
@@ -96,6 +109,19 @@ def main() -> int:
         if rows:
             table[provider] = rows
     table.setdefault("anthropic", {}).update({name: (*rates, None) for name, rates in ANTHROPIC.items()})
+    # A model the source no longer lists keeps its last known price. The dashboard prices PAST
+    # commits too, and a provider retiring a model from its catalog does not change what the
+    # turns already made with it cost; dropping the row would turn those commits "unpriced".
+    out = Path(__file__).resolve().parent.parent / "agitrack" / "metrics" / "price_table.py"
+    carried = 0
+    for provider, rows in _previous_prices(out).items():
+        if provider not in PROVIDERS:
+            continue
+        current = table.setdefault(provider, {})
+        for name, row in rows.items():
+            if name not in current:
+                current[name] = tuple(row)
+                carried += 1
     added = dt.date.today().isoformat()
     lines = [
         '"""Published per-token API prices: the dashboard\'s cost reference.',
@@ -116,9 +142,11 @@ def main() -> int:
             lines.append(f"        {json.dumps(name)}: {row!r},")
         lines.append("    },")
     lines.append("}")
-    out = Path(__file__).resolve().parent.parent / "agitrack" / "metrics" / "price_table.py"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"wrote {out} ({sum(len(r) for r in table.values())} models, added {added})")
+    print(
+        f"wrote {out} ({sum(len(r) for r in table.values())} models, {carried} carried over from the "
+        f"previous table because the source no longer lists them, added {added})"
+    )
     return 0
 
 
