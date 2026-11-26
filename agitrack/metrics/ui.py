@@ -225,6 +225,14 @@ p.mdp.reflow br{display:none}
    on top, so the same commit's bullets sat further in on one page than the other. */
 .dmsg.md ul,.dmsg.md ol{margin:6px 0 6px 18px;padding-left:0;list-style-position:outside}
 .dmsg.md li{margin:2px 0}
+/* Tables (an agent's results table is common in a trace). The wrapper scrolls sideways so a wide
+   table never widens the page; cells wrap rather than stretch the column. */
+.dmsg.md .md-tablewrap{overflow-x:auto;margin:8px 0;max-width:100%}
+.dmsg.md .md-table{border-collapse:collapse;font-size:12px;line-height:1.45}
+.dmsg.md .md-table th,.dmsg.md .md-table td{border:1px solid var(--line);padding:4px 9px;text-align:left;vertical-align:top}
+.dmsg.md .md-table th{color:var(--fg);background:var(--panel2);font-weight:600}
+.dmsg.md .md-table tbody tr:nth-child(even) td{background:rgba(255,255,255,.02)}
+.dmsg.md blockquote.md-q{margin:7px 0;padding:2px 0 2px 10px;border-left:2px solid var(--line);color:var(--fg-dim);font-style:italic}
 .dmsg.md code{background:var(--panel2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
 .dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
 .dmsg.md .md-code{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);
@@ -679,8 +687,16 @@ COMMIT_JS = """function commitMd(src){
     .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\\*([^*\\n]+)\\*/g, "$1<em>$2</em>")
     .replace(/\\[([^\\]]+)\\]\\((https?:[^)\\s]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  let html="", inCode=false, code=[], inList=false, inMeta=false, para=[];
-  const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
+  let html="", inCode=false, code=[], inMeta=false, para=[], quote=[];
+  // An open list: its tag, its first number (an ordered list may start anywhere) and its items,
+  // each item a list of source lines, so a hard-wrapped item's continuation stays in it.
+  let list=null;
+  const closeList = () => {
+    if(!list) return;
+    const start = list.tag === "ol" && list.start !== 1 ? ` start="${list.start}"` : "";
+    html += `<${list.tag}${start}>` + list.items.map(item => "<li>" + item.map(inline).join(" ") + "</li>").join("") + `</${list.tag}>`;
+    list = null;
+  };
   // Consecutive non-blank lines are ONE paragraph, their source breaks kept as <br>. The " "
   // before each <br> is what remains when reflowParagraphs() hides the break on a narrow
   // screen, so the lines join as prose. Metadata lines are marked "keep": their breaks are
@@ -690,26 +706,96 @@ COMMIT_JS = """function commitMd(src){
     html += `<p class="mdp${inMeta?" keep":""}">` + para.map(inline).join(" <br>") + "</p>";
     para = [];
   };
-  for(const raw of lines){
+  // A blockquote's lines are one passage (the trace's notes are written this way, wrapped).
+  const flushQuote = () => {
+    if(!quote.length) return;
+    html += '<blockquote class="md-q">' + quote.map(inline).join(" ") + "</blockquote>";
+    quote = [];
+  };
+  const flushAll = () => { flushPara(); flushQuote(); };
+  // Tables, GitHub style: a header row, a delimiter row (`|---|:---:|`), then body rows.
+  const isRow = t => /^\\s*\\|/.test(t);
+  const cells = t => {
+    let s = t.trim();
+    if(s.startsWith("|")) s = s.slice(1);
+    if(s.endsWith("|") && !s.endsWith("\\\\|")) s = s.slice(0, -1);
+    return s.split(/(?<!\\\\)\\|/).map(c => c.trim().replace(/\\\\\\|/g, "|"));
+  };
+  const isDelim = t => isRow(t) && cells(t).every(c => /^:?-+:?$/.test(c));
+  for(let i = 0; i < lines.length; i++){
+    const raw = lines[i];
     if(raw.trimStart().startsWith("```")){
-      flushPara();
+      flushAll();
       if(inCode){ html+="<pre class=\\"md-code\\">"+esc(code.join("\\n"))+"</pre>"; code=[]; inCode=false; }
       else { closeList(); inCode=true; }
       continue;
     }
     if(inCode){ code.push(raw); continue; }
+    if(isRow(raw)){
+      // The table's lines: consecutive non-blank lines that start a row, end in a pipe, or carry
+      // on a line that did not end in one. An older aGiTrack hard-wrapped long rows anywhere: in
+      // the middle of a cell, right after a pipe ("| a | b |" then "c |"), or right before one
+      // ("| a | long text" then " | c |"), so the lines are re-assembled by COUNTING CELLS: the
+      // delimiter row says how many columns the table has, and lines are joined until a row has
+      // that many.
+      const block = [];
+      let j = i;
+      while(j < lines.length && lines[j].trim() !== "" &&
+            (isRow(lines[j]) || /\\|\\s*$/.test(lines[j]) || (block.length && !/\\|\\s*$/.test(block[block.length - 1])))){
+        block.push(lines[j]); j++;
+      }
+      const d = block.findIndex(isDelim);
+      if(d > 0){
+        flushAll(); closeList();
+        const n = cells(block[d]).length;
+        const join = (a, b) => a + (/^\\s*\\|/.test(b) ? "" : " ") + b.trim();
+        const head = cells(block.slice(0, d).reduce(join));
+        const rows = [];
+        let acc = "";
+        const body = block.slice(d + 1);
+        body.forEach((line, k) => {
+          acc = acc ? join(acc, line) : line;
+          // Complete once it has every cell AND is closed: it ends in a pipe, or the next line
+          // starts a row of its own (a table written without trailing pipes). A last cell split
+          // in two already counts as a cell, so the count alone closed the row a line early.
+          const next = body[k + 1];
+          const closed = /\\|\\s*$/.test(acc) || next === undefined || (isRow(next) && !/^\\s+\\|/.test(next));
+          if(cells(acc).length >= n && closed){ rows.push(acc); acc = ""; }
+        });
+        if(acc) rows.push(acc);
+        const align = cells(block[d]).map(c => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+        const cell = (tag, text, k) => `<${tag}${align[k] ? ` style="text-align:${align[k]}"` : ""}>${inline(text || "")}</${tag}>`;
+        html += '<div class="md-tablewrap"><table class="md-table"><thead><tr>' + head.map((c, k) => cell("th", c, k)).join("") + "</tr></thead><tbody>" +
+          rows.map(r => { const cs = cells(r); return "<tr>" + head.map((_, k) => cell("td", cs[k], k)).join("") + "</tr>"; }).join("") +
+          "</tbody></table></div>";
+        i = j - 1;
+        continue;
+      }
+    }
     const h = raw.match(/^(#{1,6})\\s+(.*)$/);
     if(h){
-      flushPara(); closeList();
+      flushAll(); closeList();
       if(/agitrack\\s+metadata/i.test(h[2])) inMeta = true;
       const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue;
     }
-    const li = raw.match(/^\\s*[-*+]\\s+(.*)$/);
-    if(li){ flushPara(); if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
-    if(raw.trim()===""){ flushPara(); closeList(); continue; }
+    const ol = raw.match(/^\\s*(\\d{1,9})[.)]\\s+(.*)$/);
+    const ul = ol ? null : raw.match(/^\\s*[-*+]\\s+(.*)$/);
+    if(ol || ul){
+      flushAll();
+      const tag = ol ? "ol" : "ul";
+      if(!list || list.tag !== tag){ closeList(); list = {tag, start: ol ? +ol[1] : 1, items: []}; }
+      list.items.push([ol ? ol[2] : ul[1]]);
+      continue;
+    }
+    const q = raw.match(/^\\s*>\\s?(.*)$/);
+    if(q){ flushPara(); closeList(); quote.push(q[1]); continue; }
+    if(raw.trim()===""){ flushAll(); closeList(); continue; }
+    // A line right under a list item, not blank and not a new item, is that item wrapped.
+    if(list){ list.items[list.items.length - 1].push(raw.trim()); continue; }
+    flushQuote();
     para.push(raw);
   }
-  flushPara();
+  flushAll();
   if(inCode){ html+="<pre class=\\"md-code\\">"+esc(code.join("\\n"))+"</pre>"; }
   closeList();
   return html;

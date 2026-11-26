@@ -1598,11 +1598,12 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
 
 def test_filter_bar_keeps_one_row_by_shrinking_fields(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # The bar stays a single row on any desktop window: the FIELDS are shrinkable
-    # (min-width:0, no fixed select width), so a narrower window compresses the selects
-    # instead of dropping the reset button to a second line or forcing a horizontal
-    # page scroll. Only the phone layout wraps (test_dashboard_is_usable_at_phone_width).
-    assert "flex:0 1 165px;min-width:0" in html
+    # The bar stays a single row on any desktop window: the FIELDS take equal shares of the
+    # row and are shrinkable (flex 1 1 0, min-width:0, no fixed select width), so every
+    # dropdown is the same width and a narrower window compresses them instead of dropping
+    # the reset button to a second line or forcing a horizontal page scroll. Only the phone
+    # layout wraps (test_dashboard_is_usable_at_phone_width).
+    assert ".field{display:flex;flex-direction:column;gap:4px;flex:1 1 0;min-width:0}" in html
     assert "min-width:150px" not in html
     # The loading badge floats below the bar (absolute against it): showing and hiding
     # it must never move the reset button.
@@ -3254,6 +3255,319 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
     assert "ORANGE" not in commits and "fold commit" in commits
     # The timeline is what a reader sees first; the plain commit list is the next tab.
     assert "ORANGE" in _render_log([newer, older], tmp_path)
+
+
+def test_a_timeline_message_shows_the_agents_answer_without_opening_the_commit(tmp_path):
+    # Each timeline message carries a "show answer" button that opens the agent's reply under
+    # it, read from the trace the page already holds (the commit's own message, or a squashed
+    # part's), so the reader need not open a possibly squashed commit to see it. A message
+    # queued while the agent worked has no reply of its own between it and the next message:
+    # it borrows the next reply, and both messages warn that the reply may not match exactly.
+    from agitrack.commits import build_auto_fold_message
+    from agitrack.metrics.web import log_page
+
+    def body(trace):
+        return build_agent_commit_message(
+            latest_prompt=trace[0]["content"],
+            trace=trace,
+            backend="claude",
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 3},
+        )
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 1)
+    repo.commit(
+        body(
+            [
+                {"role": "user", "content": "PLAIN question"},
+                {"role": "agent", "content": "PLAIN answer with ## User quoted\n\n```\n## Agent fake\n```"},
+            ]
+        )
+    )
+    _write_lines(repo, "a.txt", 2)
+    repo.commit(
+        build_auto_fold_message(
+            [
+                body([{"role": "user", "content": "FIRST ask"}, {"role": "agent", "content": "FIRST reply"}]),
+                body(
+                    [
+                        {"role": "user", "content": "SECOND ask"},
+                        {"role": "user", "content": "QUEUED follow-up", "starts_turn": False},
+                        {"role": "agent", "content": "SECOND reply"},
+                    ]
+                ),
+            ]
+        )
+    )
+    entries = log_page(build_dashboard(repo), view="timeline")["entries"]
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); const out = {};"
+        " for(const c of LOGPAGE.entries) for(const t of (c.turns || [])) t.prompts.forEach((p, k) =>"
+        " { out[p] = traceAnswer(messageAtPath(c, t.path), t.sections[k]); });"
+        " $('commitlog').innerHTML += '@@' + JSON.stringify(out); };"
+    )
+    drawn = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ' + probe)
+    answers = json.loads(drawn.split("@@", 1)[1])
+    assert answers["FIRST ask"] == {"text": "FIRST reply", "before": 0, "after": 0}
+    # One reply answers both of two messages sent back to back: each says how many others share it.
+    assert answers["SECOND ask"] == {"text": "SECOND reply", "before": 0, "after": 1}
+    assert answers["QUEUED follow-up"] == {"text": "SECOND reply", "before": 1, "after": 0}
+    plain = answers["PLAIN question"]
+    assert plain["text"].startswith("PLAIN answer") and "## Agent fake" in plain["text"]  # a quoted heading is no role
+    assert drawn.count('class="tans"') == 4  # one button per message
+
+
+def test_the_commit_renderer_draws_tables_lists_and_quotes(tmp_path):
+    # The renderer behind an opened commit and "show answer" draws GitHub-style tables (column
+    # alignment from the delimiter row, an escaped "|" inside a cell), joins a row an older
+    # aGiTrack hard-wrapped, numbers a list from where it starts, keeps a wrapped list item in
+    # its item, and draws a blockquote (the trace's notes) as one passage.
+    source = "\n".join(
+        [
+            "| Run | Correct | Notes |",
+            "|---|---:|:-:|",
+            "| qs1 | 0.319 | first build session, no checker",
+            "freeze yet |",
+            r"| a \| b | 0.5 | `x` |",
+            "",
+            "3. three",
+            "4. four wraps",
+            "onto a second line",
+            "",
+            "> a quoted",
+            "> note",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert '<table class="md-table"><thead><tr><th>Run</th><th style="text-align:right">Correct</th>' in html
+    assert "<td>first build session, no checker freeze yet</td>" in html.replace(' style="text-align:center"', "")
+    assert "<td>a | b</td>" in html
+    assert '<ol start="3"><li>three</li><li>four wraps onto a second line</li></ol>' in html
+    assert '<blockquote class="md-q">a quoted note</blockquote>' in html
+
+
+def test_a_cut_off_filter_value_scrolls_on_hover_with_no_browser_tooltip(tmp_path):
+    # A filter dropdown whose value is cut off slides the value across while hovered (a native
+    # select cannot scroll its own text); the browser's grey title tooltip is not used. Built on
+    # hover from the value shown then, so a value set from code never leaves it out of step.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    controls = html.split('<div class="controls">', 1)[1].split('<div class="advpanel"', 1)[0]
+    assert "title=" not in "".join(part.split(">", 1)[0] for part in controls.split("<select")[1:])
+    assert 'document.querySelectorAll(".controls .field select").forEach(hoverScrollSelect);' in html
+    assert ".field select.selscrolling{color:transparent}" in html
+
+
+def test_the_filter_bar_stays_below_notices_that_appear_later_and_names_the_repo(tmp_path):
+    # The sticky filter bar sits just below the frozen notice strip. The strip's contents change
+    # after load (the "reloaded" notice, the live update banner, the offline notice), and with
+    # the offset measured only once, a second notice covered the bar: it is re-measured whenever
+    # the strip changes size. The bar also names the repository it filters (display only).
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "new ResizeObserver(restackControls).observe(strip)" in html
+    controls = html.split('<div class="controls">', 1)[1].split('<span class="prompt">', 1)[0]
+    assert '<span class="ctlrepo">repo <b>' in controls and "__REPO__" not in controls
+
+
+def test_the_shared_sessions_panel_says_how_to_share_from_the_command_line(tmp_path):
+    # The panel explains, every time and not only when empty, how to share: `agitrack share` on
+    # the command line, or Ctrl-G in an interactive session.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    script = html.split("function renderShared(){", 1)[1].split("function sharedAge", 1)[0]
+    assert "run <code>agitrack share</code>" in script and "<code>--overwrite-shared</code>" in script
+    assert "Ctrl-G → session → Share this session" in script
+    assert script.count("+ how") == 2  # shown when the list is empty AND under a list
+
+
+def test_a_table_row_wrapped_right_after_a_pipe_is_joined_back(tmp_path):
+    # An older aGiTrack hard-wrapped long table rows, and the wrap often fell right AFTER a cell's
+    # pipe ("| a | b |" then "c |"): the row above ends in "|", so joining only rows that do not
+    # was not enough, and the header was cut off from its table (seen live, a results table with
+    # an ε column header). A non-row line ending in "|" continues the row above.
+    source = "\n".join(
+        [
+            "| Build and setup | ε | Automation | Incorrect | Correct automation |",
+            "Incorrect on hidden tasks |",
+            "|---|---|---|---|---|---|",
+            "| fb1, Jev, layer | 0 | 0.350 ± 0.044 | 0.075 | 0.325 | 0.200 |",
+            "| fb1 | airline | frozen builder 1 (template v9, safety layer) | Jev |",
+            "yes, with Jev and with Qwen |",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert html.count("<th>") == 6 and "<th>Incorrect on hidden tasks</th>" in html and "<th>ε</th>" in html
+    assert "<td>yes, with Jev and with Qwen</td>" in html
+    assert "mdp" not in html  # nothing of the table is left as loose text
+
+    # The two other shapes the old wrap produced, all from the same real commit: a header split
+    # right BEFORE a pipe (the continuation starts " | ", so it looked like a row of its own),
+    # and a row whose LAST cell was split (its first line already counts every cell). Rows are
+    # re-assembled by counting cells against the delimiter row, and only close on a pipe.
+    source = "\n".join(
+        [
+            "| Build | Routed at ε0 because the checker couldn't confirm the decision",
+            " | Correct automation, ε0 → ε1 |",
+            "|---|---|---|",
+            "| fb1 | 21 | 0.325 → 0.333 |",
+            "| fb1 | retail | partly, stopped at your",
+            "request |",
+            "| qs1 | 50 | 0.150 → 0.325 |",
+        ]
+    )
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); $('commitlog').innerHTML += '@@' + commitMd("
+        + json.dumps(source)
+        + "); };"
+    )
+    html = _render_log([], tmp_path, setup=probe).split("@@", 1)[1]
+    assert html.count("<th>") == 3 and "the decision</th><th>Correct automation, ε0 → ε1</th>" in html
+    assert "<td>partly, stopped at your request</td>" in html
+    assert html.count("<tr>") == 4 and "mdp" not in html  # header + three rows, nothing loose
+
+
+def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
+    # The branch being viewed stays on screen while the page scrolls: its picker is the first
+    # field of the sticky filter bar, not a select on the line under the title.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    controls = html.split('<div class="controls">', 1)[1].split('<div class="advpanel"', 1)[0]
+    assert '<div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch"' in controls
+    assert controls.index('id="f-branch"') < controls.index('id="f-author"')
+    meta = html.split('<div class="meta">', 1)[1].split("</div>", 1)[0]
+    assert "f-branch" not in meta
+
+
+def test_show_answer_finds_the_reply_a_later_commit_holds(tmp_path):
+    # A commit made while a turn is still running carries the question and the agent's early
+    # words, then the "still running" note; the reply lands in the NEXT record (opening with the
+    # "continued from the previous commit" note). An older aGiTrack instead repeated the question
+    # in the later record. Either way the message's answer is attached from the later commit,
+    # and the note is never shown as part of the user's message.
+    from agitrack.commits.message import TRACE_NOTE_ROLE
+    from agitrack.metrics.web import log_page
+
+    def commit(n, trace, session="s1"):
+        _write_lines(repo, "a.txt", n)
+        repo.commit(
+            build_agent_commit_message(
+                latest_prompt="x",
+                trace=trace,
+                backend="claude",
+                backend_session_id=session,
+                agitrack_session_id="sid",
+                model="opus",
+                token_usage={"output": 1},
+            )
+        )
+
+    running = "This turn was still running when this commit was made. The rest of it is recorded in a later commit."
+    repo = GitRepo.init(tmp_path)
+    commit(
+        1,
+        [
+            {"role": "user", "content": "FIX the figure"},
+            {"role": "agent", "content": "I'll fix it now."},
+            {"role": TRACE_NOTE_ROLE, "content": running},
+        ],
+    )
+    commit(
+        2,
+        [{"role": "user", "content": "unrelated, other conversation"}, {"role": "agent", "content": "nope"}],
+        session="s2",
+    )
+    commit(
+        3,
+        [
+            {
+                "role": TRACE_NOTE_ROLE,
+                "content": "Continued from the interaction recorded in the previous commit, which the agent made while this turn was still running.",
+            },
+            {"role": "agent", "content": "FIXED: the figure now shows both paths."},
+        ],
+    )
+    commit(4, [{"role": "user", "content": "OLD style question"}, {"role": TRACE_NOTE_ROLE, "content": running}])
+    commit(5, [{"role": "user", "content": "OLD style question"}, {"role": "agent", "content": "OLD style answer"}])
+
+    entries = log_page(build_dashboard(repo), view="timeline", limit=50)["entries"]
+    turns = {t["prompts"][0]: (e, t) for e in entries for t in e.get("turns", [])}
+    fix_entry, fix = turns["FIX the figure"]
+    assert fix["later"]["0"]["text"] == "FIXED: the figure now shows both paths."
+    assert fix["later"]["0"]["short"] == next(e["short"] for e in entries if "FIXED" in e["message"])
+    assert "still running" not in fix["prompts"][0]  # the note is not the user's words
+    old = [t for e in entries for t in e.get("turns", []) if t["prompts"] == ["OLD style question"]]
+    assert any(t.get("later", {}).get("0", {}).get("text") == "OLD style answer" for t in old)
+    other = turns["unrelated, other conversation"][1]
+    assert "later" not in other  # a complete reply of its own needs no search
+
+
+def test_an_opened_answer_grows_with_the_page_and_has_no_scroll_bar_of_its_own(tmp_path):
+    # Like an expanded commit, an opened answer is laid out in full in the page: no height cap
+    # and no inner scroll bar, so every opened answer reads in the one page scroll.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    rule = next(line for line in html.splitlines() if line.startswith(".tprompt .tanswer{"))
+    rule += next(line for line in html.split(rule, 1)[1].splitlines() if line.strip())
+    assert "max-height" not in rule and "overflow:auto" not in rule
+
+
+def test_a_new_commit_redraws_the_log_without_closing_what_the_reader_opened(tmp_path):
+    # When new commits land the log is redrawn, and the redraw used to close every expanded
+    # commit and opened answer. What is open is remembered by commit id (a new commit shifts
+    # every row) and reopened, with the parts open inside a squash, a file diff that was showing,
+    # long messages expanded with "show all", and the scroll position on the row being read.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    refresh = html.split("async function refresh(){", 1)[1].split("\n}\n", 1)[0]
+    assert "const kept = captureLogState();" in refresh
+    assert refresh.index("captureLogState()") < refresh.index("renderLog()") < refresh.index("restoreLogState(kept)")
+    # The refresh behind a restored view keeps it too.
+    assert "{ const kept = captureLogState(); renderLog(); restoreLogState(kept); }" in html
+    restore = html.split("function restoreLogState(st){", 1)[1].split("\nasync function refresh", 1)[0]
+    for reopened in (
+        "toggleDetail(i)",
+        "parts[k].open = true",
+        "toggleDiff(i)",
+        "toggleAnswer(btn)",
+        'classList.remove("clamp")',
+        "window.scrollBy",
+    ):
+        assert reopened in restore
+
+
+def test_the_timeline_has_one_button_to_show_every_answer_on_the_page(tmp_path):
+    # "show all answers" opens every answer on the timeline page at once; while any answer is open
+    # it reads "hide all answers"; it lives in the log's tab row, on the timeline tab only.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    bar = html.split('<div class="panebar logpart">', 1)[1].split('<div class="logsort">', 1)[0]
+    assert '<button class="allans" id="allanswers" type="button" hidden>show all answers</button>' in bar
+    assert '$("allanswers").onclick = toggleAllAnswers;' in html
+    # "hide all answers" while ANY answer is open (closing them all), "show all answers" only when
+    # none is.
+    assert 'all.textContent = anyOpen ? "hide all answers" : "show all answers";' in html
+    assert 'all.hidden = LOGTAB !== "timeline"' in html
 
 
 def _two_people_merged(repo_dir) -> dict[str, str]:

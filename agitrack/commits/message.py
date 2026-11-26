@@ -1101,8 +1101,28 @@ def _subject_parts(text: str, *, width: int) -> tuple[str, str | None]:
 
 
 def _body_lines(text: str) -> list[str]:
+    """*text* hard-wrapped to the body width, except where a wrap would change what it says.
+
+    A Markdown table row is one line by definition (splitting one turned a reply's results
+    table into a broken row and a stray line of text in every commit and dashboard), and a line
+    inside a fenced code block is code, whose line breaks are meaning. Both are kept whole: git
+    imposes no line length, and the rest of the prose still wraps for plain-text ``git log``."""
     lines: list[str] = []
+    in_fence = False
+    fence_marker = ""
     for raw_line in str(text).splitlines() or [""]:
+        fence = CODE_FENCE_RE.match(raw_line)
+        if fence:
+            marker = fence.group(1)
+            if not in_fence:
+                in_fence, fence_marker = True, marker
+            elif marker == fence_marker:
+                in_fence, fence_marker = False, ""
+            lines.append(raw_line)
+            continue
+        if in_fence or raw_line.lstrip().startswith("|"):
+            lines.append(raw_line)
+            continue
         lines.extend(wrap(raw_line, width=MAX_BODY_WIDTH, replace_whitespace=False, drop_whitespace=False) or [""])
     return lines
 

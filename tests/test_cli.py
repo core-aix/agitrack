@@ -1839,7 +1839,30 @@ def test_overwrite_shared_alone_is_an_error_not_an_agent_session(monkeypatch, ca
     assert cli.main(["--overwrite-shared"]) == 2
 
     out = capsys.readouterr().out
-    assert "--share-sessions" in out
+    assert "--share-sessions" in out and "agitrack share --overwrite-shared" in out
+
+
+def test_agitrack_share_is_the_command_form_of_share_sessions(tmp_path, monkeypatch):
+    """The dashboard's shared-sessions panel tells people to run `agitrack share`: it must run
+    exactly what `--share-sessions` runs, take `--overwrite-shared` and `--yes`, work after
+    `--repo` too, and never start an agent session."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    calls = []
+    monkeypatch.setattr(cli, "_run_share_sessions", lambda repo, **k: calls.append((repo.repo, k)) or 0)
+    monkeypatch.setattr(cli, "ProxyRunner", lambda *a, **k: pytest.fail("`agitrack share` must not start a session"))
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["share"]) == 0
+    assert cli.main(["share", "--overwrite-shared", "--yes"]) == 0
+    assert cli.main(["--repo", str(tmp_path), "share"]) == 0
+    assert [k for _, k in calls] == [
+        {"overwrite": False, "assume_yes": False},
+        {"overwrite": True, "assume_yes": True},
+        {"overwrite": False, "assume_yes": False},
+    ]
+    assert all(path.resolve() == tmp_path.resolve() for path, _ in calls)
 
 
 def test_flag_prefixes_are_not_accepted(monkeypatch, capsys):

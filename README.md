@@ -398,11 +398,11 @@ The reconstruction is best-effort from what the transcripts recorded; review it 
 A transcript only exists on the machine that recorded it, so a plain `--backtrace` shows *one laptop's* view of a project. Two commands together turn it into the **project's** view: everyone pushes their sessions to the shared remote, and the reconstruction pulls them all back.
 
 ```bash
-agitrack --share-sessions            # push EVERY local session for this repo to origin, then exit
+agitrack share                       # push EVERY local session for this repo to origin, then exit
 agitrack --backtrace                 # reconstructs from local sessions AND everything on origin
 ```
 
-- **`--share-sessions` (upload).** Does what the `session` menu's *Share this session* does, for every conversation recorded in this directory (or a subdirectory), on every backend, in one pass — no TUI, no agent launched. Each is published under your GitHub id using the same storage, redaction and cap as an ordinary share (see [Sharing sessions](#sharing-sessions)). **The same consent applies**: transcripts can contain file contents, command output and secrets, the masking is best-effort and not a guarantee, and this uploads *all* of them at once — so review what's in them first. Run it whenever you want to publish a stretch of work; it is safe to repeat.
+- **`agitrack share` (upload; `--share-sessions` is the same).** Does what the `session` menu's *Share this session* does, for every conversation recorded in this directory (or a subdirectory), on every backend, in one pass — no TUI, no agent launched. Each is published under your GitHub id using the same storage, redaction and cap as an ordinary share (see [Sharing sessions](#sharing-sessions)). **The same consent applies**: transcripts can contain file contents, command output and secrets, the masking is best-effort and not a guarantee, and this uploads *all* of them at once — so review what's in them first. Run it whenever you want to publish a stretch of work; it is safe to repeat.
   - **Idempotent.** A session already shared with identical content is skipped without a network round trip, so re-running costs almost nothing.
   - **Never rewinds.** A session whose shared copy already has *more* turns than this machine's is refused, not overwritten — an old laptop coming back online can't roll back everyone else's copy. Those are reported as `behind`; pass `--overwrite-shared` to deliberately replace them.
   - Sessions keep their aGiTrack name where they have one, otherwise `session-<short-id>`.
@@ -427,7 +427,7 @@ From the `session` menu (`Ctrl-G` → `session`) — where each session is also 
 - **Resume a shared session** — lists teammates' sessions as `<github-id>/<name>` and continues one in a fresh session worktree.
 - **Manage shared sessions** — see what *you've* shared (with "up to date" vs "local has newer turns"), push the latest turns, toggle auto-update, or unshare.
 
-To publish **everything at once** instead of picking sessions one at a time, use `agitrack --share-sessions` — the same storage and the same consent, applied to every session recorded for the repo. It is what makes a cross-machine, whole-team [backtrace](#across-machines-and-teammates) possible.
+To publish **everything at once** instead of picking sessions one at a time, use `agitrack share` (or `--share-sessions`) — the same storage and the same consent, applied to every session recorded for the repo. It is what makes a cross-machine, whole-team [backtrace](#across-machines-and-teammates) possible.
 
 Shared sessions also appear in the [dashboard](#dashboard) under **shared sessions**. The storage model and the guarantees behind these actions are described under [Session tracking](#session-tracking).
 

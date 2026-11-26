@@ -427,6 +427,7 @@ OpenCode (each pinned to its cheapest model tier so a smoke test never bills a f
 | Resume shared (fetch / already-live / name prompt / errors) | `test_shared_resume_*` | real-git |
 | Share-behind → overwrite + reshare / cancel | `test_share_behind_offers_overwrite_and_reshares`, `_cancel_leaves_shared_copy_untouched` | real-git |
 | Unshare (confirm, retries, fallbacks, lineage) | `test_unshare_*` | real-git |
+| Share every session from the command line: `agitrack share` (= `--share-sessions`, takes `--overwrite-shared` / `--yes`, also after `--repo`); the dashboard's shared-sessions panel explains it | `test_agitrack_share_is_the_command_form_of_share_sessions`, `test_the_shared_sessions_panel_says_how_to_share_from_the_command_line` | unit (stubbed share) + page markup |
 
 ## 12b. Learning page (dashboard `/learn`, `tests/test_learn.py`)
 The dashboard's learning coach: the user opens `/learn`, taps how much time they have (5/15/30 min)

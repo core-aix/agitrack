@@ -988,8 +988,150 @@ def _trace_user_sections(message: str) -> list[tuple[int, str]]:
             continue
         if in_trace and in_user:
             messages[-1].append(line)
-    found = ((k, "\n".join(lines).strip()) for k, lines in enumerate(messages))
+    found = ((k, _strip_running_note("\n".join(lines)).strip()) for k, lines in enumerate(messages))
     return [(k, text) for k, text in found if text]
+
+
+# The note a commit made while its turn was still running ends the trace with. It follows the last
+# message with no heading of its own, so a plain reading takes it as part of that message (the
+# timeline showed it as the user's words); and it is what says the reply comes in a later commit.
+_STILL_RUNNING_NOTE = "This turn was still running when this commit was made"
+_CONTINUED_NOTE = "Continued from the interaction recorded in the previous commit"
+
+
+def _strip_running_note(text: str) -> str:
+    """*text* without a trailing "this turn was still running" note (a blockquote)."""
+    lines = text.rstrip().splitlines()
+    end = len(lines)
+    while end and lines[end - 1].lstrip().startswith(">"):
+        end -= 1
+    quote = " ".join(line.lstrip()[1:].strip() for line in lines[end:])
+    return "\n".join(lines[:end]) if quote.startswith(_STILL_RUNNING_NOTE) else text
+
+
+def _trace_roles(message: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """A message's interaction trace as (the lines before its first role heading, then each
+    ``## <Role>`` section with its lines). Fence-aware, like :func:`_trace_user_sections`."""
+    lead: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    in_trace = in_fence = False
+    for line in (message or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("# "):
+            in_trace = stripped == "# Interaction Trace"
+            continue
+        elif not in_fence and in_trace and line.startswith("## "):
+            sections.append((stripped[3:].strip(), []))
+            continue
+        if in_trace:
+            (sections[-1][1] if sections else lead).append(line)
+    return lead, sections
+
+
+def _reply_after(sections: list[tuple[str, list[str]]], start: int) -> tuple[str, bool]:
+    """The agent's reply to the user section at index *start* (borrowing the next reply when
+    messages were sent back to back, as the page does), and whether the record stops with the
+    turn still running, its reply to come in a later commit."""
+    replies: list[str] = []
+    for role, lines in sections[start + 1 :]:
+        if role == "User":
+            if replies:
+                break
+            continue
+        if role == "Agent":
+            text = _strip_running_note("\n".join(lines)).strip()
+            if text:
+                replies.append(text)
+    tail = "\n".join(sections[-1][1]) if sections else ""
+    running = _STILL_RUNNING_NOTE in " ".join(tail.replace(">", " ").split())
+    return "\n\n".join(replies), running
+
+
+def _part_at(stat: CommitStat, path: list[int]) -> CommitStat | None:
+    """The record a timeline turn's *path* names (the parts tree, newest first, as
+    :func:`_display_parts` orders it)."""
+    node = stat
+    for index in path:
+        parts = list(node.constituents)
+        if parts and _is_own_lead(parts[0], node):
+            parts = parts[1:]
+        if not 0 <= index < len(parts):
+            return None
+        node = parts[len(parts) - 1 - index]
+    return node
+
+
+def _records(stats: list[CommitStat]) -> list[CommitStat]:
+    """Every turn record in history order: each commit, or each part of a squash or fold."""
+    out: list[CommitStat] = []
+    for stat in stats:
+        parts = list(stat.constituents)
+        if parts and _is_own_lead(parts[0], stat):
+            parts = parts[1:]
+        if parts:
+            out.extend(_records(parts))
+        else:
+            out.append(stat)
+    return out
+
+
+def _later_reply(records: list[CommitStat], owner: CommitStat, record: CommitStat, prompt: str) -> dict | None:
+    """The agent's reply to *prompt* from a LATER record of the same conversation, when its own
+    record has none or stopped with the turn still running: the record of the turn's rest (it
+    opens with the "continued from the previous commit" note), or, as an older aGiTrack wrote
+    it, a later record repeating the same message. ``{"text", "short", "sha"}`` of the commit
+    holding it (the record's own, for a pending turn: empty sha), or None."""
+    session = (record.metadata or {}).get("backend_session_id")
+    if not session:
+        return None
+    try:
+        position = next(k for k, r in enumerate(records) if r is record)
+    except StopIteration:
+        return None
+    want = " ".join(prompt.split())
+    for later in records[position + 1 :]:
+        if (later.metadata or {}).get("backend_session_id") != session:
+            continue
+        lead, sections = _trace_roles(later.message)
+        reply = ""
+        if _CONTINUED_NOTE in " ".join(" ".join(lead).replace(">", " ").split()):
+            first_user = next((k for k, (role, _) in enumerate(sections) if role == "User"), len(sections))
+            reply = "\n\n".join(
+                text
+                for role, lines in sections[:first_user]
+                if role == "Agent" and (text := _strip_running_note("\n".join(lines)).strip())
+            )
+        else:
+            for k, (role, lines) in enumerate(sections):
+                if role == "User" and " ".join(_strip_running_note("\n".join(lines)).split()) == want:
+                    reply, _ = _reply_after(sections, k)
+                    break
+        if reply:
+            return {"text": reply, "short": later.short, "sha": later.sha}
+    return None
+
+
+def _with_later_replies(entry: dict, stat: CommitStat, records_fn) -> dict:
+    """Attach, per timeline message whose own record carries no complete reply, the reply a
+    later commit holds (``turn["later"][<section>]``). Only those messages pay for the search."""
+    for turn in entry.get("turns") or []:
+        record = _part_at(stat, turn.get("path") or [])
+        if record is None:
+            continue
+        _, sections = _trace_roles(record.message)
+        users = [k for k, (role, _) in enumerate(sections) if role == "User"]
+        for prompt, sec in zip(turn.get("prompts") or [], turn.get("sections") or []):
+            if not 0 <= sec < len(users):
+                continue
+            own, running = _reply_after(sections, users[sec])
+            if own and not running:
+                continue
+            found = _later_reply(records_fn(), stat, record, prompt)
+            if found:
+                turn.setdefault("later", {})[str(sec)] = found
+    return entry
 
 
 def log_page(
@@ -1054,6 +1196,18 @@ def log_page(
     if backend or model:
         for stat, entry in zip(page, entries):
             entry["turns"] = _timeline_turns(stat, engine=(backend, model))
+    # "show answer" for a message whose reply landed in a LATER commit (one made while the turn
+    # was still running carries the question, the next one the reply). Searched over the whole
+    # history, not the filtered slice, and only for messages missing a complete reply.
+    cached: list[list[CommitStat]] = []
+
+    def records() -> list[CommitStat]:
+        if not cached:
+            cached.append(_records(dash.stats))
+        return cached[0]
+
+    for stat, entry in zip(page, entries):
+        _with_later_replies(entry, stat, records)
     payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
     if items is not None:
         local = {index: k for k, index in enumerate(shown)}
@@ -1566,16 +1720,6 @@ header{padding:26px 0 18px}
 .meta{margin-top:12px;color:var(--fg-dim);font-size:13.5px}
 .meta b{color:var(--fg);font-weight:600}
 .meta .tag{color:var(--amber)}
-/* Branch picker lives inline on the meta line (next to the repo path), styled to
-   read as part of the text rather than as a bulky filter control. */
-.meta select.branchsel{appearance:none;background:var(--ink);color:var(--fg);font-weight:600;vertical-align:baseline;
-  border:1px solid var(--line);font-family:var(--mono);font-size:13px;padding:2px 22px 2px 8px;max-width:min(60vw,520px);cursor:pointer;
-  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
-  background-position:calc(100% - 12px) 50%,calc(100% - 8px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
-.meta select.branchsel:focus{outline:none;border-color:var(--phosphor)}
-/* A file:// snapshot (or a single-branch repo) can't switch: render it as plain
-   inline text — no arrow, no box affordance. */
-.meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
 /* One row while sticky: the FIELDS shrink (min-width:0 below) rather than the row
@@ -1584,8 +1728,13 @@ header{padding:26px 0 18px}
    (max-width:760px below) is where the bar finally wraps into a grid. (No overflow
    clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:12px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
+/* Which repository the filters apply to, kept on screen with the sticky bar (switching it is the
+   hub bar's job, at the top of the page). Top right, above the buttons, which carry no label. */
+.ctlrepo{position:absolute;top:5px;right:16px;max-width:240px;font-size:11px;color:var(--fg-dim);
+  letter-spacing:.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.ctlrepo b{color:var(--fg);font-weight:600}
 /* "loading…" badge shown while a filter change re-fetches the data. It FLOATS just below
    the bar's right corner (absolute against the sticky bar), so appearing and disappearing
    never moves the reset button or anything else in the row. */
@@ -1599,13 +1748,26 @@ header{padding:26px 0 18px}
 /* Fields SHRINK (flex-basis with no fixed min-width) so the bar keeps everything on one
    line on a desktop window instead of wrapping just the reset button to a second row;
    below 760px the phone grid takes over. */
-.field{display:flex;flex-direction:column;gap:4px;flex:0 1 165px;min-width:0}
+/* Every filter field is the SAME width (flex 1 1 0: equal shares of the row, none sized by its
+   text), so the bar reads as one row of equal controls. */
+.field{display:flex;flex-direction:column;gap:4px;flex:1 1 0;min-width:0}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:0;width:100%;
+  font-family:var(--mono);font-size:12.5px;padding:7px 25px 7px 9px;cursor:pointer;min-width:0;width:100%;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
-  background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
+/* A filter value too long for its box scrolls to its end while hovered (hoverScrollSelect):
+   the select's own text is hidden and this overlay, laid exactly over it, slides instead. */
+.field{position:relative}
+.field select.selscrolling{color:transparent}
+.selview{position:absolute;overflow:hidden;white-space:nowrap;pointer-events:none;box-sizing:border-box;
+  font-family:var(--mono);font-size:12.5px;color:var(--fg);padding-left:9px}
+.selview span{display:inline-block;transition:transform linear}
+/* The branch picker sits in the sticky filter bar, so the branch being viewed stays on screen
+   while the page scrolls. A file:// snapshot or a one-branch repo cannot switch: it then reads
+   as a label, with no arrow to suggest otherwise. */
+.field select:disabled{cursor:default;background-image:none;padding-right:9px;color:var(--fg);opacity:1}
 __UI_RANGE_CSS__
 /* The advanced filter. It hangs BELOW the sticky bar rather than expanding it: growing the bar
    pushes the whole page down every time it opens, and on a phone a bar tall enough to hold three
@@ -1670,6 +1832,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .loghead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
 .loghead h2.section{margin:0}
 .logsort{display:flex;align-items:center;gap:8px}
+/* Opens (or closes) every "show answer" on the timeline page at once. Link-styled like them. */
+.allans{font:inherit;font-size:12.5px;color:var(--ops);background:none;border:0;border-bottom:1px solid rgba(103,184,214,.35);
+  padding:0 1px;cursor:pointer;margin-left:auto;white-space:nowrap}
+.allans:hover{color:var(--ink);background:var(--ops)}
 .logsort label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
 .logsort select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:13px;padding:5px 26px 5px 10px;cursor:pointer;
@@ -1767,6 +1933,9 @@ h2.section::before{content:"# ";color:var(--amber)}
 .srow .sage{color:var(--fg-dim);font-size:12px;text-align:right;white-space:nowrap}
 @media (max-width:760px){.srow{grid-template-columns:1fr;gap:4px}.srow .sage{text-align:left}}
 .hint{padding:8px 18px 0;color:var(--fg-dim);font-size:11.5px;font-style:italic}
+.sharehow{padding:10px 18px 12px;border-top:1px solid var(--line);color:var(--fg-dim);font-size:12px;line-height:1.7}
+.sharehow b{color:var(--fg);font-weight:600}
+.sharehow code{background:var(--panel2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:11.5px}
 .kindcounts{padding:11px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--fg-dim);line-height:1.9}
 .kindcounts .klabel{color:var(--amber);margin-right:4px}
 .kindcounts .kc{white-space:nowrap;cursor:help;border-bottom:1px dotted var(--fg-dim)}
@@ -1810,6 +1979,33 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .teng{color:var(--ops);border:1px solid var(--ops);border-radius:2px;padding:0 5px;font-size:11px;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
+/* "show answer" reads as a link (underlined, inverting on hover) but in the page's muted blue,
+   not the bright green of the main links, so it does not compete with the messages. */
+.tprompt .tfoot{display:flex;justify-content:flex-end;margin-top:6px}
+.tprompt .tfoot:empty{display:none}
+/* In a message shown whole, the button floats to the right of its LAST line (placeAnswerButton),
+   taking no line of its own unless that line is full. */
+.tprompt .tbody .tans{float:right;margin:2px 0 0 14px}
+/* While a long message is cut short its "show all" sits at the bottom left: share that row
+   rather than adding one below it. (Once opened, "collapse" is sticky and keeps its own row.) */
+.tprompt.clamp.long .tfoot{margin-top:-19px;pointer-events:none}
+.tprompt.clamp.long .tfoot .tans{pointer-events:auto}
+.tprompt .tans{white-space:nowrap;font:inherit;font-size:12px;color:var(--ops);background:none;border:0;
+  border-bottom:1px solid rgba(103,184,214,.35);padding:0 1px;cursor:pointer}
+.tprompt .tans:hover{color:var(--ink);background:var(--ops)}
+/* An opened answer grows with the page, as an expanded commit does: no height cap and no
+   scroll bar of its own, so every opened answer reads in the one page scroll. */
+.tprompt .tanswer{margin-top:8px;padding:8px 10px;border-left:2px solid var(--ops);background:rgba(103,184,214,.06);
+  overflow-wrap:anywhere}
+.tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
+.tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
+.tprompt .tanswer .awarn{font-size:11.5px;color:var(--amber);margin:0 0 6px}
+.tprompt .tanswer .alater{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)}
+.tprompt .tanswer .tsha{color:var(--amber);font-variant-numeric:tabular-nums}
+.tprompt .tanswer .awarn::before{content:"⚠ "}
+.tprompt .tanswer .abody{color:var(--fg)}
+.tprompt .tanswer .abody > :first-child{margin-top:0}
+.tprompt .tanswer .abody > :last-child{margin-bottom:0}
 .tprompt .tgo .tsha{font-variant-numeric:tabular-nums}
 .tprompt .tbody{color:var(--fg);overflow-wrap:anywhere}
 .tprompt .tbody > :first-child{margin-top:0}
@@ -2044,7 +2240,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
+    <div class="meta"><span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">
@@ -2055,7 +2251,9 @@ __UPDATE_BANNER__
   </div>
 
   <div class="controls">
+    <span class="ctlrepo">repo <b>__REPO__</b></span>
     <span class="prompt">&gt; filter</span>
+    <div class="field" id="branchfield"><label for="f-branch">branch</label><select id="f-branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
@@ -2164,6 +2362,7 @@ __UPDATE_BANNER__
       <button class="logtab" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
+    <button class="allans" id="allanswers" type="button" hidden>show all answers</button>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="oldest">oldest first</option>
@@ -2727,8 +2926,14 @@ function renderAgg(){
 }
 function renderShared(){
   const el = $("shared"); if(!el) return;
+  // How to share, said every time (not only when the list is empty): from the command line, or
+  // from inside an interactive session.
+  const how = `<div class="sharehow"><b>To share:</b> run <code>agitrack share</code> in the repository to upload every local `+
+    `agent session to <code>origin</code> (it asks first; add <code>--overwrite-shared</code> to replace a newer shared copy), `+
+    `or, in an interactive session, press Ctrl-G → session → Share this session. Teammates then see them with `+
+    `<code>agitrack --backtrace</code>.</div>`;
   if(!SHARED.length){
-    el.innerHTML = `<div class="empty">no sessions shared yet — share one from aGiTrack (Ctrl-G → session → Share this session)</div>`;
+    el.innerHTML = `<div class="empty">no sessions shared yet</div>` + how;
     return;
   }
   el.innerHTML = SHARED.map(s => {
@@ -2736,7 +2941,7 @@ function renderShared(){
     const age = s.updated ? sharedAge(s.updated) : "";
     return `<div class="srow"><span class="sid">${esc(s.label || s.owner)}<b>/</b>${esc(s.name)}</span>`+
       `<span class="smeta">${meta}</span><span class="sage">${esc(age)}</span></div>`;
-  }).join("");
+  }).join("") + how;
 }
 function sharedAge(epoch){
   const d = Math.max(0, Math.floor(Date.now()/1000 - epoch));
@@ -2928,6 +3133,127 @@ function setMessageToggle(el){
   more.textContent = cut ? "show all" : "collapse";
   more.title = cut ? "show the whole message" : "cut the message short again";
 }
+// The message a timeline row's link points into: the commit's own (path []) or, down the parts
+// tree (each index as _display_parts orders them), a squashed part's.
+function messageAtPath(c, path){
+  let node = c;
+  for(const k of (path || [])){
+    const next = (node.parts || [])[k];
+    if(!next) return "";
+    node = next;
+  }
+  return node.message || "";
+}
+// What the agent answered to the `sec`-th "## User" of a message's interaction trace (empty ones
+// counted, as the server counts them): every "## Agent" section after it, up to the next
+// "## User". Fence-aware like the server's reading, so a heading QUOTED in a code block is not a
+// role. Messages sent back to back with no reply between them (a follow-up queued while the
+// agent worked, or a question sent before the previous one was answered) share ONE reply: a
+// message borrows the next reply, and `before`/`after` count the other messages that reply also
+// answers, so the page can warn that it may not match this message exactly.
+function traceAnswer(text, sec){
+  const sections = [];
+  let inTrace = false, fence = false, cur = null;
+  for(const line of (text || "").split("\n")){
+    const s = line.trim();
+    if(/^(```|~~~)/.test(s)){ fence = !fence; if(cur) cur.lines.push(line); continue; }
+    if(!fence && line.startsWith("# ")){ inTrace = s === "# Interaction Trace"; cur = null; continue; }
+    if(!fence && inTrace && line.startsWith("## ")){ cur = {role: s.slice(3).trim(), lines: []}; sections.push(cur); continue; }
+    if(inTrace && cur) cur.lines.push(line);
+  }
+  let user = -1, start = -1;
+  sections.forEach((x, k) => { if(x.role === "User" && ++user === sec && start < 0) start = k; });
+  if(start < 0) return null;
+  const hasText = x => x.lines.join("").trim() !== "";
+  // Messages just before this one that got no reply of their own: the reply covers them too.
+  let before = 0;
+  for(let k = start - 1; k >= 0 && sections[k].role === "User"; k--) if(hasText(sections[k])) before++;
+  const replies = [];
+  let after = 0;
+  for(let k = start + 1; k < sections.length; k++){
+    const x = sections[k];
+    if(x.role === "User"){ if(replies.length) break; if(hasText(x)) after++; continue; }
+    if(x.role === "Agent"){ const t = stripRunningNote(x.lines.join("\n")).trim(); if(t) replies.push(t); }
+  }
+  return {text: replies.join("\n\n"), before, after};
+}
+// The note a commit made mid-turn ends its trace with ("this turn was still running…") is
+// aGiTrack's, not the agent's words: the reply it promises is shown from the later commit.
+function stripRunningNote(text){
+  const lines = (text || "").replace(/\s+$/, "").split("\n");
+  let end = lines.length;
+  while(end && lines[end-1].trimStart().startsWith(">")) end--;
+  const quote = lines.slice(end).map(l => l.trimStart().slice(1).trim()).join(" ");
+  return quote.startsWith("This turn was still running when this commit was made") ? lines.slice(0, end).join("\n") : text;
+}
+// "show answer" takes no line of its own: in a message shown whole it floats at the right of the
+// message's last line; while a long message is cut short (its end hidden) it shares the bottom
+// row with "show all"; where the message ends in a list, a table or code it stays below.
+function placeAnswerButton(el){
+  const btn = el.querySelector(".tans");
+  if(!btn) return;
+  const foot = el.querySelector(".tfoot");
+  const last = el.querySelector(".tbody > p.mdp:last-child");
+  if(!el.classList.contains("clamp") && last){ if(btn.parentNode !== last) last.append(btn); }
+  else if(foot && btn.parentNode !== foot) foot.append(btn);
+}
+// The page-wide toggle: while ANY answer on this timeline page is open it reads "hide all
+// answers" and closes them all; with none open it reads "show all answers" and opens every one.
+// Visible on the timeline tab only.
+function syncAllAnswers(){
+  const all = $("allanswers");
+  if(!all) return;
+  const buttons = [...document.querySelectorAll("#commitlog .tans")];
+  all.hidden = LOGTAB !== "timeline" || !buttons.length || !$("pane-files") || !$("pane-files").hidden;
+  const anyOpen = buttons.some(b => b.getAttribute("aria-expanded") === "true");
+  all.textContent = anyOpen ? "hide all answers" : "show all answers";
+}
+function toggleAllAnswers(){
+  const buttons = [...document.querySelectorAll("#commitlog .tans")];
+  const anyOpen = buttons.some(b => b.getAttribute("aria-expanded") === "true");
+  // Any open: close the open ones. None open: open them all.
+  for(const b of buttons) if((b.getAttribute("aria-expanded") === "true") === anyOpen) toggleAnswer(b);
+  syncAllAnswers();
+}
+function toggleAnswer(btn){
+  const el = btn.closest(".tprompt");
+  const open = el.querySelector(".tanswer");
+  if(open){ open.remove(); btn.textContent = "show answer"; btn.setAttribute("aria-expanded", "false"); return; }
+  const c = (LOG_ENTRIES || [])[+btn.dataset.ans];
+  const path = btn.dataset.path ? btn.dataset.path.split(".").map(Number) : [];
+  const sec = +btn.dataset.sec;
+  const found = c ? traceAnswer(messageAtPath(c, path), sec) : null;
+  // A reply that landed in a LATER commit (this one was made while the turn was still running):
+  // the server attaches it per message (`turn.later`), naming the commit that holds it.
+  const turn = c ? (c.turns || []).find(t => (t.path || []).join(".") === (btn.dataset.path || "") && (t.sections || []).includes(sec)) : null;
+  const later = turn && turn.later ? turn.later[String(sec)] : null;
+  const box = document.createElement("div");
+  box.className = "tanswer";
+  const laterHtml = later ? `<div class="alabel">${found && found.text ? "the rest of the reply, " : "agent replied "}in a later commit${later.short ? ` <span class="tsha">${esc(later.short)}</span>` : ""}</div>`+
+    `<div class="abody dmsg md">${md(later.text)}</div>` : "";
+  if(found && found.text){
+    const others = found.before + found.after;
+    const when = found.before && found.after ? "sent just before and after it"
+      : found.before ? `sent just before it` : `sent just after it`;
+    const warn = others
+      ? `<div class="awarn">answers this message together with ${others} other${others === 1 ? "" : "s"} ${when}, so it may not match this question exactly</div>`
+      : "";
+    box.innerHTML = `<div class="alabel">agent replied</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
+      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "");
+  } else if(later){
+    box.innerHTML = laterHtml;
+  } else {
+    box.innerHTML = `<div class="anote">${c && c.pending
+      ? "no reply recorded yet: the agent may still be working on it"
+      : "no reply to this message is recorded in its trace"}</div>`;
+  }
+  el.querySelector(".tbody").after(box);
+  const body = box.querySelector(".abody");
+  if(body) reflowParagraphs(body);
+  highlightIn(box);
+  btn.textContent = "hide answer";
+  btn.setAttribute("aria-expanded", "true");
+}
 function timelineHtml(entries, commitRow){
   const items = [];
   entries.forEach((c, i) => {
@@ -2974,9 +3300,12 @@ function timelineHtml(entries, commitRow){
       ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
       : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     const eng = it.eng ? `<span class="teng" title="asked of the backend / model you filtered by">${esc(it.eng)}</span>` : "";
+    // The agent's reply, opened in place: no need to open the (possibly squashed) commit.
+    const ans = it.sec == null ? "" : `<button class="tans" data-ans="${it.i}" ${where} aria-expanded="false" title="show what the agent answered, here">show answer</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${eng}${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
-      `<button class="tmore" title="show the whole message">show all</button></div>`;
+      `<button class="tmore" title="show the whole message">show all</button>`+
+      (ans ? `<div class="tfoot">${ans}</div>` : "") + `</div>`;
   }).join("");
 }
 function renderLog(){
@@ -3066,6 +3395,8 @@ function renderLog(){
     if(el.querySelector("mark.hit")) el.classList.remove("clamp");
     setMessageToggle(el);
   });
+  document.querySelectorAll("#commitlog .tprompt").forEach(placeAnswerButton);
+  syncAllAnswers();
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -3319,8 +3650,8 @@ function fillSelect(id, values, allLabel, keep){
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
-// The branch picker doubles as the branch label on the meta line: keep its shown
-// value in sync with the branch actually being viewed.
+// The branch picker (first field of the sticky filter bar) is also where the page says which
+// branch is being viewed: keep its shown value in sync with that branch.
 function setBranchLabel(name){ const el=$("f-branch"); if(el && name && [...el.options].some(o=>o.value===name)) el.value = name; }
 // The branch picker is a view switch, not a subset filter, so it has no "all"
 // option — exactly one branch is shown at a time. A file:// snapshot can't reach
@@ -3560,6 +3891,77 @@ async function applyFilters(){
     syncFilters(); renderAgg(); renderLog();
   } finally { showLoading(false); }  // always clear the spinner, even on a fetch failure
 }
+// A new commit redraws the log, and a redraw used to close everything the reader had open. What is
+// open is remembered by COMMIT ID (a new commit shifts every row's position) and reopened after
+// the redraw: expanded commits (with the parts open inside them, and the file diff if that was
+// showing), opened answers, and long messages expanded with "show all". The scroll position is
+// kept on the row the reader was looking at, so new rows above it do not push it away.
+function logMessageKey(c, el){
+  const btn = el.querySelector(".tans") || el.querySelector(".tgo");
+  return btn ? (c && (c.sha || c.short) || "") + "|" + (btn.dataset.path || "") + "|" + (btn.dataset.sec || "") : null;
+}
+function logAnchorKey(el, entries){
+  if(el.classList.contains("entry")){ const c = entries[+el.dataset.i]; return c && c.sha ? "c:" + c.sha : null; }
+  const key = logMessageKey(entries[+el.dataset.c], el);
+  return key ? "m:" + key : null;
+}
+function captureLogState(){
+  const entries = LOG_ENTRIES || [], log = $("commitlog");
+  if(!log) return null;
+  const st = {details: [], answers: new Set(), expanded: new Set(), anchor: null};
+  log.querySelectorAll('.detail').forEach(d => {
+    if(d.hidden) return;
+    const c = entries[+d.id.replace("detail-", "")];
+    if(!c || !c.sha) return;
+    const parts = [...d.querySelectorAll("details.part")].map((x, k) => x.open ? k : -1).filter(k => k >= 0);
+    const body = d.querySelector(".dmsg[data-mode]");
+    st.details.push({sha: c.sha, parts, diff: !!(body && body.dataset.mode === "diff")});
+  });
+  log.querySelectorAll(".tprompt").forEach(el => {
+    const key = logMessageKey(entries[+el.dataset.c], el);
+    if(!key) return;
+    if(el.querySelector(".tanswer")) st.answers.add(key);
+    if(el.classList.contains("long") && !el.classList.contains("clamp")) st.expanded.add(key);
+  });
+  const ctl = document.querySelector(".controls");
+  const top = ctl ? ctl.getBoundingClientRect().bottom : 0;
+  for(const el of log.querySelectorAll(".entry, .tprompt")){
+    const r = el.getBoundingClientRect();
+    if(r.bottom > top){ const key = logAnchorKey(el, entries); if(key) st.anchor = {key, top: r.top}; break; }
+  }
+  return st;
+}
+function restoreLogState(st){
+  if(!st) return;
+  const entries = LOG_ENTRIES || [], log = $("commitlog");
+  if(!log) return;
+  const reanchor = () => {
+    if(!st.anchor) return;
+    const el = [...log.querySelectorAll(".entry, .tprompt")].find(x => logAnchorKey(x, entries) === st.anchor.key);
+    if(el) window.scrollBy(0, el.getBoundingClientRect().top - st.anchor.top);
+  };
+  const bySha = new Map(entries.map((c, i) => [c.sha, i]));
+  for(const d of st.details){
+    const i = bySha.get(d.sha), detail = i == null ? null : $("detail-" + i);
+    if(!detail || !detail.hidden) continue;
+    toggleDetail(i);  // builds on the next frame; this frame callback runs after it
+    requestAnimationFrame(() => {
+      const parts = [...detail.querySelectorAll("details.part")];
+      d.parts.forEach(k => { if(parts[k]) parts[k].open = true; });
+      if(d.diff) toggleDiff(i);
+      reanchor();
+    });
+  }
+  log.querySelectorAll(".tprompt").forEach(el => {
+    const key = logMessageKey(entries[+el.dataset.c], el);
+    if(!key) return;
+    if(st.expanded.has(key) && el.classList.contains("clamp")){ el.classList.remove("clamp"); setMessageToggle(el); placeAnswerButton(el); }
+    const btn = el.querySelector(".tans");
+    if(st.answers.has(key) && btn && btn.getAttribute("aria-expanded") !== "true") toggleAnswer(btn);
+  });
+  syncAllAnswers();
+  reanchor();
+}
 async function refresh(){
   const prev = HEAD;
   // Whether aGiTrack is running here changes for the same reasons new commits appear (a tracker
@@ -3571,7 +3973,9 @@ async function refresh(){
     resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
     setDateBounds(); syncPeriodDates();  // extend the shown range to new commits
     await loadLog(LOGPAGE.offset||0);
+    const kept = captureLogState();  // what the reader has open survives the redraw
     syncFilters(); renderAgg(); renderLog();  // renderAgg() also repaints shared sessions
+    restoreLogState(kept);
     // Refresh the file list too — but only when no file is expanded, so a poll never
     // yanks a change the user is reading out from under them.
     if(!document.querySelector(".fdetail")){ await loadFiles(); renderFiles(); }
@@ -3712,6 +4116,7 @@ function showLogTab(tab){
   if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
   if(pc) pc.hidden = !commitish;
   if(pf) pf.hidden = tab !== "files";
+  syncAllAnswers();
   // The tabs and the pane's own control (sort / file filter) share one row, so the control
   // has to follow the tab.
   // The file filter does nothing in the commit view, so it is only there for the files tab,
@@ -3817,7 +4222,7 @@ function hideFabricatedChrome(){
   const fa = $("f-author"); if(fa && fa.closest(".field")) fa.closest(".field").style.display = "none";
   const bc = $("by-committer");
   if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }
-  const bm = $("branchmeta"); if(bm) bm.style.display = "none";  // no "branch …" in the header
+  const bf = $("branchfield"); if(bf) bf.style.display = "none";  // a reconstruction has no branches
   const sh = $("shared");
   if(sh){ sh.style.display = "none"; if(sh.previousElementSibling) sh.previousElementSibling.style.display = "none"; }
 }
@@ -3832,13 +4237,52 @@ function stackStickyBanner(){
   restackControls = () => { ctl.style.top = strip.offsetHeight + "px"; };
   restackControls();
   window.addEventListener("resize", restackControls);
+  // The strip's contents change AFTER this runs: the "reloaded" notice, the live update banner
+  // (re-rendered from the poll) and the offline notice all come and go. Measured only once, a
+  // second notice made the strip taller than the offset and covered the filter bar. Re-measure
+  // whenever the strip changes size.
+  if(typeof ResizeObserver === "function") new ResizeObserver(restackControls).observe(strip);
 }
 // Every control is wired BEFORE any data is awaited. A restored view (returning from story/learn,
 // or the reload aGiTrack does after an update) is on screen at once, and the refresh behind it
 // can take a while: a restarted daemon re-reads the history first. Wiring after that await left
 // a page that looked ready and ignored every click, expanding a commit included, for as long as
 // the read took. The page must answer from its first paint, with a spinner for what is pending.
+// Hovering a filter dropdown whose value is cut off slides the value across so all of it can be
+// read (a native select cannot scroll its own text, and its title tooltip is the browser's grey
+// box): an overlay is laid exactly over the select's text, moved at a steady reading speed, and
+// removed when the pointer leaves or the menu opens. Built on hover, from the value shown at
+// that moment, so it can never fall out of step with a value set from code.
+function hoverScrollSelect(sel){
+  let view = null;
+  const stop = () => { if(view){ view.remove(); view = null; } sel.classList.remove("selscrolling"); };
+  sel.addEventListener("mouseenter", () => {
+    stop();
+    const opt = sel.options[sel.selectedIndex];
+    if(!opt) return;
+    view = document.createElement("span");
+    view.className = "selview";
+    const inner = document.createElement("span");
+    inner.textContent = opt.text;
+    view.appendChild(inner);
+    const arrow = 25;  // the select's right padding, where its arrow is drawn
+    Object.assign(view.style, {left: sel.offsetLeft + "px", top: sel.offsetTop + "px",
+      width: Math.max(0, sel.offsetWidth - arrow) + "px", height: sel.offsetHeight + "px",
+      lineHeight: sel.offsetHeight + "px"});
+    sel.parentNode.appendChild(view);
+    const over = inner.offsetWidth - (view.clientWidth - 9);
+    if(over <= 1){ stop(); return; }  // it fits: nothing to scroll
+    sel.classList.add("selscrolling");
+    inner.style.transitionDuration = Math.max(0.6, over / 45) + "s";
+    inner.style.transitionDelay = "0.25s";
+    void inner.getBoundingClientRect();  // settle the starting position, so the move animates
+    inner.style.transform = `translateX(${-over - 4}px)`;
+  });
+  for(const ev of ["mouseleave", "mousedown", "focus", "change", "keydown"]) sel.addEventListener(ev, stop);
+}
 function wireControls(){
+  document.querySelectorAll(".controls .field select").forEach(hoverScrollSelect);
+  $("allanswers").onclick = toggleAllAnswers;
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
   $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
@@ -3896,11 +4340,14 @@ function wireControls(){
     if(dbtn && dbtn.dataset.psha){ e.preventDefault(); togglePartDiff(dbtn); return; }
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
+    const ansBtn = e.target.closest(".tans");
+    if(ansBtn){ toggleAnswer(ansBtn); syncAllAnswers(); return; }
     const more = e.target.closest(".tmore");
     if(more){
       const el = more.closest(".tprompt");
       el.classList.toggle("clamp");
       setMessageToggle(el);
+      placeAnswerButton(el);
       // Collapsing a message read to its end leaves its start above the screen; bring it back.
       if(el.classList.contains("clamp") && el.getBoundingClientRect().top < 0) el.scrollIntoView({block:"start", behavior:"smooth"});
       return;
@@ -4014,7 +4461,7 @@ async function init(){
     renderAgg();
     // Repainting the log closes whatever commit the reader opened while the refresh ran, so a
     // log that came back unchanged is left exactly as it is.
-    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog) renderLog();
+    if(!shownLog || JSON.stringify(LOGPAGE) !== shownLog){ const kept = captureLogState(); renderLog(); restoreLogState(kept); }
   }
   // The log was drawn in its tab already; this only lights that tab, without waiting for the
   // file browser below.
