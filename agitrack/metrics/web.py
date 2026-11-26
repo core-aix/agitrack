@@ -1933,6 +1933,9 @@ h2.section::before{content:"# ";color:var(--amber)}
 .srow .sage{color:var(--fg-dim);font-size:12px;text-align:right;white-space:nowrap}
 @media (max-width:760px){.srow{grid-template-columns:1fr;gap:4px}.srow .sage{text-align:left}}
 .hint{padding:8px 18px 0;color:var(--fg-dim);font-size:11.5px;font-style:italic}
+.sharehow{padding:10px 18px 12px;border-top:1px solid var(--line);color:var(--fg-dim);font-size:12px;line-height:1.7}
+.sharehow b{color:var(--fg);font-weight:600}
+.sharehow code{background:var(--panel2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:11.5px}
 .kindcounts{padding:11px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--fg-dim);line-height:1.9}
 .kindcounts .klabel{color:var(--amber);margin-right:4px}
 .kindcounts .kc{white-space:nowrap;cursor:help;border-bottom:1px dotted var(--fg-dim)}
@@ -2921,8 +2924,14 @@ function renderAgg(){
 }
 function renderShared(){
   const el = $("shared"); if(!el) return;
+  // How to share, said every time (not only when the list is empty): from the command line, or
+  // from inside an interactive session.
+  const how = `<div class="sharehow"><b>To share:</b> run <code>agitrack share</code> in the repository to upload every local `+
+    `agent session to <code>origin</code> (it asks first; add <code>--overwrite-shared</code> to replace a newer shared copy), `+
+    `or, in an interactive session, press Ctrl-G → session → Share this session. Teammates then see them with `+
+    `<code>agitrack --backtrace</code>.</div>`;
   if(!SHARED.length){
-    el.innerHTML = `<div class="empty">no sessions shared yet — share one from aGiTrack (Ctrl-G → session → Share this session)</div>`;
+    el.innerHTML = `<div class="empty">no sessions shared yet</div>` + how;
     return;
   }
   el.innerHTML = SHARED.map(s => {
@@ -2930,7 +2939,7 @@ function renderShared(){
     const age = s.updated ? sharedAge(s.updated) : "";
     return `<div class="srow"><span class="sid">${esc(s.label || s.owner)}<b>/</b>${esc(s.name)}</span>`+
       `<span class="smeta">${meta}</span><span class="sage">${esc(age)}</span></div>`;
-  }).join("");
+  }).join("") + how;
 }
 function sharedAge(epoch){
   const d = Math.max(0, Math.floor(Date.now()/1000 - epoch));

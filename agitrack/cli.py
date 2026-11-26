@@ -230,6 +230,7 @@ _COMMANDS: dict[str, str] = {
     "status": "report whether aGiTrack is running for this repository, and in which mode",
     "stop": "stop whatever aGiTrack is running for this repository, in any mode",
     "redact": "remove the interaction trace of chosen commits, or of a time window, from history",
+    "share": "share every local agent session for this repository to 'origin' (same as --share-sessions)",
 }
 
 
@@ -877,6 +878,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # same code below: a command that reports and exits belongs next to `stop`, since
         # someone who knows one will try the other.
         command, args.status = None, True
+    if command == "share":
+        # `agitrack share` is the bare-word spelling of `--share-sessions` (and takes the same
+        # `--overwrite-shared` / `--yes`): the dashboard's shared-sessions panel tells people to
+        # type it, and a command reads better there than a flag.
+        command, args.share_sessions = None, True
     # `--repo` parses as None when absent so the two cases stay distinguishable (see its help);
     # from here on it is the plain path every other reader expects.
     repo_given = args.repo is not None
@@ -1328,7 +1334,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # session. Someone who typed it meaning to fix a rejected share got a live agent instead.
         print(
             "--overwrite-shared only means something together with --share-sessions.\n"
-            "Did you mean:  agitrack --share-sessions --overwrite-shared"
+            "Did you mean:  agitrack share --overwrite-shared"
         )
         return 2
 

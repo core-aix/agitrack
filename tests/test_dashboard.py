@@ -3380,6 +3380,18 @@ def test_the_filter_bar_stays_below_notices_that_appear_later_and_names_the_repo
     assert '<span class="ctlrepo">repo <b>' in controls and "__REPO__" not in controls
 
 
+def test_the_shared_sessions_panel_says_how_to_share_from_the_command_line(tmp_path):
+    # The panel explains, every time and not only when empty, how to share: `agitrack share` on
+    # the command line, or Ctrl-G in an interactive session.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    script = html.split("function renderShared(){", 1)[1].split("function sharedAge", 1)[0]
+    assert "run <code>agitrack share</code>" in script and "<code>--overwrite-shared</code>" in script
+    assert "Ctrl-G → session → Share this session" in script
+    assert script.count("+ how") == 2  # shown when the list is empty AND under a list
+
+
 def test_the_branch_picker_sits_in_the_sticky_filter_bar(tmp_path):
     # The branch being viewed stays on screen while the page scrolls: its picker is the first
     # field of the sticky filter bar, not a select on the line under the title.
