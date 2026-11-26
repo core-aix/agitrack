@@ -3443,6 +3443,18 @@ def test_show_answer_finds_the_reply_a_later_commit_holds(tmp_path):
     assert "later" not in other  # a complete reply of its own needs no search
 
 
+def test_the_timeline_has_one_button_to_show_every_answer_on_the_page(tmp_path):
+    # "show all answers" opens every answer on the timeline page at once, then reads "hide all
+    # answers"; it lives in the log's tab row and is shown on the timeline tab only.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    bar = html.split('<div class="panebar logpart">', 1)[1].split('<div class="logsort">', 1)[0]
+    assert '<button class="allans" id="allanswers" type="button" hidden>show all answers</button>' in bar
+    assert '$("allanswers").onclick = toggleAllAnswers;' in html
+    assert 'all.hidden = LOGTAB !== "timeline"' in html
+
+
 def _two_people_merged(repo_dir) -> dict[str, str]:
     """Alice and Bob each drive an agent on their own branch at the same time; both branches
     are merged into main with merge commits. Bob's second commit folds two turns. Returns the

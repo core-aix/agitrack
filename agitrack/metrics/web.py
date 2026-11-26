@@ -1827,6 +1827,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .loghead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
 .loghead h2.section{margin:0}
 .logsort{display:flex;align-items:center;gap:8px}
+/* Opens (or closes) every "show answer" on the timeline page at once. Link-styled like them. */
+.allans{font:inherit;font-size:12.5px;color:var(--phosphor);background:none;border:0;border-bottom:1px solid var(--phosphor-dim);
+  padding:0 1px;cursor:pointer;margin-left:auto;white-space:nowrap}
+.allans:hover{color:var(--ink);background:var(--phosphor)}
 .logsort label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
 .logsort select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:13px;padding:5px 26px 5px 10px;cursor:pointer;
@@ -2347,6 +2351,7 @@ __UPDATE_BANNER__
       <button class="logtab" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
+    <button class="allans" id="allanswers" type="button" hidden>show all answers</button>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="oldest">oldest first</option>
@@ -3175,6 +3180,22 @@ function placeAnswerButton(el){
   if(!el.classList.contains("clamp") && last){ if(btn.parentNode !== last) last.append(btn); }
   else if(foot && btn.parentNode !== foot) foot.append(btn);
 }
+// The page-wide toggle: "show all answers" opens every answer on this timeline page; once all of
+// them are open it reads "hide all answers" and closes them. Visible on the timeline tab only.
+function syncAllAnswers(){
+  const all = $("allanswers");
+  if(!all) return;
+  const buttons = [...document.querySelectorAll("#commitlog .tans")];
+  all.hidden = LOGTAB !== "timeline" || !buttons.length || !$("pane-files") || !$("pane-files").hidden;
+  const allOpen = buttons.length && buttons.every(b => b.getAttribute("aria-expanded") === "true");
+  all.textContent = allOpen ? "hide all answers" : "show all answers";
+}
+function toggleAllAnswers(){
+  const buttons = [...document.querySelectorAll("#commitlog .tans")];
+  const allOpen = buttons.every(b => b.getAttribute("aria-expanded") === "true");
+  for(const b of buttons) if((b.getAttribute("aria-expanded") === "true") === allOpen) toggleAnswer(b);
+  syncAllAnswers();
+}
 function toggleAnswer(btn){
   const el = btn.closest(".tprompt");
   const open = el.querySelector(".tanswer");
@@ -3356,6 +3377,7 @@ function renderLog(){
     setMessageToggle(el);
   });
   document.querySelectorAll("#commitlog .tprompt").forEach(placeAnswerButton);
+  syncAllAnswers();
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
     if(p===cur) return;
@@ -4002,6 +4024,7 @@ function showLogTab(tab){
   if(tab !== "files"){ try{ localStorage.setItem(LOGTAB_KEY, tab); }catch(e){} }
   if(pc) pc.hidden = !commitish;
   if(pf) pf.hidden = tab !== "files";
+  syncAllAnswers();
   // The tabs and the pane's own control (sort / file filter) share one row, so the control
   // has to follow the tab.
   // The file filter does nothing in the commit view, so it is only there for the files tab,
@@ -4162,6 +4185,7 @@ function hoverScrollSelect(sel){
 }
 function wireControls(){
   document.querySelectorAll(".controls .field select").forEach(hoverScrollSelect);
+  $("allanswers").onclick = toggleAllAnswers;
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
   $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
@@ -4220,7 +4244,7 @@ function wireControls(){
     if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const ansBtn = e.target.closest(".tans");
-    if(ansBtn){ toggleAnswer(ansBtn); return; }
+    if(ansBtn){ toggleAnswer(ansBtn); syncAllAnswers(); return; }
     const more = e.target.closest(".tmore");
     if(more){
       const el = more.closest(".tprompt");
