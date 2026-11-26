@@ -629,6 +629,125 @@ def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
     assert dash.by_backend["claude"]["commits"] == 1
 
 
+def test_the_backend_and_model_filters_look_inside_a_squash(tmp_path):
+    # One commit can hold turns run on different backends and models (a GitHub squash, or a
+    # commit that folded several turns), but it is labelled with the dominant part's alone, so
+    # filtering on the other one dropped it. The filters now judge a squash by its parts: it
+    # stays when any part matches, the panels count only the matching parts' tokens, the log
+    # keeps the whole commit and marks the parts that matched, and the dropdowns offer every
+    # backend and model a part ran on.
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+    from agitrack.metrics.web import aggregates_payload, log_page
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "squashed.txt", 10)
+    repo.commit(
+        "Mixed work (#9)\n\n"
+        "* claude did most of it\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 1000\ntokens_since_last_commit_input: 500\n\n"
+        "* codex did a bit\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: codex\nmodel: gpt-5.5\n"
+        "tokens_since_last_commit_output: 40\ntokens_since_last_commit_input: 20\n"
+    )
+    _write_lines(repo, "plain.txt", 3)
+    repo.commit(
+        "<aGiTrack> plain\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 7\n"
+    )
+    dash = build_dashboard(repo)
+    squash = next(s for s in dash.stats if s.subject.startswith("Mixed"))
+    assert (squash.backend, squash.model) == ("claude", "claude-opus-4-8")  # labelled with the dominant part
+
+    opts = aggregates_payload(dash)["options"]
+    assert "codex" in opts["backends"] and "gpt-5.5" in opts["models"]
+
+    for query in ({"backend": "codex"}, {"model": "gpt-5.5"}):
+        agg = aggregates_payload(dash, **query)["agg"]
+        assert agg["total"] == 1
+        assert agg["tokens"]["output"] == 40  # the codex part only, not the claude part's 1000
+        assert set(agg["by_backend"]) == {"codex"} and set(agg["by_model"]) == {"gpt-5.5"}
+        log = log_page(dash, **query)
+        (entry,) = log["entries"]
+        assert entry["subject"].startswith("Mixed")
+        assert entry["engine_matches"] == 1 and len(entry["parts"]) == 2  # whole commit, one part marked
+        assert [bool(p.get("engine_match")) for p in entry["parts"]] == [True, False]  # newest first
+
+    claude = aggregates_payload(dash, backend="claude")["agg"]
+    assert claude["total"] == 2 and claude["tokens"]["output"] == 1007
+    assert aggregates_payload(dash, backend="opencode")["agg"]["total"] == 0
+    assert "engine_matches" not in log_page(dash)["entries"][0]  # no filter, no marks
+
+    # The squash's row says how many of its parts ran on the filtered model.
+    drawn = _render_log(
+        log_page(dash, model="gpt-5.5")["entries"], tmp_path, setup='LOGTAB = "commits"; state.model = "gpt-5.5"; '
+    )
+    assert "1 on this model" in drawn
+
+    # The live endpoints answer the same way.
+    scope = RepoScope(repo)
+    body = _json.loads(scope.get("/log", {"model": ["gpt-5.5"]}).body)
+    assert [e["subject"] for e in body["entries"]] == ["Mixed work (#9)"]
+
+
+def test_a_filtered_timeline_shows_only_what_was_asked_of_the_matching_parts(tmp_path):
+    # With a backend or model filter, a squash is in the timeline for its matching parts, so only
+    # THEIR messages are shown, each naming the backend/model it was asked of. Opening the commit
+    # still shows every part (the matching ones marked), and the message links still point at the
+    # right place in it.
+    from agitrack.metrics.web import log_page
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "squashed.txt", 10)
+    repo.commit(
+        "Mixed work (#9)\n\n"
+        "* claude part\n\n# Interaction Trace\n\n## User\n\nAPPLE question\n\n## Agent\n\nok\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "agent_started_at: 2026-11-20T10:00:00Z\ntokens_since_last_commit_output: 1000\n\n"
+        "* codex part\n\n# Interaction Trace\n\n## User\n\nBANANA question\n\n## Agent\n\nok\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: codex\nmodel: gpt-5.5\n"
+        "agent_started_at: 2026-11-20T11:00:00Z\ntokens_since_last_commit_output: 40\n"
+    )
+    dash = build_dashboard(repo)
+
+    def messages(page):
+        out = []
+        for i, seq in page["items"]:
+            if seq:
+                prompts = [(p, t) for t in page["entries"][i]["turns"] for p in t["prompts"]]
+                out.append(prompts[seq - 1])
+        return out
+
+    whole = log_page(dash, view="timeline")
+    assert sorted(p for p, _ in messages(whole)) == ["APPLE question", "BANANA question"]
+
+    for query in ({"backend": "codex"}, {"model": "gpt-5.5"}):
+        page = log_page(dash, view="timeline", **query)
+        found = messages(page)
+        assert [p for p, _ in found] == ["BANANA question"]
+        assert (found[0][1]["backend"], found[0][1]["model"]) == ("codex", "gpt-5.5")
+        (entry,) = page["entries"]
+        assert len(entry["parts"]) == 2 and entry["engine_matches"] == 1  # the commit stays whole
+        assert found[0][1]["path"] == [0]  # newest-first parts: the codex part is shown first
+
+    claude = messages(log_page(dash, view="timeline", backend="claude"))
+    assert [p for p, _ in claude] == ["APPLE question"]
+
+    # Each message names the backend / model it was asked of.
+    drawn = _render_log(
+        log_page(dash, view="timeline", model="gpt-5.5")["entries"],
+        tmp_path,
+        setup='LOGTAB = "timeline"; state.model = "gpt-5.5"; ',
+    )
+    assert "BANANA" in drawn and "APPLE" not in drawn
+    assert '<span class="teng" title="asked of the backend / model you filtered by">gpt-5.5</span>' in drawn
+    assert 'class="teng"' not in _render_log(
+        log_page(dash, view="timeline")["entries"], tmp_path, setup='LOGTAB = "timeline"; '
+    )
+
+
 def test_same_commit_in_multiple_squashes_counts_tokens_once(tmp_path):
     # An original commit can be rolled into more than one squash (a branch is
     # squash-merged, then that result squashed again). Its metadata block — and so
@@ -2955,8 +3074,17 @@ def test_the_timeline_lists_each_turns_prompts_with_when_the_turn_began(tmp_path
             "prompts": ["rename the helper\nand its test"],
             "path": [1],
             "sections": [0],
+            "backend": "claude",  # what each turn ran on, for a backend/model-filtered timeline
+            "model": None,
         },
-        {"at": None, "prompts": ["fix the docs", "and the README"], "path": [0], "sections": [0, 1]},
+        {
+            "at": None,
+            "prompts": ["fix the docs", "and the README"],
+            "path": [0],
+            "sections": [0, 1],
+            "backend": "claude",
+            "model": None,
+        },
     ]
     assert _timeline_turns(stats["plain user commit"]) == []
 
@@ -2974,7 +3102,9 @@ def test_a_timeline_message_in_a_plain_commit_points_at_its_own_section(tmp_path
         "## User\n\nrename it\n\n## Agent\n\ndone\n\n# aGiTrack Metadata\ncommit_type: agent\n"
     )
     stat = next(s for s in build_dashboard(repo).stats if s.subject == "<aGiTrack> tidy")
-    assert _timeline_turns(stat) == [{"at": None, "prompts": ["rename it"], "path": [], "sections": [1]}]
+    assert _timeline_turns(stat) == [
+        {"at": None, "prompts": ["rename it"], "path": [], "sections": [1], "backend": None, "model": None}
+    ]
 
 
 def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
