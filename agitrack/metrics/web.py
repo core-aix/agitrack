@@ -909,7 +909,10 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     }
 
 
-def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
+Engine = tuple[str, str]  # (backend, model) the log is filtered to; empty strings for "any"
+
+
+def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = (), engine: Engine = ("", "")) -> list[dict]:
     """The turns behind a commit, oldest first, each with when it began (``at``, epoch seconds,
     None when the turn recorded no start) and every message the user sent in it, in full, for
     the log's timeline view. A squash or a fold has one turn per part (recursively); the fold's
@@ -920,11 +923,18 @@ def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
     timeline's link can open that place and mark the message: ``path`` is the part's position
     in the displayed parts tree (newest first, as :func:`_display_parts` orders it; empty for
     the commit's own message), and ``sections`` gives, per prompt, which ``## User`` section of
-    that message's interaction trace it is."""
+    that message's interaction trace it is.
+
+    Each turn also names the ``backend`` and ``model`` it ran on. With *engine* set (a backend or
+    model filter), a squashed part that did not run on it contributes no turn: the squash is in
+    the filtered log because of its matching parts, and the timeline shows only what was asked
+    of them. A commit that is not a squash already matched the filter as a whole."""
     parts = list(stat.constituents)
     if parts and _is_own_lead(parts[0], stat):
         parts = parts[1:]
     if not parts:
+        if path and any(engine) and not _part_matches_engine(stat, *engine):
+            return []
         found = _trace_user_sections(stat.message)
         if not found:
             return []
@@ -934,6 +944,8 @@ def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
             "prompts": [text for _, text in found],
             "path": list(path),
             "sections": [ordinal for ordinal, _ in found],
+            "backend": stat.backend,
+            "model": stat.model,
         }
         sent = _user_message_times(stat)
         if any(sent):
@@ -943,7 +955,7 @@ def _timeline_turns(stat: CommitStat, path: tuple[int, ...] = ()) -> list[dict]:
             turn["times"] = [(sent[k] if k < len(sent) else None) or at for k, _ in found]
         return [turn]
     last = len(parts) - 1
-    return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j))]
+    return [turn for j, part in enumerate(parts) for turn in _timeline_turns(part, (*path, last - j), engine)]
 
 
 def _user_message_times(stat: CommitStat) -> list[float | None]:
@@ -1024,7 +1036,7 @@ def log_page(
     limit = max(1, min(limit, 200))
     items: list[tuple[int, int]] | None = None
     if view == "timeline":
-        rows = _timeline_rows(stats, sort)
+        rows = _timeline_rows(stats, sort, (backend, model))
         if at_commit is not None:
             offset = next((n for n, row in enumerate(rows) if row == (at_commit, 0)), 0)
         offset = min(offset, max(len(rows) - 1, 0)) // limit * limit
@@ -1039,6 +1051,9 @@ def log_page(
         _with_engine_matches(_with_part_matches(_log_entry(dash, stat, covers), text, text_in), backend, model)
         for stat in page
     ]
+    if backend or model:
+        for stat, entry in zip(page, entries):
+            entry["turns"] = _timeline_turns(stat, engine=(backend, model))
     payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
     if items is not None:
         local = {index: k for k, index in enumerate(shown)}
@@ -1056,7 +1071,7 @@ def log_page(
     return payload
 
 
-def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
+def _timeline_rows(stats: list[CommitStat], sort: str, engine: Engine = ("", "")) -> list[tuple[int, int]]:
     """Every row the timeline shows, in the order it shows them: ``(index, seq)`` with ``index``
     the commit's place in ``stats`` and ``seq`` 0 for the commit itself, n for its n-th message
     (oldest first). A page is a slice of these, so it holds exactly ``limit`` rows whether they
@@ -1067,7 +1082,7 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
     comes before the commit it went into. The page script draws the rows in exactly this order."""
     by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
     oldest = sort == "oldest"
-    repeats = _repeated_messages(stats)
+    repeats = _repeated_messages(stats, engine)
     keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
         commit_time = stat.timestamp or 0
@@ -1080,7 +1095,7 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
                 keyed.append(((commit_time, index, 1, 0), (index, 0)))
             else:
                 keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
-        for seq, at in enumerate(_prompt_times(stat), start=1):
+        for seq, at in enumerate(_prompt_times(stat, engine), start=1):
             if (index, seq) in repeats:
                 continue
             when = at or commit_time
@@ -1092,7 +1107,7 @@ def _timeline_rows(stats: list[CommitStat], sort: str) -> list[tuple[int, int]]:
     return [row for _, row in keyed]
 
 
-def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
+def _repeated_messages(stats: list[CommitStat], engine: Engine = ("", "")) -> set[tuple[int, int]]:
     """The ``(index, seq)`` of every message the timeline already shows from an EARLIER record of
     the same turn. A commit made while a turn is still running carries the turn as it stood, and
     the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
@@ -1105,7 +1120,7 @@ def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
     seen: set[tuple[float, str]] = set()
     repeats: set[tuple[int, int]] = set()
     for index in sorted(range(len(stats)), key=lambda k: (stats[k].pending, stats[k].timestamp or 0)):
-        for seq, key in enumerate(_prompt_keys(stats[index]), start=1):
+        for seq, key in enumerate(_prompt_keys(stats[index], engine), start=1):
             if key is None:
                 continue
             if key in seen:
@@ -1117,11 +1132,11 @@ def _repeated_messages(stats: list[CommitStat]) -> set[tuple[int, int]]:
 
 # The identity of each of a commit's messages, oldest first: when it was SENT and what it said
 # (None where its turn recorded no start), by commit.
-_PROMPT_KEYS: dict[tuple[str, int], tuple[tuple[float, str] | None, ...]] = {}
+_PROMPT_KEYS: dict[tuple, tuple[tuple[float, str] | None, ...]] = {}
 
 
-def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
-    key = (stat.sha, len(stat.message))
+def _prompt_keys(stat: CommitStat, engine: Engine = ("", "")) -> tuple[tuple[float, str] | None, ...]:
+    key = (stat.sha, len(stat.message), engine)
     found = _PROMPT_KEYS.get(key)
     if found is None:
         if len(_PROMPT_KEYS) > 50_000:
@@ -1136,8 +1151,8 @@ def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
             # and the message was shown twice (seen live, on most queued follow-ups).
             (at, " ".join(text.split())) if at else None
             for at, text in zip(
-                _prompt_times(stat),
-                (text for turn in _timeline_turns(stat) for text in turn["prompts"]),
+                _prompt_times(stat, engine),
+                (text for turn in _timeline_turns(stat, engine=engine) for text in turn["prompts"]),
             )
         )
     return found
@@ -1146,18 +1161,18 @@ def _prompt_keys(stat: CommitStat) -> tuple[tuple[float, str] | None, ...]:
 # When each of a commit's messages was sent, oldest first (None where its turn recorded no
 # start), by commit. A commit's message never changes, so this is worked out once; every
 # timeline page request needs it for the whole filtered history.
-_PROMPT_TIMES: dict[tuple[str, int], tuple[float | None, ...]] = {}
+_PROMPT_TIMES: dict[tuple, tuple[float | None, ...]] = {}
 
 
-def _prompt_times(stat: CommitStat) -> tuple[float | None, ...]:
-    key = (stat.sha, len(stat.message))
+def _prompt_times(stat: CommitStat, engine: Engine = ("", "")) -> tuple[float | None, ...]:
+    key = (stat.sha, len(stat.message), engine)
     times = _PROMPT_TIMES.get(key)
     if times is None:
         if len(_PROMPT_TIMES) > 50_000:
             _PROMPT_TIMES.clear()
         times = _PROMPT_TIMES[key] = tuple(
             (turn.get("times") or [turn["at"]] * len(turn["prompts"]))[k]
-            for turn in _timeline_turns(stat)
+            for turn in _timeline_turns(stat, engine=engine)
             for k in range(len(turn["prompts"]))
         )
     return times
@@ -1792,6 +1807,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .tprompt .twho{color:var(--ops);letter-spacing:.5px;font-size:11px}
 .tprompt .twho .tid{font-weight:600}
 .tprompt .when{font-variant-numeric:tabular-nums;white-space:nowrap}
+.tprompt .teng{color:var(--ops);border:1px solid var(--ops);border-radius:2px;padding:0 5px;font-size:11px;white-space:nowrap}
 .tprompt .tgo{margin-left:auto;white-space:nowrap;font:inherit;font-size:11.5px;color:var(--amber);background:none;border:0;padding:0;cursor:pointer}
 .tprompt .tgo:hover{text-decoration:underline}
 .tprompt .tgo .tsha{font-variant-numeric:tabular-nums}
@@ -2920,8 +2936,12 @@ function timelineHtml(entries, commitRow){
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
         const sent = (turn.times || [])[k] || turn.at;
+        // Filtered by backend or model: each message names the one it was asked of, so a squash
+        // shown for one of its parts reads as that part's conversation.
+        const eng = [state.backend && (turn.backend || state.backend), state.model && (turn.model || state.model)]
+          .filter(Boolean).join(" · ");
         items.push({t: sent || c.ts || 0, approx: !sent, follow: k > 0, own: sent !== turn.at, seq: ++seq, i, text,
-          path: turn.path || [], sec: (turn.sections || [])[k]});
+          path: turn.path || [], sec: (turn.sections || [])[k], eng});
       });
     }
   });
@@ -2953,8 +2973,9 @@ function timelineHtml(entries, commitRow){
     const target = c.pending
       ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
       : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
+    const eng = it.eng ? `<span class="teng" title="asked of the backend / model you filtered by">${esc(it.eng)}</span>` : "";
     return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
-      `${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
+      `${eng}${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button></div>`;
   }).join("");
 }
