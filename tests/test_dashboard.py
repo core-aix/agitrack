@@ -629,6 +629,69 @@ def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
     assert dash.by_backend["claude"]["commits"] == 1
 
 
+def test_the_backend_and_model_filters_look_inside_a_squash(tmp_path):
+    # One commit can hold turns run on different backends and models (a GitHub squash, or a
+    # commit that folded several turns), but it is labelled with the dominant part's alone, so
+    # filtering on the other one dropped it. The filters now judge a squash by its parts: it
+    # stays when any part matches, the panels count only the matching parts' tokens, the log
+    # keeps the whole commit and marks the parts that matched, and the dropdowns offer every
+    # backend and model a part ran on.
+    import json as _json
+
+    from agitrack.metrics.server import RepoScope
+    from agitrack.metrics.web import aggregates_payload, log_page
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "squashed.txt", 10)
+    repo.commit(
+        "Mixed work (#9)\n\n"
+        "* claude did most of it\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 1000\ntokens_since_last_commit_input: 500\n\n"
+        "* codex did a bit\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: codex\nmodel: gpt-5.5\n"
+        "tokens_since_last_commit_output: 40\ntokens_since_last_commit_input: 20\n"
+    )
+    _write_lines(repo, "plain.txt", 3)
+    repo.commit(
+        "<aGiTrack> plain\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 7\n"
+    )
+    dash = build_dashboard(repo)
+    squash = next(s for s in dash.stats if s.subject.startswith("Mixed"))
+    assert (squash.backend, squash.model) == ("claude", "claude-opus-4-8")  # labelled with the dominant part
+
+    opts = aggregates_payload(dash)["options"]
+    assert "codex" in opts["backends"] and "gpt-5.5" in opts["models"]
+
+    for query in ({"backend": "codex"}, {"model": "gpt-5.5"}):
+        agg = aggregates_payload(dash, **query)["agg"]
+        assert agg["total"] == 1
+        assert agg["tokens"]["output"] == 40  # the codex part only, not the claude part's 1000
+        assert set(agg["by_backend"]) == {"codex"} and set(agg["by_model"]) == {"gpt-5.5"}
+        log = log_page(dash, **query)
+        (entry,) = log["entries"]
+        assert entry["subject"].startswith("Mixed")
+        assert entry["engine_matches"] == 1 and len(entry["parts"]) == 2  # whole commit, one part marked
+        assert [bool(p.get("engine_match")) for p in entry["parts"]] == [True, False]  # newest first
+
+    claude = aggregates_payload(dash, backend="claude")["agg"]
+    assert claude["total"] == 2 and claude["tokens"]["output"] == 1007
+    assert aggregates_payload(dash, backend="opencode")["agg"]["total"] == 0
+    assert "engine_matches" not in log_page(dash)["entries"][0]  # no filter, no marks
+
+    # The squash's row says how many of its parts ran on the filtered model.
+    drawn = _render_log(
+        log_page(dash, model="gpt-5.5")["entries"], tmp_path, setup='LOGTAB = "commits"; state.model = "gpt-5.5"; '
+    )
+    assert "1 on this model" in drawn
+
+    # The live endpoints answer the same way.
+    scope = RepoScope(repo)
+    body = _json.loads(scope.get("/log", {"model": ["gpt-5.5"]}).body)
+    assert [e["subject"] for e in body["entries"]] == ["Mixed work (#9)"]
+
+
 def test_same_commit_in_multiple_squashes_counts_tokens_once(tmp_path):
     # An original commit can be rolled into more than one squash (a branch is
     # squash-merged, then that result squashed again). Its metadata block — and so

@@ -24,6 +24,7 @@ and ad-hoc use; the live page does not embed it.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -341,8 +342,9 @@ def dashboard_data(dash: Dashboard) -> dict:
         # Only committers who contributed lines — the same set the breakdown shows, so the
         # filter never offers a name whose row is not there (see Dashboard.by_author).
         "committers": sorted(a for a in dash.committers_with_lines() if a),
-        "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
-        "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
+        # Every backend/model a commit or a squashed part ran on, as the live filter offers.
+        "backends": _options(dash)["backends"],
+        "models": _options(dash)["models"],
         "meta_fields": metadata_filter_fields(dash),
         "commits": commits,
     }
@@ -588,6 +590,39 @@ def _numeric_sort_key(value: str) -> float:
         return 0.0
 
 
+_AI_PART_KINDS = ("agent", "covered", "agent-merge")
+
+
+def _part_matches_engine(part: CommitStat, backend: str, model: str) -> bool:
+    """Whether a squashed part (recursively, for a nested squash) holds a turn run on *backend*
+    and *model* (either may be empty, meaning any)."""
+    if part.constituents:
+        return any(_part_matches_engine(child, backend, model) for child in part.constituents)
+    if part.kind not in _AI_PART_KINDS:
+        return False
+    return (not backend or part.backend == backend) and (not model or part.model == model)
+
+
+def _narrowed_to_engine(stat: CommitStat, backend: str, model: str) -> CommitStat | None:
+    """*stat* as seen through a backend/model filter, or None when nothing in it matches.
+
+    A squash (a GitHub squash merge, or a commit that folded several turns) can hold turns run on
+    different backends and models, so it is judged by its PARTS, not by the single dominant
+    backend/model it is labelled with: it stays in the slice when any part matches, narrowed to
+    those parts so the panels count only their tokens and cost. Its lines are one combined diff
+    that cannot be split by part, so they stay the commit's."""
+    parts = [part for part in stat.constituents if _part_matches_engine(part, backend, model)]
+    if not parts:
+        return None
+    parts = [_narrowed_to_engine(part, backend, model) or part if part.constituents else part for part in parts]
+    tokens: dict[str, int] = {}
+    for part in parts:
+        for key, value in part.tokens.items():
+            tokens[key] = tokens.get(key, 0) + value
+    dominant = max(parts, key=lambda part: part.tokens.get("output", 0))
+    return dataclasses.replace(stat, constituents=parts, tokens=tokens, backend=dominant.backend, model=dominant.model)
+
+
 def _filter_stats(
     dash: Dashboard,
     *,
@@ -597,7 +632,11 @@ def _filter_stats(
     frm: int,
     to: int,
     meta: list[tuple[str, str, str]] | None = None,
+    narrow: bool = True,
 ) -> list[CommitStat]:
+    """The commits the filters select. A squashed commit passes the backend/model filter when
+    any of its parts does; with *narrow* (the panels) it is replaced by a copy holding only the
+    matching parts, while the log (``narrow=False``) keeps the whole commit and marks them."""
     covers = _covers(dash)
     out: list[CommitStat] = []
     for stat in dash.stats:
@@ -605,17 +644,34 @@ def _filter_stats(
             continue
         if meta and not _passes_meta(stat, meta):
             continue
+        if frm and (not stat.timestamp or stat.timestamp < frm):
+            continue
+        if to and (not stat.timestamp or stat.timestamp > to):
+            continue
+        if (backend or model) and stat.constituents:
+            narrowed = _narrowed_to_engine(stat, backend, model)
+            if narrowed is None:
+                continue
+            out.append(narrowed if narrow else stat)
+            continue
         eff_backend, eff_model = _effective(stat, covers)
         if backend and eff_backend != backend:
             continue
         if model and eff_model != model:
             continue
-        if frm and (not stat.timestamp or stat.timestamp < frm):
-            continue
-        if to and (not stat.timestamp or stat.timestamp > to):
-            continue
         out.append(stat)
     return out
+
+
+def _ai_parts(stat: CommitStat) -> list[CommitStat]:
+    """Every AI turn a squash holds, nested squashes flattened."""
+    found: list[CommitStat] = []
+    for part in stat.constituents:
+        if part.constituents:
+            found.extend(_ai_parts(part))
+        elif part.kind in _AI_PART_KINDS:
+            found.append(part)
+    return found
 
 
 def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
@@ -760,6 +816,13 @@ def _options(dash: Dashboard) -> dict:
             backends.add(eff_backend)
         if eff_model:
             models.add(eff_model)
+        # A squash can hold turns on several backends and models; each is selectable, not
+        # only the dominant one the commit is labelled with.
+        for part in _ai_parts(stat):
+            if part.backend:
+                backends.add(part.backend)
+            if part.model:
+                models.add(part.model)
     return {
         "committers": sorted(c for c in committers if c),
         "backends": sorted(backends),
@@ -953,7 +1016,7 @@ def log_page(
 
     When ``repo`` is given, the page's commits get their line counts from the cache or the
     local blobs, never by fetching (see :func:`agitrack.metrics.collect.apply_numstat_for`)."""
-    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta)
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to, meta=meta, narrow=False)
     stats = _text_filtered(stats, text, text_in)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
@@ -972,7 +1035,10 @@ def log_page(
         page = stats[offset : offset + limit]
     if repo is not None and page:
         apply_numstat_for(repo, [stat.sha for stat in page], {stat.sha: stat for stat in page})
-    entries = [_with_part_matches(_log_entry(dash, stat, covers), text, text_in) for stat in page]
+    entries = [
+        _with_engine_matches(_with_part_matches(_log_entry(dash, stat, covers), text, text_in), backend, model)
+        for stat in page
+    ]
     payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
     if items is not None:
         local = {index: k for k, index in enumerate(shown)}
@@ -1095,6 +1161,35 @@ def _prompt_times(stat: CommitStat) -> tuple[float | None, ...]:
             for k in range(len(turn["prompts"]))
         )
     return times
+
+
+def _with_engine_matches(entry: dict, backend: str, model: str) -> dict:
+    """With a backend or model filter on, flag each squashed part that holds a turn run on it
+    (``engine_match``, recursively) and count them on the entry (``engine_matches``): the squash
+    is in the log because of those parts, and the reader should not have to open every part to
+    find them."""
+    if not (backend or model):
+        return entry
+    count = _mark_engine_parts(entry.get("parts") or [], backend, model)
+    if count:
+        entry["engine_matches"] = count
+    return entry
+
+
+def _mark_engine_parts(parts: list[dict], backend: str, model: str) -> int:
+    count = 0
+    for part in parts:
+        inner = _mark_engine_parts(part.get("parts") or [], backend, model)
+        own = (
+            not part.get("parts")
+            and part.get("kind") in _AI_PART_KINDS
+            and (not backend or part.get("backend") == backend)
+            and (not model or part.get("model") == model)
+        )
+        if own or inner:
+            part["engine_match"] = True
+            count += 1
+    return count
 
 
 def _with_part_matches(entry: dict, text: str, text_in: str) -> dict:
@@ -2879,7 +2974,8 @@ function renderLog(){
     const anom = c.token_anomaly?`<span class="badge anomaly" title="This commit re-exported conversation history that earlier commits already accounted for (a lost watermark on an older aGiTrack), so its token counts are excluded from every total.">tokens excluded</span>`:"";
     // With a search on, a squash also says how many of its parts match, so the reader can tell
     // which squash is worth opening without opening each one.
-    const pm = c.part_matches ? ` · <span class="pmatch">${c.part_matches} matching part${c.part_matches===1?"":"s"}</span>` : "";
+    const pm = (c.part_matches ? ` · <span class="pmatch">${c.part_matches} matching part${c.part_matches===1?"":"s"}</span>` : "") +
+      (c.engine_matches ? ` · <span class="pmatch" title="parts run on the backend / model you filtered by">${c.engine_matches} on this ${state.model ? "model" : "backend"}</span>` : "");
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed${pm}</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
@@ -2993,6 +3089,7 @@ function partsHtml(parts){
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
       `<span class="psubj">${esc(p.subject||"(no subject)")}</span>`+
       (p.match ? `<span class="pmatch" title="this part contains what you searched for">match</span>` : "")+
+      (p.engine_match ? `<span class="pmatch" title="this part ran on the backend / model you filtered by">${esc(state.model || state.backend)}</span>` : "")+
       `${right}</summary>`+
       (buttons ? `<div class="dhead">${buttons}</div>${boxes}` : "")+
       `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
