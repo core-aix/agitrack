@@ -743,9 +743,9 @@ def test_a_filtered_timeline_shows_only_what_was_asked_of_the_matching_parts(tmp
     )
     assert "BANANA" in drawn and "APPLE" not in drawn
     assert '<span class="teng" title="asked of the backend / model you filtered by">gpt-5.5</span>' in drawn
-    assert 'class="teng"' not in _render_log(
-        log_page(dash, view="timeline")["entries"], tmp_path, setup='LOGTAB = "timeline"; '
-    )
+    # Unfiltered, a commit holding turns from two backends names each message's backend too.
+    whole_drawn = _render_log(log_page(dash, view="timeline")["entries"], tmp_path, setup='LOGTAB = "timeline"; ')
+    assert ">claude · claude-opus-4-8</span>" in whole_drawn and ">codex · gpt-5.5</span>" in whole_drawn
 
 
 def test_a_subagent_block_an_older_version_repeated_on_every_turn_is_counted_once(tmp_path):
@@ -4104,7 +4104,7 @@ def test_show_answer_says_when_the_rest_of_a_reply_is_not_recorded_yet(tmp_path)
     turn = log_page(build_dashboard(repo), view="timeline")["entries"][0]["turns"][0]
     assert turn["unfinished"] == [0, 1] and "later" not in turn and "owner" not in turn
     html = shell_html(_seeded(tmp_path / "s"))
-    assert "the rest of its reply is not recorded yet" in html and "agent had said so far" in html
+    assert "the rest of its reply is not recorded yet" in html and "had said so far" in html
 
 
 def test_show_answer_finds_the_rest_of_a_reply_an_older_version_cut_short(tmp_path):
@@ -4128,3 +4128,90 @@ def test_show_answer_finds_the_rest_of_a_reply_an_older_version_cut_short(tmp_pa
     turns = {t["prompts"][0]: t for e in entries for t in e.get("turns", [])}
     assert turns["REVISE figure 2"]["later"]["0"]["text"] == "Figure 2 now shows both."
     assert "later" not in turns["SEPARATE question"] and "unfinished" not in turns["SEPARATE question"]
+
+
+def test_a_commit_holding_two_backends_turns_names_which_agent_asked_and_answered(tmp_path, monkeypatch):
+    # Claude and Codex worked alternately on one repository: Claude's own commit folded a Codex
+    # turn whose edits were still uncommitted, so the commit row shows Claude's subject and model
+    # above a Codex message (seen live). Each message now names its backend, and its answer says
+    # which agent replied. The Codex turn ended on a usage limit before any final reply, which an
+    # older aGiTrack did not record: its early words ("I'll revise Figure 2") read as the whole
+    # reply. The local rollout says why it stopped, and the answer box says so.
+    from agitrack.metrics.web import log_page
+    from datetime import datetime
+
+    from agitrack.transcripts import codex
+
+    started = "2026-11-20T23:34:00Z"
+    epoch = int(datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+    monkeypatch.setattr(
+        codex, "turn_errors", lambda session: {epoch: "You have hit your usage limit."} if session == "cx" else {}
+    )
+
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 3)
+    repo.commit(
+        "Claude's work\n\n"
+        "* claude part\n\n# Interaction Trace\n\n## User\n\nCLAUDE question\n\n## Agent\n\nCLAUDE answer\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: opus\nbackend_session_id: cl\n"
+        "agent_started_at: 2026-11-20T23:40:00Z\ntokens_since_last_commit_output: 10\n\n"
+        "* codex part\n\n# Interaction Trace\n\n## User\n\nCODEX question\n\n## Agent\n\nI'll revise Figure 2.\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: codex\nmodel: gpt\nbackend_session_id: cx\n"
+        f"agent_started_at: {started}\ntokens_since_last_commit_output: 5\n"
+    )
+    entries = log_page(build_dashboard(repo), view="timeline")["entries"]
+    turns = {t["prompts"][0]: t for t in entries[0]["turns"]}
+    assert turns["CODEX question"]["ended"] == {"0": "You have hit your usage limit."}
+    assert "ended" not in turns["CLAUDE question"]
+
+    probe = (
+        "const _r = renderLog; renderLog = () => { _r(); const out = {};"
+        " LOGPAGE.entries.forEach((c, i) => (c.turns || []).forEach(t => t.prompts.forEach((p, k) => {"
+        "   let box = null; const el = {querySelector: s => s === '.tanswer' ? null : {after: b => { box = b; }}};"
+        "   toggleAnswer({dataset: {ans: String(i), path: (t.path || []).join('.'), sec: String(t.sections[k])},"
+        "     closest: () => el, setAttribute: () => {}, textContent: ''});"
+        "   out[p] = box ? box.innerHTML : null; })));"
+        " $('commitlog').innerHTML += '@@' + JSON.stringify(out); };"
+    )
+    drawn = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ' + probe)
+    page, answers = drawn.split("@@", 1)
+    answers = json.loads(answers)
+    assert ">codex · gpt</span>" in page and ">claude · opus</span>" in page
+    assert "claude replied" in answers["CLAUDE question"] and "CLAUDE answer" in answers["CLAUDE question"]
+    codex_box = answers["CODEX question"]
+    assert "codex had said so far" in codex_box and "the turn ended without a final reply" in codex_box
+    assert "codex reported: You have hit your usage limit." in codex_box
+
+
+def test_codex_turn_errors_reads_a_turn_ended_before_any_final_reply(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    from agitrack.transcripts import codex
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    session = "01a1f96b-eb01-7db3-a4d2-1e1c650959fd"
+    folder = tmp_path / "sessions" / "2026" / "11" / "20"
+    folder.mkdir(parents=True)
+    rows = [
+        {"timestamp": "2026-11-20T23:28:16.519Z", "type": "event_msg", "payload": {"type": "task_started"}},
+        {
+            "timestamp": "2026-11-20T23:32:18.657Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "Figure 2 now shows it."},
+        },
+        {"timestamp": "2026-11-20T23:34:00.327Z", "type": "event_msg", "payload": {"type": "task_started"}},
+        {
+            "timestamp": "2026-11-20T23:36:34.776Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "last_agent_message": None,
+                "error": {"message": "You have hit your usage limit.", "codex_error_info": "usage_limit_exceeded"},
+            },
+        },
+    ]
+    path = folder / f"rollout-2026-11-20T14-46-01-{session}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    at = int(datetime.fromisoformat("2026-11-20T23:34:00+00:00").timestamp())
+    assert codex.turn_errors(session) == {at: "You have hit your usage limit."}
+    assert codex.turn_errors("missing") == {}

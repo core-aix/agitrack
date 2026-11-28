@@ -1206,6 +1206,33 @@ def _later_reply(index: _ReplyIndex, record: CommitStat, prompt: str, own: str, 
     return None
 
 
+_ENDED_NOTE = "The turn ended without a final reply from the agent"
+
+
+def _older_turn_error(record: CommitStat) -> str:
+    """Why the backend ended *record*'s turn before the agent's final reply, read from the local
+    Codex rollout, for a record an older aGiTrack wrote: it carries no "ended without a final
+    reply" note, so the agent's early words ("I'll revise Figure 2 ...") read as the whole reply.
+    "" for any other backend, a record that says so itself, or a rollout not on this machine."""
+    meta = record.metadata or {}
+    if str(meta.get("backend") or "") != "codex" or _ENDED_NOTE in record.message:
+        return ""
+    session, started = _session_of(record), str(meta.get("agent_started_at") or "")
+    if not session or not started:
+        return ""
+    try:
+        at = int(datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+        from agitrack.transcripts import codex
+
+        errors = codex.turn_errors(session)
+    except Exception:  # noqa: BLE001 - a display hint must never fail the page
+        return ""
+    for delta in (0, -1, 1, -2, 2):
+        if at + delta in errors:
+            return errors[at + delta]
+    return ""
+
+
 def _with_later_replies(entry: dict, stat: CommitStat, index_fn) -> dict:
     """Attach, per timeline message, the reply a later commit holds (``turn["later"][<sec>]``),
     and mark a message whose record stopped mid-turn with no later record of the rest yet
@@ -1217,6 +1244,7 @@ def _with_later_replies(entry: dict, stat: CommitStat, index_fn) -> dict:
             continue
         _, sections = _trace_roles(record.message)
         users = [k for k, (role, _) in enumerate(sections) if role == "User"]
+        last_reply: str | None = None
         for prompt, sec in zip(turn.get("prompts") or [], turn.get("sections") or []):
             if not 0 <= sec < len(users):
                 continue
@@ -1224,6 +1252,13 @@ def _with_later_replies(entry: dict, stat: CommitStat, index_fn) -> dict:
             found = _later_reply(index_fn(), record, prompt, own, running)
             if found:
                 turn.setdefault("later", {})[str(sec)] = found
+            elif not running:
+                # The record's last turn, ended by the backend before any final reply (an older
+                # record says nothing of it): the reply shown is only the agent's early words.
+                if last_reply is None:
+                    last_reply = _reply_after(sections, users[-1])[0]
+                if own == last_reply and (error := _older_turn_error(record)):
+                    turn.setdefault("ended", {})[str(sec)] = error
             elif running:
                 # Recorded, but its words were taken out since (the trace age limit, or
                 # `agitrack redact`): say so rather than "not recorded yet".
@@ -3423,9 +3458,17 @@ function toggleAnswer(btn){
   // the server attaches it per message (`turn.later`), naming the commit that holds it.
   const turn = c ? (c.turns || []).find(t => (t.path || []).join(".") === (btn.dataset.path || "") && (t.sections || []).includes(sec)) : null;
   const later = turn && turn.later ? turn.later[String(sec)] : null;
+  // Which agent answered: named when the commit holds turns from more than one backend.
+  const who = turn && turn.backend && mixedBackends(c) ? turn.backend : "agent";
+  // The backend ended the turn on an error before the agent's final reply (an older record
+  // shows the agent's early words as if they were the reply): `turn.ended` says why.
+  const ended = !later && turn && turn.ended ? turn.ended[String(sec)] : null;
+  const endNote = ended
+    ? `<div class="anote">the turn ended without a final reply from the agent, so this is only what it had said by then; ${esc(who === "agent" ? "the backend" : who)} reported: ${esc(ended)}</div>`
+    : "";
   const box = document.createElement("div");
   box.className = "tanswer";
-  const laterHtml = later ? `<div class="alabel">${found && found.text ? "the rest of the reply, " : "agent replied "}in a later commit${later.short ? ` <span class="tsha">${esc(later.short)}</span>` : ""}</div>`+
+  const laterHtml = later ? `<div class="alabel">${found && found.text ? "the rest of the reply, " : `${who} replied `}in a later commit${later.short ? ` <span class="tsha">${esc(later.short)}</span>` : ""}</div>`+
     `<div class="abody dmsg md">${md(later.text)}</div>` : "";
   // A commit made while the turn was still running, with nothing recording the rest yet: what
   // it holds is only what the agent had said by then.
@@ -3441,12 +3484,14 @@ function toggleAnswer(btn){
     const warn = others
       ? `<div class="awarn">answers this message together with ${others} other${others === 1 ? "" : "s"} ${when}, so it may not match this question exactly</div>`
       : "";
-    box.innerHTML = `<div class="alabel">${unfinished ? "agent had said so far" : "agent replied"}</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
-      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "") + (unfinished ? cutNote : "");
+    box.innerHTML = `<div class="alabel">${unfinished || ended ? `${who} had said so far` : `${who} replied`}</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
+      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "") + (unfinished ? cutNote : endNote);
   } else if(later){
     box.innerHTML = laterHtml;
   } else if(unfinished){
     box.innerHTML = cutNote;
+  } else if(ended){
+    box.innerHTML = endNote;
   } else {
     box.innerHTML = `<div class="anote">${c && c.pending
       ? "no reply recorded yet: the agent may still be working on it"
@@ -3459,23 +3504,34 @@ function toggleAnswer(btn){
   btn.textContent = "hide answer";
   btn.setAttribute("aria-expanded", "true");
 }
+// How many backends ran the turns a commit holds, when more than one (0 otherwise).
+function mixedBackends(c){
+  const seen = new Set((c && c.turns || []).map(t => t.backend).filter(Boolean));
+  return seen.size > 1 ? seen.size : 0;
+}
 function timelineHtml(entries, commitRow){
   const items = [];
   entries.forEach((c, i) => {
     items.push({t: c.ts || 0, commit: true, seq: 0, i});
     let seq = 0;
+    const mixed = mixedBackends(c);
     for(const turn of (c.turns || [])){
       (turn.prompts || []).forEach((text, k) => {
         const sent = (turn.times || [])[k] || turn.at;
         // Filtered by backend or model: each message names the one it was asked of, so a squash
-        // shown for one of its parts reads as that part's conversation.
-        const eng = [state.backend && (turn.backend || state.backend), state.model && (turn.model || state.model)]
+        // shown for one of its parts reads as that part's conversation. A commit holding turns
+        // run on different backends (one agent committed while another's turn was still
+        // uncommitted) names each message's backend too: its row shows only the one that made it.
+        const filtered = [state.backend && (turn.backend || state.backend), state.model && (turn.model || state.model)]
           .filter(Boolean).join(" · ");
+        const eng = filtered || (mixed ? [turn.backend, turn.model].filter(Boolean).join(" · ") : "");
+        const engTitle = filtered ? "asked of the backend / model you filtered by"
+          : `asked of this backend; the commit holds turns run on ${mixed} backends, and its row shows the one that made it`;
         const sec = (turn.sections || [])[k];
         // The entry this message is shown with: its own, or the later commit that answers it.
         const owner = turn.owner && turn.owner[String(sec)] != null ? turn.owner[String(sec)] : i;
         items.push({t: sent || c.ts || 0, approx: !sent, follow: k > 0, own: sent !== turn.at, seq: ++seq, i, text,
-          path: turn.path || [], sec, eng, owner});
+          path: turn.path || [], sec, eng, engTitle, owner});
       });
     }
   });
@@ -3515,7 +3571,7 @@ function timelineHtml(entries, commitRow){
       : BACKTRACE ? ""
       : o ? `<button class="tgo" data-go="${it.owner}" title="sent while the agent was working; a commit it made then (${esc(c.short || "")}) records it, and this commit holds the answer">answered in <span class="tsha">${esc(o.short || "")}</span> →</button>`
       : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
-    const eng = it.eng ? `<span class="teng" title="asked of the backend / model you filtered by">${esc(it.eng)}</span>` : "";
+    const eng = it.eng ? `<span class="teng" title="${esc(it.engTitle)}">${esc(it.eng)}</span>` : "";
     // The agent's reply, opened in place: no need to open the (possibly squashed) commit.
     const ans = it.sec == null ? "" : `<button class="tans" data-ans="${it.i}" ${where} aria-expanded="false" title="show what the agent answered, here">show answer</button>`;
     return `<div class="tprompt clamp" data-c="${it.i}" data-own="${it.owner != null ? it.owner : it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+

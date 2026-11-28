@@ -210,6 +210,49 @@ def session_transcript_path(session_id: str) -> Path | None:
     return None
 
 
+_TURN_ERRORS: dict[str, tuple[tuple[str, float, int], dict[int, str]]] = {}
+
+
+def turn_errors(session_id: str) -> dict[int, str]:
+    """``{turn start (epoch seconds): error}`` for the session's turns the backend ENDED on an
+    error before any final reply (a usage limit: ``task_complete`` with an ``error`` and no
+    ``last_agent_message``). The dashboard asks this of records an older aGiTrack wrote, which
+    show the agent's early words ("I'll revise Figure 2 ...") as if they were the reply. Memoized
+    on the rollout's path, mtime and size; {} when the rollout is not on this machine."""
+    path = session_transcript_path(session_id)
+    if path is None:
+        return {}
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (str(path), stat.st_mtime, stat.st_size)
+    cached = _TURN_ERRORS.get(session_id)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    found: dict[int, str] = {}
+    started: int | None = None
+    for row in _read_rows(path):
+        kind, payload_kind = _row_kind(row)
+        if kind != "event_msg":
+            continue
+        if payload_kind == "task_started":
+            started = _row_time(row)
+        elif payload_kind == "task_complete":
+            payload = _payload(row)
+            last = payload.get("last_agent_message")
+            failure = payload.get("error")
+            reason = failure.get("message") if isinstance(failure, dict) else failure
+            if started is not None and not (isinstance(last, str) and last.strip()):
+                if isinstance(reason, str) and reason.strip():
+                    found[started] = " ".join(reason.split())
+            started = None
+    if len(_TURN_ERRORS) > 256:
+        _TURN_ERRORS.clear()
+    _TURN_ERRORS[session_id] = (key, found)
+    return found
+
+
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
     path = session_transcript_path(session_id)
     if path is None:
