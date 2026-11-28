@@ -3160,7 +3160,7 @@ def test_a_timeline_message_in_a_plain_commit_points_at_its_own_section(tmp_path
     ]
 
 
-def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
+def _render_log(entries: list[dict], tmp_path, setup: str = "", items: list | None = None) -> str:
     """What the dashboard script draws for this log page (``renderLog``), under node."""
     import os
     import shutil
@@ -3180,7 +3180,9 @@ def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
     script = work / "log.js"
     run = (
         setup
-        + f"LOGPAGE = {{entries: {json.dumps(entries)}, total: {len(entries)}, offset: 0, limit: 50}}; renderLog();"
+        + f"LOGPAGE = {{entries: {json.dumps(entries)}, total: {len(entries)}, offset: 0, limit: 50"
+        + (f", items: {json.dumps(items)}" if items is not None else "")
+        + "}; renderLog();"
     )
     script.write_text(
         "const SOURCE = "
@@ -3208,10 +3210,11 @@ def _render_log(entries: list[dict], tmp_path, setup: str = "") -> str:
     return result.stdout
 
 
-def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_path):
-    """Newest first, by time: a message shows where it was sent, even when it went into a LATER
-    commit than the one made just after it (a fold), and each says which commit it went into.
-    The commits tab is unchanged."""
+def test_the_timeline_shows_each_message_with_the_commit_it_led_to(tmp_path):
+    """Newest first: each commit, then the messages it holds, newest first, even when one was
+    sent before an EARLIER commit than its own (a fold): placed at the moment it was sent, it read
+    as the reason for that other commit. Each message still says when it was sent, and which
+    commit it went into. The commits tab is unchanged."""
     newer = {
         "sha": "b" * 40,
         "short": "bbbbbbbb",
@@ -3236,7 +3239,7 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
         "turns": [{"at": None, "prompts": ["KIWI undated"]}],
     }
     out = _render_log([newer, older], tmp_path, setup='LOGTAB = "timeline"; ')
-    order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "middle commit", "KIWI", "ORANGE")]
+    order = [out.index(word) for word in ("fold commit", "LIME", "LEMON", "ORANGE", "middle commit", "KIWI")]
     assert order == sorted(order)
     # Each message says where to find more: the commit it went into, by id.
     assert out.count('more in <span class="tsha">bbbbbbbb</span> →') == 3
@@ -3248,7 +3251,7 @@ def test_the_timeline_interleaves_what_was_asked_with_the_commits_it_led_to(tmp_
 
     # Oldest first, the same rows run forwards: each message before the commit it went into.
     rev = _render_log([older, newer], tmp_path, setup='LOGTAB = "timeline"; state.sort = "oldest"; ')
-    order = [rev.index(word) for word in ("ORANGE", "KIWI", "middle commit", "LEMON", "LIME", "fold commit")]
+    order = [rev.index(word) for word in ("KIWI", "middle commit", "ORANGE", "LEMON", "LIME", "fold commit")]
     assert order == sorted(order)
 
     commits = _render_log([newer, older], tmp_path, setup='LOGTAB = "commits"; ')
@@ -3636,8 +3639,8 @@ def _two_people_merged(repo_dir) -> dict[str, str]:
 def test_the_timeline_of_two_people_working_at_once_on_merged_branches(tmp_path):
     # Two people talk to their own agents at the same time, commit separately on their own
     # branches, and both branches are merged. Every message is shown once, labelled with the
-    # person whose commit it went into, at the time it was asked (so the two people's messages
-    # interleave), pointing at that commit and, for a fold, at the right part. The merges carry
+    # person whose commit it went into, listed with that commit (each message keeps the time it
+    # was asked), pointing at that commit and, for a fold, at the right part. The merges carry
     # no messages of their own, so nothing appears twice. Also checked in headless Chrome on
     # the same repository: all six links opened the right commit or part and marked the
     # message, and filtering to one committer left only that person's messages.
@@ -3669,8 +3672,16 @@ def test_the_timeline_of_two_people_working_at_once_on_merged_branches(tmp_path)
     assert by_sha[ids["B2"]]["parts"][1]["subject"] == "<aGiTrack> bob two"
 
     out = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
-    order = [out.index(word) for word in ("BOB-3", "ALICE-2b", "ALICE-2<", "BOB-2", "BOB-1", "ALICE-1")]
-    assert order == sorted(order)  # newest first, the two people's messages interleaved by time
+    # Newest first, each person's messages right under the commit they went into, never under
+    # the other person's commit made in between.
+    rows = re.findall(r'<div class="(?:entry[^"]*" data-i="(\d+)"|tprompt[^"]*" data-c="(\d+)")', out)
+    under = None
+    for commit, message in rows:
+        if commit:
+            under = commit
+        else:
+            assert message == under
+    assert len([m for _c, m in rows if m]) == 6
     assert out.count("bob</b> asked") == 3 and out.count("alice</b> asked") == 2
     assert out.count("alice</b> followed up") == 1
     assert out.count(f'<span class="tsha">{by_sha[ids["B2"]]["short"]}</span>') == 2
@@ -3943,13 +3954,12 @@ def _people_taking_turns_on_main(repo_dir) -> None:
     git("merge", "-q", "--no-ff", "-m", "Merge bob-work", "bob-work", who="carol", at=d + "10:45:00Z")
 
 
-def test_hovering_a_timeline_message_lights_its_own_commit_even_when_others_lie_between(tmp_path):
-    # Pointing at a message lights up the commit that INCLUDED it and that commit's other
-    # messages, never "the stretch of rail around it": with several people committing at once,
-    # someone else's commit (and their messages) routinely sits between a message and its own
-    # commit, so the lit items are not one block. Also checked in headless Chrome on the same
-    # repository at 1280 and 390 px with real mouse moves: all 10 messages lit exactly their own
-    # commit and its messages, 9 of them as split blocks.
+def test_a_timeline_message_sits_with_its_own_commit_when_others_commit_in_between(tmp_path):
+    # With several people committing at once, someone else's commit is often made between a
+    # message being sent and the commit it went into. Placed at the moment it was sent, the
+    # message then read as the reason for that other commit. Every message sits with the commit
+    # that included it (right below it, newest first), and pointing at it lights exactly that
+    # commit and its other messages, as one block.
     import json as _json
     import subprocess
 
@@ -3957,36 +3967,164 @@ def test_hovering_a_timeline_message_lights_its_own_commit_even_when_others_lie_
 
     repo_dir = tmp_path / "team"
     _people_taking_turns_on_main(repo_dir)
-    entries = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {}).body)["entries"]
-    html = _render_log(entries, tmp_path, setup='LOGTAB = "timeline"; ')
+    payload = _json.loads(RepoScope(GitRepo.discover(repo_dir)).get("/log", {"view": ["timeline"]}).body)
+    entries = payload["entries"]
+    html = _render_log(entries, tmp_path, setup="LOGTAB = 'timeline'; ", items=payload["items"])
 
-    # The rail in order: commits carry data-i, messages data-c (the commit they went into).
     rail = re.findall(r'<div class="(entry[^"]*|tprompt[^"]*)" data-(i|c)="(\d+)"', html)
     assert rail, html[:500]
     messages = [m.group(1).strip() for m in re.finditer(r'<div class="tbody md">(.*?)</div>', html, re.S)]
     messages = [re.sub(r"<[^>]+>", "", m).strip() for m in messages]
     assert len(messages) == sum(1 for _cls, kind, _n in rail if kind == "c") == 10
 
-    def lit_by(index: str) -> list[int]:
-        # What the hover handler selects: `.entry[data-i=N]` and `.tprompt[data-c=N]`.
-        return [pos for pos, (_cls, _kind, n) in enumerate(rail) if n == index]
-
-    split = 0
     message_at = iter(messages)
-    for pos, (_cls, kind, n) in enumerate(rail):
-        if kind != "c":
+    current = None
+    for _cls, kind, n in rail:
+        if kind == "i":
+            current = n
             continue
         text = next(message_at)
-        sha = entries[int(n)]["sha"]
         body = subprocess.run(
-            ["git", "-C", str(repo_dir), "log", "-1", "--format=%B", sha], capture_output=True, text=True
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%B", entries[int(n)]["sha"]],
+            capture_output=True,
+            text=True,
         ).stdout
         assert f"## User\n\n{text}\n" in body, (text, entries[int(n)]["subject"])
-        lit = lit_by(n)
-        assert pos in lit and sum(1 for p in lit if rail[p][1] == "i") == 1
-        split += any(b - a > 1 for a, b in zip(lit, lit[1:]))
-    assert split >= 5  # the highlight follows the commit, not the neighbourhood
+        assert n == current, (text, "is not under its own commit")
+        lit = [p for p, (_c, _k, m) in enumerate(rail) if m == n]
+        assert all(b - a == 1 for a, b in zip(lit, lit[1:]))  # one block
 
-    # And the page's hover handler keys on exactly that association.
+    # The same order without the server's row list (the page's own fallback).
+    assert re.findall(r'data-(?:i|c)="(\d+)"', _render_log(entries, tmp_path, setup="LOGTAB = 'timeline'; ")) == [
+        n for _c, _k, n in rail
+    ]
+
+    # The page's hover handler keys on the commit a message is shown with.
     page = render_html(_demo_repo(tmp_path / "demo"))
-    assert """'#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]'""" in page
+    assert """'#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-own="'+i+'"]'""" in page
+
+
+def _trace_commit(repo, n, trace, session="s1", backend="codex"):
+    _write_lines(repo, "a.txt", n)
+    repo.commit(
+        build_agent_commit_message(
+            latest_prompt="x",
+            trace=trace,
+            backend=backend,
+            backend_session_id=session,
+            agitrack_session_id="sid",
+            model="m",
+            token_usage={"output": 1},
+        )
+    )
+
+
+_STILL_RUNNING = "This turn was still running when this commit was made. The rest of it is recorded in a later commit."
+_CONTINUED = (
+    "Continued from the interaction recorded in the previous commit, which the agent made while this turn"
+    " was still running."
+)
+
+
+def test_a_followup_sent_while_the_agent_worked_is_shown_with_the_commit_that_answers_it(tmp_path):
+    # The agent commits its own work mid-turn (here a price refresh) after the user has sent a
+    # follow-up about something else; that commit carries every message sent so far. The
+    # follow-up is answered in the record of the turn's rest, so the timeline lists it with that
+    # commit: under the mid-turn commit it read as the reason for a commit about something else
+    # (seen live). The turn's own prompt stays with the mid-turn commit, which is work on it.
+    from agitrack.commits.message import TRACE_NOTE_ROLE
+    from agitrack.metrics.web import log_page
+
+    repo = GitRepo.init(tmp_path)
+    _trace_commit(
+        repo,
+        1,
+        [
+            {"role": "user", "content": "UPDATE the price list"},
+            {"role": "user", "content": "ALSO no separate scrolling", "starts_turn": False},
+            {"role": "agent", "content": "I'll refresh the prices first."},
+            {"role": TRACE_NOTE_ROLE, "content": _STILL_RUNNING},
+        ],
+    )
+    _trace_commit(
+        repo, 2, [{"role": "user", "content": "OTHER talk"}, {"role": "agent", "content": "ok"}], session="s2"
+    )
+    _trace_commit(
+        repo,
+        3,
+        [
+            {"role": TRACE_NOTE_ROLE, "content": _CONTINUED},
+            {"role": "user", "content": "AND one more", "starts_turn": False},
+            {"role": "agent", "content": "DONE: prices refreshed and answers grow with the page."},
+        ],
+    )
+    page = log_page(build_dashboard(repo), view="timeline", limit=50)
+    entries = page["entries"]
+    first = next(e for e in entries if "UPDATE the price list" in e["message"])
+    last = next(e for e in entries if "DONE:" in e["message"])
+    turn = first["turns"][0]
+    assert turn["prompts"] == ["UPDATE the price list", "ALSO no separate scrolling"]
+    assert turn["owner"] == {"1": entries.index(last)}  # the follow-up, not the prompt
+    # Both are answered from the record of the turn's rest.
+    assert turn["later"]["0"]["text"].startswith("DONE:") and turn["later"]["1"]["text"].startswith("DONE:")
+
+    # Rows: each commit, then the messages shown with it.
+    def label(row):
+        index, seq = row
+        entry = entries[index]
+        if seq == 0:
+            return entry["short"]
+        return [p for t in entry["turns"] for p in t["prompts"]][seq - 1].split()[0]
+
+    shown = [label((i, seq)) for i, seq in page["items"]]
+    middle = next(e for e in entries if "OTHER talk" in e["message"])
+    assert shown[:-1] == [last["short"], "AND", "ALSO", middle["short"], "OTHER", first["short"], "UPDATE"]
+
+    out = _render_log(entries, tmp_path, setup="LOGTAB = 'timeline'; ", items=page["items"])
+    assert out.count(f'answered in <span class="tsha">{last["short"]}</span> →') == 1
+
+
+def test_show_answer_says_when_the_rest_of_a_reply_is_not_recorded_yet(tmp_path):
+    # A commit made mid-turn, with nothing recording the turn's rest yet: the reply it holds is
+    # only what the agent had said by then, and the answer box says so.
+    from agitrack.commits.message import TRACE_NOTE_ROLE
+    from agitrack.metrics.web import log_page, shell_html
+
+    repo = GitRepo.init(tmp_path)
+    _trace_commit(
+        repo,
+        1,
+        [
+            {"role": "user", "content": "FIX it"},
+            {"role": "user", "content": "QUICKLY", "starts_turn": False},
+            {"role": "agent", "content": "I'll fix it now."},
+            {"role": TRACE_NOTE_ROLE, "content": _STILL_RUNNING},
+        ],
+    )
+    turn = log_page(build_dashboard(repo), view="timeline")["entries"][0]["turns"][0]
+    assert turn["unfinished"] == [0, 1] and "later" not in turn and "owner" not in turn
+    html = shell_html(_seeded(tmp_path / "s"))
+    assert "the rest of its reply is not recorded yet" in html and "agent had said so far" in html
+
+
+def test_show_answer_finds_the_rest_of_a_reply_an_older_version_cut_short(tmp_path):
+    # An older aGiTrack wrote no "still running" note: a commit made mid-turn carries the agent's
+    # early words ("I'll revise Figure 2") as if they were the reply, and the record of the rest
+    # repeats the message with the real reply. The later reply is attached even though the
+    # message's own record looks complete; a message answered once is left alone.
+    from agitrack.metrics.web import log_page
+
+    repo = GitRepo.init(tmp_path)
+    _trace_commit(
+        repo, 1, [{"role": "user", "content": "REVISE figure 2"}, {"role": "agent", "content": "I'll revise it."}]
+    )
+    _trace_commit(repo, 2, [{"role": "user", "content": "SEPARATE question"}, {"role": "agent", "content": "answer"}])
+    _trace_commit(
+        repo,
+        3,
+        [{"role": "user", "content": "REVISE figure 2"}, {"role": "agent", "content": "Figure 2 now shows both."}],
+    )
+    entries = log_page(build_dashboard(repo), view="timeline")["entries"]
+    turns = {t["prompts"][0]: t for e in entries for t in e.get("turns", [])}
+    assert turns["REVISE figure 2"]["later"]["0"]["text"] == "Figure 2 now shows both."
+    assert "later" not in turns["SEPARATE question"] and "unfinished" not in turns["SEPARATE question"]

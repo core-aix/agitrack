@@ -1063,59 +1063,154 @@ def _part_at(stat: CommitStat, path: list[int]) -> CommitStat | None:
     return node
 
 
-def _records(stats: list[CommitStat]) -> list[CommitStat]:
-    """Every turn record in history order: each commit, or each part of a squash or fold."""
-    out: list[CommitStat] = []
-    for stat in stats:
-        parts = list(stat.constituents)
-        if parts and _is_own_lead(parts[0], stat):
-            parts = parts[1:]
-        if parts:
-            out.extend(_records(parts))
-        else:
-            out.append(stat)
-    return out
+# What one record's trace says about how it ends, by message text (a record's message never
+# changes, and every timeline page asks this of the whole history): whether it CONTINUES a turn
+# an earlier commit captured mid-flight (it opens with the "continued" note), whether it STOPS
+# mid-turn (it ends with the "still running" note), and which of its messages are follow-ups
+# sent while that last turn ran that it never answers (ordinals among its ``## User`` sections).
+_RECORD_FACTS: dict[str, tuple[bool, bool, tuple[int, ...]]] = {}
 
 
-def _later_reply(records: list[CommitStat], owner: CommitStat, record: CommitStat, prompt: str) -> dict | None:
-    """The agent's reply to *prompt* from a LATER record of the same conversation, when its own
-    record has none or stopped with the turn still running: the record of the turn's rest (it
-    opens with the "continued from the previous commit" note), or, as an older aGiTrack wrote
-    it, a later record repeating the same message. ``{"text", "short", "sha"}`` of the commit
-    holding it (the record's own, for a pending turn: empty sha), or None."""
-    session = (record.metadata or {}).get("backend_session_id")
-    if not session:
-        return None
-    try:
-        position = next(k for k, r in enumerate(records) if r is record)
-    except StopIteration:
+def _record_facts(message: str) -> tuple[bool, bool, tuple[int, ...]]:
+    found = _RECORD_FACTS.get(message)
+    if found is not None:
+        return found
+    if len(_RECORD_FACTS) > 50_000:
+        _RECORD_FACTS.clear()
+    lead, sections = _trace_roles(message)
+    continued = _CONTINUED_NOTE in " ".join(" ".join(lead).replace(">", " ").split())
+    _, running = _reply_after(sections, len(sections))
+    late: list[int] = []
+    if running:
+        # The turn that was still running is the last run of messages and the agent's words
+        # after it (a turn is written as its prompt, the follow-ups sent while it ran, then what
+        # the agent said, so a follow-up never reads as answered in its own record). Its first
+        # message is the turn's own prompt, which the commit is work on; the others were sent
+        # while the agent worked, and their answer is in the record of the turn's rest. A record
+        # that itself continues a turn and opens with that run holds no prompt: every message in
+        # it was sent while the turn ran.
+        last = len(sections)
+        while last and sections[last - 1][0] != "User":
+            last -= 1
+        first = last
+        while first and sections[first - 1][0] == "User":
+            first -= 1
+        ordinals = [k for k, (role, _) in enumerate(sections) if role == "User"]
+        run = [ordinals.index(k) for k in range(first, last) if _strip_running_note("\n".join(sections[k][1])).strip()]
+        late = run if (continued and first == 0) else run[1:]
+    found = _RECORD_FACTS[message] = (continued, running, tuple(late))
+    return found
+
+
+def _session_of(record: CommitStat) -> str:
+    return str((record.metadata or {}).get("backend_session_id") or "")
+
+
+class _ReplyIndex:
+    """Where, in the whole history, a message's reply could continue: per conversation, the
+    records that continue a turn captured mid-flight, and every record that carries a given
+    message (an older aGiTrack repeated a turn's prompt in the record of its rest; a follow-up
+    queued during a turn opens the next record too). Built once per history, so finding the
+    reply a later record holds never re-reads every record for every message."""
+
+    def __init__(self, stats: list[CommitStat]):
+        self.records: list[CommitStat] = []
+        self.holder: list[CommitStat] = []  # the commit (or pending turn) each record is in
+        for stat in stats:
+            for _, record in _leaves(stat):
+                self.records.append(record)
+                self.holder.append(stat)
+        self.position = {id(record): k for k, record in enumerate(self.records)}
+        self.continuations: dict[str, list[int]] = {}
+        self.carrying: dict[tuple[str, str], list[int]] = {}
+        self.by_session: dict[str, list[int]] = {}
+        for k, record in enumerate(self.records):
+            session = _session_of(record)
+            if not session:
+                continue
+            self.by_session.setdefault(session, []).append(k)
+            if _record_facts(record.message)[0]:
+                self.continuations.setdefault(session, []).append(k)
+            for _, text in _trace_user_sections(record.message):
+                self.carrying.setdefault((session, " ".join(text.split())), []).append(k)
+
+    def next_in_session(self, record: CommitStat) -> CommitStat | None:
+        """The next record of *record*'s conversation, if any."""
+        position = self.position.get(id(record))
+        later = [k for k in self.by_session.get(_session_of(record), []) if position is not None and k > position]
+        return self.records[later[0]] if later else None
+
+
+_REPLY_INDEX: dict[tuple, _ReplyIndex] = {}
+
+
+def _reply_index(stats: list[CommitStat]) -> _ReplyIndex:
+    key = (id(stats), len(stats), stats[-1].sha if stats else "", len(stats[-1].message) if stats else 0)
+    found = _REPLY_INDEX.get(key)
+    if found is None:
+        _REPLY_INDEX.clear()  # one history at a time: a rebuilt dashboard is a new list
+        found = _REPLY_INDEX[key] = _ReplyIndex(stats)
+    return found
+
+
+def _continued_reply(record: CommitStat) -> str:
+    """The agent's words in a record that continues a turn: the rest of that turn's reply. The
+    record writes the follow-ups sent since the earlier commit first, then what the agent said,
+    so the reply is the first run of the agent's words, up to a message after it (a new turn)."""
+    _, sections = _trace_roles(record.message)
+    replies: list[str] = []
+    for role, lines in sections:
+        if role == "User" and replies:
+            break
+        if role == "Agent" and (text := _strip_running_note("\n".join(lines)).strip()):
+            replies.append(text)
+    return "\n\n".join(replies)
+
+
+def _repeated_reply(record: CommitStat, want: str) -> str:
+    """The reply *record* gives to the message *want* (whitespace collapsed), "" if none."""
+    _, sections = _trace_roles(record.message)
+    for k, (role, lines) in enumerate(sections):
+        if role == "User" and " ".join(_strip_running_note("\n".join(lines)).split()) == want:
+            return _reply_after(sections, k)[0]
+    return ""
+
+
+def _later_reply(index: _ReplyIndex, record: CommitStat, prompt: str, own: str, running: bool) -> dict | None:
+    """The agent's reply to *prompt* from a LATER record of the same conversation. When its own
+    record stopped with the turn still running (or holds no reply): the record of the turn's
+    rest (it opens with the "continued from the previous commit" note), or a later record
+    repeating the same message. When its own record looks complete: only a later record that
+    repeats the message with a DIFFERENT reply, which is how an older aGiTrack, writing no
+    "still running" note, recorded the rest of a turn its mid-turn commit cut short (and how a
+    follow-up queued during a turn gets its own answer in the next record).
+    ``{"text", "short", "sha"}`` of the commit holding it (a pending turn's own), or None."""
+    session = _session_of(record)
+    position = index.position.get(id(record))
+    if not session or position is None:
         return None
     want = " ".join(prompt.split())
-    for later in records[position + 1 :]:
-        if (later.metadata or {}).get("backend_session_id") != session:
+    repeats = [k for k in index.carrying.get((session, want), []) if k > position]
+    if running or not own:
+        candidates = sorted({*repeats, *(k for k in index.continuations.get(session, []) if k > position)})
+    else:
+        candidates = repeats
+    mine = " ".join(own.split())
+    for k in candidates:
+        later = index.records[k]
+        reply = _repeated_reply(later, want) if k in repeats else _continued_reply(later)
+        if not reply or (not running and own and " ".join(reply.split()) == mine):
             continue
-        lead, sections = _trace_roles(later.message)
-        reply = ""
-        if _CONTINUED_NOTE in " ".join(" ".join(lead).replace(">", " ").split()):
-            first_user = next((k for k, (role, _) in enumerate(sections) if role == "User"), len(sections))
-            reply = "\n\n".join(
-                text
-                for role, lines in sections[:first_user]
-                if role == "Agent" and (text := _strip_running_note("\n".join(lines)).strip())
-            )
-        else:
-            for k, (role, lines) in enumerate(sections):
-                if role == "User" and " ".join(_strip_running_note("\n".join(lines)).split()) == want:
-                    reply, _ = _reply_after(sections, k)
-                    break
-        if reply:
-            return {"text": reply, "short": later.short, "sha": later.sha}
+        holder = index.holder[k]
+        return {"text": reply, "short": holder.short, "sha": holder.sha}
     return None
 
 
-def _with_later_replies(entry: dict, stat: CommitStat, records_fn) -> dict:
-    """Attach, per timeline message whose own record carries no complete reply, the reply a
-    later commit holds (``turn["later"][<section>]``). Only those messages pay for the search."""
+def _with_later_replies(entry: dict, stat: CommitStat, index_fn) -> dict:
+    """Attach, per timeline message, the reply a later commit holds (``turn["later"][<sec>]``),
+    and mark a message whose record stopped mid-turn with no later record of the rest yet
+    (``turn["unfinished"]``: the reply shown is only what the agent had said by then), or whose
+    rest was recorded with its words taken out since (``turn["trimmed"]``)."""
     for turn in entry.get("turns") or []:
         record = _part_at(stat, turn.get("path") or [])
         if record is None:
@@ -1126,11 +1221,16 @@ def _with_later_replies(entry: dict, stat: CommitStat, records_fn) -> dict:
             if not 0 <= sec < len(users):
                 continue
             own, running = _reply_after(sections, users[sec])
-            if own and not running:
-                continue
-            found = _later_reply(records_fn(), stat, record, prompt)
+            found = _later_reply(index_fn(), record, prompt, own, running)
             if found:
                 turn.setdefault("later", {})[str(sec)] = found
+            elif running:
+                # Recorded, but its words were taken out since (the trace age limit, or
+                # `agitrack redact`): say so rather than "not recorded yet".
+                rest = index_fn().next_in_session(record)
+                meta = (rest.metadata or {}) if rest is not None else {}
+                trimmed = bool(meta.get("trace_aged_out") or meta.get("trace_removed"))
+                turn.setdefault("trimmed" if trimmed else "unfinished", []).append(sec)
     return entry
 
 
@@ -1177,13 +1277,17 @@ def log_page(
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
     items: list[tuple[int, int]] | None = None
+    owners: dict[tuple[int, int], int] = {}
     if view == "timeline":
-        rows = _timeline_rows(stats, sort, (backend, model))
+        rank = {stat.sha: k for k, stat in enumerate(dash.stats)}
+        owners = _message_owners(stats, (backend, model), rank)
+        rows = _timeline_rows(stats, sort, (backend, model), owners, rank)
         if at_commit is not None:
             offset = next((n for n, row in enumerate(rows) if row == (at_commit, 0)), 0)
         offset = min(offset, max(len(rows) - 1, 0)) // limit * limit
         items = rows[offset : offset + limit]
-        shown = sorted({index for index, _ in items})
+        # A message shown with a later commit than its own needs that commit's entry too.
+        shown = sorted({index for index, _ in items} | {owners[row] for row in items if row in owners})
         page = [stats[index] for index in shown]
     else:
         page = stats[offset : offset + limit]
@@ -1196,18 +1300,15 @@ def log_page(
     if backend or model:
         for stat, entry in zip(page, entries):
             entry["turns"] = _timeline_turns(stat, engine=(backend, model))
+
     # "show answer" for a message whose reply landed in a LATER commit (one made while the turn
     # was still running carries the question, the next one the reply). Searched over the whole
     # history, not the filtered slice, and only for messages missing a complete reply.
-    cached: list[list[CommitStat]] = []
-
-    def records() -> list[CommitStat]:
-        if not cached:
-            cached.append(_records(dash.stats))
-        return cached[0]
+    def reply_index() -> _ReplyIndex:
+        return _reply_index(dash.stats)
 
     for stat, entry in zip(page, entries):
-        _with_later_replies(entry, stat, records)
+        _with_later_replies(entry, stat, reply_index)
     payload = {"total": len(stats), "offset": offset, "limit": limit, "entries": entries}
     if items is not None:
         local = {index: k for k, index in enumerate(shown)}
@@ -1222,21 +1323,45 @@ def log_page(
         for index, entry in zip(shown, entries):
             entry["index"] = index
             entry["row"] = commit_rows.get(index, 0)
+            # Which entry each message of it is shown with, where that is not its own
+            # (`turn["owner"][<section>]`, an index into `entries`).
+            seq = 0
+            for turn in entry.get("turns") or []:
+                for sec in turn.get("sections") or []:
+                    seq += 1
+                    owner = owners.get((index, seq))
+                    if owner is not None and owner in local:
+                        turn.setdefault("owner", {})[str(sec)] = local[owner]
     return payload
 
 
-def _timeline_rows(stats: list[CommitStat], sort: str, engine: Engine = ("", "")) -> list[tuple[int, int]]:
+def _timeline_rows(
+    stats: list[CommitStat],
+    sort: str,
+    engine: Engine = ("", ""),
+    owners: dict[tuple[int, int], int] | None = None,
+    rank: dict[str, int] | None = None,
+) -> list[tuple[int, int]]:
     """Every row the timeline shows, in the order it shows them: ``(index, seq)`` with ``index``
     the commit's place in ``stats`` and ``seq`` 0 for the commit itself, n for its n-th message
     (oldest first). A page is a slice of these, so it holds exactly ``limit`` rows whether they
     are commits or messages, and a commit's messages continue onto the next page when they do
-    not fit. Sorted by date, messages and commits interleave by time, newest first (a message is
-    placed when its turn began); under another sort each commit is followed by its own messages,
-    newest first. Sorted ``oldest`` first the same rows run forwards in time, so each message
-    comes before the commit it went into. The page script draws the rows in exactly this order."""
+    not fit.
+
+    Each message sits WITH the commit it went into (its owner, :func:`_message_owners`): right
+    below it, newest first, or right before it when sorted ``oldest`` first (asked, then
+    committed). Commits run by date (or by the chosen sort), so other people's commits come
+    between commits, never between a commit and its own messages: placing every message at the
+    moment it was sent let a commit the agent made mid-turn land between a message and the commit
+    that answered it, and the message read as the reason for a commit about something else. A
+    message still says when it was sent. A message of a pending turn (recorded, not yet in a
+    commit) has no commit row to sit with and is placed when it was sent. The page script draws
+    the rows in exactly this order."""
     by_time = sort not in ("lines", "tokens")  # as _sorted_for_log: anything else is by date
     oldest = sort == "oldest"
-    repeats = _repeated_messages(stats, engine)
+    repeats = _repeated_messages(stats, engine, rank)
+    if owners is None:
+        owners = _message_owners(stats, engine, rank)
     keyed: list[tuple[tuple, tuple[int, int]]] = []
     for index, stat in enumerate(stats):
         commit_time = stat.timestamp or 0
@@ -1246,22 +1371,92 @@ def _timeline_rows(stats: list[CommitStat], sort: str, engine: Engine = ("", "")
         # commit list still lists it, and it folds into the next commit like the rest.
         if not stat.pending:
             if oldest:
-                keyed.append(((commit_time, index, 1, 0), (index, 0)))
+                keyed.append(((commit_time, index, 1, 0, 0, 0), (index, 0)))
             else:
-                keyed.append(((-commit_time if by_time else 0, index, 0, 0), (index, 0)))
+                keyed.append(((-commit_time if by_time else 0, index, 0, 0, 0, 0), (index, 0)))
         for seq, at in enumerate(_prompt_times(stat, engine), start=1):
             if (index, seq) in repeats:
                 continue
             when = at or commit_time
+            owner = owners.get((index, seq), index)
+            anchor = when if stats[owner].pending else (stats[owner].timestamp or 0)
             if oldest:
-                keyed.append(((when, index, 0, seq), (index, seq)))
+                keyed.append(((anchor, owner, 0, when, index, seq), (index, seq)))
             else:
-                keyed.append(((-when if by_time else 0, index, 1, -seq), (index, seq)))
+                keyed.append(((-anchor if by_time else 0, owner, 1, -when, index, -seq), (index, seq)))
     keyed.sort(key=lambda pair: pair[0])
     return [row for _, row in keyed]
 
 
-def _repeated_messages(stats: list[CommitStat], engine: Engine = ("", "")) -> set[tuple[int, int]]:
+def _leaves(stat: CommitStat, path: tuple[int, ...] = ()) -> list[tuple[tuple[int, ...], CommitStat]]:
+    """Every turn record in a commit, with its place in the parts tree (as :func:`_timeline_turns`
+    numbers it), oldest first: the commit itself, or each part of a squash or fold."""
+    parts = list(stat.constituents)
+    if parts and _is_own_lead(parts[0], stat):
+        parts = parts[1:]
+    if not parts:
+        return [(path, stat)]
+    last = len(parts) - 1
+    return [leaf for j, part in enumerate(parts) for leaf in _leaves(part, (*path, last - j))]
+
+
+def _history_order(stats: list[CommitStat], rank: dict[str, int] | None) -> list[int]:
+    """Indices of *stats* in history order: committed before pending, then by time, then by
+    place in the branch's history (*rank*, sha to position), since commits made within the same
+    second share a timestamp."""
+    rank = rank or {}
+    return sorted(
+        range(len(stats)), key=lambda k: (stats[k].pending, stats[k].timestamp or 0, rank.get(stats[k].sha, 0))
+    )
+
+
+def _message_owners(
+    stats: list[CommitStat], engine: Engine = ("", ""), rank: dict[str, int] | None = None
+) -> dict[tuple[int, int], int]:
+    """The ``(index, seq)`` of every message the timeline shows with a LATER commit than the one
+    whose trace carries it, mapped to that commit's index. A commit made while a turn was still
+    running (often the agent's own, mid-turn) carries every message sent so far, including the
+    follow-ups the user sent while the agent worked; the commit is work on the turn's prompt, and
+    those follow-ups are answered in the record of the turn's rest. Listed with the mid-turn
+    commit, a follow-up read as the reason for a commit about something else (seen live: "don't
+    make a separate scrolling" under "Refresh the price reference"). Only when the record of the
+    rest is in ``stats`` (the same conversation, the next record that continues a turn)."""
+    order = _history_order(stats, rank)
+    leaves = [(index, path, record) for index in order for path, record in _leaves(stats[index])]
+    owners: dict[tuple[int, int], int] = {}
+    pending: dict[str, list[tuple[int, tuple[int, ...], tuple[int, ...]]]] = {}
+    for index, path, record in leaves:
+        session = _session_of(record)
+        if not session:
+            continue
+        continued, _, late = _record_facts(record.message)
+        if continued:
+            for src, src_path, ordinals in pending.pop(session, []):
+                if src == index:
+                    continue
+                for seq in _seqs_of(stats[src], src_path, ordinals, engine):
+                    owners[(src, seq)] = index
+        if late:
+            pending.setdefault(session, []).append((index, path, late))
+    return owners
+
+
+def _seqs_of(stat: CommitStat, path: tuple[int, ...], ordinals: tuple[int, ...], engine: Engine) -> list[int]:
+    """The timeline ``seq`` (1-based, over the commit's messages oldest first) of the ``## User``
+    sections *ordinals* of the record at *path*."""
+    seq = 0
+    found: list[int] = []
+    for turn in _timeline_turns(stat, engine=engine):
+        for sec in turn["sections"]:
+            seq += 1
+            if tuple(turn["path"]) == path and sec in ordinals:
+                found.append(seq)
+    return found
+
+
+def _repeated_messages(
+    stats: list[CommitStat], engine: Engine = ("", ""), rank: dict[str, int] | None = None
+) -> set[tuple[int, int]]:
     """The ``(index, seq)`` of every message the timeline already shows from an EARLIER record of
     the same turn. A commit made while a turn is still running carries the turn as it stood, and
     the rest of the turn is recorded afterwards as its own record (its final reply and the tokens
@@ -1273,7 +1468,7 @@ def _repeated_messages(stats: list[CommitStat], engine: Engine = ("", "")) -> se
     whose turn recorded no start cannot be placed and is never folded away."""
     seen: set[tuple[float, str]] = set()
     repeats: set[tuple[int, int]] = set()
-    for index in sorted(range(len(stats)), key=lambda k: (stats[k].pending, stats[k].timestamp or 0)):
+    for index in _history_order(stats, rank):
         for seq, key in enumerate(_prompt_keys(stats[index], engine), start=1):
             if key is None:
                 continue
@@ -1999,6 +2194,7 @@ h2.section::before{content:"# ";color:var(--amber)}
   overflow-wrap:anywhere}
 .tprompt .tanswer .alabel{font-size:11px;letter-spacing:.5px;color:var(--ops);margin-bottom:4px}
 .tprompt .tanswer .anote{font-size:11.5px;color:var(--fg-dim);font-style:italic}
+.tprompt .tanswer .abody + .anote,.tprompt .tanswer .alater + .anote{margin-top:6px}
 .tprompt .tanswer .awarn{font-size:11.5px;color:var(--amber);margin:0 0 6px}
 .tprompt .tanswer .alater{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)}
 .tprompt .tanswer .tsha{color:var(--amber);font-variant-numeric:tabular-nums}
@@ -3231,6 +3427,13 @@ function toggleAnswer(btn){
   box.className = "tanswer";
   const laterHtml = later ? `<div class="alabel">${found && found.text ? "the rest of the reply, " : "agent replied "}in a later commit${later.short ? ` <span class="tsha">${esc(later.short)}</span>` : ""}</div>`+
     `<div class="abody dmsg md">${md(later.text)}</div>` : "";
+  // A commit made while the turn was still running, with nothing recording the rest yet: what
+  // it holds is only what the agent had said by then.
+  const trimmed = !later && turn && (turn.trimmed || []).includes(sec);
+  const unfinished = trimmed || (!later && turn && (turn.unfinished || []).includes(sec));
+  const cutNote = trimmed
+    ? `<div class="anote">this commit was made while the agent was still working, so this is only what it had said by then; the rest of the turn was recorded later, but its words were left out of that record (older than the trace age limit, or removed)</div>`
+    : `<div class="anote">this commit was made while the agent was still working, so this is only what it had said by then; the rest of its reply is not recorded yet and will show here once a later commit records it</div>`;
   if(found && found.text){
     const others = found.before + found.after;
     const when = found.before && found.after ? "sent just before and after it"
@@ -3238,10 +3441,12 @@ function toggleAnswer(btn){
     const warn = others
       ? `<div class="awarn">answers this message together with ${others} other${others === 1 ? "" : "s"} ${when}, so it may not match this question exactly</div>`
       : "";
-    box.innerHTML = `<div class="alabel">agent replied</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
-      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "");
+    box.innerHTML = `<div class="alabel">${unfinished ? "agent had said so far" : "agent replied"}</div>${warn}<div class="abody dmsg md">${md(found.text)}</div>` +
+      (laterHtml ? `<div class="alater">${laterHtml}</div>` : "") + (unfinished ? cutNote : "");
   } else if(later){
     box.innerHTML = laterHtml;
+  } else if(unfinished){
+    box.innerHTML = cutNote;
   } else {
     box.innerHTML = `<div class="anote">${c && c.pending
       ? "no reply recorded yet: the agent may still be working on it"
@@ -3266,8 +3471,11 @@ function timelineHtml(entries, commitRow){
         // shown for one of its parts reads as that part's conversation.
         const eng = [state.backend && (turn.backend || state.backend), state.model && (turn.model || state.model)]
           .filter(Boolean).join(" · ");
+        const sec = (turn.sections || [])[k];
+        // The entry this message is shown with: its own, or the later commit that answers it.
+        const owner = turn.owner && turn.owner[String(sec)] != null ? turn.owner[String(sec)] : i;
         items.push({t: sent || c.ts || 0, approx: !sent, follow: k > 0, own: sent !== turn.at, seq: ++seq, i, text,
-          path: turn.path || [], sec: (turn.sections || [])[k], eng});
+          path: turn.path || [], sec, eng, owner});
       });
     }
   });
@@ -3279,13 +3487,16 @@ function timelineHtml(entries, commitRow){
     const byKey = new Map(items.map(it => [it.i + ":" + it.seq, it]));
     rows = LOGPAGE.items.map(([i, seq]) => byKey.get(i + ":" + seq)).filter(Boolean);
   } else {
+    // Each message sits with its commit (as the server orders them): commits by date, a pending
+    // turn's messages (no commit row) when they were sent.
+    const anchor = it => it.commit || !entries[it.i].pending ? (entries[it.i].ts || 0) : it.t;
     if(state.sort === "oldest"){
-      items.sort((a, b) => (a.t - b.t) || (a.i - b.i) ||
-        (a.commit === b.commit ? a.seq - b.seq : (a.commit ? 1 : -1)));
+      items.sort((a, b) => (anchor(a) - anchor(b)) || (a.i - b.i) ||
+        (a.commit === b.commit ? (a.t - b.t) || (a.seq - b.seq) : (a.commit ? 1 : -1)));
     } else {
-      const byTime = state.sort === "date";
-      items.sort((a, b) => (byTime ? (b.t - a.t) : 0) || (a.i - b.i) ||
-        (a.commit === b.commit ? b.seq - a.seq : (a.commit ? -1 : 1)));
+      const byTime = state.sort !== "lines" && state.sort !== "tokens";
+      items.sort((a, b) => (byTime ? (anchor(b) - anchor(a)) : 0) || (a.i - b.i) ||
+        (a.commit === b.commit ? (b.t - a.t) || (b.seq - a.seq) : (a.commit ? -1 : 1)));
     }
   }
   return rows.map(it => {
@@ -3296,13 +3507,18 @@ function timelineHtml(entries, commitRow){
       : `<span class="when" title="${esc((it.follow && !it.own ? "sent while the turn that began at this time was running · " : "") + w.title)}">${esc(w.text)}</span>`;
     const where = `data-path="${esc(it.path.join("."))}"` + (it.sec == null ? "" : ` data-sec="${it.sec}"`);
     // A pending turn has no commit to open yet: it folds into the next one.
-    const target = c.pending
+    // A follow-up sent while the agent worked is shown with the commit that answers it, when a
+    // commit made mid-turn carries it: the link opens that commit.
+    const o = it.owner != null && it.owner !== it.i ? entries[it.owner] : null;
+    const target = (o || c).pending
       ? `<span class="badge pending tpending" title="not yet committed: this message folds into your next commit">pending commit</span>`
-      : BACKTRACE ? "" : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
+      : BACKTRACE ? ""
+      : o ? `<button class="tgo" data-go="${it.owner}" title="sent while the agent was working; a commit it made then (${esc(c.short || "")}) records it, and this commit holds the answer">answered in <span class="tsha">${esc(o.short || "")}</span> →</button>`
+      : `<button class="tgo" data-go="${it.i}" ${where} title="open the commit this went into, at this message">more in <span class="tsha">${esc(c.short || "")}</span> →</button>`;
     const eng = it.eng ? `<span class="teng" title="asked of the backend / model you filtered by">${esc(it.eng)}</span>` : "";
     // The agent's reply, opened in place: no need to open the (possibly squashed) commit.
     const ans = it.sec == null ? "" : `<button class="tans" data-ans="${it.i}" ${where} aria-expanded="false" title="show what the agent answered, here">show answer</button>`;
-    return `<div class="tprompt clamp" data-c="${it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
+    return `<div class="tprompt clamp" data-c="${it.i}" data-own="${it.owner != null ? it.owner : it.i}"><div class="thead"><span class="twho"><b class="tid">${esc(c.author || "unknown")}</b> ${it.follow ? "followed up" : "asked"}</span>`+
       `${eng}${when}${target}</div><div class="tbody md">${md(it.text)}</div>`+
       `<button class="tmore" title="show the whole message">show all</button>`+
       (ans ? `<div class="tfoot">${ans}</div>` : "") + `</div>`;
@@ -4365,8 +4581,8 @@ function wireControls(){
   const linkHover = (e, on) => {
     const el = e.target.closest && e.target.closest(".tprompt, .entry");
     if(!el || !$("commitlog").classList.contains("timeline")) return;
-    const i = el.dataset.c !== undefined ? el.dataset.c : el.dataset.i;
-    document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-c="'+i+'"]')
+    const i = el.dataset.own !== undefined ? el.dataset.own : el.dataset.i;
+    document.querySelectorAll('#commitlog .entry[data-i="'+i+'"], #commitlog .tprompt[data-own="'+i+'"]')
       .forEach(n => n.classList.toggle("linked", on));
   };
   // A squashed part is a closed <details> when its commit opens, so its paragraphs have no
